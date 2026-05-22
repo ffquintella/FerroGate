@@ -1,0 +1,29 @@
+# Rust / Cargo
+/target
+debug/
+**/*.rs.bk
+*.pdb
+# Cargo.lock IS committed: the workspace ships binaries (cmis, mia, ferrogate).
+lcov.info
+
+# Environment
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+
+# logs
+logs/
+*.log
+*.log.*
+
+# frontend
+node_modules
+dist
+.vite
+.angular
