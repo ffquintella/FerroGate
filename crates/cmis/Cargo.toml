@@ -1,0 +1,28 @@
+[package]
+name        = "cmis"
+description = "FerroGate — Central Machine Identity Service (gRPC server)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[[bin]]
+name = "cmis"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ferro-crypto = { path = "../ferro-crypto" }
+ferro-attest = { path = "../ferro-attest" }
+ferro-audit  = { path = "../ferro-audit" }
+ferro-proto  = { path = "../ferro-proto" }
+ferro-tee    = { path = "../ferro-tee" }
+
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }

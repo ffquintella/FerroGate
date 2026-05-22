@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cmis",
+    "crates/mia",
+    "crates/ferro-crypto",
+    "crates/ferro-attest",
+    "crates/ferro-audit",
+    "crates/ferro-proto",
+    "crates/ferro-tee",
+    "crates/ferrogate-cli",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.78"
+license      = "Apache-2.0"
+repository   = "https://github.com/ffquintella/FerroGate"
+authors      = ["FerroGate contributors"]
+
+[workspace.lints.rust]
+unsafe_code         = "deny"
+missing_docs        = "warn"
+unreachable_pub     = "warn"
+rust_2018_idioms    = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all              = { level = "warn", priority = -1 }
+pedantic         = { level = "warn", priority = -1 }
+needless_pass_by_value  = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+doc_markdown            = "allow"
+unnecessary_wraps       = "allow"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "fs", "signal"] }
+
+# tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender   = "0.2"
+file-rotate        = "0.7"
+
+# errors
+thiserror = "1"
+anyhow    = "1"
+
+# serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium   = "0.2"
+
+# crypto (placeholders pinned now, used in later milestones)
+sha3          = "0.10"
+zeroize       = { version = "1.8", features = ["zeroize_derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+rand_core     = { version = "0.6", features = ["std"] }
+ring          = "0.17"
+
+# misc
+parking_lot = "0.12"
+once_cell   = "1"
+
+# test helpers
+proptest = "1"
