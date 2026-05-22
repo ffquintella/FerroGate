@@ -12,10 +12,24 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-thiserror     = { workspace = true }
-zeroize       = { workspace = true }
-sha3          = { workspace = true }
-ed25519-dalek = { workspace = true }
-rand_core     = { workspace = true }
-ring          = { workspace = true }
-serde         = { workspace = true }
+thiserror           = { workspace = true }
+zeroize             = { workspace = true }
+sha2                = { workspace = true }
+sha3                = { workspace = true }
+subtle              = { workspace = true }
+hex                 = { workspace = true }
+ed25519-dalek       = { workspace = true }
+rand_core           = { workspace = true }
+ring                = { workspace = true }
+serde               = { workspace = true }
+rustls              = { workspace = true }
+rustls-post-quantum = { workspace = true }
+rustls-pki-types    = { workspace = true }
+x509-parser         = { workspace = true }
+
+[dev-dependencies]
+tokio        = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen        = { workspace = true }
+aws-lc-rs    = { workspace = true }
+wycheproof   = { workspace = true }

@@ -32,6 +32,10 @@ allow = [
 allow = ["OpenSSL"]
 name  = "ring"
 
+[[licenses.exceptions]]
+allow = ["OpenSSL"]
+name  = "aws-lc-sys"
+
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
