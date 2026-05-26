@@ -6,14 +6,15 @@
 //!   configured for hybrid `X25519MLKEM768` key exchange (feature F01).
 //! - [`pin`] — SPKI-pin server certificate verifier for MIA-side handshakes
 //!   (feature F01).
+//! - [`composite`] — composite Ed25519 + ML-DSA-65 signatures with
+//!   AND-combiner verification (feature F03).
 //!
-//! Composite Ed25519 + ML-DSA-65 signatures (feature F03) land in a
-//! follow-up change.
-//!
-//! See `docs/crypto.md` and `docs/features/F01-hybrid-pqc-tls.md`.
+//! See `docs/crypto.md`, `docs/features/F01-hybrid-pqc-tls.md`, and
+//! `docs/features/F03-composite-signatures.md`.
 
 #![forbid(unsafe_code)]
 
+pub mod composite;
 pub mod pin;
 pub mod tls;
 

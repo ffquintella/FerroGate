@@ -335,6 +335,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "der_derive",
  "zeroize",
 ]
 
@@ -350,6 +351,17 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "rusticata-macros",
+]
+
+[[package]]
+name = "der_derive"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -460,8 +472,12 @@ name = "ferro-crypto"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "base64",
+ "der",
  "ed25519-dalek",
+ "fips204",
  "hex",
+ "proptest",
  "rand_core 0.6.4",
  "rcgen",
  "ring",
@@ -469,6 +485,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-post-quantum",
  "serde",
+ "serde_json",
  "sha2",
  "sha3",
  "subtle",
@@ -527,6 +544,18 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "fips204"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9fb5a367b9846933e271a3c2a992930743f82ae5e8cb7faa780715a80fa0b15"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha2",
+ "sha3",
+ "zeroize",
+]
 
 [[package]]
 name = "flate2"

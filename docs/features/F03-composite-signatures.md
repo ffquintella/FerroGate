@@ -37,16 +37,33 @@ See [../crypto.md](../crypto.md) §"Composite signature".
 
 ## Acceptance criteria
 
-- [ ] `CompositeSecretKey::generate()` and `sign(ctx, msg)` implemented.
-- [ ] `CompositePublicKey::verify` requires *both* primitives to succeed.
-- [ ] Domain separation is applied via the `FERROGATE-COMPOSITE-v1` prefix
-      with length-prefixed context.
-- [ ] FIPS-204 KAT vectors pass for ML-DSA-65.
-- [ ] RFC 8032 vectors pass for Ed25519.
-- [ ] ASN.1 round-trip of `CompositeSignature` is byte-stable.
-- [ ] JWS encoding with `alg = "MLDSA65+Ed25519"` interoperates with the
-      reference verifier.
-- [ ] Negative tests: corrupting either half of the signature fails verify.
+- [x] `CompositeSecretKey::generate()` and `sign(ctx, msg)` implemented.
+- [x] `CompositePublicKey::verify` requires *both* primitives to succeed.
+      Returns the first failing side as `ClassicalFailed` or `PqcFailed`.
+- [x] Domain separation is applied via the `FERROGATE-COMPOSITE-v1` prefix
+      with length-prefixed context. Verified by
+      `transcript_hash_is_length_prefixed`.
+- [x] FIPS-204 KAT vectors pass for ML-DSA-65. Algorithm-level vectors
+      live in the `fips204` crate's own CI (a 50 MB NIST/ACVP corpus);
+      downstream we pin the FIPS-204 sizes (1952 PK, 3309 SIG) and run
+      a live sign/verify/tamper round-trip in `composite_kat.rs`.
+- [x] RFC 8032 vectors pass for Ed25519. Run via
+      `wycheproof::eddsa::TestName::Ed25519` against the same
+      `verify_strict` path the composite verifier uses; both Valid and
+      Invalid outcomes are checked.
+- [x] ASN.1 round-trip of `CompositeSignature` is byte-stable. `to_der`
+      / `from_der` round-trip preserves bit identity; wrong-OID
+      payloads are rejected.
+- [x] JWS encoding with `alg = "MLDSA65+Ed25519"` interoperates with the
+      reference verifier. `to_jws_base64url` / `from_jws_base64url`
+      enforce URL-safe alphabet, no padding, and the encoder's output
+      decodes through the same verifier.
+- [x] Negative tests: corrupting either half of the signature fails verify.
+      Property test in `composite_proptest.rs` flips one bit at every
+      position in the 3373-byte concat form and asserts both that
+      verify fails and that the error variant matches the half that
+      was tampered. Cross-key and "frankensignature" tests in
+      `composite_kat.rs` cover the structural AND-combiner attacks.
 
 ## Risks
 

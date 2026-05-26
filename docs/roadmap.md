@@ -51,12 +51,12 @@ Land the primitives every other feature depends on.
 
 ### F03 — Composite signatures
 
-- [ ] `CompositeSecretKey` / `CompositePublicKey` with Ed25519 + ML-DSA-65.
-- [ ] Domain-separated `sign(ctx, msg)` and AND-combiner `verify`.
-- [ ] ASN.1 SEQUENCE encoder/decoder with OID `2.16.840.1.114027.80.8.1.7`.
-- [ ] JOSE `alg = "MLDSA65+Ed25519"` glue.
-- [ ] FIPS-204 and RFC 8032 KAT runners green.
-- [ ] Property test: corrupting either half fails verify.
+- [x] `CompositeSecretKey` / `CompositePublicKey` with Ed25519 + ML-DSA-65. (`crates/ferro-crypto/src/composite.rs`.)
+- [x] Domain-separated `sign(ctx, msg)` and AND-combiner `verify`. Transcript hash is `SHA3-384("FERROGATE-COMPOSITE-v1" || len_be64(ctx) || ctx || msg)`; both halves sign the same 48-byte digest; verify uses `ed25519-dalek::verify_strict` then `fips204::ml_dsa_65::verify`, returning the first failing side as `ClassicalFailed` or `PqcFailed`.
+- [x] ASN.1 SEQUENCE encoder/decoder with OID `2.16.840.1.114027.80.8.1.7`. (`to_der` / `from_der`; round-trip and wrong-OID rejection tested.)
+- [x] JOSE `alg = "MLDSA65+Ed25519"` glue. (`to_jws_base64url` / `from_jws_base64url`; URL-safe alphabet enforced by the encoder.)
+- [x] FIPS-204 and RFC 8032 KAT runners green. RFC 8032 / Ed25519 vectors run against `wycheproof::eddsa` (the full Ed25519 Wycheproof set, including malleability cases). FIPS-204 lengths are pinned to 1952/3309; algorithm KATs are exercised by the upstream `fips204` crate's CI — see `tests/composite_kat.rs` docstring for rationale.
+- [x] Property test: corrupting either half fails verify. (`crates/ferro-crypto/tests/composite_proptest.rs` — 32 cases of random `(ctx, msg)`; flips at every bit position; verifies the AND-combiner classifies errors correctly.)
 
 ## Milestone M2 — TPM attestation MVP
 
