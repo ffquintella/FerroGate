@@ -1,0 +1,112 @@
+// FerroGate MachineIdentity gRPC surface (feature F04).
+//
+// All RPCs run over a hybrid post-quantum TLS 1.3 channel (feature F01).
+// `Attest` is the only RPC a client may call without an existing valid SVID;
+// the client authenticates anonymously at the TLS layer and proves its
+// hardware identity in-band via the four-phase protocol (docs/protocol.md).
+
+syntax = "proto3";
+
+package ferrogate.v1;
+
+service MachineIdentity {
+  // Four-phase streaming attestation handshake. The server speaks first with
+  // a Nonce, then drives challenge/response and finally returns the SVID.
+  rpc Attest (stream AttestRequest) returns (stream AttestResponse);
+
+  // Fetch the most recently issued SVID for a SPIFFE id (debug / cache miss).
+  rpc FetchSVID (FetchRequest) returns (SVIDBundle);
+
+  // In-window renewal. No TPM interaction when PCRs and policy epoch are
+  // unchanged and the SVID is inside its re-attestation window; otherwise the
+  // server refuses and the client must run a full Attest.
+  rpc Rotate (RotateRequest) returns (SVIDBundle);
+
+  // Composite verification key set used to validate SVID signatures.
+  rpc JWKS (JWKSRequest) returns (JWKSResponse);
+}
+
+// ---- Attest: client -> server ------------------------------------------
+
+message AttestRequest {
+  oneof phase {
+    AttestInit init = 1;
+    ChallengeResponse challenge_response = 2;
+    Csr csr = 3;
+  }
+}
+
+// Phase 2 — hardware and boot attestation evidence.
+message AttestInit {
+  bytes ek_cert = 1;                  // DER EK certificate
+  repeated bytes ek_intermediates = 2; // DER intermediate CA certs
+  bytes aik_pub = 3;                  // marshaled TPMT_PUBLIC
+  bytes quote_blob = 4;               // marshaled TPMS_ATTEST
+  bytes signature = 5;                // marshaled TPMT_SIGNATURE
+  repeated PcrValue pcr_values = 6;   // raw PCR values for digest recompute
+}
+
+message PcrValue {
+  uint32 index = 1;
+  bytes value = 2;
+}
+
+// Phase 3 — the secret released by TPM2_ActivateCredential.
+message ChallengeResponse {
+  bytes secret = 1;
+}
+
+// Phase 4 — TPM-bound composite CSR.
+message Csr {
+  bytes composite_pub = 1; // concat composite public key (1984 bytes)
+  string dpop_jkt = 2;     // DPoP key thumbprint, base64url
+  bytes aik_sig = 3;       // AIK signature over SHA-384(composite_pub)
+}
+
+// ---- Attest: server -> client ------------------------------------------
+
+message AttestResponse {
+  oneof phase {
+    Nonce nonce = 1;
+    Challenge challenge = 2;
+    SVIDBundle svid = 3;
+  }
+}
+
+// Phase 2 — server-supplied qualifyingData for the quote.
+message Nonce {
+  bytes nonce = 1;
+}
+
+// Phase 3 — credential-activation challenge (MakeCredential output).
+message Challenge {
+  bytes credential_blob = 1;
+  bytes secret_blob = 2;
+}
+
+// ---- Shared issuance result --------------------------------------------
+
+message SVIDBundle {
+  string jws = 1;          // compact JWS SVID
+  int64 issued_at = 2;     // unix seconds (iat)
+  int64 expires_at = 3;    // unix seconds (exp)
+  string spiffe_id = 4;    // sub claim, for convenience
+}
+
+// ---- Rotate / Fetch / JWKS ---------------------------------------------
+
+message FetchRequest {
+  string spiffe_id = 1;
+}
+
+message RotateRequest {
+  string current_svid = 1;            // the JWS to renew
+  repeated PcrValue pcr_values = 2;   // current PCRs, for drift detection
+  uint64 known_epoch = 3;             // policy epoch the client believes is live
+}
+
+message JWKSRequest {}
+
+message JWKSResponse {
+  string jwks_json = 1;
+}

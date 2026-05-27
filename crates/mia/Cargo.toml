@@ -24,16 +24,37 @@ ferro-crypto = { path = "../ferro-crypto" }
 ferro-attest = { path = "../ferro-attest" }
 ferro-audit  = { path = "../ferro-audit" }
 ferro-proto  = { path = "../ferro-proto" }
+ferro-svid   = { path = "../ferro-svid" }
 
 tokio              = { workspace = true }
+tokio-stream       = { workspace = true }
+tonic              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+rand_core          = { workspace = true }
+sha2               = { workspace = true }
+hex                = { workspace = true }
+
+[dev-dependencies]
+cmis              = { path = "../cmis" }
+ferro-svid        = { path = "../ferro-svid" }
+ferro-svid-verify = { path = "../ferro-svid-verify" }
+ferro-attest      = { path = "../ferro-attest" }
+tokio-stream      = { workspace = true }
+futures           = { workspace = true }
+tonic             = { workspace = true }
+rcgen             = { workspace = true }
+p256              = { workspace = true }
+sha2              = { workspace = true }
+rand_core         = { workspace = true }
 
 # The TPM 2.0 ESAPI stack only builds where a TSS2 implementation exists
 # (Linux `/dev/tpmrm0`, Windows TBS). On other hosts `mia::tpm` compiles out.
 [target.'cfg(target_os = "linux")'.dependencies]
 tss-esapi = { workspace = true }
+ring      = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 hex          = { workspace = true }

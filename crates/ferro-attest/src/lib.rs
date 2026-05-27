@@ -31,8 +31,8 @@ pub mod verify;
 pub use rim::{PolicyId, RimStore};
 pub use vendor::{ChainError, Vendor, VendorMatch, VendorTrustStore};
 pub use verify::{
-    credential_secret_matches, PcrSet, QuoteVerification, RejectReason, TpmQuoteVerifier,
-    VerifiedQuote,
+    credential_secret_matches, verify_aik_signature, PcrSet, QuoteVerification, RejectReason,
+    TpmQuoteVerifier, VerifiedQuote,
 };
 
 /// Crate identifier.

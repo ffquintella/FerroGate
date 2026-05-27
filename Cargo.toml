@@ -7,6 +7,8 @@ members = [
     "crates/ferro-attest",
     "crates/ferro-audit",
     "crates/ferro-proto",
+    "crates/ferro-svid",
+    "crates/ferro-svid-verify",
     "crates/ferro-tee",
     "crates/ferrogate-cli",
 ]
@@ -81,6 +83,14 @@ wycheproof   = "0.6"
 
 # TPM 2.0 ESAPI (F02 — MIA-side hardware glue; Linux/Windows only)
 tss-esapi = "7.5"
+
+# gRPC / protobuf (F04 — MachineIdentity service surface)
+tonic        = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+tonic-build  = { version = "0.12", default-features = false, features = ["prost"] }
+prost        = "0.13"
+tokio-stream = { version = "0.1", features = ["net"] }
+futures      = "0.3"
+uuid         = { version = "1", features = ["v8"] }
 
 # misc
 parking_lot = "0.12"

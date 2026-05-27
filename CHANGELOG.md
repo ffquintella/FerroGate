@@ -8,6 +8,42 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added — F04: SVID issuance and lifecycle (M2)
+
+- **`ferro-proto` — `MachineIdentity` gRPC surface.** A proto3 service
+  (`Attest` bidi stream, `Rotate`, `FetchSVID`, `JWKS`) compiled to tonic
+  client/server stubs. `Attest` is server-first: it opens with a `Nonce`
+  supplying the quote's `qualifyingData`, then drives the four-phase handshake.
+- **`ferro-svid` — JWS SVID envelope, issuance, and lifecycle.** The
+  `ferrogate-svid-v1` claim schema; composite-signed compact JWS
+  (`alg = MLDSA65+Ed25519`, `typ = ferrogate-svid+jwt`); SPIFFE-ID derivation
+  from `SHA-384(ek_cert)`; a composite JWK / JWK-set; the
+  renewal-vs-re-attestation decision (24 h window, PCR drift, epoch bump); and
+  the 60%-of-TTL ±10% rotation-scheduler math. 1 h max TTL, `nbf` with a 60 s
+  lookback.
+- **`ferro-svid-verify` — standalone reference verifier.** Self-contained
+  (re-declares the schema, depends only on `ferro-crypto` for the composite
+  primitive): parses the compact JWS, verifies the AND-combined signature
+  against a JWK set, and enforces `nbf`/`exp` fail-closed. Refuses expired SVIDs.
+- **`cmis` — the issuance server.** `MachineIdentitySvc` runs the four-phase
+  `Attest` (F02 quote verification → phase-3 credential activation via the
+  `CredentialMaker` seam → phase-4 AIK-bound composite CSR check → composite
+  SVID issuance), the in-window `Rotate` short path with forced re-attestation
+  on drift/epoch change, `FetchSVID`, and `JWKS`. Client-visible errors collapse
+  to the fixed status set in `docs/cmis.md`; precise reasons are logged only.
+- **`mia` — attest client, sealing, scheduler.** `client::run_attest` drives the
+  handshake (generic over an `AttestEvidence` trait so it runs against a real
+  TPM or a software stand-in) and returns the SVID plus its composite key.
+  `seal` (Linux-only) seals a 256-bit key to a `PolicyPCR` over PCRs
+  `{0,4,7,8}` (SHA-384) and ChaCha20-Poly1305-encrypts the cache; a sealed-PCR
+  change makes the cache fail to unseal. `scheduler` computes the jittered
+  rotation instant.
+- **Tests.** An end-to-end gRPC test over a real in-process tonic channel
+  (`crates/mia/tests/e2e_attest.rs`: issuance accepted by the reference
+  verifier, `Rotate` short path, `Rotate` refused on drift), an `swtpm` sealing
+  test (`crates/mia/tests/swtpm_seal.rs`), plus unit/round-trip coverage in
+  `ferro-svid`. The TPM-backed modules are verified in the Linux/`swtpm` image.
+
 ### Added — F02: TPM 2.0 attestation engine (M2)
 
 - **`ferro-attest` — CMIS-side quote verifier.** `TpmQuoteVerifier::verify_quote`

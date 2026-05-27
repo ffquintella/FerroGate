@@ -1,20 +1,27 @@
-//! `ferro-proto` — generated gRPC stubs and shared wire types.
+//! `ferro-proto` — generated gRPC stubs for the FerroGate `MachineIdentity`
+//! service (feature F04).
 //!
-//! Empty in M0. From M2 onward, this crate will host the `tonic`-generated
-//! `MachineIdentity` service stubs (see `docs/cmis.md`) plus any wire-shared
-//! types that do not belong in a higher-level crate.
+//! The wire surface is defined in `proto/machine_identity.proto` and compiled
+//! by `build.rs` into tonic client and server stubs, re-exported here under
+//! [`v1`]. See `docs/cmis.md` §"gRPC surface" and `docs/protocol.md`.
 
 #![forbid(unsafe_code)]
 
+/// Generated `ferrogate.v1` protobuf types and tonic service stubs.
+///
+/// Lints are relaxed inside this module because the contents are machine
+/// generated and not under our style control.
+pub mod v1 {
+    #![allow(
+        clippy::all,
+        clippy::pedantic,
+        clippy::nursery,
+        missing_docs,
+        unreachable_pub,
+        rust_2018_idioms
+    )]
+    tonic::include_proto!("ferrogate.v1");
+}
+
 /// Crate identifier.
 pub const CRATE_NAME: &str = "ferro-proto";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn crate_name_is_set() {
-        assert_eq!(CRATE_NAME, "ferro-proto");
-    }
-}

@@ -204,6 +204,23 @@ impl TpmQuoteVerifier {
     }
 }
 
+/// Verify an AIK signature over an arbitrary `message`, as produced by the
+/// MIA's restricted AIK in phase 4 (the TPM hashes `message` internally, then
+/// signs the digest). CMIS calls this over the marshaled composite public key
+/// to bind the in-software SVID key to the attested hardware.
+///
+/// `aik_pub_marshaled` is the `TPMT_PUBLIC` of the AIK; `signature` is the
+/// marshaled `TPMT_SIGNATURE`. The digest algorithm is taken from the
+/// signature structure (SHA-256 or SHA-384).
+pub fn verify_aik_signature(
+    aik_pub_marshaled: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), RejectReason> {
+    let aik = EccPublic::parse(aik_pub_marshaled).map_err(RejectReason::Malformed)?;
+    verify_quote_signature(&aik, message, signature)
+}
+
 /// Recompute `SHA-384( concat(pcr_i for i in selection) )` over the selected
 /// PCRs, in ascending index order across the listed selections.
 fn recompute_pcr_digest(quote: &QuoteInfo, pcrs: &PcrSet) -> Result<[u8; 48], RejectReason> {

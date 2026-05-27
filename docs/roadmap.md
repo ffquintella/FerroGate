@@ -79,14 +79,16 @@ no HA. No persistence, no audit, no helper API yet.
 
 ### F04 — SVID issuance and lifecycle (subset)
 
-- [ ] gRPC `MachineIdentity::Attest` streaming RPC.
-- [ ] JWS SVID issuance with the documented payload schema.
-- [ ] SPIFFE ID derivation from `SHA-384(ek_cert)`.
-- [ ] `Rotate` RPC with the in-window short path.
-- [ ] PCR-drift triggers re-attestation.
-- [ ] Local sealing of SVID + key to PCRs `{0,4,7,8}`.
-- [ ] Rotation scheduler at 60% TTL with jitter.
-- [ ] Reference JWS verifier as a separate crate.
+- [x] gRPC `MachineIdentity::Attest` streaming RPC. (`crates/ferro-proto/proto/machine_identity.proto` + tonic codegen; the four-phase server handler is `crates/cmis/src/service.rs`, with a server-first `Nonce` message supplying the quote's `qualifyingData`. The MIA client driver is `crates/mia/src/client.rs`. End-to-end over a real in-process tonic channel in `crates/mia/tests/e2e_attest.rs`.)
+- [x] JWS SVID issuance with the documented payload schema. (`crates/ferro-svid/src/{claims,envelope,issue}.rs` — composite-signed compact JWS, `alg = MLDSA65+Ed25519`, `typ = ferrogate-svid+jwt`, 1 h max TTL, `nbf` with 60 s lookback.)
+- [x] SPIFFE ID derivation from `SHA-384(ek_cert)`. (`crates/ferro-svid/src/spiffe.rs` — `sub = spiffe://<td>/host/<uuid>` where the UUID is a v8 stamp over the first 16 bytes of the EK-cert digest.)
+- [x] `Rotate` RPC with the in-window short path. (`MachineIdentitySvc::rotate` reissues without TPM I/O when the policy epoch and PCR aggregate are unchanged inside the 24 h window; `crates/ferro-svid/src/lifecycle.rs::decide_renewal`.)
+- [x] PCR-drift triggers re-attestation. (Same `decide_renewal`; `Rotate` returns `FAILED_PRECONDITION` on PCR drift or epoch bump. Covered by `rotate_refused_on_pcr_drift`.)
+- [x] Local sealing of SVID + key to PCRs `{0,4,7,8}`. (`crates/mia/src/seal.rs`, Linux-only: a 256-bit key is sealed to a `PolicyPCR` over `{0,4,7,8}` SHA-384 and AEAD-encrypts the cache blob. `crates/mia/tests/swtpm_seal.rs` proves a sealed PCR change makes the cache fail to unseal.)
+- [x] Rotation scheduler at 60% TTL with jitter. (`crates/ferro-svid/src/lifecycle.rs::rotation_delay_secs` — 60% ±10% of TTL; `crates/mia/src/scheduler.rs` wraps it with an OS-CSPRNG jitter sample.)
+- [x] Reference JWS verifier as a separate crate. (`crates/ferro-svid-verify` — self-contained: re-declares the schema, verifies the composite signature against a JWK set, enforces `nbf`/`exp`; an expired SVID is refused.)
+
+**F04 status: done for M2.** Verified on Linux (`docker/f02-dev.Dockerfile`) with `cargo test --workspace --all-targets` (incl. the `swtpm` sealing test) plus `clippy -D warnings` and `fmt --check`. Two seams remain for later milestones and are intentionally not closed here: the CMIS gRPC listener runs plaintext in the M2 bring-up binary (hybrid-PQC TLS termination is F01/F05 transport work; the provider already exists in `ferro-crypto`), and phase-3 `MakeCredential` is a `cmis::CredentialMaker` trait with only a software test implementation — a production TCG/EK wrapper lands with the TEE work (the MIA-side `TPM2_ActivateCredential` already exists from F02).
 
 ### F10 — RIM and PCR policy (subset)
 

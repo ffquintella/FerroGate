@@ -20,7 +20,7 @@ fi
 TTY_FLAGS=()
 if [ -t 0 ]; then TTY_FLAGS=(-it); fi
 
-exec docker run --rm "${TTY_FLAGS[@]}" \
+exec docker run --rm ${TTY_FLAGS[@]+"${TTY_FLAGS[@]}"} \
     -v "$REPO_ROOT":/work \
     -v ferrogate-cargo-registry:/usr/local/cargo/registry \
     -v ferrogate-f02-target:/work/target \

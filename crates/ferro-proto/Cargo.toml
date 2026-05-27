@@ -1,6 +1,6 @@
 [package]
 name        = "ferro-proto"
-description = "FerroGate — generated gRPC stubs and shared wire types (M2)"
+description = "FerroGate — generated gRPC stubs and shared wire types (M2/F04)"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -12,4 +12,8 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-serde = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

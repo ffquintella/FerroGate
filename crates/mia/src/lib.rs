@@ -1,13 +1,26 @@
 //! `mia` — Machine Identity Agent library surface.
 //!
 //! The daemon binary (`src/main.rs`) is a thin wrapper; the reusable pieces
-//! live here so they can be integration-tested. Today that is the TPM 2.0
-//! attestation engine (feature F02).
+//! live here so they can be integration-tested:
+//!
+//! - [`tpm`] — the TPM 2.0 attestation engine and PCR sealing (feature F02/F04,
+//!   Linux-only).
+//! - [`client`] — drives the four-phase `Attest` handshake against CMIS and
+//!   recovers a freshly issued SVID plus its composite private key (F04).
+//! - [`scheduler`] — computes when to rotate a live SVID (60% of TTL, jittered).
 //!
 //! `unsafe` is forbidden in this crate (see `docs/features/F12-mia-hardening.md`).
 
 #![forbid(unsafe_code)]
 
-/// TPM 2.0 attestation glue (feature F02). Linux-only: needs a TSS2 stack.
+pub mod client;
+pub mod scheduler;
+
+/// TPM 2.0 attestation glue and PCR sealing (features F02/F04). Linux-only:
+/// needs a TSS2 stack.
 #[cfg(target_os = "linux")]
 pub mod tpm;
+
+/// PCR-bound sealing of the SVID cache (feature F04). Linux-only.
+#[cfg(target_os = "linux")]
+pub mod seal;
