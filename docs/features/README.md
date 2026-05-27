@@ -7,7 +7,7 @@ reviewed in isolation, even though some have ordering dependencies.
 | ID  | Feature | Component(s) | Status |
 |-----|---------|--------------|--------|
 | F01 | [Hybrid PQC TLS transport](F01-hybrid-pqc-tls.md) | CMIS, MIA | Done |
-| F02 | [TPM 2.0 attestation engine](F02-tpm-attestation.md) | MIA, CMIS | Not started |
+| F02 | [TPM 2.0 attestation engine](F02-tpm-attestation.md) | MIA, CMIS | Done |
 | F03 | [Composite Ed25519 + ML-DSA-65 signatures](F03-composite-signatures.md) | CMIS, MIA | Done |
 | F04 | [SVID issuance and lifecycle](F04-svid-lifecycle.md) | CMIS, MIA | Not started |
 | F05 | [CMIS high availability](F05-cmis-ha.md) | CMIS | Not started |

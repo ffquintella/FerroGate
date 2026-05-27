@@ -65,17 +65,17 @@ no HA. No persistence, no audit, no helper API yet.
 
 ### F02 — TPM 2.0 attestation engine
 
-- [ ] `mia::tpm::TpmEngine` over `tss-esapi` (`/dev/tpmrm0`).
-- [ ] EK creation in endorsement hierarchy (ECC-P256 default template).
-- [ ] AIK creation with full required attribute mask.
-- [ ] PCR quote over the policy PCR set with SHA-384.
-- [ ] `TPM2_ActivateCredential` flow.
-- [ ] AIK signature over composite CSR.
-- [ ] Bound HMAC sessions on all sensitive commands.
-- [ ] `ferro-attest::TpmQuoteVerifier::verify_quote` implementing all 10 steps.
-- [ ] Vendor root CA bundles: Infineon, Nuvoton, ST, Intel PTT.
-- [ ] `swtpm` integration test for the happy path.
-- [ ] Negative tests: wrong nonce, tampered quote, missing PCR, unrestricted AIK.
+- [x] `mia::tpm::TpmEngine` over `tss-esapi` (`/dev/tpmrm0`). (`crates/mia/src/tpm.rs`, Linux-gated via `cfg(target_os = "linux")`; `open_device()` resolves the resource-manager TCTI, never raw `/dev/tpm0`.)
+- [x] EK creation in endorsement hierarchy (ECC-P256 default template). (`TpmEngine::load_ek` via the `tss-esapi` `ek::create_ek_object` abstraction.)
+- [x] AIK creation with full required attribute mask. (`TpmEngine::create_aik` — restricted, signing-only ECDSA P-256 child of the EK.)
+- [x] PCR quote over the policy PCR set with SHA-384. (`TpmEngine::quote` over `{0,1,2,3,4,7,8,9,10,11,14}`; reads back raw PCRs via the looping `pcr::read_all` so CMIS can recompute the digest.)
+- [x] `TPM2_ActivateCredential` flow. (`TpmEngine::activate_credential` with an endorsement-hierarchy `PolicySecret` session for the EK; exercised end-to-end against `swtpm`.)
+- [x] AIK signature over composite CSR. (`TpmEngine::sign_aik` — hashes the payload inside the TPM for a validation ticket, as a restricted key requires; CSR/issuance wiring lands with F04.)
+- [x] Bound HMAC sessions on all sensitive commands. (`hmac_session` with parameter encryption; sessions are flushed after use to avoid `TPM_RC_SESSION_MEMORY`.)
+- [x] `ferro-attest::TpmQuoteVerifier::verify_quote` implementing all 10 steps. (`crates/ferro-attest/src/verify.rs` — ordered, fail-closed: EK chain → AIK mask → magic/type → nonce → ECDSA-P256 signature → recomputed SHA-384 PCR digest → RIM `policy_id`; each rejection carries a precise audit-only `RejectReason`. Phase-3 credential-activation compare is constant-time.)
+- [x] Vendor root CA bundles: Infineon, Nuvoton, ST, Intel PTT. (`crates/ferro-attest/src/vendor.rs` + `build.rs` embed `vendor-roots/<vendor>/*.pem` at compile time, independently loadable; nothing trusted by default. Provisioning tool `scripts/ferrogate-ca.sh`, procedure in `vendor-roots/README.md`.)
+- [x] `swtpm` integration test for the happy path. (`crates/mia/tests/swtpm_attest.rs` drives a real software TPM and verifies the evidence end-to-end; `docker/f02-dev.Dockerfile` + `scripts/f02-docker.sh` provide the TSS2 + `swtpm` toolchain.)
+- [x] Negative tests: wrong nonce, tampered quote, missing PCR, unrestricted AIK. (Plus untrusted EK root, not-in-RIM, wrong signing key, and credential-activation mismatch — 9 verifier tests in `crates/ferro-attest/tests/verify_quote.rs` and 2 negatives in the `swtpm` test.)
 
 ### F04 — SVID issuance and lifecycle (subset)
 

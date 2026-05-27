@@ -44,18 +44,24 @@ See [../tpm.md](../tpm.md) and [../protocol.md](../protocol.md) phases 2–3.
 
 ## Acceptance criteria
 
-- [ ] `mia::tpm::TpmEngine` exposes `load_ek`, `create_aik`, `quote`,
-      `activate_credential`, `sign_aik`.
-- [ ] `ferro-attest::TpmQuoteVerifier::verify_quote` implements all 10 steps
+- [x] `mia::tpm::TpmEngine` exposes `load_ek`, `create_aik`, `quote`,
+      `activate_credential`, `sign_aik`. (`crates/mia/src/tpm.rs`.)
+- [x] `ferro-attest::TpmQuoteVerifier::verify_quote` implements all 10 steps
       and rejects every malformed input with a precise (audit-only) reason.
-- [ ] Vendor root CAs for Infineon, Nuvoton, ST, and Intel PTT are bundled and
-      independently loadable.
-- [ ] Integration test under `swtpm` produces a valid quote and CMIS accepts
-      it end-to-end.
-- [ ] Negative tests: tampered quote, wrong nonce, missing PCR, AIK not
-      restricted — each is rejected.
-- [ ] Credential-activation mismatch is rejected in constant time.
-- [ ] All TPM commands run under bound HMAC sessions.
+      (`crates/ferro-attest/src/verify.rs`; `RejectReason` per step.)
+- [x] Vendor root CAs for Infineon, Nuvoton, ST, and Intel PTT are bundled and
+      independently loadable. (`vendor.rs` + `build.rs`; per-vendor
+      `with_vendor`. No roots ship by default — operators provision them with
+      `scripts/ferrogate-ca.sh`, see `vendor-roots/README.md`.)
+- [x] Integration test under `swtpm` produces a valid quote and CMIS accepts
+      it end-to-end. (`crates/mia/tests/swtpm_attest.rs`.)
+- [x] Negative tests: tampered quote, wrong nonce, missing PCR, AIK not
+      restricted — each is rejected. (`tests/verify_quote.rs`, plus untrusted
+      root, not-in-RIM, and wrong-key cases.)
+- [x] Credential-activation mismatch is rejected in constant time.
+      (`verify::credential_secret_matches`, `subtle::ConstantTimeEq`.)
+- [x] All TPM commands run under bound HMAC sessions. (`TpmEngine::hmac_session`
+      with parameter encryption; flushed after use.)
 
 ## Risks
 
