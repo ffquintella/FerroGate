@@ -8,6 +8,10 @@ license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
 
+[lib]
+name = "mia"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mia"
 path = "src/main.rs"
@@ -25,3 +29,15 @@ tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
+
+# The TPM 2.0 ESAPI stack only builds where a TSS2 implementation exists
+# (Linux `/dev/tpmrm0`, Windows TBS). On other hosts `mia::tpm` compiles out.
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+hex          = { workspace = true }
+sha2         = { workspace = true }
+rcgen        = { workspace = true }
+tss-esapi    = { workspace = true }
+ferro-attest = { path = "../ferro-attest" }

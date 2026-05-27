@@ -15,6 +15,20 @@ The TPM does **not** perform PQC operations (TPM 2.0 has no ML-DSA or
 ML-KEM support). The composite SVID keypair is generated in software inside
 MIA and *bound* to the hardware by an AIK signature over its public key.
 
+## Vendor root CAs
+
+The EK certificate must chain to a root we trust for its vendor (step 1 of the
+verification algorithm below). Roots are bundled per vendor under
+`crates/ferro-attest/vendor-roots/<vendor>/` and embedded into the verifier at
+build time; each vendor (Infineon, Nuvoton, ST, Intel PTT) is independently
+loadable. **No roots ship with the source** — nothing is trusted until an
+operator provisions one, which is a deliberate, reviewed trust decision.
+
+Provision and inspect roots with `scripts/ferrogate-ca.sh` (pin the SHA-256
+fingerprint against the vendor's published value, then rebuild and commit). See
+[`crates/ferro-attest/vendor-roots/README.md`](../crates/ferro-attest/vendor-roots/README.md)
+for the step-by-step procedure.
+
 ## PCR policy
 
 | PCR | Measures | Allowed values |

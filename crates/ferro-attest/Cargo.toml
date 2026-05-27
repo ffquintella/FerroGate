@@ -12,6 +12,15 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
-sha3      = { workspace = true }
-serde     = { workspace = true }
+thiserror   = { workspace = true }
+sha2        = { workspace = true }
+sha3        = { workspace = true }
+serde       = { workspace = true }
+subtle      = { workspace = true }
+hex         = { workspace = true }
+x509-parser = { workspace = true, features = ["verify"] }
+p256        = { workspace = true }
+
+[dev-dependencies]
+rcgen     = { workspace = true }
+rand_core = { workspace = true }
