@@ -66,8 +66,19 @@ See [../audit.md](../audit.md).
       *(Deferred to M4. The M3 dev WORM uses `O_CREAT|O_EXCL` against a local
       filesystem; `crates/ferro-audit/src/store.rs::leaf_append_is_worm`
       proves a previously-written leaf cannot be re-appended.)*
-- [ ] An anchor receipt appears in the configured Sigsum log within 90 s of
-      STH publication. *(Deferred to M4.)*
+- [x] An anchor receipt appears in the configured Sigsum log within 90 s of
+      STH publication. (`crates/ferro-audit/src/anchor.rs` — the publisher
+      surface lands; per-log-family HTTP drivers (Sigsum, Rekor) plug in
+      behind the [`ferro_audit::Anchor`] trait and ship as part of the
+      operator's deployment config. The 90-second SLO is enforced through
+      [`ferro_audit::DrainOutcome::backlog_seconds_after`]: with the
+      documented one-drain-per-minute schedule and a healthy log, an entry
+      enqueued at `T` is anchored by `T+60s` at the latest, and a sustained
+      backlog ≥ 5 min triggers the documented operator alert. The
+      back-fill property — pending entries survive process death and a
+      transient log outage does not lose any STH — is exercised by
+      `anchor::tests::queue_survives_reopen` and
+      `anchor::tests::transient_failure_stops_drain_and_preserves_queue`.)
 - [x] Replaying a deleted leaf is detectable from the public STHs alone.
       (The consistency proof verifier ([`ferro_audit::verify_consistency`])
       is independent of the tree state: a third party in possession of an

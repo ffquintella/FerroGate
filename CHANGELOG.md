@@ -8,6 +8,47 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added — F07 continued: Sigsum / Rekor anchor publisher with back-fill (M4 subset)
+
+- **`ferro_audit::anchor` module.** A transparency-log publisher with
+  persistent back-fill so an upstream outage cannot silently drop anchors.
+  The `Anchor` trait abstracts the log family (Sigsum, Rekor v1/v2, …); a
+  driver's only contract is `submit(&CoSignedTreeHead) -> Result<AnchorReceipt,
+  AnchorError>` with a `Transient` (retry) vs. `Permanent` (quarantine)
+  error taxonomy. The HTTP wire for each log lives behind this trait and is
+  part of the operator's deployment config.
+- **Disk-backed `AnchorQueue`.** Pending STHs land under
+  `pending/<tree_size:020>.{sth.json,enq}` (the `.enq` marker carries the
+  first-enqueue Unix-seconds timestamp); successful submissions land under
+  `receipts/<tree_size:020>.json`; permanent failures move to
+  `dead/<tree_size:020>.{sth.json,err}`. All writes use `O_CREAT|O_EXCL`, so
+  re-enqueueing the same `tree_size` is a deterministic no-op and a
+  publisher restart that re-observes the same STH does not lose the
+  original backlog age.
+- **`AnchorPublisher::drain_once`.** Submits pending entries in `tree_size`
+  order. A `Transient` failure stops the drain (so the publisher does not
+  hammer an unavailable log); a `Permanent` failure quarantines the entry
+  and the drain continues with the rest of the queue. Returns a
+  `DrainOutcome { published, transient_failures, quarantined,
+  backlog_seconds_after }`. Operators alert on backlog ≥ 5 min, as
+  documented in `docs/audit.md` §"Anchor outage".
+- **Tests.** 7 tests in `anchor`: happy-path enqueue + drain (order
+  preserved, receipts persisted); enqueue is idempotent per `tree_size`
+  and preserves the original `enqueued_at`; a transient failure makes
+  exactly one submit attempt, leaves all entries pending, and the next
+  drain (with the anchor flipped to success) catches up entirely; a
+  permanent failure quarantines and the drain continues; the queue
+  survives reopen from disk (back-fill across a process restart); an
+  already-anchored `tree_size` is not re-enqueued; backlog age tracks the
+  earliest pending entry.
+- **Out of this slice:** the actual Rekor / Sigsum HTTP drivers (concrete
+  `Anchor` impls). Both are short — `POST /api/v1/log/entries` for Rekor,
+  the Sigsum `add-leaf` request for Sigsum — and ship as part of the
+  per-deployment config so operators can choose their preferred log
+  family without forking the audit crate. CMIS scheduling (a 60-second
+  tokio task that calls `drain_once` and feeds the outcome into metrics)
+  lands with the wider F07-anchor wiring task in the CMIS service.
+
 ### Added — F07 continued: Raft-majority co-signed STHs (M4 subset)
 
 - **New `ferro_audit::cosign` module.** `CoSignedTreeHead` carries the same

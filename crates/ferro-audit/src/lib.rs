@@ -17,6 +17,12 @@
 //!   (M4) without changing callers.
 //! - [`log`] — the [`log::AuditLog`] facade tying tree + store + signer
 //!   together with a thread-safe append API.
+//! - [`anchor`] — the M4 external-transparency anchor publisher: an
+//!   [`anchor::Anchor`] trait abstracts Sigsum / Rekor / etc.; an
+//!   [`anchor::AnchorQueue`] persists pending STHs on disk so a publisher
+//!   restart never drops anchors during an upstream outage; and
+//!   [`anchor::AnchorPublisher::drain_once`] drives a single pass with
+//!   transient-vs-permanent failure handling and backlog-age reporting.
 //! - [`cosign`] — the M4 surface for STHs co-signed by a Raft majority:
 //!   [`cosign::QuorumSigner`] aggregates per-replica composite signatures
 //!   over the same canonical body, and [`cosign::verify_cosigned`] accepts
@@ -25,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod anchor;
 pub mod bytes;
 pub mod cosign;
 pub mod event;
@@ -33,6 +40,10 @@ pub mod merkle;
 pub mod sth;
 pub mod store;
 
+pub use anchor::{
+    Anchor, AnchorError, AnchorPublisher, AnchorQueue, AnchorQueueError, AnchorReceipt,
+    DrainOutcome, PendingEntry,
+};
 pub use bytes::{Bytes16, Hash384};
 
 pub use cosign::{
