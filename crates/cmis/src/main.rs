@@ -14,6 +14,7 @@ use std::sync::Arc;
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
 use ferro_attest::{RimStore, TpmQuoteVerifier, VendorTrustStore};
+use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
 use ferro_svid::Issuer;
 use tracing_subscriber::EnvFilter;
 
@@ -46,11 +47,23 @@ async fn main() -> anyhow::Result<()> {
 
     let issuer = Issuer::generate("cmis-dev-1", "ferrogate.dev")?;
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), RimStore::new());
+
+    // M3 audit log: local-disk WORM store + in-process composite signer. The
+    // production swap (S3 Object Lock + TEE threshold signer) lands in M4.
+    let worm_root =
+        std::env::var("CMIS_AUDIT_ROOT").unwrap_or_else(|_| "/var/lib/ferrogate/audit".to_string());
+    let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(worm_root)?);
+    let (signer, _audit_pk) = InProcessSigner::generate("cmis-dev-audit-1")
+        .map_err(|e| anyhow::anyhow!("audit signer: {e}"))?;
+    tracing::info!(audit_kid = signer.kid(), "audit signer ready");
+    let audit = AuditLog::new(store, Arc::new(signer));
+
     let state = Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(UnconfiguredCredentialMaker),
         CmisConfig::default(),
+        audit,
     ));
 
     tracing::info!(

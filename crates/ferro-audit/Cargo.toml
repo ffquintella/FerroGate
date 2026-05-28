@@ -12,10 +12,16 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
-sha3      = { workspace = true }
-serde     = { workspace = true }
-ciborium  = { workspace = true }
+ferro-crypto = { path = "../ferro-crypto" }
+
+thiserror   = { workspace = true }
+sha3        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+ciborium    = { workspace = true }
+parking_lot = { workspace = true }
+hex         = { workspace = true }
+base64      = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

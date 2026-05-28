@@ -51,6 +51,7 @@ p256              = { workspace = true }
 sha2              = { workspace = true }
 rand_core         = { workspace = true }
 serde_json        = { workspace = true }
+base64            = { workspace = true }
 
 # The TPM 2.0 ESAPI stack only builds where a TSS2 implementation exists
 # (Linux `/dev/tpmrm0`, Windows TBS). On other hosts `mia::tpm` compiles out.

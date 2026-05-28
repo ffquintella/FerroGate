@@ -26,6 +26,7 @@ use ferro_attest::tpm::{
     TPM_ECC_NIST_P256, TPM_GENERATED_VALUE, TPM_ST_ATTEST_QUOTE,
 };
 use ferro_attest::{PolicyId, RimStore, TpmQuoteVerifier, Vendor, VendorTrustStore};
+use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore};
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
 use ferro_proto::v1::{PcrValue, RotateRequest};
 use ferro_svid::Issuer;
@@ -243,8 +244,28 @@ fn build_state(evidence: &SoftwareEvidence) -> Arc<CmisState> {
 }
 
 fn state_with_verifier(verifier: TpmQuoteVerifier) -> Arc<CmisState> {
+    state_with_verifier_capturing_audit(verifier).0
+}
+
+/// Same as [`state_with_verifier`] but also hands back the audit signer's
+/// public key so a verifier in the test can authenticate STHs offline.
+fn state_with_verifier_capturing_audit(
+    verifier: TpmQuoteVerifier,
+) -> (Arc<CmisState>, ferro_crypto::composite::CompositePublicKey) {
     let issuer = Issuer::generate("kid-e2e", "ferrogate.test").unwrap();
-    Arc::new(CmisState::new(
+    let audit_root = {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("ferrogate-e2e-audit-{nanos}"));
+        p
+    };
+    let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&audit_root).unwrap());
+    let (signer, audit_pk) = InProcessSigner::generate("audit-test").unwrap();
+    let audit = AuditLog::new(store, Arc::new(signer));
+    let state = Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(SoftwareCredentialMaker),
@@ -253,7 +274,9 @@ fn state_with_verifier(verifier: TpmQuoteVerifier) -> Arc<CmisState> {
             svid_ttl_secs: 3600,
             policy_epoch: 1,
         },
-    ))
+        audit,
+    ));
+    (state, audit_pk)
 }
 
 async fn spawn_server(state: Arc<CmisState>) -> MachineIdentityClient<tonic::transport::Channel> {
@@ -469,4 +492,139 @@ async fn rim_loader_hot_swap_admits_a_freshly_published_generation() {
     assert_eq!(result.claims.attest.policy_id, "loader-fleet");
 
     std::fs::remove_file(bundle_path).ok();
+}
+
+// --- F07: audit log RPCs ----------------------------------------------------
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // step-by-step exposition of the audit RPC contract.
+async fn audit_log_records_attest_events_and_proofs_verify_offline() {
+    use base64::Engine as _;
+    use ferro_audit::{event as audit_event, verify_sth, AuditEvent, Hash384};
+    use ferro_proto::v1::{ConsistencyProofRequest, InclusionProofRequest, LatestSthRequest};
+
+    let mut evidence = SoftwareEvidence::new();
+    let (state, audit_pk) = state_with_verifier_capturing_audit({
+        let mut trust = VendorTrustStore::new();
+        trust
+            .add_root_der(&evidence.ek_root, Vendor::Infineon)
+            .unwrap();
+        let (_blob, pcr_digest) = build_quote(&[0u8; 32]);
+        let rim = RimStore::new();
+        rim.approve(pcr_digest, PolicyId("test-fleet".into()));
+        TpmQuoteVerifier::new(trust, rim)
+    });
+    let mut client = spawn_server(state).await;
+
+    // Drive a successful attestation. CMIS appends AttestStart + SvidIssued.
+    let _attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+        .await
+        .unwrap();
+
+    // The latest STH must verify under the audit publisher key and report a
+    // size of at least 2 leaves (AttestStart + SvidIssued).
+    let sth_resp = client
+        .latest_sth(LatestSthRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let proto_sth = sth_resp.sth.expect("server returned an STH");
+    let sth = ferro_audit::SignedTreeHead {
+        body_cbor: proto_sth.body_cbor,
+        signer_kid: proto_sth.signer_kid,
+        signature_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(&proto_sth.signature),
+    };
+    let body = verify_sth(&sth, &audit_pk).expect("STH must verify under audit publisher key");
+    assert!(body.tree_size >= 2);
+
+    // Fetch and verify an inclusion proof for the AttestStart leaf (index 0).
+    let inc_resp = client
+        .inclusion_proof(InclusionProofRequest { leaf_index: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut leaf = [0u8; 48];
+    leaf.copy_from_slice(&inc_resp.leaf_hash);
+    let mut root = [0u8; 48];
+    root.copy_from_slice(&inc_resp.root_hash);
+    let path: Vec<[u8; 48]> = inc_resp
+        .audit_path
+        .iter()
+        .map(|h| {
+            let mut a = [0u8; 48];
+            a.copy_from_slice(h);
+            a
+        })
+        .collect();
+    assert!(
+        ferro_audit::verify_inclusion(
+            &leaf,
+            inc_resp.leaf_index as usize,
+            inc_resp.tree_size as usize,
+            &root,
+            &path,
+        ),
+        "inclusion proof must verify offline"
+    );
+    // The published STH must agree with the proof's root.
+    assert_eq!(body.root_hash.0, root);
+
+    // Forward a MIA-side event; the tree grows; consistency from the old size
+    // back to the new size verifies.
+    let old_size = body.tree_size;
+    let leaf_idx = mia::audit_client::forward(
+        &mut client,
+        &AuditEvent::LocalGrant {
+            pid: 4242,
+            uid: 1000,
+            bin_sha: Hash384([0xAA; 48]),
+            jti: ferro_audit::Bytes16([0x55; 16]),
+        },
+    )
+    .await
+    .expect("audit forward succeeds");
+    assert_eq!(leaf_idx, old_size);
+
+    // Inclusion of the new leaf, then consistency back to the previous STH.
+    let inc2 = client
+        .inclusion_proof(InclusionProofRequest {
+            leaf_index: leaf_idx,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut new_root = [0u8; 48];
+    new_root.copy_from_slice(&inc2.root_hash);
+    let event_bytes = audit_event::encode(&AuditEvent::LocalGrant {
+        pid: 4242,
+        uid: 1000,
+        bin_sha: Hash384([0xAA; 48]),
+        jti: ferro_audit::Bytes16([0x55; 16]),
+    })
+    .unwrap();
+    let expected_leaf = ferro_audit::leaf_hash(&event_bytes);
+    assert_eq!(inc2.leaf_hash, expected_leaf.to_vec());
+
+    let cons = client
+        .consistency_proof(ConsistencyProofRequest { old_size })
+        .await
+        .unwrap()
+        .into_inner();
+    let cons_path: Vec<[u8; 48]> = cons
+        .audit_path
+        .iter()
+        .map(|h| {
+            let mut a = [0u8; 48];
+            a.copy_from_slice(h);
+            a
+        })
+        .collect();
+    assert!(ferro_audit::verify_consistency(
+        old_size as usize,
+        cons.new_size as usize,
+        &root,
+        &new_root,
+        &cons_path,
+    ));
 }

@@ -12,7 +12,7 @@ reviewed in isolation, even though some have ordering dependencies.
 | F04 | [SVID issuance and lifecycle](F04-svid-lifecycle.md) | CMIS, MIA | Done |
 | F05 | [CMIS high availability](F05-cmis-ha.md) | CMIS | Not started |
 | F06 | [TEE residency and threshold key shares](F06-tee-threshold-keys.md) | CMIS | Not started |
-| F07 | [Merkle-chained immutable audit log](F07-audit-log.md) | CMIS, MIA | Not started |
+| F07 | [Merkle-chained immutable audit log](F07-audit-log.md) | CMIS, MIA | M3 subset done |
 | F08 | [Local helper API](F08-helper-api.md) | MIA | Not started |
 | F09 | [DPoP-bound child tokens](F09-dpop-child-tokens.md) | MIA | Not started |
 | F10 | [RIM and PCR policy management](F10-rim-pcr-policy.md) | CMIS | M2 subset done |

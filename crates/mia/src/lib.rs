@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit_client;
 pub mod client;
 pub mod scheduler;
 

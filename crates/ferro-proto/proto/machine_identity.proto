@@ -24,6 +24,24 @@ service MachineIdentity {
 
   // Composite verification key set used to validate SVID signatures.
   rpc JWKS (JWKSRequest) returns (JWKSResponse);
+
+  // ---- Audit log (F07) ----
+
+  // Latest Signed Tree Head. Verifiers re-anchor incremental consistency
+  // proofs against this.
+  rpc LatestSth (LatestSthRequest) returns (LatestSthResponse);
+
+  // RFC 6962 inclusion proof for the leaf at `leaf_index` against the
+  // current tree.
+  rpc InclusionProof (InclusionProofRequest) returns (InclusionProofResponse);
+
+  // RFC 6962 consistency proof from `old_size` to the current tree size.
+  rpc ConsistencyProof (ConsistencyProofRequest) returns (ConsistencyProofResponse);
+
+  // MIA-originated event forwarder. The body is canonical CBOR of a
+  // `ferro_audit::AuditEvent`; CMIS appends it to its log and returns the
+  // assigned leaf index.
+  rpc AppendAuditEvent (AppendAuditRequest) returns (AppendAuditResponse);
 }
 
 // ---- Attest: client -> server ------------------------------------------
@@ -110,3 +128,34 @@ message JWKSRequest {}
 message JWKSResponse {
   string jwks_json = 1;
 }
+
+// ---- Audit log -----------------------------------------------------------
+
+message SignedTreeHead {
+  bytes body_cbor = 1;     // canonical CBOR of ferro_audit::SthBody
+  string signer_kid = 2;
+  bytes signature = 3;     // composite Ed25519+ML-DSA-65 concat
+}
+
+message LatestSthRequest {}
+message LatestSthResponse { SignedTreeHead sth = 1; }
+
+message InclusionProofRequest { uint64 leaf_index = 1; }
+message InclusionProofResponse {
+  bytes leaf_hash = 1;          // 48-byte SHA3-384
+  uint64 leaf_index = 2;
+  uint64 tree_size = 3;
+  bytes root_hash = 4;          // 48-byte SHA3-384
+  repeated bytes audit_path = 5;
+}
+
+message ConsistencyProofRequest { uint64 old_size = 1; }
+message ConsistencyProofResponse {
+  uint64 old_size = 1;
+  uint64 new_size = 2;
+  bytes new_root_hash = 3;
+  repeated bytes audit_path = 4;
+}
+
+message AppendAuditRequest { bytes event_cbor = 1; }
+message AppendAuditResponse { uint64 leaf_index = 1; }

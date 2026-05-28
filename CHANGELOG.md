@@ -8,7 +8,45 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added — F07: Merkle-chained audit log (M3 subset)
+
+- **`ferro-audit` crate fleshed out.** Seven-variant `AuditEvent` enum
+  (`AttestStart` / `AttestFail` / `SvidIssued` / `SvidRevoked` /
+  `KeyShareUsed` / `LocalGrant` / `LocalDenied`) — hashes and counters only,
+  no PII. Encoded via `ciborium`; fixed-size hash fields use `Hash384` /
+  `Bytes16` newtypes that emit single CBOR byte strings.
+- **RFC 6962 Merkle tree, SHA3-384.** Domain-separated leaf / node hashing
+  (`0x00 || x`, `0x01 || l || r`). Inclusion and consistency proof
+  construction plus state-free `verify_inclusion` / `verify_consistency`
+  callable by any third party — a verifier in possession of an earlier STH
+  can detect deletion or reordering against a later one.
+- **Signed Tree Heads.** `SthBody { tree_size, root_hash, timestamp }`
+  encoded canonically as CBOR and composite-signed (Ed25519 + ML-DSA-65)
+  under domain context `ferrogate-sth-v1`. Signing is behind an `SthSigner`
+  trait; `InProcessSigner` is the M3 stub (TEE-resident threshold signer
+  lands in M4).
+- **WORM backing store.** `AuditStore` trait + `LocalDiskWormStore` whose
+  `O_CREAT|O_EXCL` semantics refuse to overwrite a leaf or STH file. S3
+  Object Lock (Compliance, 10-year retention) and the FoundationDB mirror
+  arrive in M4.
+- **Inclusion / consistency / STH RPCs.** `LatestSth`, `InclusionProof`,
+  `ConsistencyProof`, and `AppendAuditEvent` added to the proto and
+  implemented in CMIS. The CMIS `Attest` handler now records `AttestStart`
+  on phase-2 success, `AttestFail` (with stable opcode strings, never user
+  input) on every rejection branch, and `SvidIssued` after issuance — each
+  followed by a fresh STH.
+- **MIA forwarder.** `mia::audit_client::forward` encodes any
+  `ferro_audit::AuditEvent` to CBOR and submits it via `AppendAuditEvent`.
+- **Tests.** Property test (`inclusion_and_consistency_hold_for_all_pairs`):
+  24 cases, tree sizes 1..=12, asserts every leaf's inclusion proof and
+  every `(old_size, new_size)` consistency proof verify offline against the
+  captured STH roots. New end-to-end test in `crates/mia/tests/e2e_attest.rs`:
+  attest → fetch latest STH → verify composite signature → fetch inclusion
+  proof → verify offline → forward a `LocalGrant` → fetch consistency proof
+  → verify back to the prior STH.
+- **Out of M3 scope:** Raft co-signed STHs, S3 Object Lock storage, and the
+  Sigsum / Rekor anchor publisher remain M4 work (`docs/roadmap.md` §M4 /
+  "F07 (continued)").
 
 ## [M2] — 2026-05-28 — TPM attestation MVP (v0.2.0)
 

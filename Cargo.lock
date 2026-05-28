@@ -336,6 +336,7 @@ name = "cmis"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64",
  "ferro-attest",
  "ferro-audit",
  "ferro-crypto",
@@ -666,9 +667,14 @@ dependencies = [
 name = "ferro-audit"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "ciborium",
+ "ferro-crypto",
+ "hex",
+ "parking_lot",
  "proptest",
  "serde",
+ "serde_json",
  "sha3",
  "thiserror 1.0.69",
 ]
@@ -1332,6 +1338,7 @@ name = "mia"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64",
  "cmis",
  "ferro-attest",
  "ferro-audit",

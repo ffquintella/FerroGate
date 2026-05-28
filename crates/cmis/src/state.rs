@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
 
 use ferro_attest::TpmQuoteVerifier;
+use ferro_audit::AuditLog;
 use ferro_svid::{IssueParams, IssuedSvid, Issuer, LastAttestation};
 
 use crate::credential::CredentialMaker;
@@ -58,6 +59,8 @@ pub struct CmisState {
     pub credential_maker: Box<dyn CredentialMaker>,
     /// Static issuance policy.
     pub config: CmisConfig,
+    /// Append-only audit log (Merkle tree + WORM store + STH signer).
+    pub audit: AuditLog,
     issued: Mutex<HashMap<String, IssuedRecord>>,
 }
 
@@ -69,12 +72,14 @@ impl CmisState {
         verifier: TpmQuoteVerifier,
         credential_maker: Box<dyn CredentialMaker>,
         config: CmisConfig,
+        audit: AuditLog,
     ) -> Self {
         Self {
             issuer,
             verifier,
             credential_maker,
             config,
+            audit,
             issued: Mutex::new(HashMap::new()),
         }
     }

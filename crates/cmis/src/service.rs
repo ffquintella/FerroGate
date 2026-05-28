@@ -12,15 +12,19 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use base64::Engine as _;
 use ferro_attest::{
     credential_secret_matches, verify_aik_signature, PcrSet, QuoteVerification, RejectReason,
 };
+use ferro_audit::{AuditEvent, Hash384};
 use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
 use ferro_proto::v1::{
-    AttestRequest, AttestResponse, Challenge, FetchRequest, JwksRequest, JwksResponse, Nonce,
-    RotateRequest, SvidBundle,
+    AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, Challenge,
+    ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest, InclusionProofRequest,
+    InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest, LatestSthResponse, Nonce,
+    RotateRequest, SignedTreeHead, SvidBundle,
 };
 use ferro_svid::{decide_renewal, IssueParams, IssuedSvid, LastAttestation, RenewalDecision};
 use sha2::{Digest, Sha384};
@@ -52,6 +56,31 @@ fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Append `event` to the audit log and seal a fresh STH. Audit failures are
+/// logged and swallowed — they must never take down the issuance path. (A
+/// future hardened CMIS may instead refuse to serve while audit is wedged;
+/// noted in `docs/audit.md`.)
+fn audit_record(state: &CmisState, event: AuditEvent, now: i64) {
+    if let Err(e) = state.audit.append(&event) {
+        tracing::warn!(error = %e, "audit append failed");
+        return;
+    }
+    if let Err(e) = state.audit.produce_sth(now) {
+        tracing::warn!(error = %e, "audit STH produce failed");
+    }
+}
+
+/// Record an `AttestFail` event with a stable opcode. Never user input.
+fn audit_fail(state: &CmisState, opcode: &'static str, now: i64) {
+    audit_record(
+        state,
+        AuditEvent::AttestFail {
+            reason: opcode.to_string(),
+        },
+        now,
+    );
 }
 
 /// Collapse a verifier rejection into the small fixed gRPC status set from
@@ -92,6 +121,10 @@ async fn send(
 
 /// Drive the full four-phase handshake. Any error terminates the stream with
 /// the appropriate status; the detailed reason is logged, not returned.
+///
+/// The function is long by design: the linear shape mirrors the four-phase
+/// protocol so reviewers can follow it top-to-bottom without chasing helpers.
+#[allow(clippy::too_many_lines)]
 async fn run_attest(
     state: Arc<CmisState>,
     inbound: &mut Streaming<AttestRequest>,
@@ -111,6 +144,7 @@ async fn run_attest(
 
     // Phase 2 — hardware and boot attestation.
     let ReqPhase::Init(init) = next_request(inbound).await? else {
+        audit_fail(&state, "init-expected", now);
         return Err(Status::invalid_argument("expected attest init"));
     };
 
@@ -128,13 +162,29 @@ async fn run_attest(
         pcrs: &pcrs,
         now,
     };
-    let verified = state
-        .verifier
-        .verify_quote(&verification)
-        .map_err(|reason| {
+    let verified = match state.verifier.verify_quote(&verification) {
+        Ok(v) => v,
+        Err(reason) => {
             tracing::warn!(reason = %reason, "phase 2 quote verification failed");
-            verifier_status(&reason)
-        })?;
+            let opcode = match reason {
+                RejectReason::NotInRim => "quote-not-in-rim",
+                _ => "quote-verify-failed",
+            };
+            audit_fail(&state, opcode, now);
+            return Err(verifier_status(&reason));
+        }
+    };
+
+    // Phase 2 succeeded — record an AttestStart with the EK / AIK identities.
+    audit_record(
+        &state,
+        AuditEvent::AttestStart {
+            ek_sha: Hash384(sha384(&init.ek_cert)),
+            aik_sha: Hash384(sha384(&init.aik_pub)),
+            policy_id: verified.policy_id.as_str().to_string(),
+        },
+        now,
+    );
 
     // Phase 3 — credential activation (proof of residency).
     let secret = state.random_bytes::<32>();
@@ -143,6 +193,7 @@ async fn run_attest(
         .make_credential(&init.ek_cert, &init.aik_pub, &secret)
         .map_err(|e| {
             tracing::error!(error = %e, "MakeCredential failed");
+            audit_fail(&state, "credential-wrap-failed", now);
             Status::unavailable("issuer temporarily unavailable")
         })?;
     send(
@@ -155,21 +206,25 @@ async fn run_attest(
     .await?;
 
     let ReqPhase::ChallengeResponse(challenge_resp) = next_request(inbound).await? else {
+        audit_fail(&state, "challenge-resp-expected", now);
         return Err(Status::invalid_argument("expected challenge response"));
     };
     if !credential_secret_matches(&secret, &challenge_resp.secret) {
         tracing::warn!("phase 3 credential activation mismatch");
+        audit_fail(&state, "credential-mismatch", now);
         return Err(Status::permission_denied("attestation failed"));
     }
 
     // Phase 4 — TPM-bound composite CSR and issuance.
     let ReqPhase::Csr(csr) = next_request(inbound).await? else {
+        audit_fail(&state, "csr-expected", now);
         return Err(Status::invalid_argument("expected CSR"));
     };
-    verify_aik_signature(&init.aik_pub, &csr.composite_pub, &csr.aik_sig).map_err(|reason| {
+    if let Err(reason) = verify_aik_signature(&init.aik_pub, &csr.composite_pub, &csr.aik_sig) {
         tracing::warn!(reason = %reason, "phase 4 AIK signature over CSR failed");
-        Status::permission_denied("attestation failed")
-    })?;
+        audit_fail(&state, "aik-sig-invalid", now);
+        return Err(Status::permission_denied("attestation failed"));
+    }
 
     let params = IssueParams {
         ek_cert_sha384: sha384(&init.ek_cert),
@@ -181,8 +236,19 @@ async fn run_attest(
     };
     let issued = state.issuer.issue(&params, now).map_err(|e| {
         tracing::error!(error = %e, "SVID issuance failed");
+        audit_fail(&state, "issuance-failed", now);
         Status::unavailable("issuer temporarily unavailable")
     })?;
+
+    // SVID minted — record it in the audit log alongside the issued bundle.
+    audit_record(
+        &state,
+        AuditEvent::SvidIssued {
+            cert_sha: Hash384(sha384(issued.jws.as_bytes())),
+            spiffe_id: issued.spiffe_id.clone(),
+        },
+        now,
+    );
 
     state.record(IssuedRecord {
         params: params.clone(),
@@ -295,4 +361,93 @@ impl MachineIdentity for MachineIdentitySvc {
             .map_err(|_| Status::internal("jwks encode"))?;
         Ok(Response::new(JwksResponse { jwks_json: json }))
     }
+
+    async fn latest_sth(
+        &self,
+        _request: Request<LatestSthRequest>,
+    ) -> Result<Response<LatestSthResponse>, Status> {
+        let sth = self
+            .state
+            .audit
+            .latest_sth()
+            .ok_or_else(|| Status::not_found("no STH produced yet"))?;
+        Ok(Response::new(LatestSthResponse {
+            sth: Some(to_proto_sth(&sth)?),
+        }))
+    }
+
+    async fn inclusion_proof(
+        &self,
+        request: Request<InclusionProofRequest>,
+    ) -> Result<Response<InclusionProofResponse>, Status> {
+        let req = request.into_inner();
+        let p = self
+            .state
+            .audit
+            .inclusion_proof(req.leaf_index)
+            .map_err(|e| {
+                tracing::warn!(error = %e, "inclusion proof requested for out-of-range index");
+                Status::not_found("leaf out of range")
+            })?;
+        Ok(Response::new(InclusionProofResponse {
+            leaf_hash: p.leaf_hash.to_vec(),
+            leaf_index: p.leaf_index,
+            tree_size: p.tree_size,
+            root_hash: p.root_hash.to_vec(),
+            audit_path: p.audit_path.iter().map(|h| h.to_vec()).collect(),
+        }))
+    }
+
+    async fn consistency_proof(
+        &self,
+        request: Request<ConsistencyProofRequest>,
+    ) -> Result<Response<ConsistencyProofResponse>, Status> {
+        let req = request.into_inner();
+        let p = self
+            .state
+            .audit
+            .consistency_proof(req.old_size)
+            .map_err(|e| {
+                tracing::warn!(error = %e, "consistency proof requested out of range");
+                Status::invalid_argument("old_size out of range")
+            })?;
+        Ok(Response::new(ConsistencyProofResponse {
+            old_size: p.old_size,
+            new_size: p.new_size,
+            new_root_hash: p.new_root_hash.to_vec(),
+            audit_path: p.audit_path.iter().map(|h| h.to_vec()).collect(),
+        }))
+    }
+
+    async fn append_audit_event(
+        &self,
+        request: Request<AppendAuditRequest>,
+    ) -> Result<Response<AppendAuditResponse>, Status> {
+        let req = request.into_inner();
+        let event = ferro_audit::event::decode(&req.event_cbor).map_err(|e| {
+            tracing::warn!(error = %e, "forwarded audit event failed to decode");
+            Status::invalid_argument("malformed audit event")
+        })?;
+        let now = unix_now();
+        let leaf_index = self.state.audit.append(&event).map_err(|e| {
+            tracing::error!(error = %e, "audit append (forwarded) failed");
+            Status::unavailable("audit log unavailable")
+        })?;
+        if let Err(e) = self.state.audit.produce_sth(now) {
+            tracing::warn!(error = %e, "audit STH produce failed after forward");
+        }
+        Ok(Response::new(AppendAuditResponse { leaf_index }))
+    }
+}
+
+#[allow(clippy::result_large_err)] // `tonic::Status` is the unavoidable error shape here.
+fn to_proto_sth(sth: &ferro_audit::SignedTreeHead) -> Result<SignedTreeHead, Status> {
+    let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(sth.signature_b64.as_bytes())
+        .map_err(|_| Status::internal("sth signature base64"))?;
+    Ok(SignedTreeHead {
+        body_cbor: sth.body_cbor.clone(),
+        signer_kid: sth.signer_kid.clone(),
+        signature: sig_bytes,
+    })
 }

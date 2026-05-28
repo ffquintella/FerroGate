@@ -114,13 +114,15 @@ Make the system externally observable before adding HA complexity.
 
 ### F07 — Audit log
 
-- [ ] Event enum and CBOR encoding in `ferro-audit`.
-- [ ] In-process Merkle tree with SHA3-384 leaves.
-- [ ] STH structure and TEE-style signing stub (replaced in M4).
-- [ ] Backing-store abstraction with a local-disk WORM implementation for dev.
-- [ ] Inclusion and consistency proof endpoints on CMIS.
-- [ ] Property tests covering inclusion and consistency.
-- [ ] Forward MIA events into the CMIS audit stream.
+- [x] Event enum and CBOR encoding in `ferro-audit`. (`crates/ferro-audit/src/event.rs` defines the seven-variant `AuditEvent` mirroring `docs/audit.md`; encoding via `ciborium`. The fixed-size hash fields use the `Hash384` / `Bytes16` newtypes in `bytes.rs` so they serialise as compact CBOR byte strings rather than arrays-of-small-ints.)
+- [x] In-process Merkle tree with SHA3-384 leaves. (`crates/ferro-audit/src/merkle.rs` implements the RFC 6962 algorithms — domain-separated `leaf_hash(0x00 || …)` and `node_hash(0x01 || …)`, plus `inclusion_proof`, `consistency_proof`, and standalone verifiers usable by any third party.)
+- [x] STH structure and TEE-style signing stub (replaced in M4). (`crates/ferro-audit/src/sth.rs`: `SthBody { tree_size, root_hash, timestamp }` carried over the wire as canonical CBOR + a composite Ed25519 + ML-DSA-65 signature under domain context `ferrogate-sth-v1`. The signer is a trait; `InProcessSigner` is the M3 stub.)
+- [x] Backing-store abstraction with a local-disk WORM implementation for dev. (`crates/ferro-audit/src/store.rs`: `AuditStore` trait + `LocalDiskWormStore`. `O_CREAT|O_EXCL` makes a leaf or STH file uncoverwriteable. The S3 Object Lock implementation lands in M4.)
+- [x] Inclusion and consistency proof endpoints on CMIS. (`ferro-proto` adds `LatestSth`, `InclusionProof`, `ConsistencyProof`, and `AppendAuditEvent` RPCs; `crates/cmis/src/service.rs` implements them against the shared `AuditLog`.)
+- [x] Property tests covering inclusion and consistency. (`crates/ferro-audit/src/log.rs` proptest: 24 cases, tree sizes 1..=12, asserts `verify_inclusion` holds for every leaf and `verify_consistency` holds for every `(m, n)` pair against the matching captured STH roots.)
+- [x] Forward MIA events into the CMIS audit stream. (`crates/mia/src/audit_client.rs::forward` encodes a `ferro_audit::AuditEvent` to CBOR and submits it through `AppendAuditEvent`. End-to-end driven in `crates/mia/tests/e2e_attest.rs::audit_log_records_attest_events_and_proofs_verify_offline`, which after an Attest fetches the STH, verifies the signature, fetches an inclusion proof, verifies offline, forwards a `LocalGrant`, and checks a consistency proof back to the prior STH.)
+
+**M3 status: complete.** Verified on Linux (`docker/f02-dev`) with `cargo test --workspace --all-targets`, `clippy -D warnings`, and `fmt --check`. The M4 follow-ons (Raft co-signed STHs, S3 Object Lock store, Sigsum / Rekor anchor publisher) remain explicitly out of M3 scope.
 
 ## Milestone M4 — HA and TEE
 
