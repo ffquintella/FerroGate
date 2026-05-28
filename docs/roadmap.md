@@ -63,6 +63,15 @@ Land the primitives every other feature depends on.
 End-to-end attestation against a software TPM with a single CMIS replica and
 no HA. No persistence, no audit, no helper API yet.
 
+**M2 status: complete.** F02 (TPM 2.0 attestation engine), F04 (SVID
+issuance and lifecycle), and the M2 subset of F10 (signed RIM bundles +
+generational allowlist + hot reload) are all landed and tagged as `v0.2.0`.
+Verified on Linux (`docker/f02-dev`) with `cargo test --workspace
+--all-targets` (incl. the `swtpm` attest and seal tests), `clippy -D
+warnings`, and `fmt --check`. The remaining F10 work (`bump_epoch` admin
+RPC, signed-S3 refresh) is sequenced in M5 alongside the rest of the host
+operations track.
+
 ### F02 — TPM 2.0 attestation engine
 
 - [x] `mia::tpm::TpmEngine` over `tss-esapi` (`/dev/tpmrm0`). (`crates/mia/src/tpm.rs`, Linux-gated via `cfg(target_os = "linux")`; `open_device()` resolves the resource-manager TCTI, never raw `/dev/tpm0`.)

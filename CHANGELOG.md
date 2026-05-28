@@ -8,6 +8,16 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [M2] — 2026-05-28 — TPM attestation MVP (v0.2.0)
+
+End-to-end attestation against a software TPM with a single CMIS replica:
+F02, F04, and the M2 subset of F10 all landed. Workspace version bumped from
+`0.1.0` to `0.2.0`. Verified on Linux (`docker/f02-dev`) with
+`cargo test --workspace --all-targets` (incl. `swtpm_attest` and
+`swtpm_seal`), `clippy -D warnings`, and `fmt --check`.
+
 ### Added — F10: RIM and PCR policy (M2 subset)
 
 - **Generational `RimStore`.** Refactored from a flat allowlist to a versioned
