@@ -22,10 +22,11 @@ use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
 use ferro_proto::v1::{
     AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, Challenge,
-    ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest, InclusionProofRequest,
-    InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest, LatestSthResponse, Nonce,
-    RotateRequest, SignedTreeHead, SvidBundle,
+    ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest, HealthRequest, HealthResponse,
+    InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest,
+    LatestSthResponse, Nonce, NodeRole as ProtoNodeRole, RotateRequest, SignedTreeHead, SvidBundle,
 };
+use ferro_raft::NodeRole;
 use ferro_svid::{decide_renewal, IssueParams, IssuedSvid, LastAttestation, RenewalDecision};
 use sha2::{Digest, Sha384};
 
@@ -250,15 +251,17 @@ async fn run_attest(
         now,
     );
 
-    state.record(IssuedRecord {
-        params: params.clone(),
-        last_attestation: LastAttestation {
-            at: now,
-            pcr_digest: verified.pcr_digest,
-            policy_epoch: state.config.policy_epoch,
-        },
-        bundle: issued.clone(),
-    });
+    state
+        .record(IssuedRecord {
+            params: params.clone(),
+            last_attestation: LastAttestation {
+                at: now,
+                pcr_digest: verified.pcr_digest,
+                policy_epoch: state.config.policy_epoch,
+            },
+            bundle: issued.clone(),
+        })
+        .await;
 
     tracing::info!(spiffe_id = %issued.spiffe_id, "issued SVID via full attestation");
     send(tx, RespPhase::Svid(to_bundle(&issued))).await?;
@@ -298,7 +301,7 @@ impl MachineIdentity for MachineIdentitySvc {
         request: Request<FetchRequest>,
     ) -> Result<Response<SvidBundle>, Status> {
         let spiffe_id = request.into_inner().spiffe_id;
-        match self.state.lookup(&spiffe_id) {
+        match self.state.lookup(&spiffe_id).await {
             Some(rec) => Ok(Response::new(to_bundle(&rec.bundle))),
             None => Err(Status::not_found("no SVID for subject")),
         }
@@ -320,6 +323,7 @@ impl MachineIdentity for MachineIdentitySvc {
         let record = self
             .state
             .lookup(&subject)
+            .await
             .ok_or_else(|| Status::not_found("unknown subject; full attestation required"))?;
 
         let current_digest = aggregate_digest(
@@ -341,7 +345,7 @@ impl MachineIdentity for MachineIdentitySvc {
                     .issuer
                     .issue(&record.params, now)
                     .map_err(|_| Status::unavailable("issuer temporarily unavailable"))?;
-                self.state.update_bundle(&subject, issued.clone());
+                self.state.update_bundle(&subject, issued.clone()).await;
                 tracing::info!(spiffe_id = %subject, "renewed SVID (short path)");
                 Ok(Response::new(to_bundle(&issued)))
             }
@@ -416,6 +420,25 @@ impl MachineIdentity for MachineIdentitySvc {
             new_size: p.new_size,
             new_root_hash: p.new_root_hash.to_vec(),
             audit_path: p.audit_path.iter().map(|h| h.to_vec()).collect(),
+        }))
+    }
+
+    async fn health(
+        &self,
+        _request: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        let (healthy, role) = self.state.health().await;
+        let proto_role = match role {
+            NodeRole::Leader => ProtoNodeRole::Leader,
+            NodeRole::Follower => ProtoNodeRole::Follower,
+            NodeRole::Learner => ProtoNodeRole::Learner,
+            NodeRole::Unknown => ProtoNodeRole::Unknown,
+        };
+        let node_id = self.state.cluster().map_or(0, |c| c.node_id());
+        Ok(Response::new(HealthResponse {
+            healthy,
+            role: proto_role as i32,
+            node_id,
         }))
     }
 

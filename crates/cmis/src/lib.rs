@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cluster_store;
 pub mod credential;
 pub mod pcr;
 pub mod rim_watcher;

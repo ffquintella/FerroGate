@@ -41,12 +41,30 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   work from the M4 critical path. PQC peer TLS becomes an upstream-hiqlite
   concern; the F01 hybrid-PQC provider continues to terminate the public
   MIA↔CMIS surface.
-- **F05 Part 2 (spawned task):** route CMIS issuance through `Cluster`
-  (replacing the in-process `HashMap` in `CmisState`) and expose a `Health`
-  gRPC method on `MachineIdentity` that surfaces `Cluster::role`. Blocked
-  on a small wire-type adapter because the existing `ferro-svid` structs
-  carry `[u8; 48]` fields that `serde`-derive cannot deserialise through
-  the missing-field bound chain.
+### Added — F05 Part 2: CMIS issuance over the cluster (M4)
+
+- **`CmisState` gains a cluster backend.** A new `CmisState::new_clustered`
+  constructor wires an `Arc<ferro_raft::Cluster>` into the state; `record` /
+  `lookup` / `update_bundle` become async and route through
+  `Cluster::upsert_svid` / `fetch_svid_consistent` when set, falling back to
+  the process-local `HashMap` otherwise. Existing single-replica callers
+  (F02/F04/F07/F10 tests, the `cmis` binary) keep working unchanged.
+- **Wire-type adapter (`cmis::cluster_store`).** A new `WireIssuedRecord`
+  with hex-encoded byte fields and JSON serialisation lets us replicate the
+  three `[u8; 48]`-bearing `ferro-svid` structs (`IssueParams`,
+  `LastAttestation`, `IssuedSvid`) through hiqlite without bleeding a
+  custom `serde` visitor through every owning crate. Round-trip plus
+  invalid-hex unit tests live alongside the module.
+- **`MachineIdentity.Health` gRPC method.** Returns `(healthy, role,
+  node_id)`. A non-clustered CMIS is always healthy and reports
+  `NODE_ROLE_UNKNOWN`; a clustered one mirrors `Cluster::role` /
+  `Cluster::is_healthy`. An L4/L7 load balancer maps `!healthy` or
+  `NODE_ROLE_UNKNOWN` to "not ready".
+- **3-node CMIS integration test** (`crates/mia/tests/cluster_attest.rs`).
+  Stands up three CMIS instances backed by a 3-node hiqlite cluster, drives
+  a full four-phase `Attest` against the leader, and asserts the issued
+  bundle is observable through `FetchSVID` on a follower. Also exercises
+  the `Health` RPC on both leader and follower.
 
 ### Added — F07: Merkle-chained audit log (M3 subset)
 

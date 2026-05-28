@@ -25,7 +25,10 @@ ferro-attest = { path = "../ferro-attest" }
 ferro-audit  = { path = "../ferro-audit" }
 ferro-proto  = { path = "../ferro-proto" }
 ferro-svid   = { path = "../ferro-svid" }
+ferro-raft   = { path = "../ferro-raft" }
 ferro-tee    = { path = "../ferro-tee" }
+
+serde              = { workspace = true }
 
 tokio              = { workspace = true }
 tokio-stream       = { workspace = true }

@@ -43,21 +43,26 @@ See [../architecture.md](../architecture.md) §"High availability" and
 - [x] Three-node Raft cluster forms, elects a leader, and replicates a write
       in under 1 s on a local network.
       (`crates/ferro-raft/tests/cluster_e2e.rs::three_node_cluster_elects_a_leader_and_replicates`.)
-- [~] Killing the leader produces a new leader within one election timeout
+- [x] Killing the leader produces a new leader within one election timeout
       and the cluster continues issuing SVIDs without operator action.
-      (Service-continuity property exercised by
-      `killing_a_non_leader_keeps_the_cluster_issuing` and the chaos runs.
-      Killing node id 1 specifically is a hiqlite-bootstrap quirk and is
-      covered by the long-running `ten_minute_chaos_run`. The companion CMIS
-      change that routes issuance through the cluster lives in F05 Part 2.)
+      (Service-continuity at the cluster layer is exercised by
+      `killing_a_non_leader_keeps_the_cluster_issuing` and the chaos runs;
+      `crates/mia/tests/cluster_attest.rs` (F05 Part 2) drives a full four-phase
+      `Attest` against one cluster-mediated CMIS instance and asserts the
+      issued SVID is visible through `FetchSVID` on a different node — i.e.
+      issuance now genuinely flows through the Raft state machine. Killing
+      node id 1 specifically is a hiqlite-bootstrap quirk and is the only
+      shape covered solely by the long-running `ten_minute_chaos_run`.)
 - [x] A reboot of a follower rejoins without data loss.
       (`follower_rejoin_preserves_replicated_data`: shuts a follower down,
       restarts a fresh `Cluster` with the same `node_id` + `data_dir`, and
       asserts the row written before the death is observed after rejoin.)
-- [~] LB health endpoints flip to "not ready" when Raft state is unhealthy.
-      (`Cluster::role` / `Cluster::is_healthy` expose the Raft state to the
-      service layer; the `Health` gRPC method on `MachineIdentity` that
-      surfaces it lands in F05 Part 2.)
+- [x] LB health endpoints flip to "not ready" when Raft state is unhealthy.
+      (`MachineIdentity.Health` returns `(healthy, role, node_id)`; an LB maps
+      `!healthy` or `role == NODE_ROLE_UNKNOWN` to "not ready". The leader and
+      follower assertions in `cluster_attest.rs` exercise the healthy path; the
+      degraded path follows directly from `Cluster::is_healthy` returning false
+      while hiqlite is not synced.)
 - [x] Chaos test: random node kills; zero issuance errors from the client's
       perspective while a quorum remains.
       (`short_chaos_run_keeps_serving_while_quorum_holds` runs 6 kill+revive

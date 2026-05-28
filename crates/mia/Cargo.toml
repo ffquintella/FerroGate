@@ -39,6 +39,7 @@ hex                = { workspace = true }
 
 [dev-dependencies]
 cmis              = { path = "../cmis" }
+ferro-raft        = { path = "../ferro-raft" }
 ferro-svid        = { path = "../ferro-svid" }
 ferro-svid-verify = { path = "../ferro-svid-verify" }
 ferro-attest      = { path = "../ferro-attest" }

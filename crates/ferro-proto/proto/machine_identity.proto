@@ -42,6 +42,13 @@ service MachineIdentity {
   // `ferro_audit::AuditEvent`; CMIS appends it to its log and returns the
   // assigned leaf index.
   rpc AppendAuditEvent (AppendAuditRequest) returns (AppendAuditResponse);
+
+  // ---- Cluster health (F05) ----
+
+  // Coarse readiness probe for L4/L7 load balancers. Reports the local node's
+  // Raft role and a single `healthy` boolean — an LB should treat `Unknown`
+  // and `!healthy` alike as "not ready".
+  rpc Health (HealthRequest) returns (HealthResponse);
 }
 
 // ---- Attest: client -> server ------------------------------------------
@@ -159,3 +166,27 @@ message ConsistencyProofResponse {
 
 message AppendAuditRequest { bytes event_cbor = 1; }
 message AppendAuditResponse { uint64 leaf_index = 1; }
+
+// ---- Cluster health ------------------------------------------------------
+
+// Coarse Raft role classification — matches `ferro_raft::NodeRole` but is
+// pinned in the wire schema independently.
+enum NodeRole {
+  NODE_ROLE_UNKNOWN = 0;
+  NODE_ROLE_LEADER = 1;
+  NODE_ROLE_FOLLOWER = 2;
+  NODE_ROLE_LEARNER = 3;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  // True iff the local node believes it can serve. A non-clustered CMIS is
+  // always healthy; a clustered CMIS is healthy iff hiqlite reports its local
+  // node is up and synced.
+  bool healthy = 1;
+  // Raft role of the local node. `NODE_ROLE_UNKNOWN` for non-clustered nodes
+  // or while the cluster is transitioning.
+  NodeRole role = 2;
+  // Local node id. `0` for non-clustered nodes.
+  uint64 node_id = 3;
+}
