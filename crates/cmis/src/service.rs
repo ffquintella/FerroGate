@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use ferro_attest::{credential_secret_matches, verify_aik_signature, PcrSet, QuoteVerification};
+use ferro_attest::{
+    credential_secret_matches, verify_aik_signature, PcrSet, QuoteVerification, RejectReason,
+};
 use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
@@ -50,6 +52,16 @@ fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Collapse a verifier rejection into the small fixed gRPC status set from
+/// `docs/cmis.md` §"Error model" — the only place CMIS distinguishes
+/// `NotInRim` (a precondition violation) from a quote-validation failure.
+fn verifier_status(reason: &RejectReason) -> Status {
+    match reason {
+        RejectReason::NotInRim => Status::failed_precondition("attestation failed"),
+        _ => Status::permission_denied("attestation failed"),
+    }
 }
 
 fn sha384(bytes: &[u8]) -> [u8; 48] {
@@ -121,7 +133,7 @@ async fn run_attest(
         .verify_quote(&verification)
         .map_err(|reason| {
             tracing::warn!(reason = %reason, "phase 2 quote verification failed");
-            Status::permission_denied("attestation failed")
+            verifier_status(&reason)
         })?;
 
     // Phase 3 — credential activation (proof of residency).

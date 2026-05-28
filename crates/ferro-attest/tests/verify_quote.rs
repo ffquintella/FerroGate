@@ -167,7 +167,7 @@ const NOW: i64 = 1_770_000_000;
 fn verifier_for(ek: &Ek, pcr_digest: [u8; 48]) -> TpmQuoteVerifier {
     let mut trust = VendorTrustStore::new();
     trust.add_root_der(&ek.root_der, Vendor::Infineon).unwrap();
-    let mut rim = RimStore::new();
+    let rim = RimStore::new();
     rim.approve(pcr_digest, PolicyId("test-fleet".into()));
     TpmQuoteVerifier::new(trust, rim)
 }
@@ -365,7 +365,7 @@ fn unknown_pcr_state_not_in_rim_is_rejected() {
     // Trust the EK root, but approve a *different* digest in the RIM.
     let mut trust = VendorTrustStore::new();
     trust.add_root_der(&f.ek.root_der, Vendor::Nuvoton).unwrap();
-    let mut rim = RimStore::new();
+    let rim = RimStore::new();
     rim.approve([0xEE; 48], PolicyId("other".into()));
     let verifier = TpmQuoteVerifier::new(trust, rim);
     let v = QuoteVerification {

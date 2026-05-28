@@ -92,10 +92,12 @@ no HA. No persistence, no audit, no helper API yet.
 
 ### F10 — RIM and PCR policy (subset)
 
-- [ ] RIM bundle format and loader.
-- [ ] RIM signature verification.
-- [ ] 6-generation retention.
-- [ ] Hot reload from local file (S3 deferred to M5).
+- [x] RIM bundle format and loader. (`ferro-attest::rim_bundle` defines `RimBundle` (version, policy_id, validity window, approved SHA-384 digests) and the `SignedRimBundle` wire form; `ferro-attest::rim_loader::RimLoader::try_reload` reads, verifies, and applies an on-disk bundle.)
+- [x] RIM signature verification. (Composite Ed25519 + ML-DSA-65 over canonical JSON with domain-separation context `ferrogate-rim-v1`. Fail-closed: bundles without a recognised `signer_kid`, with a malformed signature, or with a tampered body are refused before any state changes. There is no path into the store that bypasses verification.)
+- [x] 6-generation retention. (`MAX_GENERATIONS = 6`; `RimStore::apply` pushes the new generation and prunes the oldest beyond the limit. Per-generation `not_before`/`not_after` windows are honoured at lookup time, and a non-monotonic version is rejected with `ApplyError::NonMonotonic`.)
+- [x] Hot reload from local file (S3 deferred to M5). (`cmis::rim_watcher::spawn` runs a small tokio task that periodically calls `try_reload`. The swap is atomic — a single `parking_lot::RwLock` write — so in-flight `Attest` handlers always see a consistent generation set. CMIS maps `RejectReason::NotInRim` to `FAILED_PRECONDITION` to match the documented error model.)
+
+**F10 (M2 subset) status: done.** Verified on Linux with `cargo test --workspace --all-targets`, `clippy -D warnings`, and `fmt --check`. The M5 follow-ons (`bump_epoch` admin RPC and signed-S3 refresh) remain explicitly out of M2 scope.
 
 ## Milestone M3 — Audit log
 

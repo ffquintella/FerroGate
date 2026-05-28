@@ -15,7 +15,7 @@ reviewed in isolation, even though some have ordering dependencies.
 | F07 | [Merkle-chained immutable audit log](F07-audit-log.md) | CMIS, MIA | Not started |
 | F08 | [Local helper API](F08-helper-api.md) | MIA | Not started |
 | F09 | [DPoP-bound child tokens](F09-dpop-child-tokens.md) | MIA | Not started |
-| F10 | [RIM and PCR policy management](F10-rim-pcr-policy.md) | CMIS | Not started |
+| F10 | [RIM and PCR policy management](F10-rim-pcr-policy.md) | CMIS | M2 subset done |
 | F11 | [Revocation and CRL distribution](F11-revocation.md) | CMIS, MIA | Not started |
 | F12 | [MIA process hardening](F12-mia-hardening.md) | MIA | Not started |
 | F13 | [Zero-touch bootstrap and fleet enrollment](F13-bootstrap-enrollment.md) | CMIS, MIA | Not started |

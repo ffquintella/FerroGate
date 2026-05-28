@@ -8,6 +8,41 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added — F10: RIM and PCR policy (M2 subset)
+
+- **Generational `RimStore`.** Refactored from a flat allowlist to a versioned
+  generation set: `RimGeneration { version, policy_id, not_before, not_after,
+  approved }` with `MAX_GENERATIONS = 6` retention and per-generation validity
+  windows. Interior mutability (`parking_lot::RwLock`) lets a loader hot-swap
+  a generation while a `TpmQuoteVerifier` holds a clone — readers always see a
+  point-in-time consistent set. Back-compat `RimStore::approve(...)` survives
+  via a separate manual allowlist for tests / bring-up. `RimStore::apply`
+  rejects non-monotonic versions (`ApplyError::NonMonotonic`) and empty
+  windows (`ApplyError::InvalidWindow`).
+- **Signed RIM bundle format.** `ferro_attest::rim_bundle` defines `RimBundle`
+  and `SignedRimBundle` with a composite (Ed25519 + ML-DSA-65) signature over
+  the bundle's canonical JSON under domain-separation context
+  `ferrogate-rim-v1`. `TrustedKeys` holds publisher `kid -> CompositePublicKey`
+  mappings; unknown `signer_kid`, malformed signatures, and bodies tampered
+  after signing are refused before any state changes.
+- **File-backed hot reload.** `ferro_attest::rim_loader::RimLoader::try_reload`
+  reads a signed bundle from disk, verifies it, and applies it atomically.
+  Non-monotonic on-disk versions return `ReloadOutcome::UpToDate` rather than
+  escalating, so a regression publish is silently ignored. `cmis::rim_watcher`
+  spawns the polling loop; `RejectReason::NotInRim` now maps to
+  `FAILED_PRECONDITION` (per `docs/cmis.md` §"Error model"), separated from
+  other quote-validation failures.
+- **Tests.** 17 new ferro-attest tests (window honoured, retention prune at 7
+  generations, sign-then-verify roundtrip, tamper/unknown-kid/non-monotonic
+  refusal, file-backed hot reload happy path + rollback rejection, atomic
+  generation swap). Two new end-to-end tests in `crates/mia/tests/e2e_attest.rs`:
+  `attest_returns_failed_precondition_when_digest_not_in_rim` proves the new
+  status mapping over real gRPC, and `rim_loader_hot_swap_admits_a_freshly_published_generation`
+  drives the whole loader-to-issued-SVID path with the `policy_id` flowing
+  through into the SVID claim set.
+- **Out of M2 scope:** the `bump_epoch` admin RPC and signed-S3 refresh remain
+  M5 work (`docs/roadmap.md` §M5).
+
 ### Added — F04: SVID issuance and lifecycle (M2)
 
 - **`ferro-proto` — `MachineIdentity` gRPC surface.** A proto3 service

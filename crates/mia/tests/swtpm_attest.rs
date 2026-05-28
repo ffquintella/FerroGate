@@ -172,7 +172,7 @@ fn swtpm_quote_is_accepted_end_to_end() {
     let mut digest = [0u8; 48];
     digest.copy_from_slice(&agg.finalize());
 
-    let mut rim = RimStore::new();
+    let rim = RimStore::new();
     rim.approve(digest, PolicyId("swtpm-test".into()));
     let verifier = TpmQuoteVerifier::new(trust, rim);
 

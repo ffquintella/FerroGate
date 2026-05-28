@@ -236,10 +236,13 @@ fn build_state(evidence: &SoftwareEvidence) -> Arc<CmisState> {
         .add_root_der(&evidence.ek_root, Vendor::Infineon)
         .unwrap();
     let (_blob, pcr_digest) = build_quote(&[0u8; 32]);
-    let mut rim = RimStore::new();
+    let rim = RimStore::new();
     rim.approve(pcr_digest, PolicyId("test-fleet".into()));
     let verifier = TpmQuoteVerifier::new(trust, rim);
+    state_with_verifier(verifier)
+}
 
+fn state_with_verifier(verifier: TpmQuoteVerifier) -> Arc<CmisState> {
     let issuer = Issuer::generate("kid-e2e", "ferrogate.test").unwrap();
     Arc::new(CmisState::new(
         issuer,
@@ -365,4 +368,105 @@ async fn rotate_refused_on_pcr_drift() {
         .expect_err("rotate must be refused on drift");
 
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+}
+
+// --- F10: RIM bundle / loader / status mapping ------------------------------
+
+#[tokio::test]
+async fn attest_returns_failed_precondition_when_digest_not_in_rim() {
+    let mut evidence = SoftwareEvidence::new();
+
+    // Verifier with the EK root trusted but an *empty* RIM — the verifier will
+    // accept everything up to step 7 (RIM lookup), then reject with NotInRim
+    // which the service maps to FAILED_PRECONDITION (`docs/cmis.md` error model).
+    let mut trust = VendorTrustStore::new();
+    trust
+        .add_root_der(&evidence.ek_root, Vendor::Infineon)
+        .unwrap();
+    let verifier = TpmQuoteVerifier::new(trust, RimStore::new());
+    let state = state_with_verifier(verifier);
+    let mut client = spawn_server(state).await;
+
+    let Err(err) = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string()).await else {
+        panic!("attestation must be refused when the digest is not in any RIM");
+    };
+    let status = match err {
+        mia::client::AttestClientError::Transport(s) => s,
+        other => panic!("expected transport error, got {other:?}"),
+    };
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn rim_loader_hot_swap_admits_a_freshly_published_generation() {
+    use ferro_attest::{ReloadOutcome, RimBundle};
+    use ferro_attest::{RimLoader, RimStore, SignedRimBundle, TrustedKeys};
+    use ferro_crypto::composite::CompositeSecretKey;
+
+    let mut evidence = SoftwareEvidence::new();
+    let (_blob, pcr_digest) = build_quote(&[0u8; 32]);
+
+    // Publisher keypair and a temp-file bundle approving the test's PCR digest.
+    let (sk, pk) = CompositeSecretKey::generate().unwrap();
+    let mut trusted = TrustedKeys::new();
+    trusted.add("test-pub", pk);
+
+    let bundle_path = {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("ferrogate-e2e-rim-{nanos}.json"));
+        p
+    };
+    let bundle = RimBundle {
+        version: 1,
+        policy_id: "loader-fleet".to_string(),
+        not_before: 0,
+        not_after: i64::MAX / 2,
+        approved_digests_hex: vec![hex::encode(pcr_digest)],
+    };
+    std::fs::write(
+        &bundle_path,
+        serde_json::to_vec(&SignedRimBundle::sign(bundle, "test-pub", &sk).unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    // Build the verifier around a shared RimStore; the loader holds a clone.
+    let store = RimStore::new();
+    let loader = RimLoader::new(&bundle_path, trusted, store.clone());
+    let outcome = loader.try_reload().expect("reload");
+    assert!(matches!(outcome, ReloadOutcome::Applied(_)));
+
+    let mut trust = VendorTrustStore::new();
+    trust
+        .add_root_der(&evidence.ek_root, Vendor::Infineon)
+        .unwrap();
+    let verifier = TpmQuoteVerifier::new(trust, store);
+    let state = state_with_verifier(verifier);
+    let mut client = spawn_server(state).await;
+
+    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+        .await
+        .expect("attestation succeeds against the loaded RIM");
+    let jwks = ferro_svid_verify::JwkSet::from_json(
+        &client
+            .jwks(ferro_proto::v1::JwksRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .jwks_json,
+    )
+    .unwrap();
+    let result = ferro_svid_verify::verify(
+        &attested.bundle.jws,
+        &jwks,
+        attested.bundle.issued_at + 10,
+        0,
+    )
+    .unwrap();
+    assert_eq!(result.claims.attest.policy_id, "loader-fleet");
+
+    std::fs::remove_file(bundle_path).ok();
 }

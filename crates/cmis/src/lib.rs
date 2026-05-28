@@ -13,6 +13,7 @@
 
 pub mod credential;
 pub mod pcr;
+pub mod rim_watcher;
 pub mod service;
 pub mod state;
 

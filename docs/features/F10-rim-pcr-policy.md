@@ -40,13 +40,23 @@ See [../tpm.md](../tpm.md) §"PCR policy" and [../operations.md](../operations.m
 
 ## Acceptance criteria
 
-- [ ] RIM signature verification fails closed; unsigned bundles are refused.
-- [ ] Reload of a new RIM is hot and atomic; in-flight attestations see a
-      consistent generation.
-- [ ] Old generations beyond 6 are pruned and no longer accepted.
+- [x] RIM signature verification fails closed; unsigned bundles are refused.
+      (Composite signature in `ferro-attest::rim_bundle`; there is no
+      constructor that yields a bundle without verifying. Tamper/unknown-kid
+      cases in `rim_bundle::tests`.)
+- [x] Reload of a new RIM is hot and atomic; in-flight attestations see a
+      consistent generation. (Single `RwLock` write in `RimStore::apply`;
+      `cmis::rim_watcher` drives the polling loop.)
+- [x] Old generations beyond 6 are pruned and no longer accepted.
+      (`MAX_GENERATIONS = 6`; `rim::tests::retention_prunes_oldest_beyond_six`
+      proves pruned digests no longer resolve.)
 - [ ] Admin RPC `bump_epoch` emits a `PolicyEpochBumped` audit event and
-      forces re-attestation at next rotation for all hosts.
-- [ ] PCR digest not in any active generation → `FAILED_PRECONDITION`.
+      forces re-attestation at next rotation for all hosts. *(Deferred to
+      M5 per the roadmap; out of M2 scope.)*
+- [x] PCR digest not in any active generation → `FAILED_PRECONDITION`.
+      (`service::verifier_status` collapses `RejectReason::NotInRim` to
+      `FAILED_PRECONDITION`; `mia/tests/e2e_attest.rs::attest_returns_failed_precondition_when_digest_not_in_rim`
+      asserts it end-to-end over a real tonic channel.)
 
 ## Risks
 

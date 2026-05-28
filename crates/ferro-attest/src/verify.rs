@@ -135,9 +135,18 @@ impl TpmQuoteVerifier {
     }
 
     /// Borrow the RIM allowlist (e.g. to approve digests in a test rig).
+    /// [`RimStore`] uses interior mutability, so callers can mutate via the
+    /// returned reference without needing `&mut self`.
     #[must_use]
     pub fn rim_mut(&mut self) -> &mut RimStore {
         &mut self.rim
+    }
+
+    /// Borrow the RIM allowlist by shared reference. Useful when a loader
+    /// needs to hot-swap generations while a verifier is in use.
+    #[must_use]
+    pub fn rim(&self) -> &RimStore {
+        &self.rim
     }
 
     /// Borrow the trust store (e.g. to add an `swtpm` CA in a test rig).
@@ -189,11 +198,10 @@ impl TpmQuoteVerifier {
             return Err(RejectReason::PcrDigestMismatch);
         }
 
-        // Step 7 — RIM allowlist lookup -> policy_id.
+        // Step 7 — RIM allowlist lookup (windowed by `now`) -> policy_id.
         let policy_id = self
             .rim
-            .lookup(&computed)
-            .cloned()
+            .lookup_at(&computed, v.now)
             .ok_or(RejectReason::NotInRim)?;
 
         Ok(VerifiedQuote {

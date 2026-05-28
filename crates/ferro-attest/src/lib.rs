@@ -24,11 +24,18 @@
 
 pub mod aik;
 pub mod rim;
+pub mod rim_bundle;
+pub mod rim_loader;
 pub mod tpm;
 pub mod vendor;
 pub mod verify;
 
-pub use rim::{PolicyId, RimStore};
+pub use rim::{
+    ApplyError, ApplyOutcome, PolicyId, RimGeneration, RimGenerationSummary, RimStore,
+    MAX_GENERATIONS,
+};
+pub use rim_bundle::{BundleError, RimBundle, SignedRimBundle, TrustedKeys, RIM_SIGNING_CONTEXT};
+pub use rim_loader::{ReloadError, ReloadOutcome, RimLoader};
 pub use vendor::{ChainError, Vendor, VendorMatch, VendorTrustStore};
 pub use verify::{
     credential_secret_matches, verify_aik_signature, PcrSet, QuoteVerification, RejectReason,
