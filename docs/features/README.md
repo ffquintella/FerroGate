@@ -10,7 +10,7 @@ reviewed in isolation, even though some have ordering dependencies.
 | F02 | [TPM 2.0 attestation engine](F02-tpm-attestation.md) | MIA, CMIS | Done |
 | F03 | [Composite Ed25519 + ML-DSA-65 signatures](F03-composite-signatures.md) | CMIS, MIA | Done |
 | F04 | [SVID issuance and lifecycle](F04-svid-lifecycle.md) | CMIS, MIA | Done |
-| F05 | [CMIS high availability](F05-cmis-ha.md) | CMIS | Not started |
+| F05 | [CMIS high availability](F05-cmis-ha.md) | CMIS | Cluster layer done; CMIS routing in Part 2 |
 | F06 | [TEE residency and threshold key shares](F06-tee-threshold-keys.md) | CMIS | Not started |
 | F07 | [Merkle-chained immutable audit log](F07-audit-log.md) | CMIS, MIA | M3 subset done |
 | F08 | [Local helper API](F08-helper-api.md) | MIA | Not started |

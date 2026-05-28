@@ -157,7 +157,7 @@ impl AuditStore for LocalDiskWormStore {
             let Ok(n) = stem.parse::<u64>() else {
                 continue;
             };
-            if best.as_ref().map_or(true, |(b, _)| n > *b) {
+            if best.as_ref().is_none_or(|(b, _)| n > *b) {
                 best = Some((n, entry.path()));
             }
         }

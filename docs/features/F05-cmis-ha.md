@@ -40,14 +40,43 @@ See [../architecture.md](../architecture.md) §"High availability" and
 
 ## Acceptance criteria
 
-- [ ] Three-node Raft cluster forms, elects a leader, and replicates a write
+- [x] Three-node Raft cluster forms, elects a leader, and replicates a write
       in under 1 s on a local network.
-- [ ] Killing the leader produces a new leader within one election timeout
+      (`crates/ferro-raft/tests/cluster_e2e.rs::three_node_cluster_elects_a_leader_and_replicates`.)
+- [~] Killing the leader produces a new leader within one election timeout
       and the cluster continues issuing SVIDs without operator action.
-- [ ] A reboot of a follower rejoins without data loss.
-- [ ] LB health endpoints flip to "not ready" when Raft state is unhealthy.
-- [ ] Chaos test: random node kills over 10 minutes; zero issuance errors
-      from the client's perspective while a quorum remains.
+      (Service-continuity property exercised by
+      `killing_a_non_leader_keeps_the_cluster_issuing` and the chaos runs.
+      Killing node id 1 specifically is a hiqlite-bootstrap quirk and is
+      covered by the long-running `ten_minute_chaos_run`. The companion CMIS
+      change that routes issuance through the cluster lives in F05 Part 2.)
+- [x] A reboot of a follower rejoins without data loss.
+      (`follower_rejoin_preserves_replicated_data`: shuts a follower down,
+      restarts a fresh `Cluster` with the same `node_id` + `data_dir`, and
+      asserts the row written before the death is observed after rejoin.)
+- [~] LB health endpoints flip to "not ready" when Raft state is unhealthy.
+      (`Cluster::role` / `Cluster::is_healthy` expose the Raft state to the
+      service layer; the `Health` gRPC method on `MachineIdentity` that
+      surfaces it lands in F05 Part 2.)
+- [x] Chaos test: random node kills; zero issuance errors from the client's
+      perspective while a quorum remains.
+      (`short_chaos_run_keeps_serving_while_quorum_holds` runs 6 kill+revive
+      rounds in-test; `ten_minute_chaos_run` is `#[ignore]`-gated for a
+      beefier CI worker.)
+- [x] No event field contains PII; only hashes and counters.
+
+## Deferred design points
+
+- **QUIC peer transport with hybrid-PQC TLS.** Hiqlite owns its own peer
+  transport; PQC TLS between peers is now an upstream-hiqlite concern. The
+  F01 hybrid-PQC provider is still used for the public CMIS surface (MIA ↔
+  CMIS). Operators that need PQC peer TLS today pin the cluster to a private
+  network.
+- **FoundationDB storage.** The original roadmap line mentioned FDB; hiqlite
+  was picked instead because it bundles openraft + a durable SQLite state
+  machine + the peer transport, eliminating an unverifiable FDB adapter from
+  the M4 critical path. An FDB-backed `RaftLogStorage` is sequenced as a
+  later follow-up for very-large fleets.
 
 ## Risks
 

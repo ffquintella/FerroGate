@@ -221,11 +221,11 @@ pub fn verify_inclusion(
         let Some(p) = it.next() else {
             return false;
         };
-        if fn_idx % 2 == 1 || fn_idx == sn {
+        if !fn_idx.is_multiple_of(2) || fn_idx == sn {
             // Right child or rightmost-odd subtree boundary.
             r = node_hash(p, &r);
-            if fn_idx % 2 == 0 {
-                while fn_idx % 2 == 0 {
+            if fn_idx.is_multiple_of(2) {
+                while fn_idx.is_multiple_of(2) {
                     fn_idx >>= 1;
                     sn >>= 1;
                 }
@@ -280,11 +280,11 @@ pub fn verify_consistency(
         let Some(c) = it.next() else {
             return false;
         };
-        if fn_idx % 2 == 1 || fn_idx == sn {
+        if !fn_idx.is_multiple_of(2) || fn_idx == sn {
             fr = node_hash(c, &fr);
             sr = node_hash(c, &sr);
-            if fn_idx % 2 == 0 {
-                while fn_idx % 2 == 0 && fn_idx != 0 {
+            if fn_idx.is_multiple_of(2) {
+                while fn_idx.is_multiple_of(2) && fn_idx != 0 {
                     fn_idx >>= 1;
                     sn >>= 1;
                 }

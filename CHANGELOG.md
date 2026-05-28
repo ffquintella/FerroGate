@@ -8,6 +8,46 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added — F05 Part 1: CMIS Raft cluster layer (M4)
+
+- **New crate `ferro-raft`.** Wraps [hiqlite](https://crates.io/crates/hiqlite)
+  0.13 (openraft 0.9 + SQLite state machine + WAL on disk) behind a typed
+  `Cluster` API: `upsert_svid` / `fetch_svid` / `fetch_svid_consistent` /
+  `list_svids` / `delete_svid` / `current_rim_version` / `bump_rim_version`,
+  plus `role` / `is_healthy` / `leader_id` for health gating. The schema is
+  two idempotent `CREATE TABLE` statements (issued-SVID payloads keyed by
+  SPIFFE id; a one-row `rim_state` for the policy epoch). Workspace MSRV
+  bumped to 1.88 to match hiqlite's `edition = "2024"` floor.
+- **3-node cluster integration tests** (`crates/ferro-raft/tests/cluster_e2e.rs`,
+  ≈4 min wall-clock):
+  - `three_node_cluster_elects_a_leader_and_replicates`: starts three nodes
+    on free localhost ports, asserts every peer agrees on the elected
+    leader, writes through the leader, reads from a follower.
+  - `killing_a_non_leader_keeps_the_cluster_issuing`: drops a non-leader
+    cleanly, asserts the leader id is preserved, and that writes still
+    succeed while the surviving 2/3 quorum holds.
+  - `follower_rejoin_preserves_replicated_data`: shuts a follower, starts
+    a fresh `Cluster` with the same `node_id` + `data_dir`, and asserts
+    pre-death rows are observed after rejoin.
+  - `short_chaos_run_keeps_serving_while_quorum_holds`: 6 kill+revive
+    rounds; every replicated write survives.
+  - `ten_minute_chaos_run`: the full 10-minute random-kill loop,
+    `#[ignore]`-gated so a beefier CI runner can flip it on with
+    `cargo test -- --ignored`.
+- **Roadmap pivots, explicitly noted in `docs/features/F05-cmis-ha.md`.**
+  Hiqlite replaces the originally-planned FoundationDB storage + a custom
+  QUIC peer transport: it bundles openraft + a durable state machine + the
+  peer transport into one crate and removes ~3 k LOC of unverifiable adapter
+  work from the M4 critical path. PQC peer TLS becomes an upstream-hiqlite
+  concern; the F01 hybrid-PQC provider continues to terminate the public
+  MIA↔CMIS surface.
+- **F05 Part 2 (spawned task):** route CMIS issuance through `Cluster`
+  (replacing the in-process `HashMap` in `CmisState`) and expose a `Health`
+  gRPC method on `MachineIdentity` that surfaces `Cluster::role`. Blocked
+  on a small wire-type adapter because the existing `ferro-svid` structs
+  carry `[u8; 48]` fields that `serde`-derive cannot deserialise through
+  the missing-field bound chain.
+
 ### Added — F07: Merkle-chained audit log (M3 subset)
 
 - **`ferro-audit` crate fleshed out.** Seven-variant `AuditEvent` enum
