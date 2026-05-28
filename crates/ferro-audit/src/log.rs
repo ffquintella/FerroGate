@@ -19,6 +19,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::bytes::Hash384;
+use crate::cosign::{CoSignedTreeHead, QuorumError, QuorumSigner};
 use crate::event::{self, AuditEvent, EventCodecError};
 use crate::merkle::{leaf_hash, MerkleTree, HASH_LEN};
 use crate::sth::{SignedTreeHead, SthBody, SthError, SthSigner};
@@ -36,6 +37,9 @@ pub enum AuditLogError {
     /// STH signer failure.
     #[error("sth: {0}")]
     Sth(#[from] SthError),
+    /// Quorum signer failure.
+    #[error("quorum: {0}")]
+    Quorum(#[from] QuorumError),
     /// A requested leaf index or tree size is out of range.
     #[error("range: {0}")]
     Range(String),
@@ -56,6 +60,7 @@ struct Inner {
 struct TreeState {
     tree: MerkleTree,
     latest_sth: Option<SignedTreeHead>,
+    latest_cosigned_sth: Option<CoSignedTreeHead>,
 }
 
 impl AuditLog {
@@ -66,6 +71,7 @@ impl AuditLog {
                 state: Mutex::new(TreeState {
                     tree: MerkleTree::new(),
                     latest_sth: None,
+                    latest_cosigned_sth: None,
                 }),
                 store,
                 signer,
@@ -122,6 +128,42 @@ impl AuditLog {
     #[must_use]
     pub fn latest_sth(&self) -> Option<SignedTreeHead> {
         self.inner.state.lock().latest_sth.clone()
+    }
+
+    /// Sign the current tree state with a Raft-majority [`QuorumSigner`],
+    /// persist the resulting [`CoSignedTreeHead`] to the backing store, and
+    /// cache it as the latest co-signed STH.
+    ///
+    /// This is the M4 publication path: the proposer aggregates per-replica
+    /// composite signatures from the cluster peers before any external
+    /// observer ever sees the STH, so no single replica can publish a head
+    /// the rest of the cluster has not endorsed. Callers should fetch the
+    /// keyset from the same cluster config that defined `quorum` and verify
+    /// with [`crate::cosign::verify_cosigned`].
+    pub fn produce_cosigned_sth(
+        &self,
+        timestamp_unix: i64,
+        quorum: &QuorumSigner,
+    ) -> Result<CoSignedTreeHead, AuditLogError> {
+        let mut state = self.inner.state.lock();
+        let tree_size = state.tree.len() as u64;
+        let root_hash = state.tree.root().unwrap_or([0u8; HASH_LEN]);
+        let body = SthBody {
+            tree_size,
+            root_hash: Hash384(root_hash),
+            timestamp: timestamp_unix,
+        };
+        let sth = quorum.sign(body)?;
+        self.inner.store.record_cosigned_sth(&sth)?;
+        state.latest_cosigned_sth = Some(sth.clone());
+        Ok(sth)
+    }
+
+    /// The most recent co-signed STH produced via
+    /// [`Self::produce_cosigned_sth`]. `None` if none has been produced yet.
+    #[must_use]
+    pub fn latest_cosigned_sth(&self) -> Option<CoSignedTreeHead> {
+        self.inner.state.lock().latest_cosigned_sth.clone()
     }
 
     /// Inclusion proof for the leaf at `index` against the current tree.
@@ -252,6 +294,29 @@ mod tests {
         for i in 0..5u8 {
             assert_eq!(log.append(&event(i)).unwrap(), u64::from(i));
         }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cosigned_sth_matches_tree_and_verifies() {
+        use crate::cosign::{verify_cosigned, QuorumSigner, VerifyingKeyset};
+        let (log, dir) = fresh_log("cos");
+        for i in 0..4u8 {
+            log.append(&event(i)).unwrap();
+        }
+        let mut signers: Vec<Arc<dyn crate::sth::SthSigner>> = Vec::new();
+        let mut keys = Vec::new();
+        for kid in ["peer-a", "peer-b", "peer-c"] {
+            let (s, pk) = InProcessSigner::generate(kid).unwrap();
+            signers.push(Arc::new(s));
+            keys.push((kid.to_owned(), pk));
+        }
+        let q = QuorumSigner::new(signers, 2).unwrap();
+        let sth = log.produce_cosigned_sth(1_770_000_001, &q).unwrap();
+        let ks = VerifyingKeyset::new(keys, 2).unwrap();
+        let body = verify_cosigned(&sth, &ks).unwrap();
+        assert_eq!(body.tree_size, 4);
+        assert!(log.latest_cosigned_sth().is_some());
         std::fs::remove_dir_all(dir).ok();
     }
 

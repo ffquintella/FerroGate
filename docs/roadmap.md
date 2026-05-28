@@ -152,7 +152,7 @@ Promote CMIS from a single replica into a TEE-attested cluster.
 
 ### F07 — Audit log (continued)
 
-- [ ] Co-sign STHs by a Raft majority before publication.
+- [x] Co-sign STHs by a Raft majority before publication. (`crates/ferro-audit/src/cosign.rs` — `QuorumSigner` aggregates per-replica composite signatures over the same canonical `SthBody` CBOR; `verify_cosigned` accepts the artefact iff at least `threshold` *distinct* listed signatures verify under the keyset, so duplicate kids cannot inflate quorum and unknown kids are silently ignored. `AuditLog::produce_cosigned_sth` produces a `CoSignedTreeHead` from the current tree, persists it via the WORM store (new `record_cosigned_sth` on `AuditStore`, with a `cosigned/` subdir on `LocalDiskWormStore`), and caches it as the latest. Per-peer transport — i.e. an RPC `SthSigner` that talks to the cluster peers through `ferro-raft` — remains a deployment-wiring task; the trait seam already accepts it without further API changes.)
 - [ ] S3 Object Lock (Compliance) backing-store implementation.
 - [ ] Sigsum / Rekor anchor publisher with back-fill.
 

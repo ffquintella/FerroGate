@@ -17,10 +17,16 @@
 //!   (M4) without changing callers.
 //! - [`log`] — the [`log::AuditLog`] facade tying tree + store + signer
 //!   together with a thread-safe append API.
+//! - [`cosign`] — the M4 surface for STHs co-signed by a Raft majority:
+//!   [`cosign::QuorumSigner`] aggregates per-replica composite signatures
+//!   over the same canonical body, and [`cosign::verify_cosigned`] accepts
+//!   the artefact iff at least the configured threshold of distinct
+//!   signatures verify.
 
 #![forbid(unsafe_code)]
 
 pub mod bytes;
+pub mod cosign;
 pub mod event;
 pub mod log;
 pub mod merkle;
@@ -29,6 +35,9 @@ pub mod store;
 
 pub use bytes::{Bytes16, Hash384};
 
+pub use cosign::{
+    verify_cosigned, CoSignature, CoSignedTreeHead, QuorumError, QuorumSigner, VerifyingKeyset,
+};
 pub use event::{AuditEvent, EventCodecError};
 pub use log::{AuditLog, AuditLogError};
 pub use merkle::{

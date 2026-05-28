@@ -8,6 +8,42 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added — F07 continued: Raft-majority co-signed STHs (M4 subset)
+
+- **New `ferro_audit::cosign` module.** `CoSignedTreeHead` carries the same
+  canonical CBOR `SthBody` as the single-signer flow plus a `Vec<CoSignature>`
+  — one composite (Ed25519 + ML-DSA-65) signature per cluster replica over
+  the *identical* `body_cbor` under the existing `ferrogate-sth-v1` domain
+  context. `QuorumSigner` composes any number of `SthSigner` trait objects
+  and refuses duplicate `signer_kid`s or out-of-range thresholds at build
+  time. `verify_cosigned` accepts the artefact iff at least `threshold`
+  *distinct* signer kids verify under the keyset: duplicate kids collapse to
+  one contribution toward quorum and unknown kids are silently ignored
+  rather than failing verification outright, so an attacker who controls
+  fewer than threshold listed replicas cannot publish.
+- **WORM persistence for co-signed heads.** `AuditStore` gains
+  `record_cosigned_sth` / `latest_cosigned_sth` (default `Unsupported` so
+  existing stores stay valid); `LocalDiskWormStore` persists artefacts under
+  `cosigned/<tree_size:020>.json` with the same `O_CREAT|O_EXCL` invariant
+  as the single-signer subdir.
+- **`AuditLog::produce_cosigned_sth`.** Mirrors `produce_sth` but signs
+  through a `QuorumSigner` and writes through the new WORM path before any
+  external observer sees the head; `latest_cosigned_sth` caches it for
+  cheap reads.
+- **Tests.** 10 new `cosign` tests (3-of-3 happy path; threshold met with
+  minority of keys unknown; threshold not met when keys unknown; full body
+  tamper kills every signature; single-signature tamper still meets
+  quorum=2; duplicate kids cannot inflate quorum; unknown kids ignored;
+  invalid threshold refused; duplicate signers refused at build; `as_single`
+  extracts a per-replica view) plus end-to-end `AuditLog::produce_cosigned_sth`
+  and the WORM round-trip on `cosigned/`.
+- **Out of this slice:** per-peer RPC transport (an `SthSigner` that talks
+  to the cluster peers through `ferro-raft`) is a deployment-wiring task
+  and slots in behind the existing trait without an API break. The
+  remaining F07-continued items — S3 Object Lock storage and the
+  Sigsum / Rekor anchor publisher with back-fill — stay deferred per
+  `docs/roadmap.md` §M4 / "F07 continued".
+
 ### Added — F05 Part 1: CMIS Raft cluster layer (M4)
 
 - **New crate `ferro-raft`.** Wraps [hiqlite](https://crates.io/crates/hiqlite)

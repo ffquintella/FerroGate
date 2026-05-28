@@ -47,8 +47,21 @@ See [../audit.md](../audit.md).
       — 24 proptest cases, tree sizes 1..=12, every leaf and every
       `(old_size, new_size)` pair checked offline against the captured STH
       roots.)
-- [ ] STHs are co-signed by a Raft majority before publication.
-      *(Deferred to M4 — `docs/roadmap.md` §M4 / F07 continued.)*
+- [x] STHs are co-signed by a Raft majority before publication.
+      (`crates/ferro-audit/src/cosign.rs` —
+      [`ferro_audit::QuorumSigner`] composes per-replica
+      [`SthSigner`](ferro_audit::SthSigner) trait objects and produces a
+      [`CoSignedTreeHead`](ferro_audit::CoSignedTreeHead) carrying one
+      composite signature per peer over the *same* canonical CBOR body.
+      [`ferro_audit::verify_cosigned`] accepts the artefact iff at least the
+      configured threshold of *distinct* signer kids verify against the
+      keyset — duplicates collapse to one contribution and unknown kids do
+      not count, so an attacker controlling fewer than threshold replicas
+      cannot publish. The `AuditLog::produce_cosigned_sth` facade writes the
+      artefact through the WORM store's new `record_cosigned_sth` path
+      before any external observer sees it. Per-peer RPC transport is the
+      remaining deployment wiring and slots in behind the existing
+      `SthSigner` seam without an API break.)
 - [ ] S3 Object Lock prevents deletion in an integration test.
       *(Deferred to M4. The M3 dev WORM uses `O_CREAT|O_EXCL` against a local
       filesystem; `crates/ferro-audit/src/store.rs::leaf_append_is_worm`
