@@ -24,7 +24,7 @@ use ferro_proto::v1::{
     AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, Challenge,
     ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest, HealthRequest, HealthResponse,
     InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest,
-    LatestSthResponse, Nonce, NodeRole as ProtoNodeRole, RotateRequest, SignedTreeHead, SvidBundle,
+    LatestSthResponse, NodeRole as ProtoNodeRole, Nonce, RotateRequest, SignedTreeHead, SvidBundle,
 };
 use ferro_raft::NodeRole;
 use ferro_svid::{decide_renewal, IssueParams, IssuedSvid, LastAttestation, RenewalDecision};

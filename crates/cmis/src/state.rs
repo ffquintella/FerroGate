@@ -147,9 +147,7 @@ impl CmisState {
                 let spiffe_id = record.bundle.spiffe_id.clone();
                 match cluster_store::encode(&record) {
                     Ok(payload) => {
-                        if let Err(e) = c
-                            .upsert_svid(&spiffe_id, &payload, record.bundle.iat)
-                            .await
+                        if let Err(e) = c.upsert_svid(&spiffe_id, &payload, record.bundle.iat).await
                         {
                             tracing::error!(error = %e, %spiffe_id, "cluster upsert failed");
                         }

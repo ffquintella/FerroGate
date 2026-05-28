@@ -188,7 +188,10 @@ mod tests {
         assert_eq!(back.params.policy_id, r.params.policy_id);
         assert_eq!(back.params.tee_evidence_id, r.params.tee_evidence_id);
         assert_eq!(back.last_attestation.at, r.last_attestation.at);
-        assert_eq!(back.last_attestation.pcr_digest, r.last_attestation.pcr_digest);
+        assert_eq!(
+            back.last_attestation.pcr_digest,
+            r.last_attestation.pcr_digest
+        );
         assert_eq!(back.bundle.jws, r.bundle.jws);
         assert_eq!(back.bundle.spiffe_id, r.bundle.spiffe_id);
     }

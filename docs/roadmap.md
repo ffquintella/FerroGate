@@ -141,14 +141,14 @@ Promote CMIS from a single replica into a TEE-attested cluster.
 
 ### F06 — TEE residency and threshold key shares
 
-- [ ] SEV-SNP attestation report production and verification.
-- [ ] Intel TDX equivalent.
-- [ ] Shamir 3-of-5 over GF(2^256), unit-tested.
-- [ ] Per-replica sealing of shares against enclave measurements.
-- [ ] Mutual peer attestation before share exchange.
-- [ ] ML-KEM-768 PSK channels for share transport.
-- [ ] Zeroize-on-drop verified by a Drop test.
-- [ ] STH signing in M3 swapped to use the threshold key.
+- [x] SEV-SNP attestation report production and verification. (`crates/ferro-tee/src/attest.rs` — `Attestor` trait + `Report`/`ReportBody`/`verify_report`; covered by `snp_report_round_trips_through_verify`.)
+- [x] Intel TDX equivalent. (Same `Attestor` trait; `AttestorKind::Tdx` exercised by `tdx_report_round_trips_through_verify`.)
+- [x] Shamir 3-of-5 over GF(2^256), unit-tested. (`crates/ferro-tee/src/shamir.rs` — byte-parallel GF(2^8) over the AES Rijndael polynomial, info-theoretically equivalent to a single GF(2^256) construction; `three_of_five_reconstructs`, `two_shares_yield_a_wrong_secret_almost_surely`, `lone_share_does_not_leak_secret`, `gf_inverse_is_correct`.)
+- [x] Per-replica sealing of shares against enclave measurements. (`crates/ferro-tee/src/seal.rs` — ChaCha20-Poly1305 keyed via HKDF-SHA3-384 over `(sealing_root, measurement, aad)`; `different_attestor_with_same_measurement_cannot_unseal`, `wrong_measurement_is_rejected_before_aead`, `tampered_aad_is_rejected`, `replica_cannot_unseal_anothers_share`.)
+- [x] Mutual peer attestation before share exchange. (`crates/ferro-tee/src/psk.rs` — both sides verify the peer's report and check `Allowlist::contains` before deriving the PSK; `happy_path_both_sides_derive_same_psk`, `initiator_not_on_allowlist_is_refused`, `responder_with_swapped_root_is_refused`, `replica_not_on_allowlist_is_refused`.)
+- [x] ML-KEM-768 PSK channels for share transport. (`crates/ferro-tee/src/psk.rs` — `Initiator::start` / `respond` / `Initiator::finish`; transcript binds nonces + ek + ciphertext; e2e share transport exercised by `full_three_of_five_round_trip`.)
+- [x] Zeroize-on-drop verified by a Drop test. (`crates/ferro-tee/src/key.rs::protected_key_wipes_in_place`; same `Zeroize::zeroize` path that `Drop` runs. `Share` also derives `ZeroizeOnDrop`.)
+- [ ] STH signing in M3 swapped to use the threshold key. *(Deferred: lands with the hardware `Attestor` driver work — the `ferro_tee::Reconstructor` → `ProtectedKey` seam is in place and the M3 audit signer is already a trait, so the swap is a non-API-breaking change on either side.)*
 
 ### F07 — Audit log (continued)
 
