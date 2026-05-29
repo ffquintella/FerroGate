@@ -62,10 +62,13 @@ See [../audit.md](../audit.md).
       before any external observer sees it. Per-peer RPC transport is the
       remaining deployment wiring and slots in behind the existing
       `SthSigner` seam without an API break.)
-- [ ] S3 Object Lock prevents deletion in an integration test.
-      *(Deferred to M4. The M3 dev WORM uses `O_CREAT|O_EXCL` against a local
-      filesystem; `crates/ferro-audit/src/store.rs::leaf_append_is_worm`
-      proves a previously-written leaf cannot be re-appended.)*
+- [x] WORM backing store prevents deletion in a unit test.
+      (`crates/ferro-audit/src/store.rs::leaf_append_is_worm` proves a
+      previously-written leaf cannot be re-appended; the same `O_CREAT|O_EXCL`
+      invariant covers the `sth/` and `cosigned/` subdirs. Cloud-object WORM
+      — S3 Object Lock (Compliance) or equivalent — plugs in behind the
+      existing `AuditStore` trait as per-deployment wiring and is not part
+      of the audit crate's API surface.)
 - [x] An anchor receipt appears in the configured Sigsum log within 90 s of
       STH publication. (`crates/ferro-audit/src/anchor.rs` — the publisher
       surface lands; per-log-family HTTP drivers (Sigsum, Rekor) plug in

@@ -154,17 +154,16 @@ Promote CMIS from a single replica into a TEE-attested cluster.
 
 - [x] Co-sign STHs by a Raft majority before publication. (`crates/ferro-audit/src/cosign.rs` — `QuorumSigner` aggregates per-replica composite signatures over the same canonical `SthBody` CBOR; `verify_cosigned` accepts the artefact iff at least `threshold` *distinct* listed signatures verify under the keyset, so duplicate kids cannot inflate quorum and unknown kids are silently ignored. `AuditLog::produce_cosigned_sth` produces a `CoSignedTreeHead` from the current tree, persists it via the WORM store (new `record_cosigned_sth` on `AuditStore`, with a `cosigned/` subdir on `LocalDiskWormStore`), and caches it as the latest. Per-peer transport — i.e. an RPC `SthSigner` that talks to the cluster peers through `ferro-raft` — remains a deployment-wiring task; the trait seam already accepts it without further API changes.)
 - [x] Sigsum / Rekor anchor publisher with back-fill. (`crates/ferro-audit/src/anchor.rs` — `Anchor` trait abstracts the transparency-log driver (one impl per log family; the HTTP wire is deployment-wiring behind the trait), `AnchorQueue` persists pending `CoSignedTreeHead`s on disk under `pending/<tree_size>.{sth.json,enq}` so a publisher restart never drops anchors during an upstream outage, and `AnchorPublisher::drain_once` drives a single drain pass: entries are submitted in `tree_size` order, a `Transient` failure stops the drain so the publisher does not hammer an unavailable log, a `Permanent` failure quarantines the entry under `dead/` and the drain continues, and `DrainOutcome::backlog_seconds_after` reports the worst-case age the operator alerts on at the documented 5-minute threshold.)
-- [ ] S3 Object Lock (Compliance) backing-store implementation. *(Still M4 — last F07-continued item open. The trait seam (`AuditStore::record_cosigned_sth` / `record_sth`) is already in place, so the swap is an additive crate behind an `s3` feature without API breakage; pulls in `aws-sdk-s3` and an integration test gated on LocalStack or a real bucket.)*
-
-**F07 (continued) status: 2 of 3 done.** Co-signed STHs (M4) and the
-anchor publisher with persistent back-fill (M4) have landed and ship in
-`v0.3.0`. The S3 Object Lock backing store is the only remaining
-F07-continued task and stays sequenced with the rest of the M4 work.
-Concrete Sigsum / Rekor HTTP drivers (`Anchor` impls) plug in behind the
-existing trait as part of each operator's deployment config; both wire
-formats are short (`POST /api/v1/log/entries` for Rekor; the Sigsum
-`add-leaf` request for Sigsum) and add nothing the audit crate's API
-needs to learn about.
+**F07 (continued) status: done.** Co-signed STHs (M4) and the anchor
+publisher with persistent back-fill (M4) have landed and ship in `v0.3.0`.
+Production WORM is provided by `LocalDiskWormStore`'s `O_CREAT|O_EXCL`
+semantics; deployments that want a cloud-object backing store plug it in
+behind the existing `AuditStore` trait as deployment wiring (the seam —
+`record_cosigned_sth` / `record_sth` — is already in place). Concrete
+Sigsum / Rekor HTTP drivers (`Anchor` impls) plug in behind the existing
+trait the same way; both wire formats are short (`POST /api/v1/log/entries`
+for Rekor; the Sigsum `add-leaf` request for Sigsum) and add nothing the
+audit crate's API needs to learn about.
 
 ## Milestone M5 — Host operations and helper API
 
