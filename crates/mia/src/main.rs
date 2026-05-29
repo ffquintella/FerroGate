@@ -27,8 +27,7 @@
 
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
@@ -38,7 +37,21 @@ async fn main() -> anyhow::Result<()> {
         "FerroGate Machine Identity Agent"
     );
 
-    run().await
+    // Apply the hardening profile (feature F12) on the single startup thread,
+    // *before* building the async runtime — so the seccomp filter is inherited
+    // by every tokio worker and `mlockall(MCL_FUTURE)` covers their allocations,
+    // and before any TPM or network I/O. Fatal on failure: a MIA that cannot
+    // harden must not serve.
+    #[cfg(target_os = "linux")]
+    mia::hardening::harden()?;
+
+    // Build the multi-threaded runtime by hand (rather than `#[tokio::main]`) so
+    // hardening runs first. `enable_all` wires the I/O and time drivers the
+    // helper server and CMIS client need.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run())
 }
 
 /// Daemon entry point. Starts the helper API when `FERROGATE_HELPER_SOCKET` is
@@ -80,25 +93,22 @@ async fn start_helper_api(socket_path: std::path::PathBuf) -> anyhow::Result<()>
     });
 
     // Allowlist: configured ⇒ load and verify (fail loudly); absent ⇒ deny all.
-    let allowlist = match std::env::var_os("FERROGATE_ALLOWLIST") {
-        Some(path) => {
-            let key_path = std::env::var_os("FERROGATE_ALLOWLIST_KEY")
-                .context("FERROGATE_ALLOWLIST is set but FERROGATE_ALLOWLIST_KEY is missing")?;
-            let key_bytes = std::fs::read(&key_path).context("reading FERROGATE_ALLOWLIST_KEY")?;
-            let trusted = CompositePublicKey::from_concat_bytes(&key_bytes)
-                .map_err(|e| anyhow::anyhow!("trusted allowlist key: {e}"))?;
-            let bytes = std::fs::read(&path).context("reading FERROGATE_ALLOWLIST")?;
-            let al = Allowlist::load(&bytes, &trusted, clock(), max_age)
-                .map_err(|e| anyhow::anyhow!("allowlist verification failed: {e}"))?;
-            tracing::info!(trust_domain = al.trust_domain(), "loaded signed allowlist");
-            Some(al)
-        }
-        None => {
-            tracing::warn!(
-                "no FERROGATE_ALLOWLIST configured; helper API denies all callers (fail closed)"
-            );
-            None
-        }
+    let allowlist = if let Some(path) = std::env::var_os("FERROGATE_ALLOWLIST") {
+        let key_path = std::env::var_os("FERROGATE_ALLOWLIST_KEY")
+            .context("FERROGATE_ALLOWLIST is set but FERROGATE_ALLOWLIST_KEY is missing")?;
+        let key_bytes = std::fs::read(&key_path).context("reading FERROGATE_ALLOWLIST_KEY")?;
+        let trusted = CompositePublicKey::from_concat_bytes(&key_bytes)
+            .map_err(|e| anyhow::anyhow!("trusted allowlist key: {e}"))?;
+        let bytes = std::fs::read(&path).context("reading FERROGATE_ALLOWLIST")?;
+        let al = Allowlist::load(&bytes, &trusted, clock(), max_age)
+            .map_err(|e| anyhow::anyhow!("allowlist verification failed: {e}"))?;
+        tracing::info!(trust_domain = al.trust_domain(), "loaded signed allowlist");
+        Some(al)
+    } else {
+        tracing::warn!(
+            "no FERROGATE_ALLOWLIST configured; helper API denies all callers (fail closed)"
+        );
+        None
     };
 
     let auth = match std::env::var_os("FERROGATE_IMA_LOG") {

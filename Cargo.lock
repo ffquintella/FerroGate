@@ -672,6 +672,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "caps"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd1ddba47aba30b6a889298ad0109c3b8dcb0e8fc993b459daa7067d46f865e0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -838,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "cmis"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1422,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-attest"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1442,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-audit"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -1458,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-child-verify"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -1471,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-crypto"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -1500,8 +1509,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-harden"
+version = "0.8.0"
+dependencies = [
+ "caps",
+ "libc",
+ "seccompiler",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ferro-proto"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "prost",
  "tonic",
@@ -1510,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-raft"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -1525,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1540,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid-verify"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1553,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-tee"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chacha20poly1305",
  "ciborium",
@@ -1575,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-winauth"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "tokio",
  "windows-sys 0.59.0",
@@ -1583,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogate-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "file-rotate",
  "tracing",
@@ -2657,7 +2676,7 @@ dependencies = [
 
 [[package]]
 name = "mia"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2668,6 +2687,7 @@ dependencies = [
  "ferro-audit",
  "ferro-child-verify",
  "ferro-crypto",
+ "ferro-harden",
  "ferro-proto",
  "ferro-raft",
  "ferro-svid",
@@ -3940,6 +3960,15 @@ dependencies = [
  "pkcs8",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

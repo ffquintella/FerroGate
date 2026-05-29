@@ -10,13 +10,19 @@
 //! - [`scheduler`] — computes when to rotate a live SVID (60% of TTL, jittered).
 //! - [`helper`] — the local helper API: a UDS server that mints DPoP-bound
 //!   child tokens for vetted local callers (features F08/F09).
+//! - [`hardening`] — the startup defence-in-depth profile (feature F12): the
+//!   fail-closed IMA check and the policy that drives the `ferro-harden`
+//!   syscall wrappers (mlockall, seccomp, privilege drop).
 //!
-//! `unsafe` is forbidden in this crate (see `docs/features/F12-mia-hardening.md`).
+//! `unsafe` is forbidden in this crate (see `docs/features/F12-mia-hardening.md`);
+//! every privileged syscall lives in the `ferro-harden` (Linux) and
+//! `ferro-winauth` (Windows) FFI crates.
 
 #![forbid(unsafe_code)]
 
 pub mod audit_client;
 pub mod client;
+pub mod hardening;
 pub mod helper;
 pub mod scheduler;
 

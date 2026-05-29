@@ -28,11 +28,14 @@ impl CredentialMaker for UnusedCredentialMaker {
     }
 }
 
+/// Per-test sequence so each gets a unique audit WORM directory even when the
+/// suite's tests run concurrently in one binary.
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn svc() -> (MachineIdentitySvc, Arc<CmisState>) {
     let issuer = Issuer::generate("cmis-test-1", "ferrogate.test").unwrap();
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), RimStore::new());
 
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = std::env::temp_dir().join(format!(
         "ferrogate-cmis-rev-{}-{}",
         std::process::id(),

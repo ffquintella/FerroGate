@@ -231,12 +231,30 @@ recorded in [features/F11-revocation.md](features/F11-revocation.md) §"Status".
 
 ### F12 — MIA process hardening
 
-- [ ] `prctl` and `mlockall` startup.
-- [ ] seccomp-bpf allowlist with audit-mode toggle for dev.
-- [ ] Drop to `_ferrogate` UID with `CAP_IPC_LOCK` only.
-- [ ] Fail-closed IMA-enforcement check.
-- [ ] Reproducible build job in CI (byte-identical re-builds).
-- [ ] `#![forbid(unsafe_code)]` on all MIA modules.
+- [x] `prctl` and `mlockall` startup. (`ferro_harden::apply` — `PR_SET_DUMPABLE`,
+      `PR_SET_NO_NEW_PRIVS`, `mlockall(MCL_CURRENT|MCL_FUTURE)`, applied on the
+      startup thread before the tokio runtime spawns.)
+- [x] seccomp-bpf allowlist with audit-mode toggle for dev. (~70-name explicit
+      allow-list via `seccompiler`; `FERROGATE_SECCOMP=enforce|audit|off`. The
+      enforcing filter is proven to `SIGSYS`-kill a forbidden syscall by a
+      unit test.)
+- [x] Drop to `_ferrogate` UID with `CAP_IPC_LOCK` only. (`drop_privileges` +
+      `restrict_caps_to_ipc_lock`; `harden()` verifies the post-drop effective
+      set is exactly `{CAP_IPC_LOCK}`.)
+- [x] Fail-closed IMA-enforcement check. (`mia::hardening` refuses to start
+      unless `/proc/cmdline` requests `ima_appraise=enforce`.)
+- [x] Reproducible build job in CI (byte-identical re-builds).
+      (`scripts/reproducible-build.sh` + the `reproducible-build` CI job.)
+- [x] `#![forbid(unsafe_code)]` on all MIA modules. (All FFI isolated in the new
+      `ferro-harden` crate; the `no-unsafe-in-mia` CI job is a grep backstop.)
+
+**F12 status: done.** All hardening FFI lives in the new `ferro-harden` crate
+(Linux analogue of `ferro-winauth`), keeping `mia` `#![forbid(unsafe_code)]`.
+Verified with `cargo test -p ferro-harden` on Linux (incl. the live seccomp
+`SIGSYS` self-test and per-arch syscall-name resolution), the `mia::hardening`
+parser tests, `clippy -D warnings`, and the reproducible-build check. Static-PIE
+musl packaging (static TSS2) is left as deployment work; the reproducibility
+gate runs on the PIE-by-default glibc build.
 
 ### F13 — Zero-touch bootstrap and fleet enrollment
 

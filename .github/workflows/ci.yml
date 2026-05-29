@@ -47,6 +47,38 @@ jobs:
       # Doc-tests are not covered by --all-targets.
       - run: cargo test --workspace --doc --locked
 
+  # Feature F12: no `unsafe` may appear under crates/mia. The crate already sets
+  # `#![forbid(unsafe_code)]`, but this grep gate fails loudly even if that
+  # attribute is ever dropped, and documents the invariant in CI. All hardening
+  # FFI lives in ferro-harden (Linux) and ferro-winauth (Windows).
+  no-unsafe-in-mia:
+    name: forbid unsafe (mia)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep for unsafe constructs under crates/mia/src
+        run: |
+          # Match real unsafe items/blocks (`unsafe {`, `unsafe fn`, `unsafe impl`,
+          # `unsafe trait`), not the word in prose like "`unsafe` is forbidden".
+          if grep -rnE --include='*.rs' 'unsafe[[:space:]]*(\{|fn|impl|trait)' crates/mia/src; then
+            echo "::error::found an unsafe construct under crates/mia/src — FFI must live in ferro-harden / ferro-winauth"
+            exit 1
+          fi
+          echo "no unsafe constructs under crates/mia/src"
+
+  # Feature F12: two independent release builds of the MIA must be byte-identical.
+  reproducible-build:
+    name: reproducible build (mia)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libtss2-dev
+      - name: Two builds must be byte-identical
+        run: bash scripts/reproducible-build.sh
+
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest

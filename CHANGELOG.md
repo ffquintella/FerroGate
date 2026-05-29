@@ -8,6 +8,51 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [M5.4] — 2026-05-29 — MIA process hardening (v0.8.0)
+
+### Added — F12: MIA process hardening
+
+- **`ferro-harden` crate.** A new Linux-gated FFI crate — the analogue of
+  `ferro-winauth` — that isolates every privileged syscall so `mia` stays
+  `#![forbid(unsafe_code)]`. It applies, in dependency order:
+  `mlockall(MCL_CURRENT|MCL_FUTURE)`, `prctl(PR_SET_DUMPABLE, 0)`, a drop to a
+  dedicated UID/GID retaining only `CAP_IPC_LOCK` (via `PR_SET_KEEPCAPS` +
+  `setgroups`/`setgid`/`setuid` + bounding/effective/permitted/ambient
+  restriction), `prctl(PR_SET_NO_NEW_PRIVS, 1)`, and a seccomp-bpf **allow-list**
+  (`seccompiler`) defaulting to `SECCOMP_RET_KILL_PROCESS`. The allow-list is an
+  explicit ~70-name set resolved to per-architecture numbers (x86_64 + aarch64;
+  unknown names skipped for portability). Helpers: `resolve_user`, `is_root`,
+  `effective_capabilities`.
+- **MIA hardening orchestration (`mia::hardening`).** `harden()` runs the
+  fail-closed IMA check (refuses to start unless `/proc/cmdline` carries
+  `ima_appraise=enforce`) then drives `ferro_harden::apply`, and verifies the
+  post-drop effective capability set is exactly `{CAP_IPC_LOCK}`. `main` was
+  restructured from `#[tokio::main]` to a plain `main` that hardens on the
+  startup thread *before* building the runtime, so the seccomp filter is
+  inherited by tokio workers and `MCL_FUTURE` covers their allocations.
+- **Dev/rollout toggles.** `FERROGATE_SECCOMP=enforce|audit|off` (audit =
+  log-only, to discover allow-list drift), `FERROGATE_REQUIRE_IMA=0`,
+  `FERROGATE_RUN_AS_UID/GID`, `FERROGATE_SKIP_HARDENING=1`.
+- **Reproducible build.** `scripts/reproducible-build.sh` builds `mia` twice with
+  path remapping, `--build-id=none`, and pinned `SOURCE_DATE_EPOCH`/locale/TZ,
+  and asserts byte-identical binaries, printing the `bin_sha384`. A new
+  `reproducible-build` CI job runs it.
+- **CI `no-unsafe-in-mia` gate.** Greps `crates/mia/src` for unsafe constructs as
+  a belt-and-suspenders backstop to `#![forbid(unsafe_code)]`.
+- **Tests.** `ferro-harden` carries a live seccomp self-test that forks, installs
+  the enforcing filter, calls a forbidden syscall, and asserts the child died
+  from `SIGSYS`; plus per-arch syscall-name resolution and BPF-build tests. The
+  IMA cmdline parser is unit-tested in `mia::hardening`. The Linux paths are
+  exercised in the `rust:1.88-bookworm` container (CI runs them natively).
+
+### Notes
+
+- Static-PIE musl packaging (statically linking TSS2) is left as deployment
+  work; the reproducibility gate runs on the glibc build, which is PIE by
+  default. The `effective_capabilities == {CAP_IPC_LOCK}` and privilege-drop
+  paths require root and are exercised in privileged deployment, not unprivileged
+  CI.
+
 ## [M5.3] — 2026-05-29 — Revocation and CRL distribution (v0.7.0)
 
 ### Added — F11: Revocation and CRL distribution

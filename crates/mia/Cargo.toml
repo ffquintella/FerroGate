@@ -65,6 +65,9 @@ base64            = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 tss-esapi = { workspace = true }
 ring      = { workspace = true }
+# All hardening FFI (prctl / mlockall / seccomp / setuid / capset) lives in
+# `ferro-harden`, keeping `mia` itself `#![forbid(unsafe_code)]` (feature F12).
+ferro-harden = { path = "../ferro-harden" }
 
 # The Windows named-pipe helper transport delegates all FFI (client PID, image
 # attestation, ACL) to `ferro-winauth`, keeping `mia` itself `forbid(unsafe)`.

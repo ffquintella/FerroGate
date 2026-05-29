@@ -25,8 +25,25 @@ defences applied at startup, before any network or TPM I/O:
   `ima_appraise=enforce ima_policy=appraise_tcb` so IMA-measured binary hashes
   are kernel-enforced.
 
-`unsafe` is forbidden in MIA code; FFI to `tss-esapi` is the only path to the
-TPM and goes through audited safe wrappers.
+The profile is applied by `mia::hardening::harden` on the startup thread,
+*before* the tokio runtime spawns workers (so the seccomp filter is inherited
+and `mlockall(MCL_FUTURE)` covers their allocations) and before any TPM or
+network I/O. Every privileged syscall lives in the `ferro-harden` crate (the
+Linux analogue of `ferro-winauth`); `mia` itself is `#![forbid(unsafe_code)]`.
+
+Environment toggles for staged rollout and development:
+
+- `FERROGATE_SECCOMP=enforce|audit|off` — seccomp mode. `audit` logs violations
+  instead of killing, to discover allow-list drift before enforcing (default
+  `enforce`).
+- `FERROGATE_REQUIRE_IMA=0` — do not require enforced IMA (dev/CI only; default
+  is to require it and refuse to start otherwise).
+- `FERROGATE_RUN_AS_UID` / `FERROGATE_RUN_AS_GID` — drop to these instead of
+  resolving the `_ferrogate` user.
+- `FERROGATE_SKIP_HARDENING=1` — disable the whole profile (development only).
+
+`unsafe` is forbidden in MIA code; FFI to `tss-esapi` (TPM) and `ferro-harden`
+(hardening syscalls) are the only paths out, both through audited safe wrappers.
 
 ## Operational state machine
 

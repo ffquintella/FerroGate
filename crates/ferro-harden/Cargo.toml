@@ -1,0 +1,29 @@
+[package]
+name        = "ferro-harden"
+description = "FerroGate — Linux process-hardening FFI for the MIA (feature F12)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lib]
+name = "ferro_harden"
+path = "src/lib.rs"
+
+# This crate is the syscall/FFI boundary for the MIA hardening profile. Unlike
+# `mia` (which is `#![forbid(unsafe_code)]`), it permits `unsafe` — see the
+# crate-level `#![allow(unsafe_code)]`. The hardening primitives are gated on
+# `cfg(target_os = "linux")`; on other targets the crate compiles to no-op stubs
+# so it can sit in the workspace and be depended on unconditionally.
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc        = "0.2"
+seccompiler = "0.5"
+caps        = "0.5"
