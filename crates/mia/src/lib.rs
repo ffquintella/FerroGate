@@ -8,6 +8,8 @@
 //! - [`client`] — drives the four-phase `Attest` handshake against CMIS and
 //!   recovers a freshly issued SVID plus its composite private key (F04).
 //! - [`scheduler`] — computes when to rotate a live SVID (60% of TTL, jittered).
+//! - [`helper`] — the local helper API: a UDS server that mints DPoP-bound
+//!   child tokens for vetted local callers (features F08/F09).
 //!
 //! `unsafe` is forbidden in this crate (see `docs/features/F12-mia-hardening.md`).
 
@@ -15,6 +17,7 @@
 
 pub mod audit_client;
 pub mod client;
+pub mod helper;
 pub mod scheduler;
 
 /// TPM 2.0 attestation glue and PCR sealing (features F02/F04). Linux-only:

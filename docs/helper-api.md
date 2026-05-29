@@ -26,9 +26,19 @@ caller's identity from kernel-attested sources:
 3. It cross-checks `bin_sha` against the IMA runtime measurement log at
    `/sys/kernel/security/ima/binary_runtime_measurements`. IMA is
    kernel-enforced and cannot be forged from userspace.
-4. The pair `(uid, bin_sha)` is looked up in `/etc/ferrogate/allowlist.toml`.
-   The allowlist file is signed by CMIS at host enrollment; the MIA verifies
-   the signature before each access.
+4. The pair `(uid, bin_sha)` is looked up in the host allowlist. The
+   allowlist is signed by CMIS at host enrollment; the MIA verifies the
+   signature before each access and **fails closed** — any decode, signature,
+   or freshness failure leaves no usable allowlist, so every caller is denied.
+
+   The on-disk artefact is a CBOR `SignedAllowlist`: a canonical-CBOR
+   `AllowlistDoc` body (`trust_domain`, `issued_at`, `not_after`, `entries`)
+   plus a detached composite signature over those exact body bytes under the
+   domain-separation context `ferrogate-allowlist-v1`. CBOR (rather than the
+   TOML this doc originally sketched) gives an unambiguous canonical byte
+   string to sign and matches FerroGate's other signed artefacts. Freshness is
+   enforced on load: `now` must lie in `[issued_at, not_after]` and
+   `now - issued_at` must not exceed a configured max age.
 
 ### Windows
 
@@ -54,7 +64,11 @@ enum HelperResp {
 }
 ```
 
-The MIA mints a JWS signed by the host's composite SVID key:
+The MIA mints a compact JWS (`typ = "ferrogate-child+jwt"`,
+`alg = "MLDSA65+Ed25519"`) signed by the host's composite SVID key under the
+domain-separation context `ferrogate-child-token-v1` — distinct from the SVID
+and allowlist contexts, so a signature can never be reinterpreted across
+artefacts. The requested `ttl_secs` is clamped to ≤ 600 s server-side:
 
 ```jsonc
 {

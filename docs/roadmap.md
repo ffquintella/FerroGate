@@ -171,17 +171,17 @@ Make the system usable by real applications and operators.
 
 ### F08 — Local helper API
 
-- [ ] UDS listener at `/run/ferrogate/mia.sock` with correct permissions.
-- [ ] CBOR request/response framing.
-- [ ] `SO_PEERCRED` + IMA runtime-hash caller authentication.
-- [ ] Signed allowlist loader with fail-closed verification.
-- [ ] `LocalGrant` / `LocalDenied` audit events.
-- [ ] Concurrency / starvation test.
+- [x] UDS listener at `/run/ferrogate/mia.sock` with correct permissions.
+- [x] CBOR request/response framing.
+- [x] `SO_PEERCRED` + IMA runtime-hash caller authentication.
+- [x] Signed allowlist loader with fail-closed verification.
+- [x] `LocalGrant` / `LocalDenied` audit events.
+- [x] Concurrency / starvation test.
 - [ ] Windows Named Pipe variant.
 
 ### F09 — DPoP-bound child tokens
 
-- [ ] Token minter with TTL clamp, `jti`, `cnf.jkt`.
+- [x] Token minter with TTL clamp, `jti`, `cnf.jkt` (landed with F08).
 - [ ] JWKS endpoint on CMIS with multi-key support.
 - [ ] Reference verifier in Rust.
 - [ ] Reference verifier in Go.

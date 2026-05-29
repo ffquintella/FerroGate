@@ -8,6 +8,67 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [M5] — 2026-05-29 — Local helper API and DPoP child tokens (v0.4.0)
+
+### Added — F08: Local helper API (with the F09 child-token minter)
+
+- **`mia::helper` module.** A local IPC channel over which vetted host
+  applications request short-lived, audience-bound, DPoP-bound child tokens.
+  Caller identity is derived from kernel-attested sources, never from anything
+  the caller claims.
+- **`helper::proto`.** CBOR request/response (`HelperReq` / `HelperResp` /
+  `ChildToken` / `ErrorCode`) with length-delimited framing — a 4-byte
+  big-endian length bounded by `MAX_FRAME_LEN` (64 KiB), so a hostile prefix
+  cannot make the MIA allocate without limit.
+- **`helper::auth`.** The `CallerAuth` trait and `CallerIdentity` it produces,
+  plus the pure `cross_check_ima` parser: an on-disk `SHA-384(/proc/<pid>/exe)`
+  must equal the IMA-measured runtime hash for the same path, so a post-exec
+  symlink/file swap is caught (`MismatchOutcome::Mismatch`). The Linux
+  `ImaCallerAuth` (`SO_PEERCRED` + IMA log) is compiled only on Linux; the
+  trait, identity type, and cross-check are portable and unit-tested anywhere.
+- **`helper::allowlist`.** A fail-closed signed loader. The on-disk artefact is
+  a CBOR `SignedAllowlist` (canonical-CBOR `AllowlistDoc` body + detached
+  composite signature over those bytes under `ferrogate-allowlist-v1`).
+  Verification happens before the body is parsed; freshness (`now ∈
+  [issued_at, not_after]` and a max-age bound on `issued_at`) is enforced on
+  load. Any failure yields no usable allowlist, denying every caller.
+- **`helper::token` (feature F09 minter).** `ChildTokenMinter` mints a compact
+  JWS (`typ = "ferrogate-child+jwt"`, `alg = "MLDSA65+Ed25519"`) signed with
+  the host composite SVID key under the distinct context
+  `ferrogate-child-token-v1`. TTL is clamped to ≤ 600 s, `jti` is a fresh
+  128-bit value, `cnf.jkt` carries the caller DPoP thumbprint, and a
+  `ferrogate` block records `parent_svid` / `actor_pid` / `actor_uid` /
+  `actor_bin`.
+- **`helper::server`.** A Unix-domain-socket listener (Unix only) created with
+  the configured mode (default `0o660`) and optional group owner. The accept
+  loop spawns one task per connection bounded by a `Semaphore`, with a
+  per-connection read deadline so a slow/idle client releases its permit
+  promptly and cannot starve well-behaved callers. `SO_PEERCRED` is read on the
+  async side (`CallerAuth::identify` takes a `PeerCred` value), and the
+  authenticator's blocking IMA / `/proc` reads run on the blocking pool so they
+  never stall a runtime worker. Every decoded request produces exactly one
+  audit event (`LocalGrant` / `LocalDenied`) pushed onto an `mpsc` channel for
+  the `audit_client` forwarder to drain to CMIS.
+- **Daemon wiring (`mia` binary).** The daemon now starts the helper API when
+  `FERROGATE_HELPER_SOCKET` is set (Linux): it loads/verifies the signed
+  allowlist (`FERROGATE_ALLOWLIST` + `FERROGATE_ALLOWLIST_KEY`), binds the
+  socket with `FERROGATE_HELPER_SOCKET_MODE` (default `660`), uses the real
+  `ImaCallerAuth`, drains audit events to the log, and serves until
+  `SIGINT`/`SIGTERM`. Token minting stays disabled (`no_host_svid`) until the
+  attestation loop supplies the host SVID key — a fail-safe surface for
+  verifying socket permissions, caller attestation, and the allowlist in
+  production ahead of minting.
+- **Tests.** 23 lib unit tests and 9 socket-level integration tests covering
+  every F08 acceptance criterion: `0o660` socket mode (via `stat`), IMA
+  swap rejection, allowlist-absent and not-allowlisted denial, well-formed
+  grant, signature fail-closed (wrong key / tampered body / garbage / expired /
+  too-old), exactly-one-audit-event per request, and slow-client
+  non-starvation. The minted token's composite signature verifies under the
+  host key (what a downstream JWKS verifier does).
+- **Out of this slice:** the Windows Named Pipe transport, the CMIS JWKS
+  endpoint for child tokens, and the Rust/Go reference verifiers (the rest of
+  F09). DPoP *proof* verification is the third-party API's job, by design.
+
 ### Added — F07 continued: Sigsum / Rekor anchor publisher with back-fill (M4 subset)
 
 - **`ferro_audit::anchor` module.** A transparency-log publisher with

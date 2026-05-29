@@ -37,18 +37,62 @@ Out:
 
 See [../helper-api.md](../helper-api.md).
 
+Implemented in `crates/mia/src/helper/`:
+
+- `proto` — CBOR request/response types and length-delimited framing
+  (4-byte big-endian length, bounded by `MAX_FRAME_LEN`).
+- `auth` — the `CallerAuth` trait plus the pure `cross_check_ima` parser; the
+  Linux `ImaCallerAuth` (`SO_PEERCRED` + IMA) is compiled only on Linux while
+  the trait, identity type, and cross-check logic are portable and unit-tested
+  on any host.
+- `allowlist` — a fail-closed, signed loader. The on-disk artefact is a CBOR
+  `SignedAllowlist` (a canonical-CBOR `AllowlistDoc` body plus a detached
+  composite signature over those exact bytes under `ferrogate-allowlist-v1`),
+  rather than the TOML the prose sketch suggests: CBOR gives an unambiguous
+  byte string to sign and matches the rest of FerroGate's signed-artefact
+  idiom. Freshness (`not_after` and a max-age bound on `issued_at`) is enforced
+  on load.
+- `token` — the DPoP-bound child-token minter (feature F09): a compact JWS
+  signed with the host composite SVID key under `ferrogate-child-token-v1`,
+  TTL clamped to ≤ 600 s, `jti` a fresh 128-bit value.
+- `server` — the Unix-socket listener wiring it together (Unix only; the
+  Windows Named Pipe variant is still outstanding). `SO_PEERCRED` is read on
+  the async side and the authenticator's blocking work (IMA log,
+  `/proc/<pid>/exe`) runs on the blocking pool, so a large IMA log never stalls
+  a runtime worker. Each connection holds a `Semaphore` permit under a read
+  deadline, so a slow client is reaped rather than starving others.
+
+### Daemon bring-up
+
+The `mia` binary starts the helper API when `FERROGATE_HELPER_SOCKET` is set
+(Linux only — it needs `SO_PEERCRED` + IMA). It loads and verifies the signed
+allowlist from `FERROGATE_ALLOWLIST` (key in `FERROGATE_ALLOWLIST_KEY`), binds
+the socket with `FERROGATE_HELPER_SOCKET_MODE` (default `660`), drains audit
+events to the log, and serves until `SIGINT`/`SIGTERM`. Until the attestation
+loop (F04) is wired into the daemon to supply the host SVID composite key, the
+server runs with **no minter**: it authenticates and authorizes callers but
+refuses to mint (`no_host_svid`) — a fail-safe, deployable surface for
+verifying socket permissions, caller attestation, and the allowlist in
+production ahead of minting.
+
 ## Acceptance criteria
 
-- [ ] Server listens with correct UDS permissions; verified by `stat` in a
-      test.
-- [ ] Spoofed `/proc/<pid>/exe` (symlink swap) is detected via IMA
-      cross-check and rejected.
-- [ ] Caller whose `(uid, bin_sha)` is absent from the allowlist gets
-      `permission_denied`.
-- [ ] Caller in allowlist receives a properly-formed child token.
-- [ ] Allowlist signature verification fails closed.
-- [ ] Every request produces exactly one audit event.
-- [ ] Concurrent clients are isolated; one slow client cannot starve others.
+- [x] Server listens with correct UDS permissions; verified by `stat` in a
+      test (`socket_is_created_with_0660_permissions`).
+- [x] Spoofed `/proc/<pid>/exe` (symlink swap) is detected via IMA
+      cross-check and rejected (`auth::tests::swapped_binary_is_a_mismatch`,
+      `spoofed_exe_ima_mismatch_is_rejected`).
+- [x] Caller whose `(uid, bin_sha)` is absent from the allowlist gets
+      `permission_denied` (`caller_absent_from_allowlist_is_denied`).
+- [x] Caller in allowlist receives a properly-formed child token
+      (`allowlisted_caller_receives_well_formed_child_token`).
+- [x] Allowlist signature verification fails closed (`allowlist::tests`:
+      wrong key, tampered body, garbage, expired, too-old; plus
+      `no_allowlist_fails_closed`).
+- [x] Every request produces exactly one audit event (asserted across the
+      grant/deny integration tests).
+- [x] Concurrent clients are isolated; one slow client cannot starve others
+      (`slow_client_does_not_starve_a_good_client`).
 
 ## Risks
 

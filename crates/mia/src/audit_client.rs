@@ -5,9 +5,10 @@
 //! tree and seals a fresh STH; the returned leaf index lets the caller fetch
 //! an inclusion proof for the event later.
 //!
-//! Local helper-API events (`LocalGrant`, `LocalDenied`) land here once F08
-//! ships; for now the forwarder lets MIA emit any of the documented event
-//! variants for tests and bring-up.
+//! Local helper-API events (`LocalGrant`, `LocalDenied`) flow here: the
+//! [`crate::helper`] server (F08) pushes one event per request onto an `mpsc`
+//! channel, and a forwarder task drains it through [`forward`] to CMIS,
+//! decoupling token-minting latency from the audit network path.
 
 use ferro_audit::{event, AuditEvent, EventCodecError};
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;

@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "cmis"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-attest"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1441,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-audit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-crypto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "prost",
  "tonic",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-raft"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid-verify"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-tee"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chacha20poly1305",
  "ciborium",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogate-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "file-rotate",
  "tracing",
@@ -2633,10 +2633,11 @@ dependencies = [
 
 [[package]]
 name = "mia"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "ciborium",
  "cmis",
  "ferro-attest",
  "ferro-audit",
@@ -2651,6 +2652,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rcgen 0.13.2",
  "ring",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
