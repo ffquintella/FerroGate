@@ -59,9 +59,11 @@ async fn start_helper_api(socket_path: std::path::PathBuf) -> anyhow::Result<()>
     use std::time::Duration;
 
     use anyhow::Context as _;
+    use std::sync::Arc;
+
     use ferro_crypto::composite::CompositePublicKey;
     use mia::helper::auth::ImaCallerAuth;
-    use mia::helper::{system_clock, Allowlist, HelperServer, HelperServerConfig};
+    use mia::helper::{system_clock, Allowlist, CrlCache, HelperServer, HelperServerConfig};
     use tokio::sync::mpsc;
 
     let socket_mode = env_octal("FERROGATE_HELPER_SOCKET_MODE", 0o660)?;
@@ -115,8 +117,12 @@ async fn start_helper_api(socket_path: std::path::PathBuf) -> anyhow::Result<()>
 
     // No minter yet: the host SVID composite key arrives with the attestation
     // loop (F04). Until then the server authenticates and authorizes callers
-    // but refuses to mint with `no_host_svid`.
-    let server = HelperServer::bind(config, auth, None, allowlist, audit_tx, clock)?;
+    // but refuses to mint with `no_host_svid`. The CRL cache (feature F11)
+    // starts empty — once the attestation loop lands it will be fed by a puller
+    // (`mia::helper::crl::spawn_puller`) against the host's CMIS endpoint; until
+    // then an empty cache simply means the (absent) minter stays disabled.
+    let crl = Arc::new(CrlCache::new());
+    let server = HelperServer::bind(config, auth, None, allowlist, crl, audit_tx, clock)?;
     tracing::warn!(
         "host SVID not present; token minting disabled (returns no_host_svid) until attestation lands"
     );

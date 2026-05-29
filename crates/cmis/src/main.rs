@@ -66,6 +66,14 @@ async fn main() -> anyhow::Result<()> {
         audit,
     ));
 
+    // Keep the published CRL fresh (feature F11). Revocations publish inline on
+    // the admin RPC; this heartbeat republishes every 60 s so consumers' 5-min
+    // freshness check keeps passing in steady state.
+    let _crl_publisher = cmis::crl_publisher::spawn(
+        Arc::clone(&state),
+        cmis::crl_publisher::DEFAULT_PUBLISH_INTERVAL,
+    );
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         %addr,

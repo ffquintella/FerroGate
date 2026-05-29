@@ -13,6 +13,7 @@
 
 pub mod cluster_store;
 pub mod credential;
+pub mod crl_publisher;
 pub mod pcr;
 pub mod rim_watcher;
 pub mod service;

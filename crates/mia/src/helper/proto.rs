@@ -43,6 +43,9 @@ pub enum ErrorCode {
     PermissionDenied,
     /// The MIA holds no valid host SVID, so it cannot mint.
     NoHostSvid,
+    /// The cached CRL is missing or stale (> 5 min), so the MIA fails closed
+    /// and refuses to mint until a fresh CRL is pulled (feature F11).
+    CrlStale,
     /// The request was malformed (bad fields).
     MalformedRequest,
     /// The server is shedding load; retry later.

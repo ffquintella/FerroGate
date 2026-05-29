@@ -206,11 +206,28 @@ cluster-wide means persisting `composite_pub` in the issued-SVID store.
 
 ### F11 — Revocation and CRL distribution
 
-- [ ] Admin RPC `revoke_svid(cert_sha, reason)`.
-- [ ] CRL delta publisher (60 s cadence).
-- [ ] JWKS `x-ferrogate-crl` extension.
-- [ ] MIA freshness enforcement (≤ 5 min).
-- [ ] CRL signature verification (fail closed).
+- [x] Admin RPC `revoke_svid(cert_sha, reason)`. (`MachineIdentity.RevokeSvid`
+      plus `RevokeHost` for per-host revocation; `crates/cmis/src/service.rs`.)
+- [x] CRL delta publisher (60 s cadence). (`crates/cmis/src/crl_publisher.rs`
+      heartbeat plus an inline publish on every revoke so a revocation lands
+      within one cycle. Expired entries — past the 1 h max SVID TTL — are pruned
+      each cycle to bound CRL growth.)
+- [x] JWKS `x-ferrogate-crl` extension. (`ferro_svid::JwkSet` carries an
+      optional composite-signed `SignedCrl`; `CmisState::published_jwks`
+      attaches it. The member is omitted when no CRL has been published.)
+- [x] MIA freshness enforcement (≤ 5 min). (`crates/mia/src/helper/crl.rs`
+      cache + gate; a stale or missing CRL fails closed with `CrlStale`.)
+- [x] CRL signature verification (fail closed). (`SignedCrl::verify` in
+      `ferro-svid`, the MIA-side `crl::ingest`, and the reference verifier's
+      `verify_unrevoked` all reject unknown-kid / wrong-key / tampered CRLs
+      without yielding the body.)
+
+**F11 status: done.** Verified with `cargo test -p ferro-svid`,
+`cargo test -p ferro-svid-verify`, `cargo test -p cmis --test revocation`, and
+`cargo test -p mia --test helper_api`, plus `clippy -D warnings` and
+`fmt --check`. Two deployment seams are deferred (cluster-replicated revocation
+set; wiring the MIA CRL puller into the not-yet-landed attestation loop) — both
+recorded in [features/F11-revocation.md](features/F11-revocation.md) §"Status".
 
 ### F12 — MIA process hardening
 

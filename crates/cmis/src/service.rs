@@ -25,10 +25,13 @@ use ferro_proto::v1::{
     AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, Challenge,
     ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest, HealthRequest, HealthResponse,
     InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest,
-    LatestSthResponse, NodeRole as ProtoNodeRole, Nonce, RotateRequest, SignedTreeHead, SvidBundle,
+    LatestSthResponse, NodeRole as ProtoNodeRole, Nonce, RevokeHostRequest, RevokeResponse,
+    RevokeSvidRequest, RotateRequest, SignedTreeHead, SvidBundle,
 };
 use ferro_raft::NodeRole;
-use ferro_svid::{decide_renewal, IssueParams, IssuedSvid, LastAttestation, RenewalDecision};
+use ferro_svid::{
+    decide_renewal, IssueParams, IssuedSvid, LastAttestation, RenewalDecision, RevocationTarget,
+};
 use sha2::{Digest, Sha384};
 
 use crate::pcr::aggregate_digest;
@@ -52,6 +55,39 @@ impl MachineIdentitySvc {
     pub fn into_server(self) -> MachineIdentityServer<Self> {
         MachineIdentityServer::new(self)
     }
+
+    /// Publish a fresh CRL right now so a revocation reaches consumers within
+    /// one publish cycle (here, immediately) rather than waiting for the next
+    /// periodic tick. A signing failure is surfaced to the admin caller.
+    #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
+    fn publish_crl_now(&self, now: i64) -> Result<u64, Status> {
+        self.state.publish_crl(now).map_err(|e| {
+            tracing::error!(error = %e, "CRL publish failed");
+            Status::unavailable("issuer temporarily unavailable")
+        })
+    }
+}
+
+/// Validate and decode a lowercase-hex `SHA-384` (96 hex chars ⇒ 48 bytes).
+#[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
+fn parse_cert_sha(s: &str) -> Result<[u8; 48], Status> {
+    let bytes =
+        hex::decode(s.trim()).map_err(|_| Status::invalid_argument("cert_sha is not hex"))?;
+    let arr: [u8; 48] = bytes
+        .try_into()
+        .map_err(|_| Status::invalid_argument("cert_sha must be 48 bytes (SHA-384)"))?;
+    Ok(arr)
+}
+
+/// Normalise the operator-supplied revocation reason to a bounded opcode so the
+/// CRL and audit log never carry unbounded free-text. An empty reason becomes
+/// the catch-all `"unspecified"`.
+fn revocation_reason(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "unspecified".to_string();
+    }
+    trimmed.chars().take(64).collect()
 }
 
 fn unix_now() -> i64 {
@@ -374,6 +410,72 @@ impl MachineIdentity for MachineIdentitySvc {
         let json = serde_json::to_string(&self.state.published_jwks())
             .map_err(|_| Status::internal("jwks encode"))?;
         Ok(Response::new(JwksResponse { jwks_json: json }))
+    }
+
+    async fn revoke_svid(
+        &self,
+        request: Request<RevokeSvidRequest>,
+    ) -> Result<Response<RevokeResponse>, Status> {
+        let req = request.into_inner();
+        let now = unix_now();
+
+        // `cert_sha` must be a 96-char lowercase-hex SHA-384. Normalising and
+        // validating here keeps a single canonical key in the CRL and gives the
+        // audit event a real `Hash384`.
+        let cert_bytes = parse_cert_sha(&req.cert_sha)?;
+        let cert_sha = hex::encode(cert_bytes);
+        let reason = revocation_reason(&req.reason);
+
+        self.state.revoke(
+            RevocationTarget::Svid {
+                cert_sha: cert_sha.clone(),
+            },
+            reason.clone(),
+            now,
+        );
+        audit_record(
+            &self.state,
+            AuditEvent::SvidRevoked {
+                cert_sha: Hash384(cert_bytes),
+                reason,
+            },
+            now,
+        );
+        let number = self.publish_crl_now(now)?;
+        tracing::info!(%cert_sha, crl_number = number, "SVID revoked");
+        Ok(Response::new(RevokeResponse { crl_number: number }))
+    }
+
+    async fn revoke_host(
+        &self,
+        request: Request<RevokeHostRequest>,
+    ) -> Result<Response<RevokeResponse>, Status> {
+        let req = request.into_inner();
+        let now = unix_now();
+
+        if req.spiffe_id.is_empty() {
+            return Err(Status::invalid_argument("empty spiffe_id"));
+        }
+        let reason = revocation_reason(&req.reason);
+
+        self.state.revoke(
+            RevocationTarget::Host {
+                spiffe_id: req.spiffe_id.clone(),
+            },
+            reason.clone(),
+            now,
+        );
+        audit_record(
+            &self.state,
+            AuditEvent::HostRevoked {
+                spiffe_id: req.spiffe_id.clone(),
+                reason,
+            },
+            now,
+        );
+        let number = self.publish_crl_now(now)?;
+        tracing::info!(spiffe_id = %req.spiffe_id, crl_number = number, "host revoked");
+        Ok(Response::new(RevokeResponse { crl_number: number }))
     }
 
     async fn latest_sth(

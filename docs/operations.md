@@ -32,9 +32,26 @@ on the EK cert.
 ## Revocation
 
 - CMIS publishes a composite-signed CRL delta every 60 s as a JWKS extension
-  (`x-ferrogate-crl`).
-- The MIA refuses to mint helper tokens if the cached CRL is more than 5
-  minutes old.
+  (`x-ferrogate-crl`). The CRL is signed with the composite issuance key under
+  the `ferrogate-crl-v1` domain context and verified against the issuer key the
+  same JWKS publishes.
+- Operators revoke through the `MachineIdentity` admin RPCs (authenticated as
+  operator actions at the transport):
+  - `RevokeSvid(cert_sha, reason)` — revoke one SVID by the lowercase-hex
+    `SHA-384` of its compact JWS.
+  - `RevokeHost(spiffe_id, reason)` — revoke every SVID and child token for a
+    host.
+  Each revocation is recorded in the audit log (`SvidRevoked` / `HostRevoked`,
+  with the reason opcode) and republishes the CRL immediately, so the change
+  reaches consumers within one publish cycle rather than after the next tick.
+- The MIA refuses to mint helper tokens if the cached CRL is missing or more
+  than 5 minutes old (fail closed), and refuses if the CRL revokes its own
+  host. The independent reference verifier (`ferro-svid-verify`) likewise
+  rejects a revoked SVID, requiring a fresh, signature-valid CRL to make the
+  decision.
+- CRL entries are pruned once they age past the 1 h max SVID TTL: a revoked
+  artefact can never reappear after expiry, so dropping the entry bounds CRL
+  growth.
 - For mass revocation (compromised RIM generation, vulnerable kernel image),
   the operator increments the `policy_id` epoch. All SVIDs whose
   `attest.policy_id` does not match the active epoch become invalid at next

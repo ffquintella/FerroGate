@@ -22,8 +22,20 @@ service MachineIdentity {
   // server refuses and the client must run a full Attest.
   rpc Rotate (RotateRequest) returns (SVIDBundle);
 
-  // Composite verification key set used to validate SVID signatures.
+  // Composite verification key set used to validate SVID signatures. Also
+  // carries the composite-signed CRL in the `x-ferrogate-crl` extension member
+  // (feature F11).
   rpc JWKS (JWKSRequest) returns (JWKSResponse);
+
+  // ---- Revocation (F11) ----
+
+  // Admin RPC: revoke a single SVID by the lowercase-hex SHA-384 of its compact
+  // JWS. The revocation appears in the next published CRL (CMIS publishes
+  // immediately on revoke). Authenticated out of band as an operator action.
+  rpc RevokeSvid (RevokeSvidRequest) returns (RevokeResponse);
+
+  // Admin RPC: revoke every SVID and child token for a host SPIFFE ID.
+  rpc RevokeHost (RevokeHostRequest) returns (RevokeResponse);
 
   // ---- Audit log (F07) ----
 
@@ -134,6 +146,22 @@ message JWKSRequest {}
 
 message JWKSResponse {
   string jwks_json = 1;
+}
+
+// ---- Revocation (F11) --------------------------------------------------
+
+message RevokeSvidRequest {
+  string cert_sha = 1; // lowercase hex SHA-384 of the compact JWS (96 chars)
+  string reason = 2;   // stable operator opcode, e.g. "key-compromise"
+}
+
+message RevokeHostRequest {
+  string spiffe_id = 1; // host SPIFFE id to revoke
+  string reason = 2;    // stable operator opcode
+}
+
+message RevokeResponse {
+  uint64 crl_number = 1; // sequence number of the CRL carrying the revocation
 }
 
 // ---- Audit log -----------------------------------------------------------

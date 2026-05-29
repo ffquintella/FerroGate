@@ -26,9 +26,11 @@ use ferro_audit::AuditEvent;
 use ferro_crypto::composite::{CompositePublicKey, CompositeSecretKey, CompositeSignature};
 use mia::helper::allowlist::{self, AllowEntry, Allowlist, AllowlistDoc};
 use mia::helper::auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
+use mia::helper::crl::CrlCache;
 use mia::helper::proto::{self, ChildToken, ErrorCode, HelperReq, HelperResp};
 use mia::helper::server::{Clock, HelperServer, HelperServerConfig};
 use mia::helper::token::{ChildTokenMinter, MinterConfig};
+use std::sync::Arc;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
@@ -116,12 +118,39 @@ fn signed_allowlist(
     Allowlist::load(&bytes, pk, now, 86_400).unwrap()
 }
 
+/// A CRL cache seeded with a fresh, empty (no-revocation) CRL at `now`, so the
+/// F11 gate admits minting. Tests that exercise stale/revoked behaviour build
+/// their own cache instead (see [`spawn_server_with_crl`]).
+fn fresh_crl_cache(now: i64) -> Arc<CrlCache> {
+    Arc::new(CrlCache::seeded(ferro_svid::CrlBody {
+        issued_at: now,
+        number: 1,
+        entries: vec![],
+    }))
+}
+
 /// Spawn a server; return its socket path, the audit receiver, and a shutdown
 /// trigger.
 fn spawn_server(
     auth: FixedAuth,
     minter: Option<ChildTokenMinter>,
     allowlist: Option<Allowlist>,
+    now: i64,
+) -> (
+    PathBuf,
+    mpsc::Receiver<AuditEvent>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    spawn_server_with_crl(auth, minter, allowlist, fresh_crl_cache(now), now)
+}
+
+/// Like [`spawn_server`] but with a caller-supplied CRL cache, to drive the
+/// F11 freshness/revocation gate.
+fn spawn_server_with_crl(
+    auth: FixedAuth,
+    minter: Option<ChildTokenMinter>,
+    allowlist: Option<Allowlist>,
+    crl: Arc<CrlCache>,
     now: i64,
 ) -> (
     PathBuf,
@@ -138,8 +167,16 @@ fn spawn_server(
         max_concurrent: 16,
         read_timeout: Duration::from_millis(300),
     };
-    let server =
-        HelperServer::bind(cfg, auth, minter, allowlist, audit_tx, fixed_clock(now)).unwrap();
+    let server = HelperServer::bind(
+        cfg,
+        auth,
+        minter,
+        allowlist,
+        crl,
+        audit_tx,
+        fixed_clock(now),
+    )
+    .unwrap();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         server
@@ -329,6 +366,134 @@ async fn no_host_svid_refuses_to_mint() {
         AuditEvent::LocalDenied { reason, .. } => assert_eq!(reason, "no-host-svid"),
         other => panic!("expected LocalDenied, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn stale_crl_refuses_to_mint() {
+    // A CRL cached well in the past (older than the 5-min freshness bound) must
+    // make the MIA fail closed even for an otherwise-permitted caller (F11).
+    let crl = Arc::new(CrlCache::seeded(ferro_svid::CrlBody {
+        issued_at: 0,
+        number: 1,
+        entries: vec![],
+    }));
+    let (path, mut rx, _stop) = spawn_server_with_crl(
+        FixedAuth(Ok(id(APP_UID, APP_BIN))),
+        Some(minter()),
+        Some(allowlist_with_app(1_000_000)),
+        crl,
+        1_000_000, // far past issued_at=0 ⇒ stale
+    );
+
+    let resp = round_trip(&path, &good_req()).await;
+    assert!(matches!(
+        resp,
+        HelperResp::Error {
+            code: ErrorCode::CrlStale,
+            ..
+        }
+    ));
+    match rx.recv().await.unwrap() {
+        AuditEvent::LocalDenied { reason, .. } => assert_eq!(reason, "crl-stale"),
+        other => panic!("expected LocalDenied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn missing_crl_refuses_to_mint() {
+    // No CRL ever pulled ⇒ fail closed.
+    let crl = Arc::new(CrlCache::new());
+    let (path, mut rx, _stop) = spawn_server_with_crl(
+        FixedAuth(Ok(id(APP_UID, APP_BIN))),
+        Some(minter()),
+        Some(allowlist_with_app(1000)),
+        crl,
+        1000,
+    );
+
+    let resp = round_trip(&path, &good_req()).await;
+    assert!(matches!(
+        resp,
+        HelperResp::Error {
+            code: ErrorCode::CrlStale,
+            ..
+        }
+    ));
+    assert!(matches!(
+        rx.recv().await.unwrap(),
+        AuditEvent::LocalDenied { .. }
+    ));
+}
+
+#[tokio::test]
+async fn revoked_host_refuses_to_mint() {
+    // A fresh CRL that revokes this MIA's host SPIFFE id blocks minting even
+    // when the caller is allowlisted — and the gate runs before allowlisting.
+    let crl = Arc::new(CrlCache::seeded(ferro_svid::CrlBody {
+        issued_at: 1000,
+        number: 2,
+        entries: vec![ferro_svid::CrlEntry::new(
+            ferro_svid::RevocationTarget::Host {
+                // Matches the host id in `minter()`.
+                spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
+            },
+            "decommissioned",
+            1000,
+        )],
+    }));
+    let (path, mut rx, _stop) = spawn_server_with_crl(
+        FixedAuth(Ok(id(APP_UID, APP_BIN))),
+        Some(minter()),
+        Some(allowlist_with_app(1000)),
+        crl,
+        1000,
+    );
+
+    let resp = round_trip(&path, &good_req()).await;
+    assert!(matches!(
+        resp,
+        HelperResp::Error {
+            code: ErrorCode::PermissionDenied,
+            ..
+        }
+    ));
+    match rx.recv().await.unwrap() {
+        AuditEvent::LocalDenied { reason, .. } => assert_eq!(reason, "svid-revoked"),
+        other => panic!("expected LocalDenied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn revoked_svid_by_cert_sha_refuses_to_mint() {
+    // The same, but revoking the specific parent SVID by cert_sha. `minter()`
+    // uses parent_svid_sha384 = [0x33; 48].
+    let crl = Arc::new(CrlCache::seeded(ferro_svid::CrlBody {
+        issued_at: 1000,
+        number: 3,
+        entries: vec![ferro_svid::CrlEntry::new(
+            ferro_svid::RevocationTarget::Svid {
+                cert_sha: hex::encode([0x33u8; 48]),
+            },
+            "key-compromise",
+            1000,
+        )],
+    }));
+    let (path, _rx, _stop) = spawn_server_with_crl(
+        FixedAuth(Ok(id(APP_UID, APP_BIN))),
+        Some(minter()),
+        Some(allowlist_with_app(1000)),
+        crl,
+        1000,
+    );
+
+    let resp = round_trip(&path, &good_req()).await;
+    assert!(matches!(
+        resp,
+        HelperResp::Error {
+            code: ErrorCode::PermissionDenied,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

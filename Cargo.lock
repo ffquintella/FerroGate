@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "cmis"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -848,6 +848,7 @@ dependencies = [
  "ferro-proto",
  "ferro-raft",
  "ferro-svid",
+ "ferro-svid-verify",
  "ferro-tee",
  "futures",
  "hex",
@@ -1421,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-attest"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1441,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-audit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -1457,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-child-verify"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -1470,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-crypto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -1500,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "prost",
  "tonic",
@@ -1509,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-raft"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -1524,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1539,18 +1540,20 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid-verify"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "ferro-tee"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chacha20poly1305",
  "ciborium",
@@ -1572,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-winauth"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "tokio",
  "windows-sys 0.59.0",
@@ -1580,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogate-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "file-rotate",
  "tracing",
@@ -2654,7 +2657,7 @@ dependencies = [
 
 [[package]]
 name = "mia"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

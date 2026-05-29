@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::helper::allowlist::Allowlist;
 use crate::helper::auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
+use crate::helper::crl::{CrlCache, CrlGate};
 use crate::helper::proto::{self, ChildToken, ErrorCode, HelperReq, HelperResp};
 use crate::helper::token::ChildTokenMinter;
 
@@ -111,6 +112,9 @@ struct Shared<A: CallerAuth> {
     minter: Option<ChildTokenMinter>,
     /// `None` ⇒ no valid allowlist loaded ⇒ fail closed, deny all callers.
     allowlist: RwLock<Option<Allowlist>>,
+    /// The CRL freshness gate (feature F11). A stale or missing CRL, or one
+    /// that revokes this host, blocks minting — fail closed.
+    crl: Arc<CrlCache>,
     audit_tx: mpsc::Sender<AuditEvent>,
     clock: Clock,
 }
@@ -208,6 +212,27 @@ async fn process_request<A: CallerAuth>(
         return err(ErrorCode::NoHostSvid, None);
     };
 
+    let now = (shared.clock)();
+
+    // 3.5 CRL gate (feature F11). Fail closed on a missing/stale CRL, and refuse
+    //     to mint if this host has been revoked. Checked before allowlisting so
+    //     a revoked host cannot mint even if it is otherwise permitted.
+    match shared
+        .crl
+        .gate(&minter.parent_cert_sha_hex(), minter.host_spiffe_id(), now)
+        .await
+    {
+        CrlGate::Ok => {}
+        CrlGate::Stale => {
+            deny(shared, id.pid, id.uid, id.bin_sha, "crl-stale").await;
+            return err(ErrorCode::CrlStale, None);
+        }
+        CrlGate::Revoked => {
+            deny(shared, id.pid, id.uid, id.bin_sha, "svid-revoked").await;
+            return err(ErrorCode::PermissionDenied, None);
+        }
+    }
+
     // 4. The caller must be on the (signed, fresh) allowlist. A missing
     //    allowlist fails closed.
     let permitted = match &*shared.allowlist.read().await {
@@ -220,7 +245,6 @@ async fn process_request<A: CallerAuth>(
     }
 
     // 5. Mint.
-    let now = (shared.clock)();
     let Ok(tok) = minter.mint(&req.audience, &req.dpop_jkt, req.ttl_secs, &id, now) else {
         deny(shared, id.pid, id.uid, id.bin_sha, "mint-failed").await;
         return err(ErrorCode::Internal, None);

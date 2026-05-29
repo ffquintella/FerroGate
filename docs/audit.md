@@ -14,6 +14,7 @@ enum AuditEvent {
     AttestFail   { reason:  &'static str },
     SvidIssued   { cert_sha:[u8;48], spiffe_id: String },
     SvidRevoked  { cert_sha:[u8;48], reason:    String },
+    HostRevoked  { spiffe_id: String, reason:   String },
     KeyShareUsed { share_idx: u8,    mrenclave: [u8;48] },
     LocalGrant   { pid: u32, uid: u32, bin_sha: [u8;48], jti: [u8;16] },
     LocalDenied  { pid: u32, uid: u32, bin_sha: [u8;48], reason: &'static str },

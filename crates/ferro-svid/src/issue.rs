@@ -3,6 +3,7 @@
 use ferro_crypto::composite::{CompositeError, CompositePublicKey, CompositeSecretKey};
 
 use crate::claims::{AttestClaims, Cnf, SvidClaims};
+use crate::crl::{CrlBody, CrlError, SignedCrl};
 use crate::envelope::{self, EnvelopeError, JwsHeader};
 use crate::jwks::{Jwk, JwkSet};
 use crate::spiffe::{self, SpiffeError};
@@ -52,6 +53,9 @@ pub enum IssueError {
     /// The composite signer failed.
     #[error("composite sign: {0}")]
     Composite(#[from] CompositeError),
+    /// CRL signing failed.
+    #[error("crl: {0}")]
+    Crl(#[from] CrlError),
 }
 
 /// The CMIS issuance authority: a composite signing key plus the trust-domain
@@ -105,6 +109,13 @@ impl Issuer {
     #[must_use]
     pub fn jwks(&self) -> JwkSet {
         JwkSet::single(Jwk::from_public_key(self.kid.clone(), &self.public))
+    }
+
+    /// Sign a [`CrlBody`] with the composite issuance key, stamping this
+    /// issuer's `kid` so consumers resolve the verification key from the same
+    /// published JWK set (feature F11).
+    pub fn sign_crl(&self, body: CrlBody) -> Result<SignedCrl, IssueError> {
+        Ok(SignedCrl::sign(body, self.kid.clone(), &self.secret)?)
     }
 
     /// Mint an SVID. `now` is the reference clock in Unix seconds.

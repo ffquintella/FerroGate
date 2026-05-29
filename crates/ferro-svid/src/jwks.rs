@@ -69,17 +69,32 @@ impl Jwk {
 }
 
 /// A JWK set as served by the CMIS `JWKS` RPC.
+///
+/// Besides the verification keys, the set may carry FerroGate's revocation list
+/// in the `x-ferrogate-crl` extension member (feature F11). The member is
+/// omitted entirely when no CRL has been published yet, keeping a stock JWKS
+/// parser happy; consumers that understand revocation pull it from here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JwkSet {
     /// The verification keys, newest-preferred ordering left to the caller.
     pub keys: Vec<Jwk>,
+    /// The composite-signed CRL, when published (feature F11).
+    #[serde(
+        rename = "x-ferrogate-crl",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub crl: Option<crate::crl::SignedCrl>,
 }
 
 impl JwkSet {
-    /// A set containing a single key.
+    /// A set containing a single key and no CRL.
     #[must_use]
     pub fn single(jwk: Jwk) -> Self {
-        Self { keys: vec![jwk] }
+        Self {
+            keys: vec![jwk],
+            crl: None,
+        }
     }
 
     /// Find a key by `kid`.

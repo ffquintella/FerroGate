@@ -115,6 +115,20 @@ impl ChildTokenMinter {
         Self { secret, cfg }
     }
 
+    /// The host SPIFFE id this minter issues under (used by the F11 CRL gate to
+    /// check whether the host itself has been revoked).
+    #[must_use]
+    pub fn host_spiffe_id(&self) -> &str {
+        &self.cfg.host_spiffe_id
+    }
+
+    /// Lowercase hex `SHA-384` of the parent host SVID — the `cert_sha` a CMIS
+    /// operator would use to revoke this specific SVID (feature F11).
+    #[must_use]
+    pub fn parent_cert_sha_hex(&self) -> String {
+        hex::encode(self.cfg.parent_svid_sha384)
+    }
+
     /// Mint a token for `actor`, bound to `audience` and `dpop_jkt`.
     ///
     /// `ttl_secs` is clamped to [`MAX_CHILD_TTL_SECS`]; `now` is the reference

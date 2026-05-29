@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, Semaphore};
 use super::{serve_connection, Clock, HelperServerConfig, ServerError, Shared};
 use crate::helper::allowlist::Allowlist;
 use crate::helper::auth::{AuthError, CallerAuth, PeerCred};
+use crate::helper::crl::CrlCache;
 use crate::helper::token::ChildTokenMinter;
 
 /// The helper-API server, backed by a Unix Domain Socket.
@@ -25,11 +26,13 @@ impl<A: CallerAuth> HelperServer<A> {
     /// Any existing file at `socket_path` is removed first (a stale socket from
     /// a previous run). The socket is created, then its mode (and optionally
     /// its group owner) is set before any client can connect.
+    #[allow(clippy::too_many_arguments)] // each handle is a distinct collaborator.
     pub fn bind(
         config: HelperServerConfig,
         auth: A,
         minter: Option<ChildTokenMinter>,
         allowlist: Option<Allowlist>,
+        crl: Arc<CrlCache>,
         audit_tx: mpsc::Sender<AuditEvent>,
         clock: Clock,
     ) -> Result<Self, ServerError> {
@@ -53,6 +56,7 @@ impl<A: CallerAuth> HelperServer<A> {
                 auth,
                 minter,
                 allowlist: tokio::sync::RwLock::new(allowlist),
+                crl,
                 audit_tx,
                 clock,
             }),

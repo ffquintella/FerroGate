@@ -8,6 +8,66 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [M5.3] — 2026-05-29 — Revocation and CRL distribution (v0.7.0)
+
+### Added — F11: Revocation and CRL distribution
+
+- **CRL data model (`ferro-svid::crl`).** A composite-signed `SignedCrl`
+  carrying a `CrlBody { issued_at, number, entries }`. Each `CrlEntry` revokes
+  either a single SVID by `cert_sha` (lowercase hex `SHA-384` of the compact
+  JWS) or a whole host by SPIFFE id, with a stable reason opcode and an
+  `expires_at` one max-SVID-TTL out (the "CRL bloat" mitigation — a revoked
+  artefact can never reappear once its TTL elapses). The signature covers the
+  canonical JSON under a distinct domain-separation context
+  (`ferrogate-crl-v1`). `Issuer::sign_crl` signs with the composite issuance
+  key; `SignedCrl::verify` is fail-closed (unknown kid, wrong key, or tampered
+  bytes never yield the body).
+- **JWKS `x-ferrogate-crl` extension.** `ferro_svid::JwkSet` gained an optional
+  `crl` member, serialised as `x-ferrogate-crl` and omitted when absent, so a
+  stock JWKS parser is unaffected. `CmisState::published_jwks` attaches the
+  latest published CRL.
+- **CMIS revocation store, admin RPCs, and publisher.** `MachineIdentity`
+  gained `RevokeSvid(cert_sha, reason)` and `RevokeHost(spiffe_id, reason)`.
+  Each validates and records the revocation, appends a `SvidRevoked` /
+  `HostRevoked` audit event, and republishes a fresh signed CRL inline so the
+  change lands within one publish cycle. `crates/cmis/src/crl_publisher.rs`
+  is the 60 s heartbeat that keeps `issued_at` fresh (and prunes expired
+  entries) between revocations; wired into the CMIS binary.
+- **MIA freshness gate and CRL cache (`mia::helper::crl`).** A `CrlCache`
+  holding the most recently *verified* CRL body, a puller
+  (`spawn_puller` / `refresh_once` / `ingest`) that pulls the CRL from the CMIS
+  `JWKS` RPC and verifies its signature fail-closed before caching, and a gate
+  consulted on every child-token mint: a missing or stale (> 5 min) CRL refuses
+  with `CrlStale`, and a CRL that revokes this host (by parent SVID `cert_sha`
+  or by SPIFFE id) refuses with `permission_denied`. The gate runs before
+  allowlisting, so a revoked host cannot mint even if otherwise permitted. Every
+  refusal emits exactly one `LocalDenied` audit event.
+- **Reference-verifier revocation support (`ferro-svid-verify`).** A new
+  `verify_unrevoked` re-declares the CRL schema (staying self-contained),
+  verifies the CRL signature against the JWKS keys, requires a fresh CRL (fail
+  closed: absent/stale ⇒ `CrlStale`, bad signature ⇒ `CrlInvalid`), and rejects
+  a revoked SVID (`Revoked`).
+- **Audit.** Added the `HostRevoked { spiffe_id, reason }` event alongside the
+  existing `SvidRevoked`.
+- **Tests.** `crates/cmis/tests/revocation.rs` drives the admin RPCs through to
+  the published JWKS CRL, asserts audit growth, and proves a revoked SVID is
+  rejected by the reference verifier after propagation;
+  `crates/ferro-svid/tests/verify_roundtrip.rs` proves the CMIS-signed CRL
+  verifies under the independent verifier across the crate boundary (canonical
+  JSON match), with revoked-by-cert / revoked-by-host / stale / absent / tampered
+  cases; `crates/mia/tests/helper_api.rs` covers the stale / missing / revoked
+  mint refusals; plus unit tests in `ferro-svid` and `mia` for fail-closed
+  verification.
+
+### Deferred (deployment seams)
+
+- The CMIS revocation working set is process-local; replicating it through the
+  Raft store so every replica's CRL agrees is wiring on the existing
+  `CmisState::revoke` seam (mirrors the F09 process-local JWKS registry note).
+- The MIA CRL puller is wired by the attestation loop that supplies the host
+  SVID (not yet landed); until then the daemon runs with an empty cache and so
+  refuses to mint (fail closed).
+
 ## [M5.2] — 2026-05-29 — DPoP child-token verification (v0.6.0)
 
 ### Added — F09: DPoP-bound child tokens (completion)

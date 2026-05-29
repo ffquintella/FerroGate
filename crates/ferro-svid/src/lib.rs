@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod claims;
+pub mod crl;
 pub mod envelope;
 pub mod issue;
 pub mod jwks;
@@ -45,6 +46,10 @@ pub const MAX_TTL_SECS: u64 = 3600;
 pub const NBF_LOOKBACK_SECS: i64 = 60;
 
 pub use claims::{AttestClaims, Cnf, SvidClaims};
+pub use crl::{
+    CrlBody, CrlEntry, CrlError, RevocationTarget, SignedCrl, CRL_ENTRY_TTL_SECS, CRL_MAX_AGE_SECS,
+    CRL_SIGNING_CONTEXT,
+};
 pub use issue::{IssueError, IssueParams, IssuedSvid, Issuer};
 pub use jwks::{child_signing_kid, Jwk, JwkSet};
 pub use lifecycle::{

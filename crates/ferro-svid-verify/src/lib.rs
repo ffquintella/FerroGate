@@ -18,6 +18,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ferro_crypto::composite::{CompositePublicKey, CompositeSignature};
 use serde::Deserialize;
+use sha2::{Digest, Sha384};
 
 /// JOSE `alg` this verifier accepts.
 pub const SVID_ALG: &str = ferro_crypto::composite::COMPOSITE_JOSE_ALG;
@@ -91,11 +92,26 @@ pub struct Jwk {
     pub public: String,
 }
 
-/// A JWK set.
+impl Jwk {
+    /// Reconstruct the composite public key carried by this JWK.
+    fn to_public_key(&self) -> Result<CompositePublicKey, VerifyError> {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(self.public.as_bytes())
+            .map_err(|e| VerifyError::Malformed(format!("jwk pub: {e}")))?;
+        CompositePublicKey::from_concat_bytes(&bytes)
+            .map_err(|e| VerifyError::Malformed(format!("jwk pub: {e}")))
+    }
+}
+
+/// A JWK set, optionally carrying FerroGate's CRL (feature F11) in the
+/// `x-ferrogate-crl` extension member.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JwkSet {
     /// Keys.
     pub keys: Vec<Jwk>,
+    /// The composite-signed revocation list, when published.
+    #[serde(rename = "x-ferrogate-crl", default)]
+    pub crl: Option<SignedCrl>,
 }
 
 impl JwkSet {
@@ -106,6 +122,109 @@ impl JwkSet {
 
     fn find(&self, kid: &str) -> Option<&Jwk> {
         self.keys.iter().find(|k| k.kid == kid)
+    }
+}
+
+// ---- CRL (feature F11) -----------------------------------------------------
+//
+// Re-declared here, like the rest of the schema, so the reference verifier
+// stays self-contained. The field order matches `ferro_svid::crl` exactly
+// because the composite signature covers the canonical JSON (declaration
+// order), and `serde_json` honours it.
+
+/// Domain-separation context the CRL signature covers.
+pub const CRL_SIGNING_CONTEXT: &[u8] = b"ferrogate-crl-v1";
+
+/// Maximum CRL age (seconds) a verifier will trust.
+pub const CRL_MAX_AGE_SECS: i64 = 300;
+
+/// What a revocation targets. Both `Serialize` and `Deserialize` so the signed
+/// body can be parsed from the JWKS and re-serialised byte-for-byte to recompute
+/// the canonical JSON the signature covers.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RevocationTarget {
+    /// A single SVID by lowercase-hex `SHA-384(jws_bytes)`.
+    Svid {
+        /// The revoked SVID's `cert_sha`.
+        cert_sha: String,
+    },
+    /// Every SVID/child token for a host SPIFFE id.
+    Host {
+        /// The revoked host SPIFFE id.
+        spiffe_id: String,
+    },
+}
+
+/// One revocation record.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct CrlEntry {
+    /// What is revoked.
+    pub target: RevocationTarget,
+    /// Stable reason opcode.
+    pub reason: String,
+    /// Unix seconds the revocation took effect.
+    pub revoked_at: i64,
+    /// Unix seconds after which the entry may be pruned.
+    pub expires_at: i64,
+}
+
+/// The signable contents of one CRL.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct CrlBody {
+    /// Unix seconds the CRL was produced.
+    pub issued_at: i64,
+    /// Monotonic publish sequence number.
+    pub number: u64,
+    /// The active revocation entries.
+    pub entries: Vec<CrlEntry>,
+}
+
+impl CrlBody {
+    fn revokes_svid(&self, cert_sha_hex: &str) -> bool {
+        self.entries.iter().any(|e| {
+            matches!(&e.target, RevocationTarget::Svid { cert_sha } if cert_sha.eq_ignore_ascii_case(cert_sha_hex))
+        })
+    }
+    fn revokes_host(&self, spiffe_id: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(&e.target, RevocationTarget::Host { spiffe_id: s } if s == spiffe_id))
+    }
+    fn is_fresh(&self, now: i64, leeway_secs: i64) -> bool {
+        let age = now - self.issued_at;
+        age <= CRL_MAX_AGE_SECS && age >= -leeway_secs
+    }
+}
+
+/// A [`CrlBody`] with the issuer's composite signature.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignedCrl {
+    /// The CRL contents.
+    pub body: CrlBody,
+    /// Key id selecting the issuer key in the JWK set.
+    pub signer_kid: String,
+    /// base64url of the concatenated composite signature.
+    pub signature_b64: String,
+}
+
+impl SignedCrl {
+    /// Verify the CRL signature against the keys in `jwks`. Fail-closed.
+    fn verify<'a>(&'a self, jwks: &JwkSet) -> Result<&'a CrlBody, VerifyError> {
+        let jwk = jwks.find(&self.signer_kid).ok_or_else(|| {
+            VerifyError::CrlInvalid(format!("unknown signer kid {}", self.signer_kid))
+        })?;
+        let pk = jwk.to_public_key()?;
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(self.signature_b64.as_bytes())
+            .map_err(|e| VerifyError::CrlInvalid(format!("signature b64: {e}")))?;
+        let sig = CompositeSignature::from_concat_bytes(&sig_bytes)
+            .map_err(|e| VerifyError::CrlInvalid(e.to_string()))?;
+        let payload = serde_json::to_vec(&self.body)
+            .map_err(|e| VerifyError::CrlInvalid(format!("canonical json: {e}")))?;
+        pk.verify(CRL_SIGNING_CONTEXT, &payload, &sig)
+            .map_err(|_| VerifyError::CrlInvalid("signature did not verify".to_string()))?;
+        Ok(&self.body)
     }
 }
 
@@ -140,6 +259,17 @@ pub enum VerifyError {
     /// The SVID has expired (`now >= exp`).
     #[error("SVID expired")]
     Expired,
+    /// No fresh CRL was available to make a revocation decision (feature F11).
+    /// The CRL was absent or older than [`CRL_MAX_AGE_SECS`]; a revocation-aware
+    /// verifier fails closed rather than treat a missing CRL as "not revoked".
+    #[error("CRL missing or stale")]
+    CrlStale,
+    /// The CRL was present but its signature was malformed or did not verify.
+    #[error("CRL invalid: {0}")]
+    CrlInvalid(String),
+    /// The SVID (or its host) is named in the CRL.
+    #[error("SVID revoked")]
+    Revoked,
 }
 
 /// Verify a compact-JWS SVID against a JWK set at reference time `now`
@@ -202,6 +332,39 @@ pub fn verify(
         claims,
         kid: header.kid,
     })
+}
+
+/// Verify an SVID **and** check it against the CRL carried in the JWK set
+/// (feature F11). On success the SVID's signature and time bounds hold *and* it
+/// is not revoked.
+///
+/// Fail-closed revocation policy: a revocation decision requires a fresh,
+/// signature-valid CRL in `jwks`. If the CRL is absent or older than
+/// [`CRL_MAX_AGE_SECS`], this returns [`VerifyError::CrlStale`]; if its
+/// signature does not verify, [`VerifyError::CrlInvalid`]. A revoked SVID (by
+/// its `cert_sha` — the lowercase-hex `SHA-384` of the compact JWS — or by its
+/// `sub` host SPIFFE id) returns [`VerifyError::Revoked`].
+#[allow(clippy::similar_names)]
+pub fn verify_unrevoked(
+    jws: &str,
+    jwks: &JwkSet,
+    now: i64,
+    leeway_secs: i64,
+) -> Result<Verified, VerifyError> {
+    let verified = verify(jws, jwks, now, leeway_secs)?;
+
+    // A revocation decision is only possible against a fresh, authentic CRL.
+    let signed = jwks.crl.as_ref().ok_or(VerifyError::CrlStale)?;
+    let body = signed.verify(jwks)?;
+    if !body.is_fresh(now, leeway_secs) {
+        return Err(VerifyError::CrlStale);
+    }
+
+    let cert_sha = hex::encode(Sha384::digest(jws.as_bytes()));
+    if body.revokes_svid(&cert_sha) || body.revokes_host(&verified.claims.sub) {
+        return Err(VerifyError::Revoked);
+    }
+    Ok(verified)
 }
 
 fn decode_json<T: for<'de> Deserialize<'de>>(segment: &str) -> Result<T, VerifyError> {

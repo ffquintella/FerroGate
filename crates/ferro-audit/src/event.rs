@@ -50,6 +50,13 @@ pub enum AuditEvent {
         /// Stable opcode for the revocation reason.
         reason: String,
     },
+    /// Every SVID and child token for a host was revoked (admin RPC).
+    HostRevoked {
+        /// The revoked host SPIFFE ID.
+        spiffe_id: String,
+        /// Stable opcode for the revocation reason.
+        reason: String,
+    },
     /// A threshold key share was used to reconstruct the issuance key.
     KeyShareUsed {
         /// Which share (0..=4 in the 3-of-5 scheme).

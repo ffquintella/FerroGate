@@ -18,6 +18,7 @@
 
 pub mod allowlist;
 pub mod auth;
+pub mod crl;
 pub mod proto;
 pub mod token;
 
@@ -26,6 +27,7 @@ pub mod server;
 
 pub use allowlist::{Allowlist, AllowlistError};
 pub use auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
+pub use crl::{CrlCache, CrlGate};
 pub use proto::{ChildToken, ErrorCode, HelperReq, HelperResp};
 pub use token::{ChildTokenMinter, MintedToken, MinterConfig, MAX_CHILD_TTL_SECS};
 

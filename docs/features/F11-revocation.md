@@ -38,13 +38,49 @@ See [../operations.md](../operations.md) §"Revocation".
 
 ## Acceptance criteria
 
-- [ ] `revoke_svid(cert_sha, reason)` admin RPC produces a CRL delta within
-      one publish cycle.
-- [ ] MIAs refuse child-token mint if cached CRL age > 300 s.
-- [ ] CRL signature verification fails closed.
-- [ ] Revoked SVID is rejected by the reference verifier after CRL
-      propagation.
-- [ ] Audit log records every revocation with reason.
+- [x] `revoke_svid(cert_sha, reason)` admin RPC produces a CRL delta within
+      one publish cycle. (`MachineIdentity.RevokeSvid` / `RevokeHost` in
+      `crates/ferro-proto`; `crates/cmis/src/service.rs` validates the
+      `cert_sha`, records the revocation, and publishes a fresh signed CRL
+      inline — within the same call. Covered by
+      `crates/cmis/tests/revocation.rs`.)
+- [x] MIAs refuse child-token mint if cached CRL age > 300 s.
+      (`crates/mia/src/helper/crl.rs::CrlCache::gate` returns `Stale` once the
+      cached CRL ages past `CRL_MAX_AGE_SECS`; the helper pipeline
+      (`server/mod.rs`) maps it to `CrlStale` and a `LocalDenied{crl-stale}`
+      audit event before allowlisting. Covered by `stale_crl_refuses_to_mint`
+      and `missing_crl_refuses_to_mint` in `crates/mia/tests/helper_api.rs`.)
+- [x] CRL signature verification fails closed.
+      (`ferro_svid::crl::SignedCrl::verify` and the MIA-side
+      `crl::ingest` reject an unknown `signer_kid`, a wrong key, or a tampered
+      signature without yielding the body, leaving the cache stale. Covered by
+      unit tests in both crates.)
+- [x] Revoked SVID is rejected by the reference verifier after CRL
+      propagation. (`ferro_svid_verify::verify_unrevoked` checks the SVID
+      against the fresh, signature-valid CRL carried in the JWKS — by
+      `cert_sha` or host SPIFFE id — and returns `Revoked`. Covered by the
+      cross-crate `crates/ferro-svid/tests/verify_roundtrip.rs` and the
+      end-to-end `revoked_svid_is_rejected_by_reference_verifier_after_propagation`
+      in `crates/cmis/tests/revocation.rs`.)
+- [x] Audit log records every revocation with reason. (`SvidRevoked` /
+      `HostRevoked` events appended by `crates/cmis/src/service.rs`; the
+      bounded reason opcode is carried verbatim. Tree growth asserted in
+      `revoke_svid_appears_in_jwks_crl_and_audit`.)
+
+## Status
+
+**Done.** Per-SVID and per-host revocation, the composite-signed CRL delta in
+the `x-ferrogate-crl` JWKS extension (60 s publisher heartbeat plus inline
+publish on revoke), MIA freshness/revocation enforcement, fail-closed CRL
+signature verification, and reference-verifier rejection all landed. Two seams
+are intentionally deferred, matching the precedent set by the F09 JWKS
+registry: the revocation working set is **process-local** (replicating it
+through the Raft store so every replica's CRL agrees is deployment wiring on
+the existing `CmisState::revoke` seam), and the MIA CRL puller
+(`crl::spawn_puller`) is wired by the attestation loop that supplies the host
+SVID — until that lands the daemon runs with an empty cache and therefore
+refuses to mint (fail closed). The admin RPCs are authenticated as operator
+actions out of band (mTLS/role gating at the transport), not in the message.
 
 ## Risks
 

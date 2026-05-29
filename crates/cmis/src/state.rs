@@ -24,7 +24,8 @@ use ferro_audit::AuditLog;
 use ferro_crypto::composite::CompositePublicKey;
 use ferro_raft::{Cluster, NodeRole};
 use ferro_svid::{
-    child_signing_kid, IssueParams, IssuedSvid, Issuer, Jwk, JwkSet, LastAttestation,
+    child_signing_kid, CrlBody, CrlEntry, IssueParams, IssuedSvid, Issuer, Jwk, JwkSet,
+    LastAttestation, RevocationTarget, SignedCrl,
 };
 use parking_lot::RwLock;
 
@@ -79,7 +80,22 @@ pub struct CmisState {
     /// plus the per-host child-token signing keys registered at attestation
     /// time (feature F09). Process-local — see [`CmisState::register_child_key`].
     published_keys: RwLock<Vec<Jwk>>,
+    /// Revocation state (feature F11). `entries` is the working set of active
+    /// revocations; `crl` is the most recently published composite-signed CRL
+    /// served in the `x-ferrogate-crl` JWKS extension. Both are process-local —
+    /// replicating revocations across the cluster is a documented seam (see
+    /// [`CmisState::revoke`]).
+    revocations: Mutex<Revocations>,
+    published_crl: RwLock<Option<SignedCrl>>,
     backend: Backend,
+}
+
+/// The mutable revocation working set.
+#[derive(Default)]
+struct Revocations {
+    entries: Vec<CrlEntry>,
+    /// Monotonic CRL sequence number; bumped on every publish.
+    number: u64,
 }
 
 enum Backend {
@@ -105,6 +121,8 @@ impl CmisState {
             config,
             audit,
             published_keys,
+            revocations: Mutex::new(Revocations::default()),
+            published_crl: RwLock::new(None),
             backend: Backend::Local(Mutex::new(HashMap::new())),
         }
     }
@@ -128,6 +146,8 @@ impl CmisState {
             config,
             audit,
             published_keys,
+            revocations: Mutex::new(Revocations::default()),
+            published_crl: RwLock::new(None),
             backend: Backend::Cluster(cluster),
         }
     }
@@ -139,6 +159,7 @@ impl CmisState {
     pub fn published_jwks(&self) -> JwkSet {
         JwkSet {
             keys: self.published_keys.read().clone(),
+            crl: self.published_crl.read().clone(),
         }
     }
 
@@ -157,6 +178,50 @@ impl CmisState {
             return;
         }
         keys.push(Jwk::from_public_key(kid, pk));
+    }
+
+    /// Add a revocation to the working set (feature F11). Idempotent per target:
+    /// re-revoking the same SVID or host refreshes the reason/timestamp rather
+    /// than appending a duplicate. The caller publishes a fresh CRL afterwards
+    /// (see [`CmisState::publish_crl`]) so the change reaches consumers within
+    /// one publish cycle.
+    ///
+    /// The working set is **process-local**: replicating revocations through the
+    /// Raft store so any replica's CRL reflects them is a deployment seam left
+    /// for a later slice, mirroring the per-host JWKS registry note above.
+    pub fn revoke(&self, target: RevocationTarget, reason: impl Into<String>, now: i64) {
+        let entry = CrlEntry::new(target, reason, now);
+        let mut revs = self.revocations.lock();
+        if let Some(existing) = revs.entries.iter_mut().find(|e| e.target == entry.target) {
+            *existing = entry;
+        } else {
+            revs.entries.push(entry);
+        }
+    }
+
+    /// Build, sign, and publish a fresh CRL from the current working set.
+    ///
+    /// Expired entries (`expires_at <= now`) are pruned first — once an SVID's
+    /// max TTL has elapsed it can never reappear, so dropping the entry bounds
+    /// CRL growth (the F11 "CRL bloat" mitigation). `issued_at` is set to `now`
+    /// and the sequence number is bumped on every call, so a stalled publisher
+    /// is detectable by a consumer's freshness check even when the entry set is
+    /// unchanged. Returns the published CRL's sequence number.
+    pub fn publish_crl(&self, now: i64) -> Result<u64, ferro_svid::IssueError> {
+        let (entries, number) = {
+            let mut revs = self.revocations.lock();
+            revs.entries.retain(|e| e.expires_at > now);
+            revs.number += 1;
+            (revs.entries.clone(), revs.number)
+        };
+        let body = CrlBody {
+            issued_at: now,
+            number,
+            entries,
+        };
+        let signed = self.issuer.sign_crl(body)?;
+        *self.published_crl.write() = Some(signed);
+        Ok(number)
     }
 
     /// Borrow the local Raft cluster handle, if this state is clustered.
