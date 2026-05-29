@@ -94,6 +94,9 @@ artefacts. The requested `ttl_secs` is clamped to ≤ 600 s server-side:
 }
 ```
 
+A self-contained Rust reference verifier ships as `crates/ferro-child-verify`
+(`verify` for the token; `verify_bound` for the full DPoP sender constraint).
+
 The third-party verifier (an API gateway, sidecar, …) validates:
 
 1. The composite signature against the CMIS JWKS endpoint.

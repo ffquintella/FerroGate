@@ -10,13 +10,14 @@ members = [
     "crates/ferro-raft",
     "crates/ferro-svid",
     "crates/ferro-svid-verify",
+    "crates/ferro-child-verify",
     "crates/ferro-tee",
     "crates/ferro-winauth",
     "crates/ferrogate-cli",
 ]
 
 [workspace.package]
-version      = "0.5.0"
+version      = "0.6.0"
 edition      = "2021"
 rust-version = "1.88"
 license      = "Apache-2.0"

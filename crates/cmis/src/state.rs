@@ -21,8 +21,12 @@ use rand_core::{OsRng, RngCore};
 
 use ferro_attest::TpmQuoteVerifier;
 use ferro_audit::AuditLog;
+use ferro_crypto::composite::CompositePublicKey;
 use ferro_raft::{Cluster, NodeRole};
-use ferro_svid::{IssueParams, IssuedSvid, Issuer, LastAttestation};
+use ferro_svid::{
+    child_signing_kid, IssueParams, IssuedSvid, Issuer, Jwk, JwkSet, LastAttestation,
+};
+use parking_lot::RwLock;
 
 use crate::cluster_store;
 use crate::credential::CredentialMaker;
@@ -71,6 +75,10 @@ pub struct CmisState {
     pub config: CmisConfig,
     /// Append-only audit log (Merkle tree + WORM store + STH signer).
     pub audit: AuditLog,
+    /// Verification keys published over the `JWKS` RPC: the issuer's SVID key
+    /// plus the per-host child-token signing keys registered at attestation
+    /// time (feature F09). Process-local — see [`CmisState::register_child_key`].
+    published_keys: RwLock<Vec<Jwk>>,
     backend: Backend,
 }
 
@@ -89,12 +97,14 @@ impl CmisState {
         config: CmisConfig,
         audit: AuditLog,
     ) -> Self {
+        let published_keys = RwLock::new(issuer.jwks().keys);
         Self {
             issuer,
             verifier,
             credential_maker,
             config,
             audit,
+            published_keys,
             backend: Backend::Local(Mutex::new(HashMap::new())),
         }
     }
@@ -110,14 +120,43 @@ impl CmisState {
         audit: AuditLog,
         cluster: Arc<Cluster>,
     ) -> Self {
+        let published_keys = RwLock::new(issuer.jwks().keys);
         Self {
             issuer,
             verifier,
             credential_maker,
             config,
             audit,
+            published_keys,
             backend: Backend::Cluster(cluster),
         }
+    }
+
+    /// The JWK set published over the `JWKS` RPC: the issuer's SVID signing key
+    /// (always first) followed by the host child-token signing keys seen so
+    /// far. Downstream verifiers resolve a child token's header `kid` here.
+    #[must_use]
+    pub fn published_jwks(&self) -> JwkSet {
+        JwkSet {
+            keys: self.published_keys.read().clone(),
+        }
+    }
+
+    /// Publish a host's composite child-token signing key so verifiers can find
+    /// it by `kid`. Idempotent — a key already present (by kid) is left alone,
+    /// so repeated attestations by the same host do not grow the set.
+    ///
+    /// The registry is **process-local**: a verifier must query a replica that
+    /// has witnessed the host's attestation. Persisting `composite_pub` into the
+    /// clustered issued-SVID store so any replica can publish it is a deployment
+    /// seam left for a later slice.
+    pub fn register_child_key(&self, pk: &CompositePublicKey) {
+        let kid = child_signing_kid(pk);
+        let mut keys = self.published_keys.write();
+        if keys.iter().any(|k| k.kid == kid) {
+            return;
+        }
+        keys.push(Jwk::from_public_key(kid, pk));
     }
 
     /// Borrow the local Raft cluster handle, if this state is clustered.

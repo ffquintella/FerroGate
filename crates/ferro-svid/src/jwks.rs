@@ -10,9 +10,24 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ferro_crypto::composite::CompositePublicKey;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Key type marker for FerroGate composite keys.
 pub const COMPOSITE_KTY: &str = "FERROGATE-COMPOSITE";
+
+/// Stable key id for a host's child-token signing key.
+///
+/// The MIA signs child tokens (feature F09) with its host composite SVID key
+/// and stamps this kid into the token header; CMIS publishes the same host key
+/// under the same kid in its JWKS. Deriving the kid deterministically from the
+/// public key — `host-<first 8 bytes of SHA-256(pk_concat) in hex>` — means the
+/// two sides never have to coordinate a name out of band. A divergence between
+/// the minter's `kid` and this function is a bug.
+#[must_use]
+pub fn child_signing_kid(pk: &CompositePublicKey) -> String {
+    let digest = Sha256::digest(pk.to_concat_bytes());
+    format!("host-{}", hex::encode(&digest[..8]))
+}
 
 /// A single composite verification key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

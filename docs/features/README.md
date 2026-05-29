@@ -14,7 +14,7 @@ reviewed in isolation, even though some have ordering dependencies.
 | F06 | [TEE residency and threshold key shares](F06-tee-threshold-keys.md) | CMIS | Not started |
 | F07 | [Merkle-chained immutable audit log](F07-audit-log.md) | CMIS, MIA | M3 subset done |
 | F08 | [Local helper API](F08-helper-api.md) | MIA | Done (UDS + Windows Named Pipe) |
-| F09 | [DPoP-bound child tokens](F09-dpop-child-tokens.md) | MIA | Minter done; CMIS JWKS + verifiers pending |
+| F09 | [DPoP-bound child tokens](F09-dpop-child-tokens.md) | MIA, CMIS | Done (Rust reference verifier; Go port scoped out) |
 | F10 | [RIM and PCR policy management](F10-rim-pcr-policy.md) | CMIS | M2 subset done |
 | F11 | [Revocation and CRL distribution](F11-revocation.md) | CMIS, MIA | Not started |
 | F12 | [MIA process hardening](F12-mia-hardening.md) | MIA | Not started |

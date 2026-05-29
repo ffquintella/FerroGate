@@ -38,15 +38,34 @@ See [../helper-api.md](../helper-api.md) §"Token shape" and
 
 ## Acceptance criteria
 
-- [ ] Tokens validate against the published JWKS with a reference verifier.
-- [ ] `cnf.jkt` matches the supplied DPoP public key thumbprint.
-- [ ] TTL is clamped server-side to ≤ 600 s.
-- [ ] `jti` is unique per token (128-bit random).
-- [ ] Replay test: a token with no DPoP proof is rejected by the third-party
-      verifier sample.
-- [ ] Audit log records `jti` and caller identity but never the token body.
+- [x] Tokens validate against the published JWKS with a reference verifier.
+      (`crates/ferro-child-verify` — `verify`; round-tripped against the real
+      minter in `crates/mia/tests/child_token_verify.rs`.)
+- [x] `cnf.jkt` matches the supplied DPoP public key thumbprint.
+      (`verify_bound` computes the RFC 7638 thumbprint of the presented DPoP
+      proof key and requires equality with the token's `cnf.jkt`.)
+- [x] TTL is clamped server-side to ≤ 600 s. (`ChildTokenMinter::mint` clamps to
+      `MAX_CHILD_TTL_SECS`; landed with F08.)
+- [x] `jti` is unique per token (128-bit random). (`OsRng`-drawn 16 bytes per
+      mint; landed with F08.)
+- [x] Replay test: a token with no DPoP proof is rejected by the third-party
+      verifier sample. (`verify_bound(.., None, ..) → MissingDpopProof`, covered
+      by `token_without_dpop_proof_is_rejected` and the MIA e2e test.)
+- [x] Audit log records `jti` and caller identity but never the token body.
+      (`LocalGrant { pid, uid, bin_sha, jti }` in
+      `crates/mia/src/helper/server/mod.rs`; the JWS is never logged.)
+
+## Reference verifier
+
+`crates/ferro-child-verify` is a self-contained Rust verifier: it re-declares
+the wire schema, validates the composite signature against a CMIS JWK set,
+enforces `exp`, and — via `verify_bound` — the DPoP sender constraint. DPoP
+proofs are Ed25519 (`alg = "EdDSA"`, OKP `jwk`); `verify_dpop_proof` checks the
+proof signature, the `htm`/`htu` binding, and proof freshness.
 
 ## Risks
 
 - **Verifier interop.** Composite `alg` is non-standard at JOSE level today.
-  Mitigation: ship a reference verifier crate and a Go variant.
+  Mitigation: the reference verifier crate (`ferro-child-verify`) ships as the
+  canonical interop target. A Go port was scoped out (no second-language
+  verifier in-tree); third parties on other stacks port from the Rust reference.

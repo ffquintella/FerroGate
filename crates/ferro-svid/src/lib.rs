@@ -46,7 +46,7 @@ pub const NBF_LOOKBACK_SECS: i64 = 60;
 
 pub use claims::{AttestClaims, Cnf, SvidClaims};
 pub use issue::{IssueError, IssueParams, IssuedSvid, Issuer};
-pub use jwks::{Jwk, JwkSet};
+pub use jwks::{child_signing_kid, Jwk, JwkSet};
 pub use lifecycle::{
     decide_renewal, rotation_at, rotation_delay_secs, LastAttestation, ReattestReason,
     RenewalDecision, REATTEST_WINDOW_SECS, ROTATE_FRACTION,

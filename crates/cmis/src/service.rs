@@ -17,6 +17,7 @@ use ferro_attest::{
     credential_secret_matches, verify_aik_signature, PcrSet, QuoteVerification, RejectReason,
 };
 use ferro_audit::{AuditEvent, Hash384};
+use ferro_crypto::composite::CompositePublicKey;
 use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
@@ -227,6 +228,15 @@ async fn run_attest(
         return Err(Status::permission_denied("attestation failed"));
     }
 
+    // Publish the host's composite key so downstream verifiers can validate the
+    // child tokens (F09) the MIA will mint with it. A malformed key here is the
+    // host's problem, not the issuer's — log and continue rather than fail the
+    // attestation, since the SVID itself does not depend on JWKS publication.
+    match CompositePublicKey::from_concat_bytes(&csr.composite_pub) {
+        Ok(pk) => state.register_child_key(&pk),
+        Err(e) => tracing::warn!(error = %e, "could not publish host child-token key"),
+    }
+
     let params = IssueParams {
         ek_cert_sha384: sha384(&init.ek_cert),
         pcr_digest: verified.pcr_digest,
@@ -361,7 +371,7 @@ impl MachineIdentity for MachineIdentitySvc {
     }
 
     async fn jwks(&self, _request: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {
-        let json = serde_json::to_string(&self.state.issuer.jwks())
+        let json = serde_json::to_string(&self.state.published_jwks())
             .map_err(|_| Status::internal("jwks encode"))?;
         Ok(Response::new(JwksResponse { jwks_json: json }))
     }

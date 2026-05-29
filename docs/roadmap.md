@@ -182,10 +182,27 @@ Make the system usable by real applications and operators.
 ### F09 — DPoP-bound child tokens
 
 - [x] Token minter with TTL clamp, `jti`, `cnf.jkt` (landed with F08).
-- [ ] JWKS endpoint on CMIS with multi-key support.
-- [ ] Reference verifier in Rust.
-- [ ] Reference verifier in Go.
-- [ ] Replay/no-DPoP-proof negative tests against the verifier.
+- [x] JWKS endpoint on CMIS with multi-key support. (`CmisState` publishes the
+      issuer SVID key plus each host's composite child-token signing key,
+      registered at phase-4 attestation under a deterministic
+      `ferro_svid::child_signing_kid`; the `JWKS` RPC serves the merged set.)
+- [x] Reference verifier in Rust. (`crates/ferro-child-verify`: composite
+      signature against the JWKS, `exp`, and the RFC 9449 DPoP binding via
+      `verify_bound` / `verify_dpop_proof`, RFC 7638 thumbprint.)
+- [~] ~~Reference verifier in Go.~~ Scoped out — the Rust crate is the canonical
+      interop reference; no second-language verifier ships in-tree.
+- [x] Replay/no-DPoP-proof negative tests against the verifier.
+      (`ferro-child-verify` unit tests + `crates/mia/tests/child_token_verify.rs`:
+      a no-proof bearer token is rejected with `MissingDpopProof`.)
+
+**F09 status: done.** The minter (F08) plus the JWKS multi-key publication, the
+`ferro-child-verify` reference verifier, and the replay/no-DPoP negative tests
+land here and ship in `v0.6.0`. Verified with `cargo test -p ferro-child-verify`,
+`cargo test -p mia --test child_token_verify`, the multi-key assertions in
+`crates/mia/tests/e2e_attest.rs`, and `clippy -D warnings` + `fmt --check`. One
+seam is intentionally left for later: the per-host JWKS registry is process-local
+(a verifier must reach a replica that has seen the host's attestation); making it
+cluster-wide means persisting `composite_pub` in the issued-SVID store.
 
 ### F11 — Revocation and CRL distribution
 

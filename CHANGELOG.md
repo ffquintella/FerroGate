@@ -8,6 +8,39 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [M5.2] — 2026-05-29 — DPoP child-token verification (v0.6.0)
+
+### Added — F09: DPoP-bound child tokens (completion)
+
+- **`ferro-child-verify` crate.** A self-contained Rust reference verifier for
+  the DPoP-bound, composite-signed child tokens minted by the helper API. It
+  re-declares the wire schema, validates the composite (Ed25519 + ML-DSA-65)
+  signature against a CMIS JWK set, and enforces `exp`. `verify_bound` adds the
+  RFC 9449 sender constraint: the caller must present a DPoP proof JWS whose
+  RFC 7638 key thumbprint equals the token's `cnf.jkt`, and that proof must
+  itself verify and match the HTTP request (`htm`/`htu`, freshness). A token
+  presented with **no** DPoP proof is rejected (`MissingDpopProof`) — a captured
+  bearer token cannot be replayed without the DPoP private key. DPoP proofs use
+  Ed25519 (`alg = "EdDSA"`, OKP `jwk`).
+- **Multi-key JWKS on CMIS.** `CmisState` now publishes a set of verification
+  keys — the issuer's SVID key plus each host's composite child-token signing
+  key, registered at phase-4 attestation under a deterministic key id
+  (`ferro_svid::child_signing_kid`, shared with the MIA minter so the two sides
+  never coordinate a name out of band). The `JWKS` RPC serves the merged set.
+  The registry is process-local (a verifier must reach a replica that has seen
+  the host's attestation); cluster-wide publication is a documented follow-up.
+- **Tests.** `ferro-child-verify` unit tests cover the happy path, the no-proof
+  replay rejection, thumbprint/request/freshness mismatches, expiry, unknown
+  kid, and tampered/wrong-key signatures. `crates/mia/tests/child_token_verify.rs`
+  round-trips the *real* `ChildTokenMinter` through the independent verifier, and
+  `crates/mia/tests/e2e_attest.rs` asserts the host child-signing key is
+  published in the JWKS after a full attestation.
+
+### Scoped out
+
+- The originally-planned **Go** reference verifier is dropped: the Rust crate is
+  the canonical interop target and no second-language verifier ships in-tree.
+
 ## [M5.1] — 2026-05-29 — Windows Named Pipe helper transport (v0.5.0)
 
 ### Added — F08: Windows Named Pipe transport for the helper API

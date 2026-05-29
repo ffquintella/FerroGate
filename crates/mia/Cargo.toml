@@ -46,6 +46,7 @@ cmis              = { path = "../cmis" }
 ferro-raft        = { path = "../ferro-raft" }
 ferro-svid        = { path = "../ferro-svid" }
 ferro-svid-verify = { path = "../ferro-svid-verify" }
+ferro-child-verify = { path = "../ferro-child-verify" }
 ferro-attest      = { path = "../ferro-attest" }
 ferro-crypto      = { path = "../ferro-crypto" }
 tokio-stream      = { workspace = true }
@@ -54,6 +55,7 @@ tonic             = { workspace = true }
 rcgen             = { workspace = true }
 p256              = { workspace = true }
 sha2              = { workspace = true }
+ed25519-dalek     = { workspace = true }
 rand_core         = { workspace = true }
 serde_json        = { workspace = true }
 base64            = { workspace = true }

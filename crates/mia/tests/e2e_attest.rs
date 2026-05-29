@@ -328,6 +328,15 @@ async fn attest_issues_svid_that_reference_verifier_accepts() {
     assert_eq!(verified.claims.sub, attested.bundle.spiffe_id);
     assert_eq!(verified.claims.cnf.jkt, "dpop-thumb");
     assert_eq!(verified.claims.attest.policy_id, "test-fleet");
+
+    // F09 multi-key JWKS: attestation also published the host's composite
+    // child-token signing key alongside the issuer key, so a downstream child
+    // token verifier can find it by kid.
+    assert!(jwks.keys.len() >= 2, "issuer + host child-signing key");
+    assert!(
+        jwks.keys.iter().any(|k| k.kid.starts_with("host-")),
+        "host child-signing key published"
+    );
 }
 
 #[tokio::test]
