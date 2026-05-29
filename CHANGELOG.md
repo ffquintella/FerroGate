@@ -8,6 +8,8 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [M5.1] — 2026-05-29 — Windows Named Pipe helper transport (v0.5.0)
+
 ### Added — F08: Windows Named Pipe transport for the helper API
 
 - **`ferro-winauth` crate.** The Windows FFI boundary for caller attestation,
