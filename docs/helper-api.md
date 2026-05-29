@@ -42,9 +42,15 @@ caller's identity from kernel-attested sources:
 
 ### Windows
 
-`GetNamedPipeClientProcessId` plus `NtQueryInformationProcess` give the caller
-PID; `WinVerifyTrust` and Code Integrity catalog hashes provide the
-equivalent of an IMA hash. The allowlist format is identical.
+`GetNamedPipeClientProcessId` gives the caller PID;
+`QueryFullProcessImageNameW` gives its image path (hashed to `bin_sha`,
+`SHA-384`); the process token's user SID RID serves as the allowlist `uid`; and
+`WinVerifyTrust` (Authenticode / Code Integrity) provides the equivalent of the
+IMA cross-check. The allowlist format is identical.
+
+All Windows FFI lives in the `ferro-winauth` crate, so `mia` itself remains
+`#![forbid(unsafe_code)]`. `mia`'s `WindowsCallerAuth` composes those
+primitives into the same `CallerIdentity` the Unix path produces.
 
 Any step failing terminates the request with `permission_denied` and
 appends a `LocalDenied` audit event.

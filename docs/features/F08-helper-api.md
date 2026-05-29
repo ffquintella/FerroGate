@@ -27,7 +27,10 @@ Out:
 
 ## Components touched
 
-- `crates/mia` (helper module).
+- `crates/mia` (helper module: transport-agnostic pipeline + UDS and Named
+  Pipe listeners).
+- `crates/ferro-winauth` (Windows FFI boundary: client PID, image
+  attestation, ACL — keeps `mia` `#![forbid(unsafe_code)]`).
 
 ## Dependencies
 
@@ -55,12 +58,40 @@ Implemented in `crates/mia/src/helper/`:
 - `token` — the DPoP-bound child-token minter (feature F09): a compact JWS
   signed with the host composite SVID key under `ferrogate-child-token-v1`,
   TTL clamped to ≤ 600 s, `jti` a fresh 128-bit value.
-- `server` — the Unix-socket listener wiring it together (Unix only; the
-  Windows Named Pipe variant is still outstanding). `SO_PEERCRED` is read on
-  the async side and the authenticator's blocking work (IMA log,
-  `/proc/<pid>/exe`) runs on the blocking pool, so a large IMA log never stalls
-  a runtime worker. Each connection holds a `Semaphore` permit under a read
-  deadline, so a slow client is reaped rather than starving others.
+- `server` — a transport-agnostic request pipeline (`serve_connection` over any
+  `AsyncRead + AsyncWrite`) plus two listeners: a Unix Domain Socket (`unix`)
+  and a Windows Named Pipe (`windows`). The cheap credential step
+  (`SO_PEERCRED` / `GetNamedPipeClientProcessId`) runs on the async side; the
+  authenticator's blocking work (IMA log + `/proc/<pid>/exe` on Linux; image
+  hashing + Authenticode on Windows) runs on the blocking pool, so it never
+  stalls a runtime worker. Each connection holds a `Semaphore` permit under a
+  read deadline, so a slow client is reaped rather than starving others.
+
+#### Windows transport
+
+The Windows variant listens on `\\.\pipe\ferrogate-mia`, optionally with a DACL
+restricting access to a named local group (`windows_group`, e.g.
+`FerroGateClients`) plus SYSTEM and Administrators. Because `mia` is
+`#![forbid(unsafe_code)]`, **all** Windows FFI lives in the separate
+`ferro-winauth` crate (which has no dependency on `mia`, so there is no cycle):
+
+- `client_process_id` — `GetNamedPipeClientProcessId` on the connected pipe
+  instance;
+- `process_image_path` / `process_user_rid` — `QueryFullProcessImageNameW` and
+  the token user SID's RID (the Windows analogue of a Unix uid in the
+  allowlist);
+- `verify_authenticode` — `WinVerifyTrust`, the Code-Integrity analogue of the
+  IMA cross-check;
+- `create_server_pipe` — the named-pipe instance with the optional group DACL.
+
+`mia`'s `WindowsCallerAuth` composes these (hashing the image with `sha2` on the
+safe side) into a `CallerIdentity`. The allowlist, CBOR protocol, token minter,
+audit pipeline, and concurrency model are shared verbatim with the Unix path.
+
+Because Windows tests cannot run in this environment, the Windows code is
+compile- and clippy-checked by cross-building to `x86_64-pc-windows-gnu`
+(`scripts/win-cross.sh`); the transport-agnostic pipeline is exercised by the
+Unix integration tests.
 
 ### Daemon bring-up
 

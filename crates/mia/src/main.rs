@@ -108,6 +108,7 @@ async fn start_helper_api(socket_path: std::path::PathBuf) -> anyhow::Result<()>
         socket_path: socket_path.clone(),
         socket_mode,
         socket_gid: None,
+        windows_group: None,
         max_concurrent: 64,
         read_timeout: Duration::from_secs(5),
     };

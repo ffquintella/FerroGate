@@ -177,7 +177,7 @@ Make the system usable by real applications and operators.
 - [x] Signed allowlist loader with fail-closed verification.
 - [x] `LocalGrant` / `LocalDenied` audit events.
 - [x] Concurrency / starvation test.
-- [ ] Windows Named Pipe variant.
+- [x] Windows Named Pipe variant.
 
 ### F09 — DPoP-bound child tokens
 

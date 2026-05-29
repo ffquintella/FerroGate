@@ -79,6 +79,19 @@ pub enum AuthError {
         /// PID/UID recovered from peer-cred before the failure, if any.
         partial: Option<(u32, u32)>,
     },
+    /// **Windows.** The caller's image path or user token could not be read.
+    #[error("image-unreadable")]
+    ImageUnreadable {
+        /// PID/UID recovered before the failure, if any.
+        partial: Option<(u32, u32)>,
+    },
+    /// **Windows.** The caller's image failed Authenticode / Code-Integrity
+    /// verification (the analogue of an IMA mismatch).
+    #[error("untrusted-binary")]
+    Untrusted {
+        /// PID/UID recovered before the failure, if any.
+        partial: Option<(u32, u32)>,
+    },
 }
 
 impl AuthError {
@@ -91,6 +104,8 @@ impl AuthError {
             AuthError::ImaUnavailable { .. } => "ima-unavailable",
             AuthError::ImaMissingEntry { .. } => "ima-missing-entry",
             AuthError::ImaMismatch { .. } => "ima-mismatch",
+            AuthError::ImageUnreadable { .. } => "image-unreadable",
+            AuthError::Untrusted { .. } => "untrusted-binary",
         }
     }
 
@@ -103,7 +118,9 @@ impl AuthError {
             AuthError::ExeUnreadable { partial }
             | AuthError::ImaUnavailable { partial }
             | AuthError::ImaMissingEntry { partial }
-            | AuthError::ImaMismatch { partial } => *partial,
+            | AuthError::ImaMismatch { partial }
+            | AuthError::ImageUnreadable { partial }
+            | AuthError::Untrusted { partial } => *partial,
         }
     }
 }
@@ -189,6 +206,83 @@ pub enum MismatchOutcome {
     Missing,
 }
 
+#[cfg(windows)]
+pub use windows_auth::WindowsCallerAuth;
+
+#[cfg(windows)]
+mod windows_auth {
+    use super::{AuthError, CallerAuth, CallerIdentity, PeerCred};
+    use sha2::{Digest, Sha384};
+
+    /// The production Windows caller authenticator.
+    ///
+    /// From the client PID (supplied in [`PeerCred`] by the named-pipe
+    /// transport via `GetNamedPipeClientProcessId`), it resolves the caller's
+    /// image path and user-token RID, hashes the image (`SHA-384`, the
+    /// allowlist's `bin_sha`), and — when configured — requires the image to
+    /// pass Authenticode / Code-Integrity verification. All FFI lives in the
+    /// `ferro-winauth` crate so `mia` stays `#![forbid(unsafe_code)]`.
+    pub struct WindowsCallerAuth {
+        require_authenticode: bool,
+    }
+
+    impl WindowsCallerAuth {
+        /// Require a valid Authenticode signature on the caller's image.
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                require_authenticode: true,
+            }
+        }
+
+        /// Skip the Authenticode check (identity by PID + image hash + RID
+        /// only). For environments without code-signing.
+        #[must_use]
+        pub fn without_authenticode() -> Self {
+            Self {
+                require_authenticode: false,
+            }
+        }
+    }
+
+    impl Default for WindowsCallerAuth {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl CallerAuth for WindowsCallerAuth {
+        fn identify(&self, cred: PeerCred) -> Result<CallerIdentity, AuthError> {
+            let pid = cred.pid.ok_or(AuthError::PeerCredUnavailable)?;
+            let partial = Some((pid, 0));
+
+            let path = ferro_winauth::process_image_path(pid)
+                .map_err(|_| AuthError::ImageUnreadable { partial })?;
+            let bytes = std::fs::read(&path).map_err(|_| AuthError::ImageUnreadable { partial })?;
+            let bin_sha: [u8; 48] = Sha384::digest(&bytes).into();
+
+            let uid = ferro_winauth::process_user_rid(pid)
+                .map_err(|_| AuthError::ImageUnreadable { partial })?;
+            let partial = Some((pid, uid));
+
+            if self.require_authenticode {
+                let trusted = ferro_winauth::verify_authenticode(&path)
+                    .map_err(|_| AuthError::Untrusted { partial })?;
+                if !trusted {
+                    return Err(AuthError::Untrusted { partial });
+                }
+            }
+
+            Ok(CallerIdentity {
+                pid,
+                uid,
+                gid: 0, // not meaningful on Windows
+                bin_sha,
+            })
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::ImaCallerAuth;
 
@@ -199,8 +293,7 @@ mod linux {
     use std::path::PathBuf;
 
     /// Default location of the IMA runtime measurement log.
-    pub(crate) const DEFAULT_IMA_LOG: &str =
-        "/sys/kernel/security/ima/binary_runtime_measurements";
+    pub(crate) const DEFAULT_IMA_LOG: &str = "/sys/kernel/security/ima/binary_runtime_measurements";
 
     /// The production caller authenticator: `SO_PEERCRED` + IMA cross-check.
     pub struct ImaCallerAuth {

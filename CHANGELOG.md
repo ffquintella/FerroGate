@@ -8,6 +8,31 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added — F08: Windows Named Pipe transport for the helper API
+
+- **`ferro-winauth` crate.** The Windows FFI boundary for caller attestation,
+  kept separate so `mia` stays `#![forbid(unsafe_code)]` (the crate has no
+  dependency on `mia`, so there is no cycle). Safe wrappers over
+  `GetNamedPipeClientProcessId` (client PID), `QueryFullProcessImageNameW`
+  (image path), the token user SID's RID (the Windows analogue of a uid),
+  `WinVerifyTrust` (Authenticode / Code-Integrity, the IMA-cross-check
+  analogue), and named-pipe creation with an optional group-restricted DACL.
+- **Transport-agnostic server pipeline.** `helper::server` is refactored so the
+  request pipeline (`serve_connection` over any `AsyncRead + AsyncWrite`,
+  authenticate → authorize → mint → audit) is shared, with a Unix Domain Socket
+  listener (`server::unix`) and a Windows Named Pipe listener
+  (`server::windows`). The cheap credential step runs on the async side; the
+  authenticator's blocking work runs on the blocking pool on both platforms.
+- **`WindowsCallerAuth`.** Composes the `ferro-winauth` primitives (plus
+  `sha2` image hashing on the safe side) into a `CallerIdentity`; new
+  `AuthError::ImageUnreadable` / `Untrusted` opcodes describe Windows failures.
+  The pipe binds `\\.\pipe\ferrogate-mia` with an optional `FerroGateClients`
+  DACL (`HelperServerConfig::windows_group`).
+- **Cross-build tooling.** `docker/win-cross.Dockerfile` + `scripts/win-cross.sh`
+  compile- and clippy-check the `x86_64-pc-windows-gnu` target from a
+  Linux/macOS host (Windows tests cannot run here; the shared pipeline is
+  covered by the Unix integration tests).
+
 ## [M5] — 2026-05-29 — Local helper API and DPoP child tokens (v0.4.0)
 
 ### Added — F08: Local helper API (with the F09 child-token minter)

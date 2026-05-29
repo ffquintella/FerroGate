@@ -1,0 +1,32 @@
+[package]
+name        = "ferro-winauth"
+description = "FerroGate — Windows caller-attestation FFI for the MIA helper API"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lib]
+name = "ferro_winauth"
+path = "src/lib.rs"
+
+# This crate is the FFI boundary for the Windows helper-API transport. Unlike
+# `mia` (which is `#![forbid(unsafe_code)]`), it permits `unsafe` — see the
+# crate-level `#![allow(unsafe_code)]`. Everything is gated on `cfg(windows)`;
+# on other targets the crate compiles to an empty library.
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+tokio       = { workspace = true }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+] }

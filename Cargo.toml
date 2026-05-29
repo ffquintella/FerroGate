@@ -11,6 +11,7 @@ members = [
     "crates/ferro-svid",
     "crates/ferro-svid-verify",
     "crates/ferro-tee",
+    "crates/ferro-winauth",
     "crates/ferrogate-cli",
 ]
 

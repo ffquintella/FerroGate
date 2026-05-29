@@ -1558,6 +1558,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-winauth"
+version = "0.4.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "ferrogate-cli"
 version = "0.4.0"
 dependencies = [
@@ -2646,6 +2654,7 @@ dependencies = [
  "ferro-raft",
  "ferro-svid",
  "ferro-svid-verify",
+ "ferro-winauth",
  "futures",
  "hex",
  "p256",

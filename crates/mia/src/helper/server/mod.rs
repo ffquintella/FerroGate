@@ -1,10 +1,19 @@
-//! The helper-API server: a Unix-domain-socket listener that authenticates
-//! local callers and mints DPoP-bound child tokens.
+//! The helper-API server: a local-IPC listener that authenticates callers and
+//! mints DPoP-bound child tokens.
 //!
-//! Concurrency model: the accept loop spawns one task per connection, each
-//! holding a permit from a bounded [`Semaphore`]. A per-connection read
-//! deadline ([`HelperServerConfig::read_timeout`]) means an idle or slow client
-//! releases its permit promptly, so it cannot starve well-behaved callers.
+//! The transport differs by platform — a Unix Domain Socket on Unix
+//! ([`unix`]), a Named Pipe on Windows ([`windows`]) — but the request pipeline
+//! is identical and lives here:
+//!
+//! 1. read one length-delimited CBOR request frame under a deadline;
+//! 2. establish caller identity from kernel-attested credentials (the cheap
+//!    `SO_PEERCRED` / `GetNamedPipeClientProcessId` step happens on the async
+//!    side; the authenticator's blocking work runs on the blocking pool);
+//! 3. authorize against the signed allowlist and mint, or refuse.
+//!
+//! Concurrency model: one task per connection, each holding a permit from a
+//! bounded [`Semaphore`], under a per-connection read deadline so a slow or
+//! idle client releases its permit promptly and cannot starve others.
 //!
 //! Audit contract: **every decoded request produces exactly one audit event**
 //! (`LocalGrant` on success, `LocalDenied` otherwise). A connection that never
@@ -13,21 +22,30 @@
 //! (`audit_client`) drains them to CMIS, decoupling minting latency from the
 //! audit network path.
 
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ferro_audit::{AuditEvent, Bytes16, Hash384};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, RwLock};
 
 use crate::helper::allowlist::Allowlist;
 use crate::helper::auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
 use crate::helper::proto::{self, ChildToken, ErrorCode, HelperReq, HelperResp};
 use crate::helper::token::ChildTokenMinter;
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::HelperServer;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::HelperServer;
 
 /// A monotonic-enough wall clock returning Unix seconds. Injectable for tests.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -42,15 +60,20 @@ pub fn system_clock() -> Clock {
     })
 }
 
-/// Server configuration.
+/// Server configuration. A single struct serves both transports; fields that
+/// do not apply to a platform are ignored there (documented per field).
 #[derive(Debug, Clone)]
 pub struct HelperServerConfig {
-    /// Filesystem path of the listening socket.
+    /// Listening address: the UDS path on Unix, or the pipe name on Windows
+    /// (e.g. `\\.\pipe\ferrogate-mia`).
     pub socket_path: PathBuf,
-    /// Permission bits applied to the socket (e.g. `0o660`).
+    /// **Unix only.** Permission bits applied to the socket (e.g. `0o660`).
     pub socket_mode: u32,
-    /// Optional gid to `chown` the socket to (the `ferrogate-clients` group).
+    /// **Unix only.** Optional gid to `chown` the socket to.
     pub socket_gid: Option<u32>,
+    /// **Windows only.** Local group whose members may open the pipe (e.g.
+    /// `FerroGateClients`). `None` ⇒ the pipe's default DACL applies.
+    pub windows_group: Option<String>,
     /// Maximum number of connections served concurrently.
     pub max_concurrent: usize,
     /// Per-connection deadline for receiving the request frame.
@@ -60,9 +83,13 @@ pub struct HelperServerConfig {
 impl Default for HelperServerConfig {
     fn default() -> Self {
         Self {
+            #[cfg(unix)]
             socket_path: PathBuf::from("/run/ferrogate/mia.sock"),
+            #[cfg(windows)]
+            socket_path: PathBuf::from(r"\\.\pipe\ferrogate-mia"),
             socket_mode: 0o660,
             socket_gid: None,
+            windows_group: None,
             max_concurrent: 64,
             read_timeout: Duration::from_secs(5),
         }
@@ -72,7 +99,7 @@ impl Default for HelperServerConfig {
 /// Setup / bind failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    /// Binding, permission, or ownership setup on the socket failed.
+    /// Binding, permission, or ownership setup on the listener failed.
     #[error("socket setup: {0}")]
     Socket(#[from] std::io::Error),
 }
@@ -88,98 +115,25 @@ struct Shared<A: CallerAuth> {
     clock: Clock,
 }
 
-/// The helper-API server.
-pub struct HelperServer<A: CallerAuth> {
-    listener: UnixListener,
-    config: HelperServerConfig,
-    shared: Arc<Shared<A>>,
-}
-
-impl<A: CallerAuth> HelperServer<A> {
-    /// Bind the socket with the configured permissions and prepare to serve.
-    ///
-    /// Any existing file at `socket_path` is removed first (a stale socket from
-    /// a previous run). The socket is created, then its mode (and optionally
-    /// its group owner) is set before any client can connect.
-    pub fn bind(
-        config: HelperServerConfig,
-        auth: A,
-        minter: Option<ChildTokenMinter>,
-        allowlist: Option<Allowlist>,
-        audit_tx: mpsc::Sender<AuditEvent>,
-        clock: Clock,
-    ) -> Result<Self, ServerError> {
-        match std::fs::remove_file(&config.socket_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(ServerError::Socket(e)),
-        }
-        let listener = UnixListener::bind(&config.socket_path)?;
-
-        let perms = std::fs::Permissions::from_mode(config.socket_mode);
-        std::fs::set_permissions(&config.socket_path, perms)?;
-        if let Some(gid) = config.socket_gid {
-            std::os::unix::fs::chown(&config.socket_path, None, Some(gid))?;
-        }
-
-        Ok(Self {
-            listener,
-            config,
-            shared: Arc::new(Shared {
-                auth,
-                minter,
-                allowlist: RwLock::new(allowlist),
-                audit_tx,
-                clock,
-            }),
-        })
-    }
-
-    /// Replace the live allowlist (e.g. after a signed refresh from CMIS).
-    pub async fn set_allowlist(&self, allowlist: Option<Allowlist>) {
-        *self.shared.allowlist.write().await = allowlist;
-    }
-
-    /// Serve until `shutdown` resolves. Accepted connections in flight are not
-    /// forcibly cancelled, but no new connections are accepted afterwards.
-    pub async fn serve_with_shutdown<F>(self, shutdown: F)
-    where
-        F: std::future::Future<Output = ()>,
-    {
-        let sem = Arc::new(Semaphore::new(self.config.max_concurrent));
-        let read_timeout = self.config.read_timeout;
-        tokio::pin!(shutdown);
-        loop {
-            tokio::select! {
-                () = &mut shutdown => break,
-                accepted = self.listener.accept() => {
-                    let Ok((stream, _addr)) = accepted else { continue };
-                    let shared = Arc::clone(&self.shared);
-                    let sem = Arc::clone(&sem);
-                    tokio::spawn(async move {
-                        // Hold a permit for the connection's lifetime. The read
-                        // deadline bounds how long a slow client can hold it.
-                        let Ok(_permit) = sem.acquire().await else { return };
-                        handle_conn(shared, stream, read_timeout).await;
-                    });
-                }
-            }
-        }
-    }
-
-    /// The bound socket path (for diagnostics / tests).
-    #[must_use]
-    pub fn socket_path(&self) -> &std::path::Path {
-        &self.config.socket_path
+impl<A: CallerAuth> Shared<A> {
+    async fn set_allowlist(&self, allowlist: Option<Allowlist>) {
+        *self.allowlist.write().await = allowlist;
     }
 }
 
-/// Drive one client connection through the request/response exchange.
-async fn handle_conn<A: CallerAuth>(
-    shared: Arc<Shared<A>>,
-    mut stream: UnixStream,
+/// Drive one already-accepted connection through the request/response exchange.
+///
+/// `cred` is the caller's `SO_PEERCRED` / named-pipe credentials, read cheaply
+/// on the async side before this is called (or an error if that failed).
+async fn serve_connection<A, S>(
+    shared: &Arc<Shared<A>>,
+    mut stream: S,
+    cred: Result<PeerCred, AuthError>,
     read_timeout: Duration,
-) {
+) where
+    A: CallerAuth,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Read the single request frame under a deadline. A timeout or framing
     // error is not a "request" — drop the connection without an audit event.
     let req: HelperReq =
@@ -188,28 +142,25 @@ async fn handle_conn<A: CallerAuth>(
             Ok(Err(_)) | Err(_) => return,
         };
 
-    // Read SO_PEERCRED on the async side (a cheap, non-blocking syscall), then
-    // run the authenticator's blocking filesystem work (IMA log,
-    // `/proc/<pid>/exe`) on the blocking pool so it never stalls a runtime
-    // worker thread.
-    let Ok(ucred) = stream.peer_cred() else {
-        let resp = process_request(&shared, Err(AuthError::PeerCredUnavailable), &req).await;
-        let _ = proto::write_frame(&mut stream, &resp).await;
-        return;
-    };
-    let cred = PeerCred {
-        pid: ucred.pid().and_then(|p| u32::try_from(p).ok()),
-        uid: ucred.uid(),
-        gid: ucred.gid(),
+    let cred = match cred {
+        Ok(cred) => cred,
+        Err(e) => {
+            let resp = process_request(shared, Err(e), &req).await;
+            let _ = proto::write_frame(&mut stream, &resp).await;
+            return;
+        }
     };
 
-    let auth_shared = Arc::clone(&shared);
+    // The authenticator's blocking work (IMA log / `/proc` on Unix; image
+    // hashing on Windows) runs on the blocking pool so it never stalls a
+    // runtime worker thread.
+    let auth_shared = Arc::clone(shared);
     let Ok(id_result) = tokio::task::spawn_blocking(move || auth_shared.auth.identify(cred)).await
     else {
         // The authenticator task panicked. Fail closed, but still record
         // exactly one audit event so the request is accounted for.
         deny(
-            &shared,
+            shared,
             cred.pid.unwrap_or(0),
             cred.uid,
             [0u8; 48],
@@ -220,7 +171,7 @@ async fn handle_conn<A: CallerAuth>(
         return;
     };
 
-    let resp = process_request(&shared, id_result, &req).await;
+    let resp = process_request(shared, id_result, &req).await;
     // Best-effort reply; the audit event has already been recorded.
     let _ = proto::write_frame(&mut stream, &resp).await;
 }

@@ -64,6 +64,11 @@ base64            = { workspace = true }
 tss-esapi = { workspace = true }
 ring      = { workspace = true }
 
+# The Windows named-pipe helper transport delegates all FFI (client PID, image
+# attestation, ACL) to `ferro-winauth`, keeping `mia` itself `forbid(unsafe)`.
+[target.'cfg(windows)'.dependencies]
+ferro-winauth = { path = "../ferro-winauth" }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 hex          = { workspace = true }
 sha2         = { workspace = true }
