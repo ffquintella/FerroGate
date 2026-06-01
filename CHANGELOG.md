@@ -8,6 +8,72 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [M6.0] — 2026-06-01 — Root key ceremony and rotation (v0.11.0)
+
+### Added — F14: Root key ceremony and rotation
+
+- **`crates/ferro-ceremony` — air-gapped ceremony library.** New
+  `#![forbid(unsafe_code)]` crate holding the offline primitives the ceremony
+  tool wires together. None of it touches the network; every artefact is
+  auditable JSON.
+  - `media` — **sealed transport media**. `SealedShareSet::seal` reuses the
+    `ferro-tee` 3-of-5 GF(2⁸) Shamir split of the 32-byte root seed and wraps
+    each share in a `SealedShare` envelope: a `SHA3-256` tamper-evidence tag
+    over the canonical fields (root kid, threshold, index, holder, created-at,
+    share bytes), one per holder. `combine` reconstructs into a `Zeroizing`
+    buffer after checking every envelope's integrity and that they agree on
+    root/threshold/total. Confidentiality rests on the threshold plus physical
+    custody — the envelope is integrity + labelling, not encryption (the online
+    F06 `ferro_tee::seal` path is where shares are measurement-bound).
+  - `crosssign` — **both directions**. `CrossSignBundle::create` produces
+    old-signs-new *and* new-signs-old composite signatures over a
+    domain-separated transcript (`ferrogate-root-crosssign-v1`) binding both
+    kids, both public keys, and the `[start, start+90d)` window; `verify`
+    requires both directions, so a signature can't be lifted onto another key
+    pair or replayed into another window.
+  - `minutes` — **signed by all participants**. `SignedMinutes` accumulates one
+    composite signature per listed `Participant` over the canonical body
+    (including artefact `SHA3-256` digests); `verify_all` passes only when every
+    participant has signed and rejects signatures from unlisted signers. The
+    verified JSON is anchored to the audit WORM medium.
+  - `destruction` — **post-zeroization verification**. `destroy_media`
+    overwrites a sealed-share medium in place with zeros, `fsync`s, then reads
+    it back, failing unless every byte is zero *and* the bytes no longer parse
+    as a usable share; returns an auditable `DestructionRecord`.
+    `verify_destruction` re-audits a destroyed medium standalone.
+- **`tools/offline-signer` — the ceremony CLI.** New air-gapped binary with
+  `keygen` / `pubkey` / `split` / `combine` / `cross-sign` / `verify-cross` /
+  `jwks` / `minutes-new` / `minutes-sign` / `minutes-verify` / `destroy` /
+  `verify-destruction` / `dry-run` subcommands, mirroring the `fleet-manifest`
+  CLI conventions (`@file` value resolution, `--out`/stdout). `dry-run` runs the
+  full eight-step rotation against a scratch directory with five synthetic
+  operators — the executable form of the staging dry-run.
+- **CMIS JWKS multi-key with "newer preferred" ordering.** `ferro_svid::Jwk`
+  carries an optional `x-ferrogate-created` stamp (omitted on the wire when
+  unset); `JwkSet::preferred()` — in both `ferro-svid` and the reference
+  `ferro-svid-verify` — selects the newest key. `CmisState::register_root_key`
+  publishes the incoming root for the cross-sign window, and `published_jwks`
+  now orders roots newest-first ahead of the per-host child keys, all still
+  resolvable by `kid`. SVID verification is unchanged (still by header `kid`);
+  the ordering only affects trust-anchor choice during the window.
+- **Operations runbook.** New `docs/operations/root-key-ceremony.md` with the
+  step-by-step operator procedure, artefact formats, the destruction read-back,
+  failure/recovery notes, and the recorded staging dry-run.
+
+### Verification
+
+`cargo test --workspace` (15 `ferro-ceremony` unit tests across
+media/crosssign/minutes/destruction; the 2 `offline-signer` CLI integration
+tests including the end-to-end `dry-run`; the `cmis` `root_rotation` integration
+test) and `cargo clippy --workspace --all-targets`, alongside the existing
+F01–F13 suites.
+
+### Not yet supported
+
+- **Online emergency rotation.** Deliberately out of scope — a separate,
+  off-the-happy-path runbook. F14 covers only the planned annual rotation and
+  periodic share refresh.
+
 ## [M5.6] — 2026-06-01 — RIM epoch bump and signed RIM refresh wiring (v0.10.0)
 
 ### Added — F10 (continued): RIM and PCR policy

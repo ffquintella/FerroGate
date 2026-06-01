@@ -18,8 +18,8 @@ reviewed in isolation, even though some have ordering dependencies.
 | F10 | [RIM and PCR policy management](F10-rim-pcr-policy.md) | CMIS | M2 subset done |
 | F11 | [Revocation and CRL distribution](F11-revocation.md) | CMIS, MIA | Done (composite-signed CRL in JWKS; MIA fail-closed gate) |
 | F12 | [MIA process hardening](F12-mia-hardening.md) | MIA | Done (mlockall/seccomp/cap-drop/IMA via ferro-harden) |
-| F13 | [Zero-touch bootstrap and fleet enrollment](F13-bootstrap-enrollment.md) | CMIS, MIA | Not started |
-| F14 | [Root key ceremony and rotation](F14-root-key-ceremony.md) | CMIS, offline | Not started |
+| F13 | [Zero-touch bootstrap and fleet enrollment](F13-bootstrap-enrollment.md) | CMIS, MIA | Done (fleet-manifest tool; pre-admission EK lookup) |
+| F14 | [Root key ceremony and rotation](F14-root-key-ceremony.md) | CMIS, offline | Done (offline-signer + ferro-ceremony; JWKS newer-preferred; staging dry-run) |
 
 For the planned ordering and progress tracking see
 [../roadmap.md](../roadmap.md).
