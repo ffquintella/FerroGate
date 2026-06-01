@@ -9,15 +9,33 @@
    manifest on startup and refreshes it from a signed S3 object.
 3. **First boot.** The MIA reads the EK certificate and connects to CMIS
    over hybrid-PQC TLS (server-auth only; the client has no identity yet).
-4. **Pre-admission check.** CMIS verifies the EK chain to a vendor root, then
-   looks up `SHA-384(ek_cert)` in the fleet manifest. Unknown hosts are
-   rejected without proceeding to phase 2.
+4. **Pre-admission check.** CMIS looks up `SHA-384(ek_cert)` in the active
+   fleet manifest *before* any TPM verification work runs. Unknown hosts are
+   rejected immediately (`HostRejected` audit event); enrolled hosts are logged
+   (`HostEnrolled`) and proceed. The EK chain to a vendor root is then verified
+   as part of phase 2 quote validation.
 5. **Attestation.** Protocol phases 2–4 run; on success the SVID is delivered
    and the MIA seals it to PCRs `{0, 4, 7, 8}`.
 
 There is no shared secret or pre-distributed credential between the host and
 CMIS at any point. The whole bootstrap is anchored in the vendor signature
 on the EK cert.
+
+### Operating the fleet manifest
+
+- **Build and sign** with the offline `fleet-manifest` tool. `keygen` derives a
+  publisher keypair from a 32-byte master seed (keep the seed air-gapped; only
+  it is secret). `new` / `add` / `remove` edit an unsigned manifest; `sign`
+  emits the composite-signed bundle; `verify` / `show` inspect it.
+- **Configure CMIS** with `CMIS_FLEET_MANIFEST` (path to the signed bundle),
+  `CMIS_FLEET_SIGNER_KID`, and `CMIS_FLEET_SIGNER_PUB` (the publisher public key
+  as concat-bytes hex, printed by `keygen`). With `CMIS_FLEET_MANIFEST` unset,
+  enrolment is **unenforced** and every host that can attest is admitted. A
+  configured-but-unloadable manifest aborts startup (fail-closed).
+- **Refreshes are atomic.** A newer manifest is verified and hot-swapped under a
+  write lock, so in-flight attestations see a consistent enrolment snapshot. The
+  current file-watcher stands in for the signed-S3 refresh (M5 follow-on), which
+  reuses the same verify-then-swap path.
 
 ## SVID rotation
 

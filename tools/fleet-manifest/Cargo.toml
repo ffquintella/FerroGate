@@ -1,0 +1,26 @@
+[package]
+name        = "fleet-manifest"
+description = "FerroGate — offline fleet-manifest signing tool (F13)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[[bin]]
+name = "fleet-manifest"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+cmis         = { path = "../../crates/cmis" }
+ferro-attest = { path = "../../crates/ferro-attest" }
+ferro-crypto = { path = "../../crates/ferro-crypto" }
+
+anyhow     = { workspace = true }
+serde_json = { workspace = true }
+hex        = { workspace = true }
+rand_core  = { workspace = true }

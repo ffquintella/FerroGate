@@ -39,15 +39,21 @@ See [../operations.md](../operations.md) §"Bootstrapping a new host".
 
 ## Acceptance criteria
 
-- [ ] Fleet manifest verifies under the offline root key; tampered manifests
-      are refused.
-- [ ] Host with EK cert in the manifest succeeds end-to-end.
-- [ ] Host with EK cert *not* in the manifest is rejected before any TPM
-      verification work runs.
-- [ ] Manifest refresh from S3 is atomic; in-flight attestations see a
-      consistent snapshot.
-- [ ] CLI tool can add and remove EK hashes and produce a properly signed
-      bundle.
+- [x] Fleet manifest verifies under the offline root key; tampered manifests
+      are refused. (`SignedFleetManifest::verify`;
+      `tampered_manifest_fails_signature`, `unknown_kid_is_refused_before_crypto`.)
+- [x] Host with EK cert in the manifest succeeds end-to-end.
+      (`enrolled_host_attests_end_to_end`.)
+- [x] Host with EK cert *not* in the manifest is rejected before any TPM
+      verification work runs. (`unenrolled_host_is_rejected_before_quote_verification`
+      asserts a single `HostRejected` leaf — no `AttestStart`.)
+- [x] Manifest refresh is atomic; in-flight attestations see a consistent
+      snapshot. (`FleetStore` swaps an `Arc<EnrolledHosts>` under a write lock;
+      `apply_swaps_snapshot_atomically`. The signed-S3 source reuses the
+      loader's verify-then-swap path; the file watcher is the M5 stand-in.)
+- [x] CLI tool can add and remove EK hashes and produce a properly signed
+      bundle. (`fleet-manifest` `add`/`remove`/`sign`;
+      `full_lifecycle_keygen_edit_sign_verify`.)
 
 ## Risks
 

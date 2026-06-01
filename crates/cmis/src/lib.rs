@@ -14,11 +14,17 @@
 pub mod cluster_store;
 pub mod credential;
 pub mod crl_publisher;
+pub mod fleet_manifest;
+pub mod fleet_watcher;
 pub mod pcr;
 pub mod rim_watcher;
 pub mod service;
 pub mod state;
 
 pub use credential::{CredentialError, CredentialMaker, WrappedCredential};
+pub use fleet_manifest::{
+    EnrolledHosts, EnrollmentDecision, FleetManifest, FleetManifestLoader, FleetStore,
+    SignedFleetManifest,
+};
 pub use service::MachineIdentitySvc;
 pub use state::{CmisConfig, CmisState, IssuedRecord};

@@ -8,6 +8,38 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [M5.5] — 2026-06-01 — Zero-touch bootstrap and fleet enrollment (v0.9.0)
+
+### Added — F13: Zero-touch bootstrap and fleet enrollment
+
+- **Fleet manifest format (`cmis::fleet_manifest`).** `FleetManifest` enumerates
+  the SHA-384 of every approved EK certificate; it is only ever applied as a
+  `SignedFleetManifest` — a composite (Ed25519 + ML-DSA-65) signature over the
+  manifest's canonical JSON under the new `ferrogate-fleet-v1` domain context,
+  carried by a trusted publisher key. Mirrors the F10 `SignedRimBundle` shape.
+- **Live enrolment store + loader.** `EnrolledHosts` is the lookup-optimised
+  (48-byte hash set) resolution of a manifest; `FleetStore` holds it behind an
+  `RwLock<Arc<…>>` so a refresh swaps the `Arc` under the write lock and an
+  in-flight `Attest` that took a snapshot sees a consistent set for the whole
+  handshake. `FleetManifestLoader` reads, verifies, and hot-swaps a strictly
+  newer manifest; `fleet_watcher::spawn` polls it. The signed-S3 refresh reuses
+  the loader's verify-then-swap path.
+- **Pre-admission lookup in `Attest`.** `CmisState::check_enrollment` runs on
+  the phase-2 EK-cert hash *before* any TPM quote verification. With no manifest
+  configured it is a no-op (every host admitted, as before F13); once a manifest
+  is loaded an un-enrolled host is refused at the cheapest possible point.
+  `cmis` `main` loads `CMIS_FLEET_MANIFEST` fail-closed (a configured-but-broken
+  manifest aborts startup) using `CMIS_FLEET_SIGNER_KID` / `CMIS_FLEET_SIGNER_PUB`.
+- **Audit events `HostEnrolled` / `HostRejected`** added to
+  `ferro_audit::AuditEvent` (EK hash plus, for rejection, a stable opcode).
+- **`fleet-manifest` CLI (`tools/fleet-manifest`).** Offline tool with
+  `keygen`/`new`/`add`/`remove`/`sign`/`verify`/`show`. The publisher key is
+  derived deterministically from a 32-byte master seed, so only the seed is
+  secret at rest — backed by the new `CompositeSecretKey::from_seed` in
+  `ferro-crypto` (independent SHA3-keyed sub-seeds for the two halves; the
+  expanded private key is never serialized). Production root-key handling stays
+  the F14 ceremony's job.
+
 ## [M5.4] — 2026-05-29 — MIA process hardening (v0.8.0)
 
 ### Added — F12: MIA process hardening

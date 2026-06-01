@@ -34,6 +34,7 @@ use ferro_svid::{
 };
 use sha2::{Digest, Sha384};
 
+use crate::fleet_manifest::EnrollmentDecision;
 use crate::pcr::aggregate_digest;
 use crate::state::{CmisState, IssuedRecord};
 
@@ -185,6 +186,31 @@ async fn run_attest(
         audit_fail(&state, "init-expected", now);
         return Err(Status::invalid_argument("expected attest init"));
     };
+
+    // F13 pre-admission: gate the host on the offline-signed fleet manifest
+    // *before* any TPM verification work runs. The EK-cert hash is the only
+    // input. With no manifest configured this is a no-op; once one is loaded an
+    // un-enrolled host is refused here, the cheapest possible point.
+    let ek_sha = Hash384(sha384(&init.ek_cert));
+    match state.check_enrollment(&ek_sha.0) {
+        EnrollmentDecision::Rejected => {
+            tracing::warn!("pre-admission: EK not in fleet manifest");
+            audit_record(
+                &state,
+                AuditEvent::HostRejected {
+                    ek_sha,
+                    reason: "not-enrolled".to_string(),
+                },
+                now,
+            );
+            return Err(Status::permission_denied("attestation failed"));
+        }
+        EnrollmentDecision::Enrolled => {
+            audit_record(&state, AuditEvent::HostEnrolled { ek_sha }, now);
+        }
+        // No manifest configured — nothing to record; proceed as pre-F13.
+        EnrollmentDecision::NotEnforced => {}
+    }
 
     let mut pcrs = PcrSet::new();
     for pv in &init.pcr_values {

@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 
 use crate::cluster_store;
 use crate::credential::CredentialMaker;
+use crate::fleet_manifest::{EnrollmentDecision, FleetStore};
 
 /// Static issuance policy for a CMIS instance.
 #[derive(Debug, Clone)]
@@ -87,6 +88,11 @@ pub struct CmisState {
     /// [`CmisState::revoke`]).
     revocations: Mutex<Revocations>,
     published_crl: RwLock<Option<SignedCrl>>,
+    /// The live fleet-enrolment set consulted at the start of `Attest`
+    /// (feature F13). Defaults to *unenforced* — every host is admitted — until
+    /// a signed manifest is loaded via the [`FleetStore`] handle, so a CMIS with
+    /// no manifest configured behaves exactly as it did pre-F13.
+    fleet: FleetStore,
     backend: Backend,
 }
 
@@ -123,6 +129,7 @@ impl CmisState {
             published_keys,
             revocations: Mutex::new(Revocations::default()),
             published_crl: RwLock::new(None),
+            fleet: FleetStore::unenforced(),
             backend: Backend::Local(Mutex::new(HashMap::new())),
         }
     }
@@ -148,8 +155,29 @@ impl CmisState {
             published_keys,
             revocations: Mutex::new(Revocations::default()),
             published_crl: RwLock::new(None),
+            fleet: FleetStore::unenforced(),
             backend: Backend::Cluster(cluster),
         }
+    }
+
+    /// Borrow the fleet-enrolment store handle (feature F13). Clone it to hand
+    /// to a [`crate::fleet_manifest::FleetManifestLoader`]; a manifest applied
+    /// through that loader is immediately visible to [`check_enrollment`].
+    ///
+    /// [`check_enrollment`]: CmisState::check_enrollment
+    #[must_use]
+    pub fn fleet(&self) -> &FleetStore {
+        &self.fleet
+    }
+
+    /// Decide whether a host presenting EK-cert hash `ek_sha` is admitted to the
+    /// attestation handshake. With no manifest configured this is always
+    /// [`EnrollmentDecision::NotEnforced`]; once a signed manifest is loaded an
+    /// un-enrolled host is [`EnrollmentDecision::Rejected`] before any TPM
+    /// verification work runs.
+    #[must_use]
+    pub fn check_enrollment(&self, ek_sha: &[u8; 48]) -> EnrollmentDecision {
+        self.fleet.decide(ek_sha)
     }
 
     /// The JWK set published over the `JWKS` RPC: the issuer's SVID signing key

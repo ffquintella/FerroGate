@@ -637,3 +637,68 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
         &cons_path,
     ));
 }
+
+// --- F13: fleet enrolment pre-admission -------------------------------------
+
+/// Apply an enforcing fleet manifest to `state` enrolling exactly the given EK
+/// certificates (by their SHA-384).
+fn enroll_eks(state: &CmisState, ek_certs: &[&[u8]]) {
+    let manifest = cmis::FleetManifest {
+        version: 1,
+        trust_domain: "ferrogate.test".to_string(),
+        issued_at: 0,
+        enrolled_ek_sha384: ek_certs
+            .iter()
+            .map(|c| hex::encode(Sha384::digest(c)))
+            .collect(),
+    };
+    state.fleet().apply(manifest.to_enrolled().unwrap());
+}
+
+#[tokio::test]
+async fn enrolled_host_attests_end_to_end() {
+    let mut evidence = SoftwareEvidence::new();
+    let state = build_state(&evidence);
+    // The host's EK is in the manifest — admission passes, attestation runs.
+    enroll_eks(&state, &[&evidence.ek_cert]);
+    let mut client = spawn_server(state).await;
+
+    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+        .await
+        .expect("enrolled host attests end-to-end");
+    assert!(attested
+        .bundle
+        .spiffe_id
+        .starts_with("spiffe://ferrogate.test/host/"));
+}
+
+#[tokio::test]
+async fn unenrolled_host_is_rejected_before_quote_verification() {
+    let mut evidence = SoftwareEvidence::new();
+    // `build_state` trusts this EK and approves the PCR digest, so absent a
+    // manifest this exact host attests successfully (see the test above). The
+    // *only* change here is enforcing a manifest that omits its EK, so any
+    // failure is attributable to the F13 pre-admission gate.
+    let state = build_state(&evidence);
+    enroll_eks(&state, &[b"a-different-host-ek-cert"]);
+    let audit_before = state.audit.len();
+    let mut client = spawn_server(Arc::clone(&state)).await;
+
+    let Err(err) = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string()).await else {
+        panic!("un-enrolled host must be refused");
+    };
+    let status = match err {
+        mia::client::AttestClientError::Transport(s) => s,
+        other => panic!("expected transport error, got {other:?}"),
+    };
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+    // Exactly one leaf (HostRejected) was appended: the handshake stopped at
+    // pre-admission, before any AttestStart or quote-verification work — which
+    // would otherwise have written two or more leaves.
+    assert_eq!(
+        state.audit.len(),
+        audit_before + 1,
+        "only a HostRejected event should be recorded"
+    );
+}

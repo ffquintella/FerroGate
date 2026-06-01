@@ -37,7 +37,7 @@ use ed25519_dalek::{SigningKey as EdSk, VerifyingKey as EdVk};
 use fips204::ml_dsa_65;
 use fips204::traits::{SerDes as _, Signer as _, Verifier as _};
 use rand_core::OsRng;
-use sha3::{Digest, Sha3_384};
+use sha3::{Digest, Sha3_256, Sha3_384};
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -112,6 +112,19 @@ pub fn transcript_hash(ctx: &[u8], msg: &[u8]) -> [u8; 48] {
     h.update(msg);
     let out = h.finalize();
     let mut arr = [0u8; 48];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// Derive a 32-byte sub-seed from a master seed and a domain tag.
+/// Used by [`CompositeSecretKey::from_seed`] to key the two halves
+/// independently.
+fn derive_subseed(seed: &[u8; 32], tag: &[u8]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update(tag);
+    h.update(seed);
+    let out = h.finalize();
+    let mut arr = [0u8; 32];
     arr.copy_from_slice(&out);
     arr
 }
@@ -243,6 +256,42 @@ impl CompositeSecretKey {
             mldsa65: pqc_public,
         };
         Ok((sk, pk))
+    }
+
+    /// Derive a composite keypair **deterministically** from a 32-byte master
+    /// seed.
+    ///
+    /// The same seed always yields the same keypair, so an operator who holds
+    /// the seed offline can reproduce a publisher key across machines without
+    /// ever writing the expanded private key to disk — only the 32-byte seed
+    /// is secret material at rest. This backs the F13 fleet-manifest signing
+    /// tool; production root-key handling (sealing / Shamir split) is the F14
+    /// ceremony's job.
+    ///
+    /// The two halves are keyed from **independent** sub-seeds derived by
+    /// SHA3-256 over the master seed with distinct domain tags, so a weakness
+    /// in one keygen cannot leak the other half's seed.
+    #[must_use]
+    #[allow(clippy::similar_names)] // sk/vk is the established Ed25519 convention.
+    pub fn from_seed(seed: &[u8; 32]) -> (Self, CompositePublicKey) {
+        let ed_seed = derive_subseed(seed, b"ferrogate-composite-seed/ed25519");
+        let ml_seed = derive_subseed(seed, b"ferrogate-composite-seed/ml-dsa-65");
+
+        let classical_sk = EdSk::from_bytes(&ed_seed);
+        let classical_vk = classical_sk.verifying_key();
+        let (pqc_public, pqc_secret) = <ml_dsa_65::KG as fips204::traits::KeyGen>::keygen_from_seed(
+            &ml_seed,
+        );
+
+        let sk = Self {
+            ed25519: classical_sk,
+            mldsa65: pqc_secret,
+        };
+        let pk = CompositePublicKey {
+            ed25519: classical_vk,
+            mldsa65: pqc_public,
+        };
+        (sk, pk)
     }
 
     /// Sign `msg` under domain-separation context `ctx`.
@@ -395,6 +444,25 @@ mod tests {
         let (sk, pk) = CompositeSecretKey::generate().unwrap();
         let sig = sk.sign(ctx(), b"hello world").unwrap();
         pk.verify(ctx(), b"hello world", &sig).expect("verify ok");
+    }
+
+    #[test]
+    fn from_seed_is_deterministic_and_usable() {
+        let seed = [7u8; 32];
+        let (sk_a, pk_a) = CompositeSecretKey::from_seed(&seed);
+        let (_sk_b, pk_b) = CompositeSecretKey::from_seed(&seed);
+        // Same seed ⇒ identical public key on the wire.
+        assert_eq!(pk_a.to_concat_bytes(), pk_b.to_concat_bytes());
+        // A signature from one derivation verifies under the other's pubkey.
+        let sig = sk_a.sign(ctx(), b"manifest").unwrap();
+        pk_b.verify(ctx(), b"manifest", &sig).expect("verify ok");
+    }
+
+    #[test]
+    fn from_seed_differs_by_seed() {
+        let (_sk_a, pk_a) = CompositeSecretKey::from_seed(&[1u8; 32]);
+        let (_sk_b, pk_b) = CompositeSecretKey::from_seed(&[2u8; 32]);
+        assert_ne!(pk_a.to_concat_bytes(), pk_b.to_concat_bytes());
     }
 
     #[test]

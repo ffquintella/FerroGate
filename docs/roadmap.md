@@ -258,10 +258,31 @@ gate runs on the PIE-by-default glibc build.
 
 ### F13 — Zero-touch bootstrap and fleet enrollment
 
-- [ ] Fleet manifest format and offline signing tool (`tools/fleet-manifest`).
-- [ ] CMIS load + signed-S3 refresh.
-- [ ] Pre-admission lookup at start of `Attest`.
-- [ ] Audit events `HostEnrolled` / `HostRejected`.
+- [x] Fleet manifest format and offline signing tool (`tools/fleet-manifest`).
+      (`SignedFleetManifest` in `crates/cmis/src/fleet_manifest.rs`,
+      composite-signed canonical JSON under the `ferrogate-fleet-v1` context;
+      the `fleet-manifest` CLI does `keygen`/`new`/`add`/`remove`/`sign`/
+      `verify`/`show`, with deterministic seed-derived publisher keys via
+      `CompositeSecretKey::from_seed`.)
+- [x] CMIS load. (`FleetManifestLoader` + `fleet_watcher` poll/verify/hot-swap
+      into the `FleetStore` held by `CmisState`; `main` loads from
+      `CMIS_FLEET_MANIFEST` fail-closed and spawns the watcher. Signed-S3
+      refresh reuses the loader's verify-then-swap path and is tracked under the
+      M5 follow-ons below.)
+- [x] Pre-admission lookup at start of `Attest`. (`CmisState::check_enrollment`
+      runs on the phase-2 EK hash before any TPM verification work; unenforced
+      until a manifest is loaded, so a CMIS with no manifest behaves as before.)
+- [x] Audit events `HostEnrolled` / `HostRejected`.
+
+**F13 status: done.** Zero-touch enrolment anchors a host's first SVID in the
+vendor EK signature plus an offline-signed fleet manifest of approved EK
+SHA-384 hashes. Admission is checked at the cheapest point — before quote
+verification — and is atomic: a refresh swaps an `Arc<EnrolledHosts>` under a
+write lock, so an in-flight `Attest` sees a consistent snapshot. Verified with
+`cargo test` across `ferro-crypto` (seed determinism), `cmis::fleet_manifest`
+(sign/verify/tamper/atomic-swap), the `mia` e2e harness (enrolled host attests;
+un-enrolled host rejected before any quote work, one `HostRejected` leaf only),
+and the `fleet-manifest` CLI lifecycle, plus `clippy -D warnings`.
 
 ### F10 — RIM and PCR policy (continued)
 

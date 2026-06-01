@@ -57,6 +57,22 @@ pub enum AuditEvent {
         /// Stable opcode for the revocation reason.
         reason: String,
     },
+    /// A host passed the F13 fleet-manifest pre-admission check at the start
+    /// of `Attest` — its EK certificate hash is enrolled — and was allowed to
+    /// proceed to TPM quote verification.
+    HostEnrolled {
+        /// SHA-384 of the EK certificate presented in phase 2.
+        ek_sha: Hash384,
+    },
+    /// A host was refused at the F13 pre-admission check before any TPM
+    /// verification work ran: its EK certificate hash is not in the active
+    /// fleet manifest.
+    HostRejected {
+        /// SHA-384 of the EK certificate presented in phase 2.
+        ek_sha: Hash384,
+        /// Short, stable opcode (e.g. `"not-enrolled"`).
+        reason: String,
+    },
     /// A threshold key share was used to reconstruct the issuance key.
     KeyShareUsed {
         /// Which share (0..=4 in the 3-of-5 scheme).
