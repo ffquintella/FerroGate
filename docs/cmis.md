@@ -97,7 +97,8 @@ peer_roots    = "/etc/ferrogate/peer-roots.pem"
 
 [raft]
 peers         = ["cmis-1:9443", "cmis-2:9443", "cmis-3:9443"]
-storage       = "foundationdb://fdb.cluster"
+node_id       = 1                               # 1.. ; node 1 bootstraps
+data_dir      = "/var/lib/ferrogate/raft"       # hiqlite SQLite state + WAL
 
 [rim]
 allowlist     = "/var/lib/ferrogate/rim/current.json"

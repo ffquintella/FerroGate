@@ -1,9 +1,10 @@
 //! Backing-store abstraction for the audit log.
 //!
 //! Production deployments use S3 with Object Lock Compliance mode (10-year
-//! retention) and a FoundationDB mirror; that lands in M4. The M3 surface
-//! defines [`AuditStore`] and ships [`LocalDiskWormStore`], a local-filesystem
-//! implementation suitable for dev and CI.
+//! retention) for the WORM tier; the replicated copy lives in the
+//! hiqlite-backed Raft state machine. The M3 surface defines [`AuditStore`]
+//! and ships [`LocalDiskWormStore`], a local-filesystem implementation
+//! suitable for dev and CI.
 //!
 //! The WORM property here is enforced by `OpenOptions::create_new(true)`:
 //! once a leaf file (or an STH file) exists, the store refuses to overwrite

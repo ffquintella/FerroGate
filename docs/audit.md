@@ -39,8 +39,9 @@ Every second, or every 1024 entries (whichever comes first), the replica:
 3. Signs the STH with the composite issuance key inside the TEE.
 4. Replicates the STH and leaves to Raft peers; a quorum must co-sign before
    publication.
-5. Commits the leaves and STH to S3 (Object Lock Compliance mode) and the
-   FoundationDB mirror.
+5. Commits the leaves and STH to S3 (Object Lock Compliance mode); the
+   replicated copy is durably held in the hiqlite-backed Raft state machine
+   shared with the rest of CMIS.
 
 Once per minute the latest STH is anchored to a public transparency log
 (Sigsum or Rekor). The anchor receipt is recorded as a separate audit

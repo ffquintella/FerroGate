@@ -15,8 +15,8 @@ In:
 - Append-only event API on CMIS and forwarded events from MIA.
 - SHA3-384 leaf hashing; binary Merkle tree.
 - STH structure `{ tree_size, root_hash, timestamp }` signed via F03.
-- Backing store: S3 Object Lock (Compliance, 10-year retention) and
-  FoundationDB mirror.
+- Backing store: S3 Object Lock (Compliance, 10-year retention) for the WORM
+  tier; the replicated copy lives in the hiqlite-backed Raft state machine.
 - Sigsum / Rekor anchor every minute.
 - Inclusion and consistency proof endpoints.
 

@@ -14,12 +14,13 @@
 │CMIS-1│            │CMIS-2│            │CMIS-3│
 │SEV-SNP│           │ TDX  │            │SEV-SNP│
 └──┬───┘            └──┬───┘            └──┬───┘
-   │   Raft / QUIC, hybrid-PQC mTLS        │
+   │   Raft (hiqlite), TCP peer transport  │
    └───────────────────┬───────────────────┘
                        │
             ┌──────────▼──────────┐
-            │ FoundationDB + S3   │
-            │ Object-Lock (WORM)  │
+            │ hiqlite (SQLite +   │
+            │ Raft) · S3 Object-  │
+            │ Lock (WORM)         │
             └──────────┬──────────┘
                        │
             ┌──────────▼──────────┐
@@ -36,8 +37,12 @@
 - Long-term composite signing key (Ed25519 + ML-DSA-65) is **never** stored
   whole on disk. It is Shamir-split (3-of-5) across enclaves and reconstructed
   in mlocked, zeroize-on-drop memory only when needed.
-- Replicated metadata (issued SVID hashes, CRL deltas, RIM allowlist) via Raft
-  over QUIC.
+- Replicated metadata (issued SVID hashes, CRL deltas, RIM allowlist) via a
+  Raft cluster backed by [hiqlite](https://crates.io/crates/hiqlite) — openraft
+  plus a durable SQLite state machine and its own peer transport. (The original
+  design named FoundationDB; see [roadmap.md](roadmap.md) and
+  [features/F05-cmis-ha.md](features/F05-cmis-ha.md) for why hiqlite was chosen.
+  An FDB-backed store remains a follow-up option for very-large fleets.)
 
 ### MIA — Machine Identity Agent
 
@@ -50,7 +55,8 @@
 ### Audit Notary
 
 - Per-shard Merkle tree of audit events, signed in the TEE every second.
-- Backing store: S3 Object Lock in Compliance mode, mirrored to FoundationDB.
+- Backing store: S3 Object Lock in Compliance mode for the WORM tier, with the
+  replicated copy living in the hiqlite-backed Raft state machine.
 - Signed Tree Heads (STH) are published to a public transparency log
   (Sigsum / Rekor) once per minute.
 

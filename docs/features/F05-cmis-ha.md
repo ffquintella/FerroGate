@@ -3,8 +3,8 @@
 ## Summary
 
 CMIS runs as a stateless replica set fronted by an anycast L4 load balancer
-with TLS passthrough. Replicas form a Raft group over QUIC (with hybrid-PQC
-TLS between peers) to replicate issued-SVID metadata, CRL deltas, and RIM
+with TLS passthrough. Replicas form a Raft group (via hiqlite, which owns its
+own peer transport) to replicate issued-SVID metadata, CRL deltas, and RIM
 versions.
 
 ## Scope
@@ -12,7 +12,9 @@ versions.
 In:
 
 - Minimum 3 replicas spread across ≥ 2 regions and ≥ 2 cloud providers.
-- Raft group with FoundationDB-backed storage and a QUIC transport.
+- Raft group backed by hiqlite (openraft + a durable SQLite state machine +
+  its own peer transport). See "Deferred design points" below for why hiqlite
+  replaced the originally-planned FoundationDB store and QUIC transport.
 - TLS-passthrough LB; clients pin SPKI end-to-end.
 - Failure tolerance: `f = ⌊(n-1)/2⌋` for issuance, `f = ⌊(n-1)/3⌋` for key
   reconstruction (see F06).
