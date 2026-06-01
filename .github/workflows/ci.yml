@@ -99,6 +99,70 @@ jobs:
           command: check
           arguments: --all-features
 
+  # Milestone M6: machine-check the two protocol models within a time budget.
+  # The job FAILS if any Tamarin lemma is falsified or any CryptoVerif query is
+  # not proved. The per-proof timeout is the budget; exceeding it fails loudly
+  # (a protocol change that blows the budget needs a re-examined proof, not a
+  # bumped limit). See formal/README.md.
+  formal-verification:
+    name: formal verification (tamarin + cryptoverif)
+    runs-on: ubuntu-latest
+    env:
+      FERROGATE_FORMAL_TIMEOUT: 600
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Maude (Tamarin backend)
+        run: sudo apt-get update && sudo apt-get install -y maude graphviz
+
+      - name: Install Tamarin prover
+        run: |
+          set -euo pipefail
+          ver=1.10.0
+          url="https://github.com/tamarin-prover/tamarin-prover/releases/download/${ver}/tamarin-prover-${ver}-linux64-ubuntu.tar.gz"
+          curl -fsSL "$url" -o tamarin.tar.gz
+          tar -xzf tamarin.tar.gz
+          sudo install -m 0755 tamarin-prover /usr/local/bin/tamarin-prover
+          tamarin-prover --version
+
+      - name: Install CryptoVerif
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y ocaml ocaml-findlib
+          ver=2.09
+          curl -fsSL "https://cryptoverif.inria.fr/cryptoverif${ver}.tar.gz" -o cv.tar.gz
+          mkdir -p cryptoverif && tar -xzf cv.tar.gz -C cryptoverif --strip-components=1
+          ( cd cryptoverif && ./build )
+          echo "CRYPTOVERIF_DIR=$PWD/cryptoverif" >> "$GITHUB_ENV"
+          sudo ln -sf "$PWD/cryptoverif/cryptoverif" /usr/local/bin/cryptoverif
+
+      - name: Tamarin — four-phase attestation
+        run: |
+          set -euo pipefail
+          out=$(timeout "${FERROGATE_FORMAL_TIMEOUT}" \
+            tamarin-prover --prove formal/tamarin/attestation.spthy 2>&1) || {
+              echo "$out"; echo "::error::Tamarin run failed or timed out"; exit 1; }
+          echo "$out"
+          if echo "$out" | grep -qiE 'falsified|analysis incomplete'; then
+            echo "::error::a Tamarin lemma was falsified or left incomplete"; exit 1
+          fi
+          echo "$out" | grep -qi 'verified' || {
+            echo "::error::no Tamarin lemma reported verified"; exit 1; }
+
+      - name: CryptoVerif — hybrid AKE
+        run: |
+          set -euo pipefail
+          out=$(timeout "${FERROGATE_FORMAL_TIMEOUT}" \
+            cryptoverif -lib "${CRYPTOVERIF_DIR}/default" \
+            formal/cryptoverif/hybrid_ake.cv 2>&1) || {
+              echo "$out"; echo "::error::CryptoVerif run failed or timed out"; exit 1; }
+          echo "$out"
+          if echo "$out" | grep -qiE 'RESULT.*(cannot be proved|not proved)'; then
+            echo "::error::a CryptoVerif query could not be proved"; exit 1
+          fi
+          echo "$out" | grep -qiE 'RESULT.*proved|All queries proved' || {
+            echo "::error::CryptoVerif did not report the query proved"; exit 1; }
+
   coverage:
     name: coverage (llvm-cov)
     runs-on: ubuntu-latest

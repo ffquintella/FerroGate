@@ -146,12 +146,23 @@ and the staging dry-run — is in
   new composite issuance key and re-seeds shares. All hosts must re-attest
   at next rotation.
 
+The step-by-step drill procedures — with pre-flight, pass criteria, abort
+paths, a runnable local rehearsal harness, and the drill log — are in
+[operations/drills/](operations/drills/):
+[region-loss](operations/drills/region-loss.md),
+[mass-revocation](operations/drills/mass-revocation.md), and
+[quorum-loss recovery](operations/drills/quorum-loss-recovery.md).
+
 ## Day-2 SRE concerns
 
 - **Metrics.** Issuance latency p50/p99, attestation failure breakdown,
   CRL freshness, Raft commit lag, STH publish lag.
 - **Alerts.** STH publish lag > 5 min, key-share reconstruction failure,
   RIM allowlist age > 24 h since last refresh, helper API denial rate spike.
+  Per-alert response procedures are in [operations/runbooks/](operations/runbooks/):
+  [STH lag](operations/runbooks/sth-lag.md),
+  [CRL stale](operations/runbooks/crl-stale.md), and
+  [key-share failure](operations/runbooks/key-share-failure.md).
 - **Capacity.** The dominant cost is ML-DSA-65 signing (~1 ms on modern
   cores). A single CMIS replica handles ~1000 full attestations / second
   before saturating one core.

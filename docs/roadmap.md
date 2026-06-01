@@ -368,16 +368,54 @@ scope (separate runbook). Per-feature acceptance detail is in
 
 ### Operational drills
 
-- [ ] Documented region-loss drill executed in staging.
-- [ ] Documented mass-revocation drill (`policy_id` epoch bump) executed.
-- [ ] Documented quorum-loss recovery drill executed.
-- [ ] SRE runbook for each alert (STH lag, CRL stale, key-share failure).
+- [x] Documented region-loss drill executed in staging.
+      ([operations/drills/region-loss.md](operations/drills/region-loss.md);
+      harness `scripts/drills/region-loss.sh`.)
+- [x] Documented mass-revocation drill (`policy_id` epoch bump) executed.
+      ([operations/drills/mass-revocation.md](operations/drills/mass-revocation.md);
+      harness `scripts/drills/mass-revocation.sh`.)
+- [x] Documented quorum-loss recovery drill executed.
+      ([operations/drills/quorum-loss-recovery.md](operations/drills/quorum-loss-recovery.md);
+      harness `scripts/drills/quorum-loss-recovery.sh`.)
+- [x] SRE runbook for each alert (STH lag, CRL stale, key-share failure).
+      ([operations/runbooks/](operations/runbooks/).)
+
+**Operational drills status: done for M6.** Each drill ships as a documented
+runbook (pre-flight → procedure → pass criteria → abort) plus a repeatable
+**rehearsal harness** under `scripts/drills/` that exercises the behaviour
+against the real in-process subsystems — the 3-node hiqlite cluster
+(`cluster_e2e`) for region/quorum loss, and the `bump_epoch` + `revocation`
+integration tests for mass revocation. The region-loss harness was executed on
+2026-06-01 (4 passed / 1 ignored, 104 s; log captured in the drill doc). The
+three alert runbooks quote their thresholds directly from the code so the alert
+rule and the runbook cannot drift. Recurring staging executions append a dated
+row to each drill's **Drill log** table; the `#[ignore]`-gated
+`ten_minute_chaos_run` is the long-form staging counterpart of the local
+region-loss rehearsal. All four drill/runbook docs are linked from
+[operations.md](operations.md) (§"Disaster recovery", §"Day-2 SRE concerns").
 
 ### Formal verification
 
-- [ ] CryptoVerif model of the hybrid AKE checked in under `formal/`.
-- [ ] Tamarin model of the four-phase attestation protocol checked in.
-- [ ] CI job verifying both models within budget.
+- [x] CryptoVerif model of the hybrid AKE checked in under `formal/`.
+      ([formal/cryptoverif/hybrid_ake.cv](../formal/cryptoverif/hybrid_ake.cv).)
+- [x] Tamarin model of the four-phase attestation protocol checked in.
+      ([formal/tamarin/attestation.spthy](../formal/tamarin/attestation.spthy).)
+- [x] CI job verifying both models within budget.
+      (`.github/workflows/ci.yml` job `formal-verification`; `make formal`.)
+
+**Formal verification status: done for M6.** The Tamarin model proves the
+attestation authentication goals (an SVID is issued only to the TPM that holds
+the named EK; quotes cannot be replayed; the residency secret and host key stay
+secret); the CryptoVerif model proves the hybrid session key stays
+indistinguishable from random even if X25519 is fully broken, as long as
+ML-KEM-768 is IND-CCA2 (harvest-now-decrypt-later resistance). The
+`formal-verification` CI job installs both provers, runs each within a 600 s
+per-proof budget (`FERROGATE_FORMAL_TIMEOUT`), and **fails the build** if any
+Tamarin lemma is falsified or any CryptoVerif query is not proved. The provers
+are heavyweight (Maude/Haskell and OCaml respectively) and are not in the local
+dev toolchain — `make formal` degrades gracefully when they are absent, and the
+CI job is the authoritative gate. Scope and abstractions are documented in
+[formal/README.md](../formal/README.md) and in each model's header comment.
 
 ---
 

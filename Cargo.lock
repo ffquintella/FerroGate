@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "cmis"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-attest"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-audit"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-ceremony"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-child-verify"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-crypto"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-harden"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "caps",
  "libc",
@@ -1536,7 +1536,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-proto"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "prost",
  "tonic",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-raft"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid-verify"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-tee"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chacha20poly1305",
  "ciborium",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-winauth"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "tokio",
  "windows-sys 0.59.0",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogate-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "file-rotate",
  "tracing",
@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-manifest"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "cmis",
@@ -2705,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "mia"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "offline-signer"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

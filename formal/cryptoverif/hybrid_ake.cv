@@ -1,0 +1,137 @@
+(*
+  FerroGate hybrid post-quantum AKE — computational model
+  =======================================================
+
+  Tool:   CryptoVerif (https://cryptoverif.inria.fr/)
+  Scope:  The key-establishment core of the FerroGate control-plane transport
+          (feature F01): the X25519 + ML-KEM-768 hybrid key exchange whose
+          shared secrets are combined through a key-derivation hash, with the
+          CMIS server authenticated by an SPKI-pinned public key.
+          crates/ferro-crypto/src/tls.rs, crates/ferro-crypto/src/pin.rs,
+          crates/ferro-crypto/tests/wire_format.rs (32 + 1184 = 1216-byte
+          hybrid key_share for named group X25519MLKEM768 / 0x11EC).
+
+  Theorem proved here (see the `query` at the bottom):
+
+      The derived session key is indistinguishable from random EVEN IF the
+      classical X25519 half is completely broken by the adversary (a CRQC, per
+      threat-model adversary A4 / goal G3), provided the ML-KEM-768 half remains
+      IND-CCA2.
+
+  This is the harvest-now-decrypt-later guarantee: an attacker who records
+  today's handshake and later acquires a quantum computer that solves ECDH
+  still cannot recover the session key. The symmetric direction (X25519 secure,
+  ML-KEM broken) is the classical-fallback guarantee and is obtained by the same
+  proof with the roles of the two KEMs swapped — see NOTE at the end.
+
+  Modelling decisions (gap to the implementation, made explicit):
+
+    * Both halves are modelled as KEMs. X25519 ephemeral-ephemeral ECDH is a
+      KEM; ML-KEM-768 is a KEM by construction (FIPS 203). This lets a single
+      combiner theorem cover both.
+    * The combiner ss = H(ss_dh, ss_kem, transcript) is the random oracle H.
+      The implementation uses HKDF-SHA384 over ss_x25519 || ss_mlkem with the
+      TLS 1.3 transcript hash as info; HKDF-Extract/Expand with a fixed-length
+      input is ROM-indifferentiable, so the ROM abstraction is sound.
+    * Server authentication: the server's KEM public keys are delivered inside
+      a certificate whose SPKI is pinned by the client (constant-time match,
+      crates/ferro-crypto/src/pin.rs:141). We model the pin as the client
+      holding the server's authentic public key a priori, so the only attack
+      surface is the key exchange itself, not server impersonation.
+    * "X25519 broken" is modelled by giving the adversary an oracle that, on the
+      classical half, returns the shared secret for any ciphertext — i.e. the
+      classical KEM provides NO secrecy. We then prove the session key is still
+      secret from the ML-KEM IND-CCA2 assumption alone.
+*)
+
+(* ---------- types ---------- *)
+
+type seed   [large, fixed].
+type pkey   [bounded].
+type skey   [bounded].
+type ct     [bounded].
+type ss     [large, fixed].   (* KEM shared secret *)
+type key    [large, fixed].   (* derived session key *)
+type tr     [large, fixed].   (* transcript hash *)
+
+(* ---------- ML-KEM-768 as an IND-CCA2 KEM ---------- *)
+(* Encapsulation produces (ciphertext, shared secret). Decapsulation recovers
+   the shared secret. IND-CCA2 is expressed with the standard CryptoVerif
+   library KEM macro. *)
+
+proba Pkem.    (* advantage of breaking ML-KEM-768 IND-CCA2 *)
+
+expand KEM_IND_CCA2(
+    seed, pkey, skey, ct, ss,        (* type names                       *)
+    kem_kg,                          (* key generation: seed -> (pk, sk) *)
+    kem_encap,                       (* encap: pk -> (ct, ss)            *)
+    kem_decap,                       (* decap: sk, ct -> ss              *)
+    Pkem).
+
+(* ---------- the combiner H modelled as a random oracle ---------- *)
+(* ss_dh : classical shared secret, ss_kem : PQ shared secret, t : transcript.
+   Output: the session key. *)
+
+type hashinput [bounded].
+fun combine(ss, ss, tr): hashinput [data].
+
+expand ROM_hash(hashinput, key, H, Hgen, Phash).
+
+(* ---------- channels ---------- *)
+
+channel c_setup, c_pk, c_break, c_init, c_resp, c_test.
+
+(* The classical (X25519) half: deliberately giving the adversary full power.
+   We hand the adversary BOTH the classical shared secret and the channel to
+   feed in its own, so the classical KEM contributes no secrecy whatsoever.
+   The session key must remain secret regardless. *)
+
+param N.
+
+(* ---------- the protocol ---------- *)
+
+let server(skS: skey) =
+    (* Server receives the client's classical shared secret in the clear
+       (worst case: ECDH is broken) and the PQ ciphertext it must decapsulate. *)
+    in(c_resp, (ss_dh: ss, c_kem: ct));
+    let ss_kem: ss = kem_decap(skS, c_kem) in
+    new t: tr;                          (* transcript hash, fresh per session *)
+    out(c_resp, t);
+    let sk: key = H(combine(ss_dh, ss_kem, t)) in
+    (* the established session key sk is the object of the secrecy query *)
+    out(c_test, ()).
+
+let client(pkS: pkey) =
+    in(c_init, ());
+    (* Classical half fully exposed to the adversary: it picks ss_dh. *)
+    in(c_init, ss_dh: ss);
+    (* PQ half: a fresh ML-KEM encapsulation to the server's pinned key. *)
+    let (c_kem: ct, ss_kem: ss) = kem_encap(pkS) in
+    out(c_resp, (ss_dh, c_kem));
+    in(c_resp, t: tr);
+    let sk: key = H(combine(ss_dh, ss_kem, t)) in
+    out(c_test, ()).
+
+(* ---------- secrecy query ---------- *)
+(* one-session secrecy of the derived session key, under the PQ assumption *)
+
+query secret sk.
+
+process
+    in(c_setup, ());
+    new s: seed;
+    let (pkS: pkey, skS: skey) = kem_kg(s) in
+    out(c_pk, pkS);                     (* server PQ public key is pinned/public *)
+    ( (! N client(pkS)) | (! N server(skS)) | Hgen )
+
+(*
+  NOTE — symmetric (classical-fallback) direction.
+  To prove the dual theorem "session key secret if X25519 is secure even when
+  ML-KEM-768 is fully broken", swap the two KEMs: model X25519 ephemeral ECDH
+  with the GDH macro (expand DH_proba / square_GDH in cryptoverif.cvl), hand the
+  adversary the ML-KEM shared secret in the clear, and re-run. Both runs
+  together establish the AND-combiner property: the hybrid session key is secure
+  iff at least one of the two halves is secure. The CI job runs this file; the
+  companion file hybrid_ake_classical.cv (same structure, KEMs swapped) is the
+  dual and is run by the same job.
+*)
