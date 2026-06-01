@@ -13,7 +13,9 @@
 
 - Single multi-threaded Tokio runtime, ~N+1 worker threads (one per core, one
   for I/O reactor).
-- One `tonic` gRPC server, no other listeners.
+- One `tonic` gRPC server, no other listeners (rationale:
+  [ADR-0001](adr/0001-grpc-over-http-transport.md); ports and firewall rules:
+  [networking.md](networking.md)).
 - A small set of background tasks: Raft tick, audit-flush, CRL publisher,
   RIM refresh, key-share heartbeat.
 
