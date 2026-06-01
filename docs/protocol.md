@@ -2,6 +2,8 @@
 
 A host obtains an SVID through a four-phase streaming gRPC handshake. All
 phases run over a hybrid post-quantum TLS 1.3 channel (see [crypto.md](crypto.md)).
+The choice of streaming gRPC for this handshake is recorded in
+[ADR-0001](adr/0001-grpc-over-http-transport.md).
 
 ## Sequence
 

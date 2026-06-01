@@ -2,6 +2,7 @@
 
 - Core design
   - [Architecture](architecture.md)
+  - [Networking & ports](networking.md)
   - [Threat model](threat-model.md)
   - [Attestation protocol](protocol.md)
   - [Cryptography](crypto.md)
@@ -42,6 +43,10 @@
   - [F12 — MIA hardening](features/F12-mia-hardening.md)
   - [F13 — Bootstrap & enrollment](features/F13-bootstrap-enrollment.md)
   - [F14 — Root key ceremony](features/F14-root-key-ceremony.md)
+
+- Decisions
+  - [ADR index](adr/README.md)
+  - [ADR-0001 — gRPC over HTTP](adr/0001-grpc-over-http-transport.md)
 
 - Process
   - [Testing](testing.md)
