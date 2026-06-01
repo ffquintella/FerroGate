@@ -1,5 +1,5 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
-        formal formal-tamarin formal-cryptoverif docs
+        formal formal-tamarin formal-cryptoverif docs docker-image
 
 # Default target: list available targets with their descriptions.
 .DEFAULT_GOAL := help
@@ -52,6 +52,23 @@ clean: ## Remove build artifacts
 
 docs: ## Serve the Docsify documentation site locally (PORT=3000 by default)
 	./serve-docs.sh $(PORT)
+
+# Container image. Builds a linux/amd64 runtime image that runs the ferrogate
+# CLI as an unprivileged user, exposes /opt/ferrogate/logs as a mountable
+# volume, and exports the FerroGate configuration env vars. Override the tag
+# with IMAGE="repo/name:tag".
+# Tag the image with the workspace crate version from Cargo.toml's
+# [workspace.package] section (e.g. 0.12.0).
+CARGO_VERSION := $(shell awk '/^\[workspace.package\]/{p=1} p&&/^version/{gsub(/[" ]/,"",$$3); print $$3; exit}' Cargo.toml)
+IMAGE ?= ferrogate:$(CARGO_VERSION)
+
+docker-image: ## Build the linux/amd64 ferrogate runtime image (IMAGE=tag to override)
+	docker buildx build --platform linux/amd64 \
+		-f docker/ferrogate.Dockerfile \
+		-t $(IMAGE) \
+		--load .
+	@echo "Built $(IMAGE)"
+	@echo "Run: docker run --rm -v \"\$$PWD/logs:/opt/ferrogate/logs\" -e RUST_LOG=debug $(IMAGE) hello world"
 
 # Formal verification (feature: M6). Both targets degrade gracefully when the
 # prover is not installed locally; CI installs both so the gate is real there.
