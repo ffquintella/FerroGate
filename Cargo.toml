@@ -63,7 +63,7 @@ serde_json = "1"
 ciborium   = "0.2"
 
 # crypto (placeholders pinned now, used in later milestones)
-sha3          = "0.10"
+sha3          = "0.12"
 zeroize       = { version = "1.8", features = ["zeroize_derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 rand_core     = { version = "0.6", features = ["std"] }
