@@ -91,6 +91,12 @@ pub struct CmisState {
     /// plus the per-host child-token signing keys registered at attestation
     /// time (feature F09). Process-local — see [`CmisState::register_child_key`].
     published_keys: RwLock<Vec<Jwk>>,
+    /// Additional **root** verification keys published alongside the issuer's
+    /// own root during a cross-sign rotation window (feature F14). These plus
+    /// the issuer key are served ahead of the per-host child keys, ordered
+    /// newest-first by [`Jwk::created`] so a verifier prefers the incoming root.
+    /// Process-local — populated by [`CmisState::register_root_key`].
+    extra_roots: RwLock<Vec<Jwk>>,
     /// Revocation state (feature F11). `entries` is the working set of active
     /// revocations; `crl` is the most recently published composite-signed CRL
     /// served in the `x-ferrogate-crl` JWKS extension. Both are process-local —
@@ -138,6 +144,7 @@ impl CmisState {
             config,
             audit,
             published_keys,
+            extra_roots: RwLock::new(Vec::new()),
             revocations: Mutex::new(Revocations::default()),
             published_crl: RwLock::new(None),
             fleet: FleetStore::unenforced(),
@@ -165,6 +172,7 @@ impl CmisState {
             config,
             audit,
             published_keys,
+            extra_roots: RwLock::new(Vec::new()),
             revocations: Mutex::new(Revocations::default()),
             published_crl: RwLock::new(None),
             fleet: FleetStore::unenforced(),
@@ -192,15 +200,64 @@ impl CmisState {
         self.fleet.decide(ek_sha)
     }
 
-    /// The JWK set published over the `JWKS` RPC: the issuer's SVID signing key
-    /// (always first) followed by the host child-token signing keys seen so
-    /// far. Downstream verifiers resolve a child token's header `kid` here.
+    /// The JWK set published over the `JWKS` RPC.
+    ///
+    /// Ordering is **roots first, newest-first, then child keys**: the issuer's
+    /// own root key together with any cross-sign-window roots registered via
+    /// [`register_root_key`] lead the set sorted by [`Jwk::created`] descending,
+    /// followed by the per-host child-token signing keys seen so far. The
+    /// newest-first root ordering is the "newer preferred" rule of feature F14;
+    /// downstream verifiers still resolve a token's header `kid` by exact match
+    /// (see [`JwkSet::find`]), so the ordering only affects trust-anchor choice.
+    ///
+    /// [`register_root_key`]: CmisState::register_root_key
     #[must_use]
     pub fn published_jwks(&self) -> JwkSet {
+        let published = self.published_keys.read();
+        // By construction the issuer's root key is `published_keys[0]`; every
+        // key appended by `register_child_key` follows it.
+        let (issuer_root, child_keys) = published
+            .split_first()
+            .map_or((None, &[][..]), |(head, tail)| (Some(head.clone()), tail));
+
+        let mut roots: Vec<Jwk> = issuer_root.into_iter().collect();
+        roots.extend(self.extra_roots.read().iter().cloned());
+        // Stable sort by creation time, newest first; an absent timestamp (the
+        // bare issuer key) sorts oldest.
+        roots.sort_by(|a, b| {
+            b.created
+                .unwrap_or(i64::MIN)
+                .cmp(&a.created.unwrap_or(i64::MIN))
+        });
+
+        let mut keys = roots;
+        keys.extend(child_keys.iter().cloned());
         JwkSet {
-            keys: self.published_keys.read().clone(),
+            keys,
             crl: self.published_crl.read().clone(),
         }
+    }
+
+    /// Publish an additional **root** verification key during a cross-sign
+    /// rotation window (feature F14). The incoming root is stamped with a
+    /// `created` time so [`published_jwks`] orders it ahead of the outgoing root
+    /// under the "newer preferred" rule, while both remain resolvable by `kid`
+    /// so SVIDs signed by either validate through the window. Idempotent by
+    /// `kid`; re-registering a known root refreshes its `created` stamp.
+    ///
+    /// Process-local, mirroring [`register_child_key`]: replicating the window's
+    /// root set across the cluster is a deployment seam left for a later slice.
+    ///
+    /// [`published_jwks`]: CmisState::published_jwks
+    /// [`register_child_key`]: CmisState::register_child_key
+    pub fn register_root_key(&self, pk: &CompositePublicKey, kid: impl Into<String>, created: i64) {
+        let kid = kid.into();
+        let mut roots = self.extra_roots.write();
+        if let Some(existing) = roots.iter_mut().find(|k| k.kid == kid) {
+            existing.created = Some(created);
+            return;
+        }
+        roots.push(Jwk::from_public_key_at(kid, pk, created));
     }
 
     /// Publish a host's composite child-token signing key so verifiers can find

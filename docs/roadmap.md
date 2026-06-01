@@ -314,13 +314,57 @@ the bump, `FAILED_PRECONDITION` after, one `PolicyEpochBumped` leaf) plus
 
 ### F14 — Root key ceremony
 
-- [ ] `tools/offline-signer` air-gapped tool.
-- [ ] Shamir share generation and sealed transport media format.
-- [ ] Cross-signing flow producing both directions of artefact.
-- [ ] CMIS JWKS multi-key with "newer preferred" ordering.
-- [ ] Destruction procedure with post-zeroization verification.
-- [ ] Ceremony minutes signed by all participants, stored to WORM.
-- [ ] Staging dry-run completed.
+- [x] `tools/offline-signer` air-gapped tool. (New `#![forbid(unsafe_code)]`
+      binary with `keygen`/`pubkey`/`split`/`combine`/`cross-sign`/
+      `verify-cross`/`jwks`/`minutes-new`/`minutes-sign`/`minutes-verify`/
+      `destroy`/`verify-destruction`/`dry-run` subcommands, built on the new
+      `crates/ferro-ceremony` library. No network dependency; every artefact is
+      auditable JSON.)
+- [x] Shamir share generation and sealed transport media format.
+      (`ferro_ceremony::media::SealedShareSet` reuses the `ferro-tee` 3-of-5
+      GF(2⁸) split and wraps each share in a `SealedShare` envelope — `SHA3-256`
+      tamper-evidence tag over the canonical fields, holder label, root kid, and
+      threshold params; `combine` reconstructs into a `Zeroizing` buffer after
+      checking every envelope's integrity and parameter agreement.)
+- [x] Cross-signing flow producing both directions of artefact.
+      (`ferro_ceremony::crosssign::CrossSignBundle::create` produces
+      old-signs-new and new-signs-old composite signatures over a
+      domain-separated transcript binding both kids, both public keys, and the
+      window bounds; `verify` requires *both* directions.)
+- [x] CMIS JWKS multi-key with "newer preferred" ordering.
+      (`Jwk` carries an optional `x-ferrogate-created` stamp;
+      `JwkSet::preferred()` (in both `ferro-svid` and the reference
+      `ferro-svid-verify`) selects the newest. `CmisState::register_root_key`
+      publishes the incoming root for the cross-sign window, and
+      `published_jwks` orders roots newest-first ahead of the per-host child
+      keys, all still resolvable by `kid`.)
+- [x] Destruction procedure with post-zeroization verification.
+      (`ferro_ceremony::destroy_media` overwrites a sealed-share medium in place
+      with zeros, `fsync`s, then reads it back and fails unless every byte is
+      zero *and* the bytes no longer parse as a usable share; `verify_destruction`
+      re-audits a previously-destroyed medium standalone.)
+- [x] Ceremony minutes signed by all participants, stored to WORM.
+      (`ferro_ceremony::minutes::SignedMinutes`: every listed `Participant`
+      contributes one composite signature over the canonical body — including
+      artefact `SHA3-256` digests — and `verify_all` only passes when all have
+      signed; the signed JSON is what gets anchored to the audit WORM medium.)
+- [x] Staging dry-run completed. (`offline-signer dry-run` runs the full
+      eight-step rotation against a scratch directory with five synthetic
+      operators and is driven by the CLI integration test
+      `dry_run_produces_all_verifiable_artefacts`; the recorded run is captured
+      in [operations/root-key-ceremony.md](operations/root-key-ceremony.md)
+      §"Staging dry-run".)
+
+**F14 status: done for M6.** The air-gapped ceremony surface lives in the new
+`crates/ferro-ceremony` library (`media`, `crosssign`, `minutes`, `destruction`)
+and the `tools/offline-signer` CLI that wires them together, plus the JWKS
+"newer preferred" multi-root support in `ferro-svid` / `ferro-svid-verify` /
+`cmis`. Verified with `cargo test --workspace` (15 `ferro-ceremony` unit tests,
+the 2 `offline-signer` CLI integration tests including the end-to-end dry-run,
+and the `cmis` `root_rotation` integration test) and `cargo clippy --workspace
+--all-targets`. The online emergency-rotation path remains explicitly out of
+scope (separate runbook). Per-feature acceptance detail is in
+[features/F14-root-key-ceremony.md](features/F14-root-key-ceremony.md).
 
 ### Operational drills
 

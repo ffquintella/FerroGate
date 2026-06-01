@@ -12,14 +12,16 @@ members = [
     "crates/ferro-svid-verify",
     "crates/ferro-child-verify",
     "crates/ferro-tee",
+    "crates/ferro-ceremony",
     "crates/ferro-winauth",
     "crates/ferro-harden",
     "crates/ferrogate-cli",
     "tools/fleet-manifest",
+    "tools/offline-signer",
 ]
 
 [workspace.package]
-version      = "0.10.0"
+version      = "0.11.0"
 edition      = "2021"
 rust-version = "1.88"
 license      = "Apache-2.0"

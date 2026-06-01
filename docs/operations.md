@@ -112,6 +112,11 @@ The composite issuance key is rotated annually in an air-gapped ceremony:
 5. After the window, the old key is destroyed by zeroising all five Shamir
    shares simultaneously.
 
+The step-by-step operator procedure — the `offline-signer` commands for each
+step, the sealed-share/cross-sign/minutes formats, the destruction read-back,
+and the staging dry-run — is in
+[operations/root-key-ceremony.md](operations/root-key-ceremony.md) (feature F14).
+
 ## Adding a CMIS replica
 
 1. Provision a node in a supported TEE (SEV-SNP or TDX).

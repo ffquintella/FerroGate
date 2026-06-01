@@ -90,6 +90,10 @@ pub struct Jwk {
     /// base64url of the concatenated composite public key.
     #[serde(rename = "pub")]
     pub public: String,
+    /// Unix-seconds creation time, present when more than one root is published
+    /// during a cross-sign window; used by [`JwkSet::preferred`] (feature F14).
+    #[serde(rename = "x-ferrogate-created", default)]
+    pub created: Option<i64>,
 }
 
 impl Jwk {
@@ -122,6 +126,20 @@ impl JwkSet {
 
     fn find(&self, kid: &str) -> Option<&Jwk> {
         self.keys.iter().find(|k| k.kid == kid)
+    }
+
+    /// The preferred key under "newer preferred" ordering: the one with the
+    /// greatest `created` timestamp (absent counts as oldest), ties resolving to
+    /// the first in publication order. A reference consumer uses this to pick
+    /// the trust anchor when CMIS publishes both roots during a cross-sign
+    /// rotation window (feature F14). `None` only for an empty set.
+    #[must_use]
+    pub fn preferred(&self) -> Option<&Jwk> {
+        self.keys
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, k)| (k.created.unwrap_or(i64::MIN), std::cmp::Reverse(*i)))
+            .map(|(_, k)| k)
     }
 }
 
