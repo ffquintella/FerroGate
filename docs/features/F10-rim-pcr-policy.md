@@ -50,9 +50,11 @@ See [../tpm.md](../tpm.md) §"PCR policy" and [../operations.md](../operations.m
 - [x] Old generations beyond 6 are pruned and no longer accepted.
       (`MAX_GENERATIONS = 6`; `rim::tests::retention_prunes_oldest_beyond_six`
       proves pruned digests no longer resolve.)
-- [ ] Admin RPC `bump_epoch` emits a `PolicyEpochBumped` audit event and
-      forces re-attestation at next rotation for all hosts. *(Deferred to
-      M5 per the roadmap; out of M2 scope.)*
+- [x] Admin RPC `bump_epoch` emits a `PolicyEpochBumped` audit event and
+      forces re-attestation at next rotation for all hosts. (`BumpEpoch` RPC →
+      `CmisState::bump_epoch` advances a live `AtomicU64` epoch; `decide_renewal`'s
+      `EpochBump` branch then refuses `Rotate` with `FAILED_PRECONDITION`.
+      `mia/tests/e2e_attest.rs::bump_epoch_forces_full_reattestation_on_next_rotate`.)
 - [x] PCR digest not in any active generation → `FAILED_PRECONDITION`.
       (`service::verifier_status` collapses `RejectReason::NotInRim` to
       `FAILED_PRECONDITION`; `mia/tests/e2e_attest.rs::attest_returns_failed_precondition_when_digest_not_in_rim`

@@ -28,7 +28,7 @@ use ferro_attest::tpm::{
 use ferro_attest::{PolicyId, RimStore, TpmQuoteVerifier, Vendor, VendorTrustStore};
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore};
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
-use ferro_proto::v1::{PcrValue, RotateRequest};
+use ferro_proto::v1::{BumpEpochRequest, PcrValue, RotateRequest};
 use ferro_svid::Issuer;
 use mia::client::{run_attest, AttestEvidence, QuoteEvidence};
 
@@ -636,6 +636,64 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
         &new_root,
         &cons_path,
     ));
+}
+
+// --- F10: bump_epoch forces full re-attestation -----------------------------
+
+#[tokio::test]
+async fn bump_epoch_forces_full_reattestation_on_next_rotate() {
+    let mut evidence = SoftwareEvidence::new();
+    let state = build_state(&evidence);
+    let mut client = spawn_server(Arc::clone(&state)).await;
+
+    // Attest under epoch 1, then confirm a same-epoch rotate takes the short
+    // path (no re-attestation) — the control for the assertion below.
+    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+        .await
+        .unwrap();
+    let pcrs: Vec<PcrValue> = pcr_values()
+        .into_iter()
+        .map(|(index, value)| PcrValue {
+            index: u32::from(index),
+            value,
+        })
+        .collect();
+    client
+        .rotate(RotateRequest {
+            current_svid: attested.bundle.jws.clone(),
+            pcr_values: pcrs.clone(),
+            known_epoch: 1,
+        })
+        .await
+        .expect("short-path rotate succeeds before the bump");
+
+    // Bump the live policy epoch via the admin RPC.
+    let audit_before_bump = state.audit.len();
+    let resp = client
+        .bump_epoch(BumpEpochRequest {
+            reason: "rim-policy-change".into(),
+        })
+        .await
+        .expect("bump_epoch succeeds")
+        .into_inner();
+    assert_eq!(resp.new_epoch, 2, "epoch advanced 1 -> 2");
+    assert_eq!(
+        state.audit.len(),
+        audit_before_bump + 1,
+        "one PolicyEpochBumped event recorded"
+    );
+
+    // The SVID was attested under epoch 1; with the live epoch now 2, the next
+    // rotate must be refused so the host is driven back through full Attest.
+    let status = client
+        .rotate(RotateRequest {
+            current_svid: attested.bundle.jws.clone(),
+            pcr_values: pcrs,
+            known_epoch: 2,
+        })
+        .await
+        .expect_err("rotate must be refused after an epoch bump");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 }
 
 // --- F13: fleet enrolment pre-admission -------------------------------------

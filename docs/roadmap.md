@@ -286,8 +286,29 @@ and the `fleet-manifest` CLI lifecycle, plus `clippy -D warnings`.
 
 ### F10 — RIM and PCR policy (continued)
 
-- [ ] Signed-S3 RIM refresh.
-- [ ] `bump_epoch` admin RPC with audit event and forced re-attestation.
+- [~] Signed-S3 RIM refresh. **S3 sourcing is not supported yet** (deliberately
+      deferred — no HTTP/S3 client is pulled into the workspace). The signed,
+      hot, atomic refresh path *is* wired: `RimLoader` + `rim_watcher` are now
+      spawned from `cmis` `main` (env `CMIS_RIM_BUNDLE` + `CMIS_RIM_SIGNER_KID`/
+      `CMIS_RIM_SIGNER_PUB`, fail-closed) and load the bundle from a **local
+      file**. A deployment that keeps the bundle in object storage syncs it to
+      that path out of band; because the bundle is composite-signed and verified
+      before apply, the sync path is untrusted. A native S3 fetcher can later
+      slot in behind the same verify-then-swap seam.
+- [x] `bump_epoch` admin RPC with audit event and forced re-attestation.
+      (`BumpEpoch` RPC → `CmisState::bump_epoch` advances a live `AtomicU64`
+      epoch; the next `Rotate` for any host attested under the old epoch is
+      refused (`FAILED_PRECONDITION`) via `decide_renewal`'s `EpochBump` branch.
+      Records a `PolicyEpochBumped` audit event.)
+
+**F10 (continued) status: `bump_epoch` done; S3 sourcing deferred.** The policy
+epoch is now runtime-mutable: `bump_epoch` flips an `AtomicU64` and every host
+re-attests on its next rotate. RIM bundles load and hot-reload from a signed
+local file; fetching them directly from S3 is explicitly out of scope for now
+and documented as unsupported. Verified with the `mia` e2e harness
+(`bump_epoch_forces_full_reattestation_on_next_rotate`: short-path rotate before
+the bump, `FAILED_PRECONDITION` after, one `PolicyEpochBumped` leaf) plus
+`clippy -D warnings`.
 
 ## Milestone M6 — Ceremony, drills, and production readiness
 

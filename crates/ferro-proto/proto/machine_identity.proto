@@ -37,6 +37,12 @@ service MachineIdentity {
   // Admin RPC: revoke every SVID and child token for a host SPIFFE ID.
   rpc RevokeHost (RevokeHostRequest) returns (RevokeResponse);
 
+  // Admin RPC: bump the live RIM policy epoch (feature F10). Every host whose
+  // last full attestation was under the previous epoch is forced through a
+  // fresh four-phase Attest at its next Rotate. Records a PolicyEpochBumped
+  // audit event. Authenticated out of band as an operator action.
+  rpc BumpEpoch (BumpEpochRequest) returns (BumpEpochResponse);
+
   // ---- Audit log (F07) ----
 
   // Latest Signed Tree Head. Verifiers re-anchor incremental consistency
@@ -162,6 +168,16 @@ message RevokeHostRequest {
 
 message RevokeResponse {
   uint64 crl_number = 1; // sequence number of the CRL carrying the revocation
+}
+
+// ---- Policy epoch (F10) ------------------------------------------------
+
+message BumpEpochRequest {
+  string reason = 1; // stable operator opcode, e.g. "rim-policy-change"
+}
+
+message BumpEpochResponse {
+  uint64 new_epoch = 1; // the epoch now in force after the bump
 }
 
 // ---- Audit log -----------------------------------------------------------

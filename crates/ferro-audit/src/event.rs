@@ -73,6 +73,17 @@ pub enum AuditEvent {
         /// Short, stable opcode (e.g. `"not-enrolled"`).
         reason: String,
     },
+    /// The live RIM policy epoch was bumped by an admin RPC (feature F10).
+    /// Every host attested under `old_epoch` is forced to fully re-attest on
+    /// its next `Rotate`.
+    PolicyEpochBumped {
+        /// The epoch in force before the bump.
+        old_epoch: u64,
+        /// The epoch in force after the bump.
+        new_epoch: u64,
+        /// Short, stable opcode for why (e.g. `"rim-policy-change"`).
+        reason: String,
+    },
     /// A threshold key share was used to reconstruct the issuance key.
     KeyShareUsed {
         /// Which share (0..=4 in the 3-of-5 scheme).

@@ -22,11 +22,11 @@ use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
 use ferro_proto::v1::{
-    AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, Challenge,
-    ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest, HealthRequest, HealthResponse,
-    InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest,
-    LatestSthResponse, NodeRole as ProtoNodeRole, Nonce, RevokeHostRequest, RevokeResponse,
-    RevokeSvidRequest, RotateRequest, SignedTreeHead, SvidBundle,
+    AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, BumpEpochRequest,
+    BumpEpochResponse, Challenge, ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest,
+    HealthRequest, HealthResponse, InclusionProofRequest, InclusionProofResponse, JwksRequest,
+    JwksResponse, LatestSthRequest, LatestSthResponse, NodeRole as ProtoNodeRole, Nonce,
+    RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest, SignedTreeHead, SvidBundle,
 };
 use ferro_raft::NodeRole;
 use ferro_svid::{
@@ -329,7 +329,7 @@ async fn run_attest(
             last_attestation: LastAttestation {
                 at: now,
                 pcr_digest: verified.pcr_digest,
-                policy_epoch: state.config.policy_epoch,
+                policy_epoch: state.current_epoch(),
             },
             bundle: issued.clone(),
         })
@@ -409,7 +409,7 @@ impl MachineIdentity for MachineIdentitySvc {
             &record.last_attestation,
             now,
             &current_digest,
-            self.state.config.policy_epoch,
+            self.state.current_epoch(),
         ) {
             RenewalDecision::ShortPath => {
                 let issued = self
@@ -502,6 +502,30 @@ impl MachineIdentity for MachineIdentitySvc {
         let number = self.publish_crl_now(now)?;
         tracing::info!(spiffe_id = %req.spiffe_id, crl_number = number, "host revoked");
         Ok(Response::new(RevokeResponse { crl_number: number }))
+    }
+
+    async fn bump_epoch(
+        &self,
+        request: Request<BumpEpochRequest>,
+    ) -> Result<Response<BumpEpochResponse>, Status> {
+        let req = request.into_inner();
+        let now = unix_now();
+        // Reuse the same bounded-opcode normalisation as revocation so the audit
+        // log never carries unbounded operator free-text.
+        let reason = revocation_reason(&req.reason);
+
+        let (old_epoch, new_epoch) = self.state.bump_epoch();
+        audit_record(
+            &self.state,
+            AuditEvent::PolicyEpochBumped {
+                old_epoch,
+                new_epoch,
+                reason,
+            },
+            now,
+        );
+        tracing::info!(old_epoch, new_epoch, "RIM policy epoch bumped");
+        Ok(Response::new(BumpEpochResponse { new_epoch }))
     }
 
     async fn latest_sth(

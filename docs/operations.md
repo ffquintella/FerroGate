@@ -47,6 +47,29 @@ on the EK cert.
 - Any PCR change detected at boot invalidates the cached SVID (sealing breaks)
   and forces full re-attestation.
 
+## RIM policy and epoch bump
+
+- **RIM bundle.** CMIS maps attested PCR digests to a `policy_id` via a
+  versioned, composite-signed RIM bundle (the active generation plus six prior).
+  Configure it with `CMIS_RIM_BUNDLE` (path to the signed bundle file),
+  `CMIS_RIM_SIGNER_KID`, and `CMIS_RIM_SIGNER_PUB` (publisher composite pubkey
+  as concat-bytes hex). CMIS loads it fail-closed at startup and a watcher
+  hot-swaps any strictly-newer signed bundle (verified before apply, atomic).
+  With `CMIS_RIM_BUNDLE` unset the allowlist is empty and every quote fails the
+  RIM lookup (`FAILED_PRECONDITION`) — fail-closed by default.
+- **S3 sourcing is not supported yet.** The bundle is read from a local file; a
+  deployment that keeps it in object storage syncs it to that path out of band.
+  Because the bundle is composite-signed and verified before apply, that sync
+  path is untrusted — only the signature gates what is admitted.
+- **Epoch bump (mass re-attestation).** For a compromised RIM generation or a
+  vulnerable kernel image, the operator calls the `BumpEpoch(reason)` admin RPC
+  (authenticated as an operator action at the transport). It advances the live
+  policy epoch and records a `PolicyEpochBumped` audit event. Every host whose
+  last full attestation was under the previous epoch is refused at its next
+  `Rotate` (`FAILED_PRECONDITION`) and driven back through a full four-phase
+  `Attest`. The bump is process-local; replicating it across a cluster is a
+  documented deployment seam.
+
 ## Revocation
 
 - CMIS publishes a composite-signed CRL delta every 60 s as a JWKS extension
@@ -71,9 +94,9 @@ on the EK cert.
   artefact can never reappear after expiry, so dropping the entry bounds CRL
   growth.
 - For mass revocation (compromised RIM generation, vulnerable kernel image),
-  the operator increments the `policy_id` epoch. All SVIDs whose
-  `attest.policy_id` does not match the active epoch become invalid at next
-  rotation; the global audit log records the epoch bump.
+  the operator bumps the policy epoch via `BumpEpoch` — see "RIM policy and
+  epoch bump" above. Every host attested under the old epoch re-attests at its
+  next rotation; the global audit log records the bump (`PolicyEpochBumped`).
 
 ## Root key rotation
 

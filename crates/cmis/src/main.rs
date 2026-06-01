@@ -10,11 +10,12 @@
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::fleet_manifest::FleetManifestLoader;
 use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
-use ferro_attest::{RimStore, TpmQuoteVerifier, TrustedKeys, VendorTrustStore};
+use ferro_attest::{RimLoader, RimStore, TpmQuoteVerifier, TrustedKeys, VendorTrustStore};
 use ferro_crypto::composite::CompositePublicKey;
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
 use ferro_svid::Issuer;
@@ -38,22 +39,21 @@ impl CredentialMaker for UnconfiguredCredentialMaker {
     }
 }
 
-/// Build the fleet-manifest publisher trust set from the environment.
-///
-/// `CMIS_FLEET_SIGNER_KID` selects the key id the manifest is signed under and
-/// `CMIS_FLEET_SIGNER_PUB` carries that publisher's composite public key as
-/// lowercase hex of its `ed25519(32) || ml-dsa-65(1952)` concat form (the same
-/// form the `fleet-manifest` tool prints). Production deployments source this
-/// from the F14 ceremony's published root key.
-fn load_fleet_trust() -> anyhow::Result<TrustedKeys> {
-    let kid = std::env::var("CMIS_FLEET_SIGNER_KID")
-        .map_err(|_| anyhow::anyhow!("CMIS_FLEET_MANIFEST set but CMIS_FLEET_SIGNER_KID missing"))?;
-    let pub_hex = std::env::var("CMIS_FLEET_SIGNER_PUB")
-        .map_err(|_| anyhow::anyhow!("CMIS_FLEET_MANIFEST set but CMIS_FLEET_SIGNER_PUB missing"))?;
+/// Build a single-publisher composite trust set from a pair of environment
+/// variables: `<kid_var>` selects the key id artefacts are signed under and
+/// `<pub_var>` carries that publisher's composite public key as lowercase hex
+/// of its `ed25519(32) || ml-dsa-65(1952)` concat form. Used for both the F13
+/// fleet manifest and the F10 RIM bundle; production sources these from the
+/// F14 ceremony's published root key.
+fn load_single_key_trust(kid_var: &str, pub_var: &str) -> anyhow::Result<TrustedKeys> {
+    let kid =
+        std::env::var(kid_var).map_err(|_| anyhow::anyhow!("{kid_var} missing"))?;
+    let pub_hex =
+        std::env::var(pub_var).map_err(|_| anyhow::anyhow!("{pub_var} missing"))?;
     let pub_bytes =
-        hex::decode(pub_hex.trim()).map_err(|e| anyhow::anyhow!("CMIS_FLEET_SIGNER_PUB hex: {e}"))?;
+        hex::decode(pub_hex.trim()).map_err(|e| anyhow::anyhow!("{pub_var} hex: {e}"))?;
     let pk = CompositePublicKey::from_concat_bytes(&pub_bytes)
-        .map_err(|e| anyhow::anyhow!("CMIS_FLEET_SIGNER_PUB: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{pub_var}: {e}"))?;
     let mut trust = TrustedKeys::new();
     trust.add(kid, pk);
     Ok(trust)
@@ -69,7 +69,10 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
 
     let issuer = Issuer::generate("cmis-dev-1", "ferrogate.dev")?;
-    let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), RimStore::new());
+    // The verifier and the RIM loader share one `RimStore` handle so a signed
+    // bundle applied by the loader is immediately visible to quote verification.
+    let rim_store = RimStore::new();
+    let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), rim_store.clone());
 
     // M3 audit log: local-disk WORM store + in-process composite signer. The
     // production swap (S3 Object Lock + TEE threshold signer) lands in M4.
@@ -96,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     // attest is admitted, exactly as before F13.
     let _fleet_watcher = match std::env::var("CMIS_FLEET_MANIFEST") {
         Ok(path) if !path.is_empty() => {
-            let trust = load_fleet_trust()?;
+            let trust = load_single_key_trust("CMIS_FLEET_SIGNER_KID", "CMIS_FLEET_SIGNER_PUB")?;
             let loader = Arc::new(FleetManifestLoader::new(path, trust, state.fleet().clone()));
             match loader.try_reload() {
                 Ok(outcome) => tracing::info!(?outcome, "fleet manifest loaded"),
@@ -109,6 +112,34 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => {
             tracing::warn!("no CMIS_FLEET_MANIFEST configured — fleet enrolment unenforced");
+            None
+        }
+    };
+
+    // F10 RIM refresh. If a signed RIM bundle file is configured, load it now
+    // (fail-closed: a configured-but-unloadable bundle aborts startup) and spawn
+    // a watcher that hot-swaps a strictly-newer signed bundle into the shared
+    // store. With nothing configured the RIM allowlist stays empty and every
+    // quote fails the RIM lookup (FAILED_PRECONDITION) — fail-closed by default.
+    //
+    // The bundle is read from a local file. Sourcing it directly from S3 is NOT
+    // yet supported (see docs/roadmap.md F10); a deployment that stores the
+    // bundle in object storage syncs it to this path out of band. Because the
+    // bundle is composite-signed and verified before apply, that sync path is
+    // untrusted — only the signature gates what is admitted.
+    let _rim_watcher = match std::env::var("CMIS_RIM_BUNDLE") {
+        Ok(path) if !path.is_empty() => {
+            let trust = load_single_key_trust("CMIS_RIM_SIGNER_KID", "CMIS_RIM_SIGNER_PUB")?;
+            let loader = Arc::new(RimLoader::new(path, trust, rim_store.clone()));
+            match loader.try_reload() {
+                Ok(outcome) => tracing::info!(?outcome, "RIM bundle loaded"),
+                Err(e) => return Err(anyhow::anyhow!("RIM bundle load failed: {e}")),
+            }
+            // 60 s steady-state poll, matching the fleet-manifest watcher.
+            Some(cmis::rim_watcher::spawn(loader, Duration::from_secs(60)))
+        }
+        _ => {
+            tracing::warn!("no CMIS_RIM_BUNDLE configured — RIM allowlist empty (all quotes fail)");
             None
         }
     };

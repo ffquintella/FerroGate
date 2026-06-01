@@ -14,6 +14,7 @@
 //! `record` / `lookup` / `update_bundle` methods and the implementation routes.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -73,8 +74,17 @@ pub struct CmisState {
     pub verifier: TpmQuoteVerifier,
     /// Phase-3 credential wrapper.
     pub credential_maker: Box<dyn CredentialMaker>,
-    /// Static issuance policy.
+    /// Static issuance policy. Note that `config.policy_epoch` is only the
+    /// *seed* value; the live epoch is held in [`policy_epoch`] so the
+    /// `BumpEpoch` admin RPC can advance it at runtime.
+    ///
+    /// [`policy_epoch`]: CmisState::current_epoch
     pub config: CmisConfig,
+    /// The live RIM policy epoch (feature F10), seeded from
+    /// `config.policy_epoch` and advanced by [`CmisState::bump_epoch`]. Read it
+    /// via [`CmisState::current_epoch`] — never `config.policy_epoch` directly,
+    /// which is frozen at construction.
+    policy_epoch: AtomicU64,
     /// Append-only audit log (Merkle tree + WORM store + STH signer).
     pub audit: AuditLog,
     /// Verification keys published over the `JWKS` RPC: the issuer's SVID key
@@ -124,6 +134,7 @@ impl CmisState {
             issuer,
             verifier,
             credential_maker,
+            policy_epoch: AtomicU64::new(config.policy_epoch),
             config,
             audit,
             published_keys,
@@ -150,6 +161,7 @@ impl CmisState {
             issuer,
             verifier,
             credential_maker,
+            policy_epoch: AtomicU64::new(config.policy_epoch),
             config,
             audit,
             published_keys,
@@ -259,6 +271,26 @@ impl CmisState {
             Backend::Cluster(c) => Some(c),
             Backend::Local(_) => None,
         }
+    }
+
+    /// The live RIM policy epoch (feature F10). Read this — not
+    /// `config.policy_epoch` — wherever the current epoch gates a decision
+    /// (issuance stamping, `Rotate` renewal), so a runtime `BumpEpoch` is seen.
+    #[must_use]
+    pub fn current_epoch(&self) -> u64 {
+        self.policy_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Bump the live RIM policy epoch by one and return `(old, new)`.
+    ///
+    /// After this returns, every host whose stored `last_attestation.policy_epoch`
+    /// is the old value is forced through a full re-attestation on its next
+    /// `Rotate` (see `ferro_svid::decide_renewal`). The bump is process-local,
+    /// mirroring the revocation working set: replicating it through the Raft
+    /// store so every replica advances together is a documented deployment seam.
+    pub fn bump_epoch(&self) -> (u64, u64) {
+        let old = self.policy_epoch.fetch_add(1, Ordering::SeqCst);
+        (old, old + 1)
     }
 
     /// Fill an N-byte buffer from the OS CSPRNG (nonces, phase-3 secrets).

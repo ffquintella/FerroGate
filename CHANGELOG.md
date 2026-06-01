@@ -8,6 +8,35 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [M5.6] — 2026-06-01 — RIM epoch bump and signed RIM refresh wiring (v0.10.0)
+
+### Added — F10 (continued): RIM and PCR policy
+
+- **`BumpEpoch` admin RPC.** New `MachineIdentity` RPC that advances the live
+  RIM policy epoch. `CmisState` now holds the epoch in an `AtomicU64` (seeded
+  from `CmisConfig::policy_epoch`); `current_epoch` / `bump_epoch` replace the
+  frozen `config.policy_epoch` at the issuance and `Rotate` decision points. A
+  bump forces every host attested under the previous epoch through a full
+  four-phase re-attestation on its next `Rotate` (`FAILED_PRECONDITION` via
+  `decide_renewal`'s `EpochBump` branch), and records a new `PolicyEpochBumped`
+  audit event (`old_epoch`, `new_epoch`, bounded reason opcode).
+- **Signed RIM refresh wired into CMIS.** `RimLoader` + `rim_watcher` (built in
+  M2 but never spawned) are now started from `cmis` `main` behind
+  `CMIS_RIM_BUNDLE` + `CMIS_RIM_SIGNER_KID` / `CMIS_RIM_SIGNER_PUB`, sharing one
+  `RimStore` with the quote verifier. Startup is fail-closed (a configured but
+  unloadable bundle aborts); with nothing configured the allowlist is empty and
+  every quote fails the RIM lookup. The trust-from-env helper is now shared with
+  the F13 fleet-manifest loader.
+
+### Not yet supported
+
+- **S3-sourced RIM refresh.** Fetching the bundle directly from S3 is
+  deliberately out of scope for now — no HTTP/S3 client is pulled into the
+  workspace. The bundle loads/hot-reloads from a local file; deployments sync it
+  from object storage out of band, and the composite signature (verified before
+  apply) is the only trust gate. A native fetcher can slot in behind the same
+  seam later.
+
 ## [M5.5] — 2026-06-01 — Zero-touch bootstrap and fleet enrollment (v0.9.0)
 
 ### Added — F13: Zero-touch bootstrap and fleet enrollment
