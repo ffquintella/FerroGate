@@ -1,8 +1,9 @@
 #!/bin/sh
 # FerroGate container entrypoint.
 #
-# Usage: ferrogate-entrypoint.sh <server> [args...]
-#   <server> is `cmis` (default) or `mia`.
+# Usage: ferrogate-entrypoint.sh [cmis] [args...]
+#   The only server shipped in this image is `cmis`. The `mia` host agent is
+#   installed directly on each machine from its OS package, not run here.
 #
 # Tees the server's stdout/stderr to both the container stdout (for the docker
 # log driver) and a file under $FERROGATE_LOG_DIR (a mountable volume). The
@@ -13,9 +14,9 @@ set -eu
 
 SERVER="${1:-cmis}"
 case "$SERVER" in
-    cmis|mia) shift ;;
-    -*|"")    SERVER="cmis" ;;            # only flags given: default server
-    *) echo "ferrogate: unknown server '$SERVER' (expected cmis or mia)" >&2
+    cmis) shift ;;
+    -*|"") SERVER="cmis" ;;               # only flags given: default server
+    *) echo "ferrogate: unknown server '$SERVER' (this image ships cmis only)" >&2
        exit 64 ;;
 esac
 

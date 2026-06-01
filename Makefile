@@ -1,6 +1,7 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs docker-image docker-image-push \
-        docker-repo-setup docker-repo-show
+        docker-repo-setup docker-repo-show \
+        pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools
 
 # Default target: list available targets with their descriptions.
 .DEFAULT_GOAL := help
@@ -165,3 +166,84 @@ formal-cryptoverif: ## Run the CryptoVerif hybrid AKE proof
 	else \
 		echo "SKIP: cryptoverif not on PATH (see formal/README.md to install)"; \
 	fi
+
+# ── Client packaging: rpm / deb / msi / pkg ───────────────────────────────────
+#
+# Builds OS installer packages for the FerroGate *client* — the `mia` Machine
+# Identity Agent. Each format uses the dedicated packaging tool and reads its
+# metadata from `crates/mia/Cargo.toml` (deb/rpm/msi) plus the assets in
+# `crates/mia/dist/`:
+#
+#   make pkg-deb   -> .deb   (cargo-deb,          Debian/Ubuntu)
+#   make pkg-rpm   -> .rpm   (cargo-generate-rpm, Fedora/RHEL/SUSE)
+#   make pkg-msi   -> .msi   (cargo-wix,          Windows; run ON Windows)
+#   make pkg-macos -> .pkg   (pkgbuild/productbuild, macOS; run ON macOS)
+#   make pkg       -> every format valid for the current host
+#   make pkg-tools -> install the cargo packaging tools (deb/rpm/msi)
+#
+# Each package must be built on its target OS: DEB/RPM on Linux (the release
+# binary links the Linux TPM ESAPI stack), MSI on Windows with the WiX Toolset
+# v3, the .pkg on macOS (no TPM there — mia runs as the helper-API surface).
+# Outputs land under target/debian, target/generate-rpm, target/wix, target/macos.
+PKG_CRATE := mia
+UNAME_S   := $(shell uname -s)
+
+pkg-tools: ## Install the cargo packaging tools (cargo-deb, cargo-generate-rpm, cargo-wix)
+	cargo install cargo-deb cargo-generate-rpm cargo-wix
+
+pkg-deb: ## Build the mia .deb package (Linux; needs cargo-deb)
+	@command -v cargo-deb >/dev/null 2>&1 || { echo "ERROR: cargo-deb not found — run 'make pkg-tools'"; exit 1; }
+	cargo deb -p $(PKG_CRATE)
+	@echo "==> .deb written under target/debian/"
+
+pkg-rpm: ## Build the mia .rpm package (Linux; needs cargo-generate-rpm)
+	@command -v cargo-generate-rpm >/dev/null 2>&1 || { echo "ERROR: cargo-generate-rpm not found — run 'make pkg-tools'"; exit 1; }
+	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE)
+	strip target/release/$(PKG_CRATE)
+	cargo generate-rpm -p crates/$(PKG_CRATE)
+	@echo "==> .rpm written under target/generate-rpm/"
+
+pkg-msi: ## Build the mia .msi installer (Windows; needs cargo-wix + WiX Toolset)
+	@command -v cargo-wix >/dev/null 2>&1 || { echo "ERROR: cargo-wix not found — run 'make pkg-tools'"; exit 1; }
+	cargo wix -p $(PKG_CRATE) --nocapture
+	@echo "==> .msi written under target/wix/"
+
+# macOS component+product package built with the platform's own tools (no extra
+# cargo plugin). Stages a payload root, then pkgbuild → productbuild. Set
+# PKG_SIGN_ID="Developer ID Installer: ..." to sign the product archive.
+MACOS_PKG_ID   := com.ferrogate.mia
+MACOS_PKG_ROOT := target/macos/pkgroot
+MACOS_PKG_OUT  := target/macos/ferrogate-mia-$(CARGO_VERSION).pkg
+MACOS_DIST     := crates/mia/dist
+pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
+	@[ "$(UNAME_S)" = "Darwin" ] || { echo "ERROR: pkg-macos must run on macOS (host is $(UNAME_S))"; exit 1; }
+	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE)
+	strip target/release/$(PKG_CRATE)
+	rm -rf $(MACOS_PKG_ROOT)
+	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/bin
+	install -d -m 0755 $(MACOS_PKG_ROOT)/etc/ferrogate
+	install -d -m 0755 $(MACOS_PKG_ROOT)/Library/LaunchDaemons
+	install -m 0755 target/release/$(PKG_CRATE) $(MACOS_PKG_ROOT)/usr/local/bin/$(PKG_CRATE)
+	install -m 0640 $(MACOS_DIST)/mia.env $(MACOS_PKG_ROOT)/etc/ferrogate/mia.env
+	install -m 0644 $(MACOS_DIST)/com.ferrogate.mia.plist $(MACOS_PKG_ROOT)/Library/LaunchDaemons/$(MACOS_PKG_ID).plist
+	pkgbuild --root $(MACOS_PKG_ROOT) \
+		--scripts $(MACOS_DIST)/macos-scripts \
+		--identifier $(MACOS_PKG_ID) \
+		--version $(CARGO_VERSION) \
+		--install-location / \
+		target/macos/$(PKG_CRATE)-component.pkg
+	productbuild --package target/macos/$(PKG_CRATE)-component.pkg \
+		$(if $(PKG_SIGN_ID),--sign "$(PKG_SIGN_ID)",) \
+		$(MACOS_PKG_OUT)
+	@rm -f target/macos/$(PKG_CRATE)-component.pkg
+	@echo "==> .pkg written to $(MACOS_PKG_OUT)"
+
+pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi/Windows, pkg/macOS)
+	@case "$(UNAME_S)" in \
+	  Linux)  $(MAKE) --no-print-directory pkg-deb pkg-rpm; \
+	          echo "NOTE: build the .msi on Windows ('make pkg-msi') and the .pkg on macOS ('make pkg-macos')." ;; \
+	  Darwin) $(MAKE) --no-print-directory pkg-macos; \
+	          echo "NOTE: build the .deb/.rpm on Linux ('make pkg') and the .msi on Windows ('make pkg-msi')." ;; \
+	  *)      echo "Host is $(UNAME_S): build the .msi here with 'make pkg-msi'."; \
+	          $(MAKE) --no-print-directory pkg-msi ;; \
+	esac

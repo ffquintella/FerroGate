@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd daemon for the FerroGate Machine Identity Agent (MIA) on macOS.
+
+  Installed by the .pkg to /Library/LaunchDaemons/com.ferrogate.mia.plist but
+  left UNLOADED: configure /etc/ferrogate/mia.env first, then enable with
+      sudo launchctl load -w /Library/LaunchDaemons/com.ferrogate.mia.plist
+  and disable with `launchctl unload -w <same path>`.
+
+  macOS has no TPM, so the F02 hardware-attestation path compiles out; mia runs
+  here as the helper-API surface (a Unix-domain-socket listener). Configuration
+  is by environment variable — see docs/mia.md and /etc/ferrogate/mia.env.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ferrogate.mia</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/mia</string>
+    </array>
+
+    <!-- launchd does not read EnvironmentFile; the documented defaults live in
+         /etc/ferrogate/mia.env. Set the variables mia needs here, or wrap the
+         binary in a small launcher that sources that file. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>FERROGATE_HELPER_SOCKET</key>
+        <string>/var/run/ferrogate/mia.sock</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Per docs/mia.md failure modes, retry with backoff rather than give up. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/ferrogate/mia.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/ferrogate/mia.log</string>
+</dict>
+</plist>

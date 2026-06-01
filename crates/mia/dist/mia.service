@@ -1,0 +1,32 @@
+[Unit]
+Description=FerroGate Machine Identity Agent (MIA)
+Documentation=https://github.com/ffquintella/FerroGate
+# The agent attests to and fetches identity from CMIS over the network.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Configuration is by environment variable (see man page / docs/mia.md). The
+# package ships a documented template at /etc/ferrogate/mia.env; edit it before
+# enabling the service. The leading '-' makes the file optional so the unit
+# still starts (and logs its banner) on a fresh install.
+EnvironmentFile=-/etc/ferrogate/mia.env
+ExecStart=/usr/bin/mia
+
+# MIA drops its own privileges and installs its seccomp profile (feature F12),
+# so it must start as root on Linux. Do NOT add User=/Group= here — that would
+# defeat the hardening profile, which expects to drop from root itself.
+
+# The helper-API Unix socket lives under /run/ferrogate; systemd creates and
+# tears down this directory for us.
+RuntimeDirectory=ferrogate
+RuntimeDirectoryMode=0750
+
+# Per docs/mia.md failure modes: CMIS unreachable or TPM busy should be retried
+# with backoff rather than treated as permanent failure.
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

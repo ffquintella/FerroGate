@@ -80,3 +80,58 @@ sha2         = { workspace = true }
 rcgen        = { workspace = true }
 tss-esapi    = { workspace = true }
 ferro-attest = { path = "../ferro-attest" }
+
+# ── OS package metadata ──────────────────────────────────────────────────────
+# Consumed by `cargo-deb` (DEB), `cargo-generate-rpm` (RPM) and `cargo-wix`
+# (MSI). Drive them via the repo Makefile: `make pkg` (or pkg-deb / pkg-rpm /
+# pkg-msi). The packaged artifact is the `mia` client agent.
+
+# cargo-deb: https://github.com/kornelski/cargo-deb
+# Asset source paths are resolved relative to THIS crate's directory.
+[package.metadata.deb]
+name = "ferrogate-mia"
+maintainer = "FerroGate contributors <https://github.com/ffquintella/FerroGate>"
+copyright = "FerroGate contributors"
+extended-description = """\
+FerroGate Machine Identity Agent (MIA): the host-side agent that attests the \
+machine to the Central Machine Identity Service (CMIS) over hybrid-PQC TLS and \
+exposes a local helper API for minting DPoP-bound child tokens to vetted \
+callers."""
+section = "admin"
+priority = "optional"
+# libtss2-esys is the runtime TPM 2.0 ESAPI dependency mia links on Linux.
+depends = "libc6 (>= 2.31), libtss2-esys-3.0.2-0, libssl3"
+assets = [
+    ["../../target/release/mia", "usr/bin/", "755"],
+    ["dist/mia.env", "etc/ferrogate/mia.env", "640"],
+    ["../../docs/mia.md", "usr/share/doc/ferrogate-mia/mia.md", "644"],
+]
+conf-files = ["/etc/ferrogate/mia.env"]
+# cargo-deb auto-generates the postinst/prerm maintainer scripts that register
+# the unit with systemd. enable/start are left to the operator (the agent needs
+# configuration in /etc/ferrogate/mia.env before it does anything useful).
+systemd-units = { unit-name = "mia", unit-scripts = "dist", enable = false, start = false }
+
+# cargo-generate-rpm: https://github.com/cat-in-136/cargo-generate-rpm
+# Asset source paths are resolved relative to the directory cargo-generate-rpm
+# is invoked from; the Makefile runs it from the workspace root.
+[package.metadata.generate-rpm]
+name = "ferrogate-mia"
+summary = "FerroGate Machine Identity Agent (host client)"
+license = "Apache-2.0"
+assets = [
+    { source = "target/release/mia", dest = "/usr/bin/mia", mode = "755" },
+    { source = "crates/mia/dist/mia.env", dest = "/etc/ferrogate/mia.env", mode = "640", config = true },
+    { source = "crates/mia/dist/mia.service", dest = "/usr/lib/systemd/system/mia.service", mode = "644" },
+    { source = "docs/mia.md", dest = "/usr/share/doc/ferrogate-mia/mia.md", mode = "644", doc = true },
+]
+auto-req = "no"
+
+[package.metadata.generate-rpm.requires]
+# TPM 2.0 ESAPI runtime stack (Fedora/RHEL package name).
+tpm2-tss = "*"
+
+# cargo-wix: https://github.com/volks73/cargo-wix
+[package.metadata.wix]
+name = "FerroGate-MIA"
+output = "target/wix/ferrogate-mia-installer.msi"

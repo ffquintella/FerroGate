@@ -1,12 +1,13 @@
 # FerroGate runtime image (linux/amd64).
 #
-# Multi-stage build producing a small, non-root image that runs the FerroGate
-# servers. Both `cmis` (Central Machine Identity Service, gRPC) and `mia`
-# (Machine Identity Agent) are built in; the default command runs `cmis`.
+# Multi-stage build producing a small, non-root image that runs `cmis`, the
+# Central Machine Identity Service (gRPC server). The `mia` Machine Identity
+# Agent is NOT shipped here — it is the host-side client, installed directly on
+# each machine from the OS packages (`make pkg`: .deb / .rpm / .msi / .pkg).
 #
-# The servers emit tracing to stdout; the entrypoint tees that to a rotating
-# log file under /opt/ferrogate/logs (a mountable volume) while still writing
-# to the container's stdout. The CMIS audit WORM store lives under
+# cmis emits tracing to stdout; the entrypoint tees that to a rotating log file
+# under /opt/ferrogate/logs (a mountable volume) while still writing to the
+# container's stdout. The CMIS audit WORM store lives under
 # /var/lib/ferrogate/audit, also a volume.
 #
 # Build (via the Makefile):  make docker-image
@@ -20,20 +21,16 @@
 #       -v "$PWD/audit:/var/lib/ferrogate/audit" \
 #       -e RUST_LOG=debug \
 #       -e CMIS_LISTEN=0.0.0.0:8443 \
-#       ferrogate:latest cmis
-#
-# Run MIA instead:  docker run ... ferrogate:latest mia
+#       ferrogate:latest
 
 # ---------------------------------------------------------------------------
 # Stage 1: build the release binaries for linux/amd64.
 # ---------------------------------------------------------------------------
 FROM rust:1-bookworm AS builder
 
-# ferro-proto compiles the gRPC surface with tonic-build (needs protoc); mia
-# links the TSS2 ESAPI stack on Linux (needs libtss2-dev + clang).
+# ferro-proto compiles the gRPC surface with tonic-build (needs protoc).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler \
-        libtss2-dev \
         libssl-dev \
         pkg-config \
         clang \
@@ -42,25 +39,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
-RUN cargo build --release -p cmis -p mia --bin cmis --bin mia \
-    && strip target/release/cmis target/release/mia
+RUN cargo build --release -p cmis --bin cmis \
+    && strip target/release/cmis
 
 # ---------------------------------------------------------------------------
 # Stage 2: minimal runtime image, runs as an unprivileged user.
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
-# Runtime deps: TSS2 shared libs for mia, OpenSSL, CA certs, and tini for
-# correct PID 1 signal handling/zombie reaping.
+# Runtime deps: OpenSSL, CA certs, and tini for correct PID 1 signal
+# handling/zombie reaping.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tini \
         libssl3 \
-        libtss2-esys-3.0.2-0 \
-        libtss2-mu0 \
-        libtss2-rc0 \
-        libtss2-tctildr0 \
-        libtss2-tcti-device0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Dedicated unprivileged user/group (no shell, no login).
@@ -77,7 +69,6 @@ RUN mkdir -p /opt/ferrogate/logs /var/lib/ferrogate/audit \
     && chown -R ferrogate:ferrogate /opt/ferrogate /var/lib/ferrogate
 
 COPY --from=builder /src/target/release/cmis /usr/local/bin/cmis
-COPY --from=builder /src/target/release/mia  /usr/local/bin/mia
 COPY docker/ferrogate-entrypoint.sh /usr/local/bin/ferrogate-entrypoint.sh
 
 # ---------------------------------------------------------------------------
@@ -91,12 +82,6 @@ ENV FERROGATE_LOG_DIR=/opt/ferrogate/logs
 # --- CMIS ---
 ENV CMIS_LISTEN=0.0.0.0:8443
 ENV CMIS_AUDIT_ROOT=/var/lib/ferrogate/audit
-# --- MIA hardening (feature F12) ---
-# A generic container cannot satisfy the host hardening profile (enforced IMA,
-# seccomp install, privilege drop from root). It is DISABLED here for container
-# use. REMOVE this for production host deployments, where mia must run its full
-# hardening profile.
-ENV FERROGATE_SKIP_HARDENING=1
 
 WORKDIR /opt/ferrogate
 USER ferrogate
@@ -107,5 +92,4 @@ EXPOSE 8443
 VOLUME ["/opt/ferrogate/logs", "/var/lib/ferrogate/audit"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ferrogate-entrypoint.sh"]
-# Default server; override with `docker run <image> mia`.
 CMD ["cmis"]

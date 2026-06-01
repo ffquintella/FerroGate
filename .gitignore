@@ -27,3 +27,7 @@ node_modules
 dist
 .vite
 .angular
+# ...but the MIA client packaging assets (systemd unit, env template, launchd
+# plist, postinstall) live under crates/mia/dist and must be tracked.
+!crates/mia/dist/
+!crates/mia/dist/**
