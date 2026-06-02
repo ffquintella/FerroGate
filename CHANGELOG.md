@@ -8,6 +8,14 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-06-02
+
+### Added
+
+- **`ferrogate -V` / `--version`.** The operator CLI now reports its version
+  (sourced from the workspace `CARGO_PKG_VERSION`) via `-V`, `--version`, or
+  the `version` subcommand.
+
 ## [0.13.0] — 2026-06-02 — Operator CLI
 
 ### Added

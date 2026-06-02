@@ -41,7 +41,8 @@ fn usage() -> &'static str {
      \n\
      options:\n\
      \x20 --endpoint <url>   CMIS gRPC endpoint (default http://127.0.0.1:8443,\n\
-     \x20                    or $FERROGATE_CMIS_ENDPOINT)"
+     \x20                    or $FERROGATE_CMIS_ENDPOINT)\n\
+     \x20 -V, --version      print the ferrogate version and exit"
 }
 
 #[tokio::main]
@@ -65,6 +66,11 @@ async fn run() -> anyhow::Result<()> {
 
     if matches!(command.as_str(), "help" | "-h" | "--help") {
         println!("{}", usage());
+        return Ok(());
+    }
+
+    if matches!(command.as_str(), "version" | "-V" | "--version") {
+        println!("ferrogate {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
