@@ -43,6 +43,15 @@ service MachineIdentity {
   // audit event. Authenticated out of band as an operator action.
   rpc BumpEpoch (BumpEpochRequest) returns (BumpEpochResponse);
 
+  // ---- Operator inventory ----
+
+  // Admin RPC: enumerate the issued SVIDs this node knows about — the local
+  // store on a single replica, or the full clustered set on an HA deployment.
+  // Returns a compact summary per SVID, including the `cert_sha` an operator
+  // can feed straight into RevokeSvid. Authenticated out of band as an
+  // operator action.
+  rpc ListSvids (ListSvidsRequest) returns (ListSvidsResponse);
+
   // ---- Audit log (F07) ----
 
   // Latest Signed Tree Head. Verifiers re-anchor incremental consistency
@@ -178,6 +187,25 @@ message BumpEpochRequest {
 
 message BumpEpochResponse {
   uint64 new_epoch = 1; // the epoch now in force after the bump
+}
+
+// ---- SVID inventory (operator CLI) -------------------------------------
+
+message ListSvidsRequest {}
+
+// Compact view of one issued SVID — never the private material, just enough
+// for an operator to identify a host and act on it.
+message SvidSummary {
+  string spiffe_id = 1;    // subject SPIFFE id
+  string cert_sha = 2;     // lowercase hex SHA-384 of the compact JWS (RevokeSvid key)
+  int64 issued_at = 3;     // unix seconds (iat) of the current bundle
+  int64 expires_at = 4;    // unix seconds (exp) of the current bundle
+  string policy_id = 5;    // RIM policy generation at the last full attestation
+  uint64 policy_epoch = 6; // RIM policy epoch at the last full attestation
+}
+
+message ListSvidsResponse {
+  repeated SvidSummary svids = 1;
 }
 
 // ---- Audit log -----------------------------------------------------------

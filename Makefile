@@ -55,10 +55,11 @@ clean: ## Remove build artifacts
 docs: ## Serve the Docsify documentation site locally (PORT=3000 by default)
 	./serve-docs.sh $(PORT)
 
-# Container image. Builds a linux/amd64 runtime image that runs the ferrogate
-# CLI as an unprivileged user, exposes /opt/ferrogate/logs as a mountable
-# volume, and exports the FerroGate configuration env vars. Override the tag
-# with IMAGE="repo/name:tag".
+# Container image. Builds a linux/amd64 runtime image that runs the `cmis`
+# server as an unprivileged user and bundles the `ferrogate` operator CLI (for
+# `docker exec`). Exposes /opt/ferrogate/logs as a mountable volume and exports
+# the FerroGate configuration env vars. Override the tag with
+# IMAGE="repo/name:tag".
 # Tag the image with the workspace crate version from Cargo.toml's
 # [workspace.package] section (e.g. 0.12.0).
 CARGO_VERSION := $(shell awk '/^\[workspace.package\]/{p=1} p&&/^version/{gsub(/[" ]/,"",$$3); print $$3; exit}' Cargo.toml)
@@ -70,7 +71,8 @@ docker-image: ## Build the linux/amd64 ferrogate runtime image (IMAGE=tag to ove
 		-t $(IMAGE) \
 		--load .
 	@echo "Built $(IMAGE)"
-	@echo "Run: docker run --rm -v \"\$$PWD/logs:/opt/ferrogate/logs\" -e RUST_LOG=debug $(IMAGE) cmis"
+	@echo "Run:  docker run --rm -v \"\$$PWD/logs:/opt/ferrogate/logs\" -e RUST_LOG=debug $(IMAGE) cmis"
+	@echo "CLI:  docker exec <container> ferrogate status"
 
 # ── Container image push ──────────────────────────────────────────────
 #

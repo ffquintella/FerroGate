@@ -25,8 +25,9 @@ use ferro_proto::v1::{
     AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, BumpEpochRequest,
     BumpEpochResponse, Challenge, ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest,
     HealthRequest, HealthResponse, InclusionProofRequest, InclusionProofResponse, JwksRequest,
-    JwksResponse, LatestSthRequest, LatestSthResponse, NodeRole as ProtoNodeRole, Nonce,
-    RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest, SignedTreeHead, SvidBundle,
+    JwksResponse, LatestSthRequest, LatestSthResponse, ListSvidsRequest, ListSvidsResponse,
+    NodeRole as ProtoNodeRole, Nonce, RevokeHostRequest, RevokeResponse, RevokeSvidRequest,
+    RotateRequest, SignedTreeHead, SvidBundle, SvidSummary,
 };
 use ferro_raft::NodeRole;
 use ferro_svid::{
@@ -526,6 +527,30 @@ impl MachineIdentity for MachineIdentitySvc {
         );
         tracing::info!(old_epoch, new_epoch, "RIM policy epoch bumped");
         Ok(Response::new(BumpEpochResponse { new_epoch }))
+    }
+
+    async fn list_svids(
+        &self,
+        _request: Request<ListSvidsRequest>,
+    ) -> Result<Response<ListSvidsResponse>, Status> {
+        let svids = self
+            .state
+            .list_svids()
+            .await
+            .iter()
+            .map(|rec| SvidSummary {
+                spiffe_id: rec.bundle.spiffe_id.clone(),
+                // The same lowercase-hex SHA-384 of the compact JWS that
+                // `RevokeSvid` keys on, so an operator can copy it straight
+                // across.
+                cert_sha: hex::encode(sha384(rec.bundle.jws.as_bytes())),
+                issued_at: rec.bundle.iat,
+                expires_at: rec.bundle.exp,
+                policy_id: rec.params.policy_id.clone(),
+                policy_epoch: rec.last_attestation.policy_epoch,
+            })
+            .collect();
+        Ok(Response::new(ListSvidsResponse { svids }))
     }
 
     async fn latest_sth(

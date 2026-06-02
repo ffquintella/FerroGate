@@ -1,6 +1,6 @@
 [package]
 name        = "ferrogate-cli"
-description = "FerroGate — operator CLI (placeholder, scaffolded by ironroot)"
+description = "FerroGate — operator CLI (ferrogate): inventory, status, revocation, epoch bump"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -12,18 +12,12 @@ authors.workspace      = true
 name = "ferrogate"
 path = "src/main.rs"
 
-# The original ironroot scaffold predates the workspace lints; relax until
-# the CLI gets rewritten as the operator tool in M5/M6.
-[lints.rust]
-unsafe_code  = "deny"
-missing_docs = "allow"
-
-[lints.clippy]
-all      = { level = "warn", priority = -1 }
-pedantic = "allow"
+[lints]
+workspace = true
 
 [dependencies]
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing-appender   = { workspace = true }
-file-rotate        = { workspace = true }
+ferro-proto = { path = "../ferro-proto" }
+
+tokio  = { workspace = true }
+tonic  = { workspace = true }
+anyhow = { workspace = true }

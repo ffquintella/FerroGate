@@ -1,9 +1,12 @@
 # FerroGate runtime image (linux/amd64).
 #
 # Multi-stage build producing a small, non-root image that runs `cmis`, the
-# Central Machine Identity Service (gRPC server). The `mia` Machine Identity
-# Agent is NOT shipped here — it is the host-side client, installed directly on
-# each machine from the OS packages (`make pkg`: .deb / .rpm / .msi / .pkg).
+# Central Machine Identity Service (gRPC server). The `ferrogate` operator CLI
+# is shipped alongside it so an operator can `docker exec` into a running
+# server and drive the admin RPCs against the local CMIS (status, list-svids,
+# revoke-svid, revoke-host, bump-epoch). The `mia` Machine Identity Agent is
+# NOT shipped here — it is the host-side client, installed directly on each
+# machine from the OS packages (`make pkg`: .deb / .rpm / .msi / .pkg).
 #
 # cmis emits tracing to stdout; the entrypoint tees that to a rotating log file
 # under /opt/ferrogate/logs (a mountable volume) while still writing to the
@@ -39,8 +42,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
-RUN cargo build --release -p cmis --bin cmis \
-    && strip target/release/cmis
+# Build the server (`cmis`) and the operator CLI (`ferrogate`) in one pass so
+# they share the dependency compile.
+RUN cargo build --release -p cmis --bin cmis -p ferrogate-cli --bin ferrogate \
+    && strip target/release/cmis target/release/ferrogate
 
 # ---------------------------------------------------------------------------
 # Stage 2: minimal runtime image, runs as an unprivileged user.
@@ -69,6 +74,7 @@ RUN mkdir -p /opt/ferrogate/logs /var/lib/ferrogate/audit \
     && chown -R ferrogate:ferrogate /opt/ferrogate /var/lib/ferrogate
 
 COPY --from=builder /src/target/release/cmis /usr/local/bin/cmis
+COPY --from=builder /src/target/release/ferrogate /usr/local/bin/ferrogate
 COPY docker/ferrogate-entrypoint.sh /usr/local/bin/ferrogate-entrypoint.sh
 
 # ---------------------------------------------------------------------------
@@ -82,6 +88,11 @@ ENV FERROGATE_LOG_DIR=/opt/ferrogate/logs
 # --- CMIS ---
 ENV CMIS_LISTEN=0.0.0.0:8443
 ENV CMIS_AUDIT_ROOT=/var/lib/ferrogate/audit
+# --- ferrogate operator CLI ---
+# Default target for the bundled CLI: the CMIS in this same container, over the
+# loopback. Override with `-e FERROGATE_CMIS_ENDPOINT=...` to point at another
+# replica.
+ENV FERROGATE_CMIS_ENDPOINT=http://127.0.0.1:8443
 
 WORKDIR /opt/ferrogate
 USER ferrogate

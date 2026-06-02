@@ -404,6 +404,35 @@ impl CmisState {
         }
     }
 
+    /// Enumerate every issued-SVID record this node knows about.
+    ///
+    /// On a single replica this is the process-local store; on a clustered
+    /// deployment it is the full replicated set (an ordinary, eventually
+    /// consistent read — an operator inventory does not need a leader round
+    /// trip). A record whose clustered payload fails to decode is logged and
+    /// skipped rather than failing the whole listing.
+    pub async fn list_svids(&self) -> Vec<IssuedRecord> {
+        match &self.backend {
+            Backend::Local(map) => map.lock().values().cloned().collect(),
+            Backend::Cluster(c) => match c.list_svids().await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter_map(|(spiffe_id, payload)| match cluster_store::decode(&payload) {
+                        Ok(rec) => Some(rec),
+                        Err(e) => {
+                            tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
+                            None
+                        }
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::error!(error = %e, "cluster list_svids failed");
+                    Vec::new()
+                }
+            },
+        }
+    }
+
     /// Replace the stored bundle for a subject after a renewal (the
     /// `last_attestation` window is intentionally left unchanged).
     pub async fn update_bundle(&self, spiffe_id: &str, bundle: IssuedSvid) {
