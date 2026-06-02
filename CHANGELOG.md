@@ -8,6 +8,30 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-06-02 — Operator CLI
+
+### Added
+
+- **`crates/ferrogate-cli` — the `ferrogate` operator CLI.** The former
+  ironroot scaffold is now a real admin tool: a thin gRPC client over the
+  existing `MachineIdentity` admin surface. Subcommands map one-to-one onto
+  RPCs CMIS already exposes — `status` → `Health`, `list-svids` → `ListSvids`,
+  `revoke-svid` → `RevokeSvid`, `revoke-host` → `RevokeHost`, `bump-epoch` →
+  `BumpEpoch`. Targets the local CMIS by default
+  (`http://127.0.0.1:8443`), overridable with `--endpoint` /
+  `FERROGATE_CMIS_ENDPOINT`.
+- **`ListSvids` RPC.** New admin RPC enumerating issued SVIDs (local store on a
+  single replica, the full replicated set when clustered). Each `SvidSummary`
+  carries the `cert_sha` an operator can feed straight into `RevokeSvid`.
+
+### Changed
+
+- **Container image bundles the `ferrogate` CLI.** `docker/ferrogate.Dockerfile`
+  now builds and ships the `ferrogate` binary alongside the `cmis` server, so an
+  operator can `docker exec <container> ferrogate status` and drive the admin
+  RPCs against the local CMIS. `mia` remains a host-side package, not shipped in
+  the image.
+
 ## [M6.0] — 2026-06-01 — Root key ceremony and rotation (v0.11.0)
 
 ### Added — F14: Root key ceremony and rotation
