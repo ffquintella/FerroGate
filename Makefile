@@ -1,7 +1,7 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs docker-image docker-image-push \
         docker-repo-setup docker-repo-show \
-        pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools
+        pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools pkg-sdk release
 
 # Default target: list available targets with their descriptions.
 .DEFAULT_GOAL := help
@@ -248,4 +248,28 @@ pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi/Windo
 	          echo "NOTE: build the .deb/.rpm on Linux ('make pkg') and the .msi on Windows ('make pkg-msi')." ;; \
 	  *)      echo "Host is $(UNAME_S): build the .msi here with 'make pkg-msi'."; \
 	          $(MAKE) --no-print-directory pkg-msi ;; \
+	esac
+
+# ── Integration SDK + release bundle ──────────────────────────────────────────
+#
+# `make pkg-sdk` bundles the relying-party / verifier-side crates into a
+# self-contained Cargo workspace tarball (ferrogate-sdk-rust-<version>.tgz) that
+# a third party can drop in and `cargo build`. See scripts/pack-sdk.sh.
+#
+# `make release` produces the artifacts published to a GitHub Release: the mia
+# .deb, the mia .rpm, and the SDK .tgz. It is the entry point the release
+# workflow (.github/workflows/release.yml) runs on a `releases/*` tag. On Linux
+# it builds all three; off Linux it builds only the SDK (deb/rpm need a Linux
+# host) and says so.
+pkg-sdk: ## Build the ferrogate-sdk-rust integration tarball (.tgz)
+	bash scripts/pack-sdk.sh
+
+release: ## Build the GitHub Release artifacts (mia .deb + .rpm + SDK .tgz)
+	@case "$(UNAME_S)" in \
+	  Linux) $(MAKE) --no-print-directory pkg-deb pkg-rpm pkg-sdk; \
+	         echo ""; echo "==> Release artifacts:"; \
+	         ls -1 target/debian/*.deb target/generate-rpm/*.rpm target/sdk/*.tgz 2>/dev/null ;; \
+	  *)     echo "Host is $(UNAME_S): the .deb/.rpm must be built on Linux."; \
+	         echo "Building the SDK tarball only."; \
+	         $(MAKE) --no-print-directory pkg-sdk ;; \
 	esac

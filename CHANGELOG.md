@@ -8,6 +8,22 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.13.2] — 2026-06-02
+
+### Added
+
+- **Release pipeline.** A `Release` GitHub Actions workflow now fires on
+  `releases/**` tags and publishes the mia `.deb` and `.rpm` packages plus a
+  `ferrogate-sdk-rust-<version>.tgz` integration SDK to the GitHub Release.
+  New `make release` / `make pkg-sdk` targets build the same artifacts locally;
+  the SDK bundles the verifier-side crates (`ferro-proto`, `ferro-svid`,
+  `ferro-svid-verify`, `ferro-child-verify`, `ferro-attest`, `ferro-crypto`)
+  as a self-contained Cargo workspace.
+
+### Removed
+
+- The standalone `CI` workflow (`.github/workflows/ci.yml`).
+
 ## [0.13.1] — 2026-06-02
 
 ### Added
