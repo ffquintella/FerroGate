@@ -8,6 +8,24 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-06-03
+
+### Added
+
+- **Transport security documentation.** New
+  [docs/transport-tls.md](docs/transport-tls.md): how the F01 hybrid-PQC TLS
+  transport works (TLS 1.3, `X25519MLKEM768`-only, SPKI pinning, ALPN h2, code
+  map) and how to configure it end to end — `CMIS_TLS_CERT` / `CMIS_TLS_KEY`,
+  generating a server cert, the OpenSSL SPKI-pin recipe, `connect_pinned`
+  usage, telemetry/verification, certificate + pin rotation, and
+  troubleshooting. Linked from the sidebar and cross-referenced from the
+  operations, crypto, cmis, mia, and networking docs.
+
+### Changed
+
+- Reformatted the workspace with `cargo fmt` so `cargo fmt --check` passes
+  cleanly (no behavioural change).
+
 ## [0.13.4] — 2026-06-03
 
 ### Added
