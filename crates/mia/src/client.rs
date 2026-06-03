@@ -66,12 +66,15 @@ pub async fn connect_pinned(
     let service = tower::service_fn(move |uri: Uri| {
         let connector = connector.clone();
         async move {
-            let host = uri
-                .host()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "endpoint has no host"))?;
+            let host = uri.host().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "endpoint has no host")
+            })?;
             let port = uri.port_u16().unwrap_or(8443);
             let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {e}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid server name: {e}"),
+                )
             })?;
             let tcp = TcpStream::connect((host, port)).await?;
             let tls = connector.connect(server_name, tcp).await?;

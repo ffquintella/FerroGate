@@ -250,7 +250,11 @@ fn cmd_pubkey(opts: &Opts) -> Result<()> {
 fn cmd_split(opts: &Opts) -> Result<()> {
     let seed = resolve_seed(opts.get("seed")?)?;
     let root_kid = opts.get("root-kid")?.to_string();
-    let holders: Vec<String> = opts.all("holder").iter().map(|s| (*s).to_string()).collect();
+    let holders: Vec<String> = opts
+        .all("holder")
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     if holders.is_empty() {
         bail!("split needs at least one --holder NAME");
     }
@@ -278,7 +282,12 @@ fn cmd_split(opts: &Opts) -> Result<()> {
         let path = Path::new(out_dir).join(&name);
         std::fs::write(&path, share.to_json().map_err(|e| anyhow!("encode: {e}"))?)
             .with_context(|| format!("write {}", path.display()))?;
-        eprintln!("sealed share {} for {} -> {}", share.index, share.holder, path.display());
+        eprintln!(
+            "sealed share {} for {} -> {}",
+            share.index,
+            share.holder,
+            path.display()
+        );
     }
     eprintln!(
         "\n{}-of-{} split of root {root_kid} complete. Distribute one medium per holder; \
@@ -300,7 +309,8 @@ fn load_shares(opts: &Opts) -> Result<Vec<SealedShare>> {
         paths.sort();
         for p in paths {
             let bytes = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
-            shares.push(SealedShare::from_json(&bytes).map_err(|e| anyhow!("{}: {e}", p.display()))?);
+            shares
+                .push(SealedShare::from_json(&bytes).map_err(|e| anyhow!("{}: {e}", p.display()))?);
         }
     }
     for v in opts.all("share") {
@@ -318,7 +328,11 @@ fn cmd_combine(opts: &Opts) -> Result<()> {
     let shares = load_shares(opts)?;
     let seed = SealedShareSet::combine(&shares).map_err(|e| anyhow!("combine: {e}"))?;
     let (_sk, pk) = CompositeSecretKey::from_seed(&seed);
-    println!("recovered {} share(s) -> root {}", shares.len(), shares[0].root_kid);
+    println!(
+        "recovered {} share(s) -> root {}",
+        shares.len(),
+        shares[0].root_kid
+    );
     println!("seed   {}", hex::encode(*seed));
     println!("pubkey {}", hex::encode(pk.to_concat_bytes()));
     Ok(())
@@ -341,7 +355,14 @@ fn cmd_cross_sign(opts: &Opts) -> Result<()> {
     let (old_sk, old_pk) = CompositeSecretKey::from_seed(&old_seed);
     let (new_sk, new_pk) = CompositeSecretKey::from_seed(&new_seed);
     let bundle = CrossSignBundle::create(
-        &old_sk, &old_kid, &old_pk, &new_sk, &new_kid, &new_pk, window_start, window_secs,
+        &old_sk,
+        &old_kid,
+        &old_pk,
+        &new_sk,
+        &new_kid,
+        &new_pk,
+        window_start,
+        window_secs,
     )
     .map_err(|e| anyhow!("cross-sign: {e}"))?;
     bundle.verify().map_err(|e| anyhow!("self-check: {e}"))?;
@@ -351,7 +372,9 @@ fn cmd_cross_sign(opts: &Opts) -> Result<()> {
 fn cmd_verify_cross(opts: &Opts) -> Result<()> {
     let bytes = std::fs::read(opts.get("bundle")?).context("read bundle")?;
     let bundle = CrossSignBundle::from_json(&bytes).map_err(|e| anyhow!("parse: {e}"))?;
-    bundle.verify().map_err(|e| anyhow!("verification failed: {e}"))?;
+    bundle
+        .verify()
+        .map_err(|e| anyhow!("verification failed: {e}"))?;
     println!(
         "OK  both directions verify\n  old {} <-> new {}\n  window [{}, {})",
         bundle.old_kid, bundle.new_kid, bundle.window_start, bundle.window_end
@@ -362,7 +385,9 @@ fn cmd_verify_cross(opts: &Opts) -> Result<()> {
 fn cmd_jwks(opts: &Opts) -> Result<()> {
     let bytes = std::fs::read(opts.get("bundle")?).context("read bundle")?;
     let bundle = CrossSignBundle::from_json(&bytes).map_err(|e| anyhow!("parse: {e}"))?;
-    bundle.verify().map_err(|e| anyhow!("bundle does not verify: {e}"))?;
+    bundle
+        .verify()
+        .map_err(|e| anyhow!("bundle does not verify: {e}"))?;
     let new_pk = resolve_pub_b64(&bundle.new_pub)?;
     let old_pk = resolve_pub_b64(&bundle.old_pub)?;
     // Newer preferred: the incoming root is stamped with the window start; the
@@ -479,7 +504,9 @@ fn cmd_minutes_sign(opts: &Opts) -> Result<()> {
 fn cmd_minutes_verify(opts: &Opts) -> Result<()> {
     let bytes = std::fs::read(opts.get("minutes")?).context("read minutes")?;
     let signed = SignedMinutes::from_json(&bytes).map_err(|e| anyhow!("parse: {e}"))?;
-    signed.verify_all().map_err(|e| anyhow!("verification failed: {e}"))?;
+    signed
+        .verify_all()
+        .map_err(|e| anyhow!("verification failed: {e}"))?;
     println!(
         "OK  {}  all {} participant(s) signed",
         signed.minutes.ceremony_id,
@@ -506,7 +533,10 @@ fn cmd_destroy(opts: &Opts) -> Result<()> {
     if records.is_empty() {
         bail!("destroy needs at least one --share @file");
     }
-    emit(opts, &serde_json::to_vec_pretty(&records).context("encode records")?)
+    emit(
+        opts,
+        &serde_json::to_vec_pretty(&records).context("encode records")?,
+    )
 }
 
 fn cmd_verify_destruction(opts: &Opts) -> Result<()> {

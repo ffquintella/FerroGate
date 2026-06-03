@@ -41,12 +41,18 @@ impl CredentialMaker for NoCredentialMaker {
         _aik_pub: &[u8],
         _secret: &[u8],
     ) -> Result<WrappedCredential, CredentialError> {
-        Err(CredentialError::Wrap("not configured in tls test".to_string()))
+        Err(CredentialError::Wrap(
+            "not configured in tls test".to_string(),
+        ))
     }
 }
 
 /// Self-signed server cert + key plus the SPKI pin a client would carry.
-fn make_identity() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, SpkiPin) {
+fn make_identity() -> (
+    Vec<CertificateDer<'static>>,
+    PrivateKeyDer<'static>,
+    SpkiPin,
+) {
     let ck = rcgen::generate_simple_self_signed(vec!["cmis.test.ferrogate.invalid".to_string()])
         .expect("rcgen self-signed cert");
     let cert: CertificateDer<'static> = ck.cert.der().clone();

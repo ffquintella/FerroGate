@@ -311,8 +311,8 @@ fn cmd_verify(opts: &Opts) -> Result<()> {
         );
     }
     let pub_bytes = hex::decode(resolve(opts.get("pub")?)?).context("--pub is not hex")?;
-    let pk = CompositePublicKey::from_concat_bytes(&pub_bytes)
-        .map_err(|e| anyhow!("--pub: {e}"))?;
+    let pk =
+        CompositePublicKey::from_concat_bytes(&pub_bytes).map_err(|e| anyhow!("--pub: {e}"))?;
     let mut trust = TrustedKeys::new();
     trust.add(kid, pk);
     let manifest = signed.verify(&trust).context("signature verification")?;

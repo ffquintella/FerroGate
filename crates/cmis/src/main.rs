@@ -19,9 +19,9 @@ use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::fleet_manifest::FleetManifestLoader;
 use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
 use ferro_attest::{RimLoader, RimStore, TpmQuoteVerifier, TrustedKeys, VendorTrustStore};
+use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
 use ferro_crypto::composite::CompositePublicKey;
 use ferro_crypto::tls::ProviderMode;
-use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
 use ferro_svid::Issuer;
 use tracing_subscriber::EnvFilter;
 
@@ -50,10 +50,8 @@ impl CredentialMaker for UnconfiguredCredentialMaker {
 /// fleet manifest and the F10 RIM bundle; production sources these from the
 /// F14 ceremony's published root key.
 fn load_single_key_trust(kid_var: &str, pub_var: &str) -> anyhow::Result<TrustedKeys> {
-    let kid =
-        std::env::var(kid_var).map_err(|_| anyhow::anyhow!("{kid_var} missing"))?;
-    let pub_hex =
-        std::env::var(pub_var).map_err(|_| anyhow::anyhow!("{pub_var} missing"))?;
+    let kid = std::env::var(kid_var).map_err(|_| anyhow::anyhow!("{kid_var} missing"))?;
+    let pub_hex = std::env::var(pub_var).map_err(|_| anyhow::anyhow!("{pub_var} missing"))?;
     let pub_bytes =
         hex::decode(pub_hex.trim()).map_err(|e| anyhow::anyhow!("{pub_var} hex: {e}"))?;
     let pk = CompositePublicKey::from_concat_bytes(&pub_bytes)

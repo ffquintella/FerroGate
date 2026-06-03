@@ -131,7 +131,11 @@ async fn connect(endpoint: &str) -> anyhow::Result<MachineIdentityClient<Channel
 }
 
 async fn status(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
-    let resp = client.health(HealthRequest {}).await.map_err(rpc_err)?.into_inner();
+    let resp = client
+        .health(HealthRequest {})
+        .await
+        .map_err(rpc_err)?
+        .into_inner();
     let role = match NodeRole::try_from(resp.role).unwrap_or(NodeRole::Unknown) {
         NodeRole::Leader => "leader",
         NodeRole::Follower => "follower",
@@ -145,7 +149,11 @@ async fn status(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<(
 }
 
 async fn list_svids(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
-    let resp = client.list_svids(ListSvidsRequest {}).await.map_err(rpc_err)?.into_inner();
+    let resp = client
+        .list_svids(ListSvidsRequest {})
+        .await
+        .map_err(rpc_err)?
+        .into_inner();
     if resp.svids.is_empty() {
         println!("(no issued SVIDs)");
         return Ok(());
@@ -179,7 +187,10 @@ async fn revoke_svid(
         .await
         .map_err(rpc_err)?
         .into_inner();
-    println!("revoked SVID {cert_sha}; published CRL #{}", resp.crl_number);
+    println!(
+        "revoked SVID {cert_sha}; published CRL #{}",
+        resp.crl_number
+    );
     Ok(())
 }
 
@@ -199,7 +210,10 @@ async fn revoke_host(
         .await
         .map_err(rpc_err)?
         .into_inner();
-    println!("revoked host {spiffe_id}; published CRL #{}", resp.crl_number);
+    println!(
+        "revoked host {spiffe_id}; published CRL #{}",
+        resp.crl_number
+    );
     Ok(())
 }
 

@@ -417,13 +417,15 @@ impl CmisState {
             Backend::Cluster(c) => match c.list_svids().await {
                 Ok(rows) => rows
                     .into_iter()
-                    .filter_map(|(spiffe_id, payload)| match cluster_store::decode(&payload) {
-                        Ok(rec) => Some(rec),
-                        Err(e) => {
-                            tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
-                            None
-                        }
-                    })
+                    .filter_map(
+                        |(spiffe_id, payload)| match cluster_store::decode(&payload) {
+                            Ok(rec) => Some(rec),
+                            Err(e) => {
+                                tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
+                                None
+                            }
+                        },
+                    )
                     .collect(),
                 Err(e) => {
                     tracing::error!(error = %e, "cluster list_svids failed");

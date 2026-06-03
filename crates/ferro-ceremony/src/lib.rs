@@ -33,8 +33,7 @@ pub use crosssign::{CrossSignBundle, CrossSignDirection};
 pub use destruction::{destroy_media, verify_destruction, DestructionRecord};
 pub use media::{SealedShare, SealedShareSet};
 pub use minutes::{
-    ArtefactDigest, CeremonyKind, CeremonyMinutes, Participant, ParticipantSignature,
-    SignedMinutes,
+    ArtefactDigest, CeremonyKind, CeremonyMinutes, Participant, ParticipantSignature, SignedMinutes,
 };
 
 /// Length of the root master seed in bytes — the secret that is Shamir-split.

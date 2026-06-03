@@ -103,13 +103,27 @@ impl CrossSignBundle {
         let old_signs_new = old_sk
             .sign(
                 CROSSSIGN_CONTEXT,
-                &transcript(&old_kid, &old_bytes, &new_kid, &new_bytes, window_start, window_end),
+                &transcript(
+                    &old_kid,
+                    &old_bytes,
+                    &new_kid,
+                    &new_bytes,
+                    window_start,
+                    window_end,
+                ),
             )
             .map_err(|e| CeremonyError::Signature(e.to_string()))?;
         let new_signs_old = new_sk
             .sign(
                 CROSSSIGN_CONTEXT,
-                &transcript(&new_kid, &new_bytes, &old_kid, &old_bytes, window_start, window_end),
+                &transcript(
+                    &new_kid,
+                    &new_bytes,
+                    &old_kid,
+                    &old_bytes,
+                    window_start,
+                    window_end,
+                ),
             )
             .map_err(|e| CeremonyError::Signature(e.to_string()))?;
 
@@ -224,7 +238,14 @@ mod tests {
         let (old_sk, old_pk) = keypair(1);
         let (new_sk, new_pk) = keypair(2);
         let bundle = CrossSignBundle::create(
-            &old_sk, "root-2025", &old_pk, &new_sk, "root-2026", &new_pk, 1000, DEFAULT_WINDOW_SECS,
+            &old_sk,
+            "root-2025",
+            &old_pk,
+            &new_sk,
+            "root-2026",
+            &new_pk,
+            1000,
+            DEFAULT_WINDOW_SECS,
         )
         .unwrap();
         bundle.verify().unwrap();
@@ -238,12 +259,23 @@ mod tests {
         let (old_sk, old_pk) = keypair(1);
         let (new_sk, new_pk) = keypair(2);
         let mut bundle = CrossSignBundle::create(
-            &old_sk, "root-2025", &old_pk, &new_sk, "root-2026", &new_pk, 1000, DEFAULT_WINDOW_SECS,
+            &old_sk,
+            "root-2025",
+            &old_pk,
+            &new_sk,
+            "root-2026",
+            &new_pk,
+            1000,
+            DEFAULT_WINDOW_SECS,
         )
         .unwrap();
         bundle.window_end += 1;
-        assert!(bundle.verify_direction(CrossSignDirection::OldSignsNew).is_err());
-        assert!(bundle.verify_direction(CrossSignDirection::NewSignsOld).is_err());
+        assert!(bundle
+            .verify_direction(CrossSignDirection::OldSignsNew)
+            .is_err());
+        assert!(bundle
+            .verify_direction(CrossSignDirection::NewSignsOld)
+            .is_err());
     }
 
     #[test]
@@ -251,7 +283,14 @@ mod tests {
         let (old_sk, old_pk) = keypair(1);
         let (new_sk, new_pk) = keypair(2);
         let mut bundle = CrossSignBundle::create(
-            &old_sk, "root-2025", &old_pk, &new_sk, "root-2026", &new_pk, 1000, DEFAULT_WINDOW_SECS,
+            &old_sk,
+            "root-2025",
+            &old_pk,
+            &new_sk,
+            "root-2026",
+            &new_pk,
+            1000,
+            DEFAULT_WINDOW_SECS,
         )
         .unwrap();
         // Put the new-signs-old signature into the old-signs-new slot.
