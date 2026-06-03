@@ -189,6 +189,9 @@ formal-cryptoverif: ## Run the CryptoVerif hybrid AKE proof
 # Outputs land under target/debian, target/generate-rpm, target/wix, target/macos.
 PKG_CRATE := mia
 UNAME_S   := $(shell uname -s)
+HOST_ARCH := $(shell uname -m)
+# RPM/DEB ship for amd64 only; mia links the x86_64 Linux TPM ESAPI stack.
+RPM_ARCH  := x86_64
 
 pkg-tools: ## Install the cargo packaging tools (cargo-deb, cargo-generate-rpm, cargo-wix)
 	cargo install cargo-deb cargo-generate-rpm cargo-wix
@@ -198,12 +201,17 @@ pkg-deb: ## Build the mia .deb package (Linux; needs cargo-deb)
 	cargo deb -p $(PKG_CRATE)
 	@echo "==> .deb written under target/debian/"
 
-pkg-rpm: ## Build the mia .rpm package (Linux; needs cargo-generate-rpm)
+pkg-rpm: ## Build the mia .rpm package for x86_64/amd64 (Fedora/RHEL/SUSE)
+ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
 	@command -v cargo-generate-rpm >/dev/null 2>&1 || { echo "ERROR: cargo-generate-rpm not found — run 'make pkg-tools'"; exit 1; }
 	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE)
 	strip target/release/$(PKG_CRATE)
-	cargo generate-rpm -p crates/$(PKG_CRATE)
-	@echo "==> .rpm written under target/generate-rpm/"
+	cargo generate-rpm -p crates/$(PKG_CRATE) -a $(RPM_ARCH)
+	@echo "==> $(RPM_ARCH) .rpm written under target/generate-rpm/"
+else
+	@echo "==> host is $(UNAME_S)/$(HOST_ARCH), not Linux/x86_64; building the amd64 .rpm in a linux/amd64 container"
+	./scripts/build-rpm-amd64.sh
+endif
 
 pkg-msi: ## Build the mia .msi installer (Windows; needs cargo-wix + WiX Toolset)
 	@command -v cargo-wix >/dev/null 2>&1 || { echo "ERROR: cargo-wix not found — run 'make pkg-tools'"; exit 1; }
