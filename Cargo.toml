@@ -80,7 +80,7 @@ p256          = { version = "0.13", default-features = false, features = ["ecdsa
 rustls              = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"] }
 rustls-post-quantum = "0.2"
 rustls-pki-types    = "1"
-x509-parser         = "0.16"
+x509-parser         = "0.18"
 
 # TLS transport glue (F01 — used by cmis server + mia client, plus tests)
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
