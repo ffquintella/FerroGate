@@ -1,7 +1,7 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs docker-image docker-image-push \
         docker-repo-setup docker-repo-show \
-        pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools pkg-sdk release
+        pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools pkg-sdk release deploy-release
 
 # Default target: list available targets with their descriptions.
 .DEFAULT_GOAL := help
@@ -261,6 +261,12 @@ pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi/Windo
 # workflow (.github/workflows/release.yml) runs on a `releases/*` tag. On Linux
 # it builds all three; off Linux it builds only the SDK (deb/rpm need a Linux
 # host) and says so.
+#
+# `make deploy-release` cuts the release: it creates the annotated
+# `releases/v<workspace-version>` tag and pushes it to origin, which is what
+# triggers the Release workflow (the workflow then checks the tag out and runs
+# `make release` to build + publish the artifacts). Bump the workspace version
+# and commit first; this target only tags and pushes.
 pkg-sdk: ## Build the ferrogate-sdk-rust integration tarball (.tgz)
 	bash scripts/pack-sdk.sh
 
@@ -273,3 +279,19 @@ release: ## Build the GitHub Release artifacts (mia .deb + .rpm + SDK .tgz)
 	         echo "Building the SDK tarball only."; \
 	         $(MAKE) --no-print-directory pkg-sdk ;; \
 	esac
+
+deploy-release: ## Tag releases/v<workspace-version> and push it to trigger the Release workflow
+	@VERSION="$(CARGO_VERSION)"; TAG="releases/v$$VERSION"; \
+	if [ -z "$$VERSION" ]; then \
+	  echo "error: could not read the workspace version from Cargo.toml." >&2; exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+	  echo "error: working tree is dirty; commit the version bump before tagging." >&2; exit 1; \
+	fi; \
+	if git rev-parse -q --verify "refs/tags/$$TAG" >/dev/null 2>&1; then \
+	  echo "error: tag $$TAG already exists (bump the workspace version first)." >&2; exit 1; \
+	fi; \
+	echo "==> Tagging $$TAG at $$(git rev-parse --short HEAD) and pushing to origin"; \
+	echo "    (this triggers .github/workflows/release.yml, which runs 'make release')"; \
+	git tag -a "$$TAG" -m "Release v$$VERSION"; \
+	git push origin "$$TAG"
