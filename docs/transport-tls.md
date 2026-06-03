@@ -45,7 +45,9 @@ matters is that the MIA pins its SPKI.
 | The hybrid provider (groups + suites) | [`ferro_crypto::tls`](../crates/ferro-crypto/src/tls.rs) — `ferrogate_provider(ProviderMode::HybridOnly)` |
 | SPKI pin + verifier | [`ferro_crypto::pin`](../crates/ferro-crypto/src/pin.rs) — `SpkiPin`, `SpkiPinVerifier` |
 | CMIS server listener | [`cmis::transport::tls_incoming`](../crates/cmis/src/transport.rs) + `load_pem_identity`; wired in `cmis` `main` |
-| MIA client dialer | [`mia::client::connect_pinned`](../crates/mia/src/client.rs) |
+| Shared client dialer | [`ferro_transport::connect_pinned`](../crates/ferro-transport/src/lib.rs) — dials TCP + upgrades to pinned hybrid TLS, returns a bare `Channel` |
+| MIA client dialer | [`mia::client::connect_pinned`](../crates/mia/src/client.rs) — wraps the shared dialer in `MachineIdentityClient` |
+| Operator CLI | [`ferrogate`](../crates/ferrogate-cli/src/main.rs) — `https://` endpoints use the shared dialer, pin from `--spki-pin`/`--tls-cert` |
 
 The server runs a `tokio_rustls` accept loop: each TCP connection is handshaked
 on its own task (so a slow peer cannot block others), the negotiated group is
@@ -113,10 +115,13 @@ let mut client = mia::client::connect_pinned(
 // `client` is a MachineIdentityClient<Channel> over hybrid-PQC TLS.
 ```
 
-`connect_pinned` builds the `HybridOnly` client config with the supplied pin
-set. A server that is not pinned — or that cannot negotiate the hybrid group —
-is rejected before any RPC. Multiple pins may be supplied so a new certificate's
-pin can be added ahead of a rotation (see below).
+`mia::client::connect_pinned` wraps the shared
+[`ferro_transport::connect_pinned`](../crates/ferro-transport/src/lib.rs) dialer
+(which returns a bare `Channel`) in a `MachineIdentityClient`. The dialer builds
+the `HybridOnly` client config with the supplied pin set. A server that is not
+pinned — or that cannot negotiate the hybrid group — is rejected before any RPC.
+Multiple pins may be supplied so a new certificate's pin can be added ahead of a
+rotation (see below).
 
 > **Status:** `connect_pinned` is the production dialing API and is covered by
 > live-transport tests. The standalone `mia` daemon does not yet open a CMIS
@@ -124,6 +129,40 @@ pin can be added ahead of a rotation (see below).
 > lands with the remaining F04 binary wiring. The configuration sketch in
 > [mia.md](mia.md) (`[cmis] endpoint` / `spki_pins_sha384`) is the intended
 > file-config surface for that loop.
+
+## Configuring the operator CLI (`ferrogate`)
+
+The `ferrogate` operator CLI speaks the same transport. Its endpoint scheme
+selects it:
+
+- **`http://…` (or a bare authority)** — plaintext gRPC, the dev/bring-up path.
+- **`https://…`** — hybrid-PQC TLS over the shared `connect_pinned` dialer,
+  authenticated by SPKI pin. The pin is resolved in this order:
+
+  1. `--spki-pin <hex>` (repeatable) or `$FERROGATE_CMIS_SPKI_PIN`
+     (comma-separated lowercase-hex SHA-384) — highest precedence;
+  2. otherwise the **first certificate** of the PEM at `--tls-cert <path>` or
+     `$FERROGATE_CMIS_TLS_CERT`, defaulting to `/etc/ferrogate/tls/cmis.crt`;
+  3. otherwise the CLI errors, explaining how to supply a pin or cert path.
+
+Step 2's default is the path the [`puppet-ferrogate`](https://github.com/ffquintella/puppet-ferrogate)
+module mounts the CMIS server certificate at inside the cmis container. Because
+the in-container CLI dials the very cert CMIS serves over loopback, deriving the
+pin from that mounted cert "just works" with no extra flags — trust is by pin,
+so the `127.0.0.1` SNI name is irrelevant:
+
+```bash
+# Inside the cmis container, against the loopback TLS listener — zero config:
+ferrogate --endpoint https://127.0.0.1:8443 status
+
+# Anywhere else, pin explicitly (compute the hex with the OpenSSL recipe below):
+ferrogate --endpoint https://cmis.ferrogate.internal:8443 \
+  --spki-pin <sha384-hex> status
+```
+
+> **Earlier caveat resolved.** Before F01 landed in the CLI, `ferrogate` was
+> plaintext-only and broke whenever CMIS terminated TLS. It now dials `https://`
+> endpoints natively; that limitation no longer applies.
 
 ### Computing the SPKI pin
 
@@ -186,6 +225,8 @@ least one pin that matches a live certificate.
 | `SPKI pin mismatch` / connect fails before any RPC | The pin does not match the served certificate. Recompute the pin from the *current* cert; check you rolled certs and pins in the right order. |
 | CMIS exits at startup with *"CMIS_TLS_CERT and CMIS_TLS_KEY must be set together"* | Only one of the pair was set. Set both (TLS) or neither (dev plaintext). |
 | CMIS logs *"PLAINTEXT gRPC bring-up server"* | No cert/key configured. Expected in dev; never acceptable in production. |
+| `ferrogate` errors *"no SPKI pin available for the https:// endpoint"* | The `https://` endpoint has no resolvable pin: no `--spki-pin`/`$FERROGATE_CMIS_SPKI_PIN`, and the default/`--tls-cert` server cert could not be read. Pass `--spki-pin <hex>`, or point `--tls-cert` at the CMIS server certificate. |
+| `ferrogate status` against `http://` connects but CMIS terminates TLS | The endpoint scheme is plaintext while CMIS serves TLS. Use an `https://` endpoint so the CLI dials the pinned hybrid transport. |
 
 ## Tests
 
@@ -197,6 +238,12 @@ least one pin that matches a live certificate.
   behind the TLS listener: a pinned hybrid client runs `JWKS` over TLS; a
   legacy non-PQC client cannot handshake against the listener; a wrong-pin
   client is refused by `connect_pinned`.
+- `crates/ferrogate-cli/tests/smoke.rs` — runs the compiled `ferrogate` binary
+  against a real CMIS listener: `status` over `https://` succeeds with a
+  cert-derived pin and with an explicit `--spki-pin`; a wrong pin is refused
+  before any RPC; `--spki-pin` takes precedence over `--tls-cert`; an `https://`
+  endpoint with no resolvable pin errors clearly; and the plaintext `http://`
+  path still works.
 
 See [F01 — Hybrid PQC TLS transport](features/F01-hybrid-pqc-tls.md) for the
 full acceptance criteria.

@@ -4,6 +4,7 @@ members = [
     "crates/cmis",
     "crates/mia",
     "crates/ferro-crypto",
+    "crates/ferro-transport",
     "crates/ferro-attest",
     "crates/ferro-audit",
     "crates/ferro-proto",
@@ -21,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.14.0"
+version      = "0.15.0"
 edition      = "2021"
 rust-version = "1.88"
 license      = "Apache-2.0"

@@ -8,6 +8,38 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-06-03
+
+### Added
+
+- **F01 hybrid-PQC TLS in the `ferrogate` operator CLI.** The CLI can now dial
+  CMIS over the hybrid-PQC TLS transport with SPKI pinning, closing the gap that
+  left the in-container CLI broken once CMIS terminates TLS by default.
+  - An `https://` endpoint is dialed over TLS 1.3 / `X25519MLKEM768`-only and
+    authenticated by SPKI pin (not a CA chain); `http://` (or a bare authority)
+    keeps the plaintext dev/bring-up path unchanged.
+  - New `--spki-pin <hex>` (repeatable) / `$FERROGATE_CMIS_SPKI_PIN`
+    (comma-separated) and `--tls-cert <path>` / `$FERROGATE_CMIS_TLS_CERT`
+    flags. Pin resolution precedence: explicit pins → first certificate of the
+    server-cert PEM (defaulting to `/etc/ferrogate/tls/cmis.crt`, the path the
+    `puppet-ferrogate` module mounts) → a clear error. So
+    `ferrogate --endpoint https://127.0.0.1:8443 status` works inside the cmis
+    container with no extra flags.
+- **New `ferro-transport` crate.** The client-side pinned dialer (formerly the
+  body of `mia::client::connect_pinned`) now lives in
+  `ferro_transport::connect_pinned`, returning a bare tonic `Channel`. It is
+  shared by the MIA agent and the `ferrogate` CLI, keeping
+  `ferro-crypto::transport` free of tonic/tokio-rustls and avoiding a `mia`
+  dependency in the CLI. `mia::client::connect_pinned` delegates to it; MIA
+  behaviour and its `tls_transport.rs` tests are unchanged.
+
+### Changed
+
+- `docs/transport-tls.md` documents the CLI's TLS support (endpoint scheme,
+  pin-resolution precedence, the in-container zero-config default) and notes the
+  earlier plaintext-only caveat is resolved; the code map and troubleshooting
+  tables gained CLI / `ferro-transport` rows.
+
 ## [0.14.0] — 2026-06-03
 
 ### Added

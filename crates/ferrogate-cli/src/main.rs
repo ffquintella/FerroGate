@@ -13,11 +13,21 @@
 //!
 //! It targets the local CMIS by default (`http://127.0.0.1:8443`, the plaintext
 //! bring-up endpoint), overridable with `--endpoint` or `FERROGATE_CMIS_ENDPOINT`.
-//! Hybrid-PQC TLS (feature F01) is a later seam; until CMIS terminates TLS this
-//! speaks the same plaintext gRPC the server listens on.
+//!
+//! When the endpoint is an `https://` URL the CLI speaks the FerroGate
+//! hybrid-PQC TLS transport (feature F01) via the shared
+//! [`ferro_transport::connect_pinned`] dialer: TLS 1.3 with the
+//! `X25519MLKEM768`-only group, authenticating CMIS by SPKI pin (not a CA
+//! chain). The pin is taken from `--spki-pin`/`FERROGATE_CMIS_SPKI_PIN`, or
+//! derived from a server certificate PEM (`--tls-cert`/`FERROGATE_CMIS_TLS_CERT`,
+//! defaulting to `/etc/ferrogate/tls/cmis.crt`). That default is the cert the
+//! Puppet module mounts into the cmis container, so a loopback `https://`
+//! invocation inside the container needs no extra flags. A plaintext `http://`
+//! endpoint keeps the legacy dev/bring-up behaviour.
 
 #![forbid(unsafe_code)]
 
+use ferro_crypto::pin::SpkiPin;
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
 use ferro_proto::v1::{
     BumpEpochRequest, HealthRequest, ListSvidsRequest, NodeRole, RevokeHostRequest,
@@ -26,6 +36,11 @@ use ferro_proto::v1::{
 use tonic::transport::Channel;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8443";
+
+/// In-container mount point of the CMIS server certificate (PEM), as placed by
+/// the `puppet-ferrogate` module. Used as the default SPKI-pin source for an
+/// `https://` endpoint when no explicit pin or cert path is supplied.
+const DEFAULT_TLS_CERT: &str = "/etc/ferrogate/tls/cmis.crt";
 
 fn usage() -> &'static str {
     "ferrogate — FerroGate operator CLI\n\
@@ -41,7 +56,15 @@ fn usage() -> &'static str {
      \n\
      options:\n\
      \x20 --endpoint <url>   CMIS gRPC endpoint (default http://127.0.0.1:8443,\n\
-     \x20                    or $FERROGATE_CMIS_ENDPOINT)\n\
+     \x20                    or $FERROGATE_CMIS_ENDPOINT). An https:// endpoint is\n\
+     \x20                    dialed over hybrid-PQC TLS and authenticated by SPKI pin.\n\
+     \x20 --spki-pin <hex>   accepted CMIS SPKI pin (lowercase-hex SHA-384); repeatable,\n\
+     \x20                    or comma-separated in $FERROGATE_CMIS_SPKI_PIN. Takes\n\
+     \x20                    precedence over --tls-cert.\n\
+     \x20 --tls-cert <path>  PEM server certificate to derive the SPKI pin from\n\
+     \x20                    (or $FERROGATE_CMIS_TLS_CERT; default\n\
+     \x20                    /etc/ferrogate/tls/cmis.crt). Used only for https://\n\
+     \x20                    endpoints when no --spki-pin is given.\n\
      \x20 -V, --version      print the ferrogate version and exit"
 }
 
@@ -57,7 +80,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let (endpoint, args) = parse_global_args(std::env::args().skip(1).collect());
+    let (global, args) = parse_global_args(std::env::args().skip(1).collect());
 
     let Some((command, rest)) = args.split_first() else {
         println!("{}", usage());
@@ -83,7 +106,7 @@ async fn run() -> anyhow::Result<()> {
         anyhow::bail!("unknown command: {command}\n\n{}", usage());
     }
 
-    let mut client = connect(&endpoint).await?;
+    let mut client = connect(&global).await?;
 
     match command.as_str() {
         "status" => status(&mut client).await,
@@ -95,11 +118,30 @@ async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// Pull `--endpoint <url>` (anywhere in the arg list) out of the raw args,
-/// falling back to `$FERROGATE_CMIS_ENDPOINT` then the local default.
-fn parse_global_args(raw: Vec<String>) -> (String, Vec<String>) {
+/// Connection-shaping options pulled out of the raw arg list, shared by every
+/// subcommand.
+struct GlobalArgs {
+    /// CMIS gRPC endpoint. `https://` selects the pinned TLS transport.
+    endpoint: String,
+    /// Explicit SPKI pins (lowercase-hex SHA-384). Highest-precedence pin
+    /// source; empty if none were supplied on the command line or in the env.
+    spki_pins: Vec<String>,
+    /// Explicit server-cert PEM path to derive the pin from when no explicit
+    /// pin is given; `None` falls back to [`DEFAULT_TLS_CERT`].
+    tls_cert: Option<String>,
+}
+
+/// Pull the global connection flags (anywhere in the arg list) out of the raw
+/// args. Precedence for each setting: an explicit flag (last one wins for
+/// `--endpoint`/`--tls-cert`; `--spki-pin` accumulates) overrides the matching
+/// environment variable, which overrides the built-in default.
+fn parse_global_args(raw: Vec<String>) -> (GlobalArgs, Vec<String>) {
     let mut endpoint =
         std::env::var("FERROGATE_CMIS_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+    // Explicit --spki-pin flags accumulate; only if none are given do we fall
+    // back to the comma-separated env list.
+    let mut spki_pins: Vec<String> = Vec::new();
+    let mut tls_cert = std::env::var("FERROGATE_CMIS_TLS_CERT").ok();
     let mut rest = Vec::with_capacity(raw.len());
     let mut it = raw.into_iter();
     while let Some(arg) = it.next() {
@@ -109,10 +151,38 @@ fn parse_global_args(raw: Vec<String>) -> (String, Vec<String>) {
                     endpoint = url;
                 }
             }
+            "--spki-pin" => {
+                if let Some(pin) = it.next() {
+                    spki_pins.push(pin);
+                }
+            }
+            "--tls-cert" => {
+                if let Some(path) = it.next() {
+                    tls_cert = Some(path);
+                }
+            }
             _ => rest.push(arg),
         }
     }
-    (endpoint, rest)
+    if spki_pins.is_empty() {
+        if let Ok(env_pins) = std::env::var("FERROGATE_CMIS_SPKI_PIN") {
+            spki_pins.extend(
+                env_pins
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    (
+        GlobalArgs {
+            endpoint,
+            spki_pins,
+            tls_cert,
+        },
+        rest,
+    )
 }
 
 /// Render a gRPC error as a one-line operator message instead of tonic's full
@@ -121,13 +191,74 @@ fn rpc_err(s: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("CMIS refused the request ({:?}): {}", s.code(), s.message())
 }
 
-async fn connect(endpoint: &str) -> anyhow::Result<MachineIdentityClient<Channel>> {
-    let channel = Channel::from_shared(endpoint.to_string())
-        .map_err(|e| anyhow::anyhow!("invalid endpoint `{endpoint}`: {e}"))?
-        .connect()
-        .await
-        .map_err(|e| anyhow::anyhow!("connect to CMIS at `{endpoint}` failed: {e}"))?;
-    Ok(MachineIdentityClient::new(channel))
+async fn connect(global: &GlobalArgs) -> anyhow::Result<MachineIdentityClient<Channel>> {
+    let endpoint = &global.endpoint;
+    if endpoint.starts_with("https://") {
+        // Hybrid-PQC TLS, SPKI-pinned. The pin is resolved up front so a
+        // missing/wrong pin is reported clearly rather than surfacing as an
+        // opaque handshake failure.
+        let pins = resolve_pins(global)?;
+        let channel = ferro_transport::connect_pinned(endpoint, pins)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("connect to CMIS at `{endpoint}` over TLS failed: {e:#}")
+            })?;
+        Ok(MachineIdentityClient::new(channel))
+    } else {
+        // Plaintext bring-up path: `http://` or a bare authority, unchanged.
+        let channel = Channel::from_shared(endpoint.clone())
+            .map_err(|e| anyhow::anyhow!("invalid endpoint `{endpoint}`: {e}"))?
+            .connect()
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to CMIS at `{endpoint}` failed: {e}"))?;
+        Ok(MachineIdentityClient::new(channel))
+    }
+}
+
+/// Resolve the SPKI pin set for an `https://` endpoint, in precedence order:
+///
+/// 1. explicit `--spki-pin` / `$FERROGATE_CMIS_SPKI_PIN` hex pins;
+/// 2. else the first certificate of the server-cert PEM at `--tls-cert` /
+///    `$FERROGATE_CMIS_TLS_CERT`, defaulting to [`DEFAULT_TLS_CERT`];
+/// 3. else a clear error explaining how to supply a pin or cert.
+fn resolve_pins(global: &GlobalArgs) -> anyhow::Result<Vec<SpkiPin>> {
+    if !global.spki_pins.is_empty() {
+        return global
+            .spki_pins
+            .iter()
+            .map(|hex| {
+                SpkiPin::from_hex(hex)
+                    .map_err(|e| anyhow::anyhow!("invalid --spki-pin `{hex}`: {e}"))
+            })
+            .collect();
+    }
+
+    let explicit_cert = global.tls_cert.is_some();
+    let cert_path = global.tls_cert.as_deref().unwrap_or(DEFAULT_TLS_CERT);
+    let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+        // The default path is the in-container mount; if it is absent the
+        // caller is likely running outside the container and must supply a pin
+        // or point at a cert explicitly.
+        if explicit_cert {
+            anyhow::anyhow!("reading TLS cert `{cert_path}`: {e}")
+        } else {
+            anyhow::anyhow!(
+                "no SPKI pin available for the https:// endpoint: reading the default \
+                 server cert `{cert_path}` failed ({e}). Supply --spki-pin <hex> \
+                 (or $FERROGATE_CMIS_SPKI_PIN), or --tls-cert <path> \
+                 (or $FERROGATE_CMIS_TLS_CERT) pointing at the CMIS server certificate."
+            )
+        }
+    })?;
+
+    let mut reader = std::io::BufReader::new(&cert_bytes[..]);
+    let cert = rustls_pemfile::certs(&mut reader)
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no certificate found in `{cert_path}`"))?
+        .map_err(|e| anyhow::anyhow!("parsing TLS cert `{cert_path}`: {e}"))?;
+    let pin = SpkiPin::from_certificate_der(cert.as_ref())
+        .map_err(|e| anyhow::anyhow!("deriving SPKI pin from `{cert_path}`: {e}"))?;
+    Ok(vec![pin])
 }
 
 async fn status(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
