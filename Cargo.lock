@@ -861,7 +861,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
@@ -1415,7 +1415,7 @@ dependencies = [
  "rcgen 0.13.2",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sha3",
  "subtle",
  "thiserror 1.0.69",
@@ -1463,7 +1463,7 @@ dependencies = [
  "ferro-crypto",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 1.0.69",
 ]
 
@@ -1486,7 +1486,7 @@ dependencies = [
  "rustls-post-quantum",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sha3",
  "subtle",
  "thiserror 1.0.69",
@@ -1541,7 +1541,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -1555,7 +1555,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 1.0.69",
 ]
 
@@ -2685,7 +2685,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
