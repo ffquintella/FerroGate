@@ -46,7 +46,8 @@ All MIA→CMIS control-plane traffic runs over TLS 1.3 using the hybrid
 `X25519MLKEM768` group only (feature F01). The shared rustls configs are built
 by `ferro_crypto::transport::{server_config, client_config}`; the server
 listener glue is `cmis::transport`, the client dialer is
-`mia::client::connect_pinned`.
+`mia::client::connect_pinned`. See [transport-tls.md](transport-tls.md) for the
+full how-it-works, the OpenSSL pin recipe, and troubleshooting.
 
 - **CMIS server identity.** Configure the listener with `CMIS_TLS_CERT` (PEM
   certificate chain: end-entity first, then any intermediates) and

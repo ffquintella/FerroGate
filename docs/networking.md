@@ -127,7 +127,9 @@ helper socket/pipe.
 ### Load balancer
 
 - Forward TCP `8443` to the CMIS pool with **TLS passthrough** (L4). Do not
-  terminate TLS or downgrade to HTTP/1.1.
+  terminate TLS or downgrade to HTTP/1.1. TLS is terminated on the CMIS node
+  itself (hybrid-PQC, `X25519MLKEM768`-only) — see
+  [transport-tls.md](transport-tls.md).
 - Health-check the pool via the gRPC `Health` RPC, not an HTTP path.
 
 ## Quick reference

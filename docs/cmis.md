@@ -89,6 +89,9 @@ listen        = "0.0.0.0:8443"
 spiffe_trust_domain = "ferrogate.prod"
 
 [tls]
+# The shipped binary reads these from env: CMIS_TLS_CERT / CMIS_TLS_KEY
+# (both or neither). Hybrid-only (X25519MLKEM768) is enforced by the provider.
+# See transport-tls.md for the full configuration and the SPKI pin recipe.
 hybrid_only   = true
 cert          = "/var/lib/ferrogate/cmis.crt"   # composite X.509
 key           = "/var/lib/ferrogate/cmis.key"   # references TEE-sealed key id

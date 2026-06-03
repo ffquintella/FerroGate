@@ -114,6 +114,9 @@ ek_vendor_roots     = ["/etc/ferrogate/roots/infineon.pem",
 tpm_device          = "/dev/tpmrm0"
 
 [cmis]
+# Dialed over hybrid-PQC TLS via mia::client::connect_pinned. The endpoint is
+# trusted by SPKI pin, not by CA chain; compute pins with the OpenSSL recipe in
+# transport-tls.md. Multiple pins allow overlap during certificate rotation.
 endpoint            = "https://cmis.prod.ferrogate.internal:8443"
 spki_pins_sha384    = ["<pin1>", "<pin2>"]
 hybrid_tls_only     = true

@@ -3,6 +3,7 @@
 - Core design
   - [Architecture](architecture.md)
   - [Networking & ports](networking.md)
+  - [Transport security (TLS)](transport-tls.md)
   - [Threat model](threat-model.md)
   - [Attestation protocol](protocol.md)
   - [Cryptography](crypto.md)
