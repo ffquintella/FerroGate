@@ -8,6 +8,37 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.13.4] — 2026-06-03
+
+### Added
+
+- **F01 hybrid-PQC TLS on the live gRPC transport.** The `ferro-crypto`
+  hybrid-PQC provider and SPKI-pin verifier are now wired into the actual
+  transport on both sides, closing the seam flagged in F04's status note.
+  - New `ferro_crypto::transport` module with shared rustls config builders
+    `server_config` / `client_config` (TLS 1.3 only, `X25519MLKEM768`-only,
+    ALPN `h2`), plus `is_hybrid_group` / `group_label` telemetry helpers.
+  - `cmis::transport::tls_incoming` terminates TLS via a `tokio_rustls` accept
+    loop and feeds handshake-complete connections to tonic's
+    `serve_with_incoming`; logs the negotiated key-exchange group per accepted
+    connection. The `cmis` binary enables TLS when `CMIS_TLS_CERT` +
+    `CMIS_TLS_KEY` are set, falling back to the plaintext bring-up server
+    (dev-only, loud warning) otherwise.
+  - `mia::client::connect_pinned` dials CMIS over a custom `tokio_rustls`
+    connector with SPKI pinning; a non-hybrid or wrong-pin server is rejected
+    before any RPC.
+  - Tests: `crates/mia/tests/tls_transport.rs` (pinned-hybrid JWKS over the
+    live listener, legacy non-PQC client rejected, wrong-pin rejected) and the
+    `transport_builders_negotiate_the_hybrid_group` handshake test.
+  - Operator guidance in [docs/operations.md](docs/operations.md) §"Transport
+    security (hybrid-PQC TLS)".
+
+### Changed
+
+- Enabled tonic's `tls` feature and promoted `tokio-rustls` to a regular
+  dependency of `cmis`/`mia`; added `hyper-util`, `tower`, and `rustls-pemfile`
+  workspace dependencies for the transport glue.
+
 ## [0.13.3] — 2026-06-03
 
 ### Changed

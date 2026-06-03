@@ -68,24 +68,34 @@ See [../crypto.md](../crypto.md) §"Hybrid TLS key exchange".
 ### Live-transport wiring (M6)
 
 The criteria above all cover the `ferro-crypto` provider and verifier layer.
-The provider is not yet wired into the live gRPC transport: the CMIS gRPC
-listener runs plaintext in the bring-up binary and the MIA client does not
-terminate TLS. These criteria close that seam (sequenced in the roadmap under
-M6, "F01 — Hybrid PQC TLS transport (continued)").
+These criteria close the live-transport seam (sequenced in the roadmap under
+M6, "F01 — Hybrid PQC TLS transport (continued)"). The shared rustls config
+builders are `ferro_crypto::transport::{server_config, client_config}`.
 
-- [ ] The CMIS gRPC listener terminates TLS via
-      `ferrogate_provider(ProviderMode::HybridOnly)`, replacing the plaintext
-      `tonic` server in the bring-up binary.
-- [ ] The MIA gRPC client dials over the hybrid-PQC provider with SPKI pin
-      verification (`SpkiPinVerifier`); a non-hybrid or wrong-pin server is
-      rejected before any application RPC.
-- [ ] A legacy/non-PQC client cannot complete the handshake against the live
-      CMIS listener (negative test on the wired transport, not just the
-      standalone provider).
-- [ ] The negotiated named group is surfaced in an audit/telemetry field so
-      operators can confirm every accepted connection used `X25519MLKEM768`.
-- [ ] Transport configuration (server cert + MIA pin provisioning) is
-      documented in [../operations.md](../operations.md).
+- [x] The CMIS gRPC listener terminates TLS via
+      `server_config(ProviderMode::HybridOnly, …)`, replacing the plaintext
+      `tonic` server in the bring-up binary. `cmis::transport::tls_incoming`
+      runs a `tokio_rustls` accept loop and hands handshake-complete streams to
+      `Server::serve_with_incoming`; enabled by `CMIS_TLS_CERT` +
+      `CMIS_TLS_KEY` (plaintext otherwise, with a loud warning).
+- [x] The MIA gRPC client dials over the hybrid-PQC provider with SPKI pin
+      verification. `mia::client::connect_pinned` wraps a `tokio_rustls`
+      connector built from `client_config(HybridOnly, pins)`; a non-hybrid or
+      wrong-pin server is rejected before any application RPC.
+- [x] A legacy/non-PQC client cannot complete the handshake against the live
+      CMIS listener:
+      `crates/mia/tests/tls_transport.rs::legacy_non_pqc_client_cannot_handshake_against_cmis_listener`
+      stands up the real `MachineIdentity` service over the TLS listener and a
+      legacy-X25519-only client fails the handshake;
+      `wrong_pin_client_is_rejected_by_connect_pinned` covers the pin path.
+- [x] The negotiated named group is surfaced as telemetry: `tls_incoming`
+      logs `kx_group = X25519MLKEM768` per accepted connection.
+      `ferro_crypto::transport::{is_hybrid_group, group_label}` plus the
+      `transport_builders_negotiate_the_hybrid_group` handshake test assert the
+      value end to end.
+- [x] Transport configuration (server cert + MIA pin provisioning) is
+      documented in [../operations.md](../operations.md) §"Transport security
+      (hybrid-PQC TLS)".
 
 ## Risks
 

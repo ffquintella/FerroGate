@@ -340,18 +340,38 @@ mode) and the SPKI-pinning verifier already exist from M1, but the CMIS gRPC
 listener still runs plaintext in the bring-up binary and the MIA client does
 not yet terminate TLS — the seam flagged in F04's status note.
 
-- [ ] Terminate hybrid-PQC TLS on the CMIS gRPC listener using
-      `ferro_crypto::ferrogate_provider()` (`X25519MLKEM768`-only), replacing
-      the plaintext `tonic` server in the bring-up binary.
-- [ ] MIA gRPC client dials over the hybrid-PQC provider with SPKI pin
-      verification (`ferro_crypto::pin`); a non-hybrid or wrong-pin server is
-      rejected.
-- [ ] Negative test on the live transport: a legacy/non-PQC client cannot
-      complete the handshake against the CMIS listener.
-- [ ] Surface the negotiated group in an audit/telemetry field so operators
-      can confirm every connection used the hybrid group.
-- [ ] Document the transport configuration (cert/pin provisioning) in
-      [operations.md](operations.md).
+- [x] Terminate hybrid-PQC TLS on the CMIS gRPC listener using
+      `ferro_crypto::transport::server_config(HybridOnly, …)`
+      (`X25519MLKEM768`-only). `cmis::transport::tls_incoming` runs a
+      `tokio_rustls` accept loop and feeds handshake-complete connections to
+      `tonic`'s `serve_with_incoming`; `cmis` `main` enables it when
+      `CMIS_TLS_CERT` + `CMIS_TLS_KEY` are set (plaintext bring-up otherwise,
+      with a loud warning).
+- [x] MIA gRPC client dials over the hybrid-PQC provider with SPKI pin
+      verification. `mia::client::connect_pinned` builds a `Channel` over a
+      custom `tokio_rustls` connector using
+      `ferro_crypto::transport::client_config(HybridOnly, pins)`; a non-hybrid
+      or wrong-pin server is rejected before any RPC.
+- [x] Negative test on the live transport: a legacy/non-PQC client cannot
+      complete the handshake against the CMIS listener
+      (`crates/mia/tests/tls_transport.rs::legacy_non_pqc_client_cannot_handshake_against_cmis_listener`,
+      plus `wrong_pin_client_is_rejected_by_connect_pinned`).
+- [x] Surface the negotiated group as a telemetry field: `tls_incoming` logs
+      `kx_group = X25519MLKEM768` per accepted connection (and warns loudly on
+      any non-hybrid group, unreachable under `HybridOnly`). The
+      `ferro_crypto::transport::{is_hybrid_group, group_label}` helpers and the
+      `transport_builders_negotiate_the_hybrid_group` test pin the value.
+- [x] Document the transport configuration (cert/pin provisioning) in
+      [operations.md](operations.md) §"Transport security (hybrid-PQC TLS)".
+
+**F01 (continued) status: done.** The hybrid-PQC TLS provider is now wired into
+the live transport on both sides: the CMIS listener terminates
+`X25519MLKEM768`-only TLS (`CMIS_TLS_CERT` / `CMIS_TLS_KEY`) and MIA dials it
+with SPKI pinning via `connect_pinned`. The shared rustls config builders live
+in `ferro_crypto::transport`. Verified with
+`cargo test -p ferro-crypto --test tls_handshake` (5), `cargo test -p mia
+--test tls_transport` (3 — pinned-hybrid JWKS over TLS, legacy-client reject,
+wrong-pin reject), and `clippy -D warnings` on `ferro-crypto`/`cmis`/`mia`.
 
 ### F14 — Root key ceremony
 

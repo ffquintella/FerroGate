@@ -20,6 +20,7 @@ pub mod pcr;
 pub mod rim_watcher;
 pub mod service;
 pub mod state;
+pub mod transport;
 
 pub use credential::{CredentialError, CredentialMaker, WrappedCredential};
 pub use fleet_manifest::{

@@ -165,6 +165,57 @@ async fn legacy_only_client_is_rejected_by_hybrid_only_server() {
 }
 
 #[tokio::test]
+async fn transport_builders_negotiate_the_hybrid_group() {
+    // Exercise the *production* config builders (the ones cmis/mia use), not
+    // the inline ones above, and assert the negotiated key-exchange group is
+    // the hybrid group — the value the CMIS listener surfaces as telemetry.
+    use ferro_crypto::transport::{client_config, is_hybrid_group, server_config};
+
+    let ident = make_server_identity();
+    let s_cfg = server_config(
+        ProviderMode::HybridOnly,
+        vec![ident.cert.clone()],
+        ident.key.clone_key(),
+    )
+    .expect("server config");
+    let c_cfg = client_config(ProviderMode::HybridOnly, vec![ident.pin]).expect("client config");
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let acceptor = TlsAcceptor::from(s_cfg);
+    let connector = TlsConnector::from(c_cfg);
+    let server_name = ServerName::try_from("cmis.test.ferrogate.invalid").unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let stream = acceptor.accept(server_io).await.expect("server handshake");
+        let group = {
+            let (_io, conn) = stream.get_ref();
+            conn.negotiated_key_exchange_group()
+                .map(rustls::crypto::SupportedKxGroup::name)
+        };
+        assert!(
+            is_hybrid_group(group),
+            "server side must record the hybrid group as negotiated"
+        );
+    });
+
+    let client = connector
+        .connect(server_name, client_io)
+        .await
+        .expect("client handshake");
+    let group = {
+        let (_io, conn) = client.get_ref();
+        conn.negotiated_key_exchange_group()
+            .map(rustls::crypto::SupportedKxGroup::name)
+    };
+    assert!(
+        is_hybrid_group(group),
+        "client side must negotiate X25519MLKEM768"
+    );
+
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
 async fn wrong_pin_rejects_otherwise_valid_server() {
     // Server cert is genuine; the client carries a pin for a *different*
     // certificate. The handshake must fail at certificate verification,

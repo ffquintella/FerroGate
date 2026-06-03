@@ -1,14 +1,17 @@
 //! `cmis` — Central Machine Identity Service binary.
 //!
 //! A thin wrapper: assemble [`cmis::CmisState`] and serve the
-//! [`cmis::MachineIdentitySvc`] gRPC surface. The M2 bring-up server listens in
-//! plaintext gRPC; hybrid-PQC TLS termination (F01) and a TEE-resident issuance
-//! key (F06) are layered on in later milestones, as is a configured phase-3
-//! credential maker. Until then `JWKS` is fully functional and `Attest` will
-//! report the credential service as unavailable.
+//! [`cmis::MachineIdentitySvc`] gRPC surface. The listener terminates
+//! hybrid-PQC TLS (F01, `X25519MLKEM768`-only) when `CMIS_TLS_CERT` +
+//! `CMIS_TLS_KEY` are configured, falling back to a plaintext bring-up server
+//! for local development otherwise. A TEE-resident issuance key (F06) and a
+//! configured phase-3 credential maker are layered on in later milestones;
+//! until then `JWKS` is fully functional and `Attest` will report the
+//! credential service as unavailable.
 
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +20,7 @@ use cmis::fleet_manifest::FleetManifestLoader;
 use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
 use ferro_attest::{RimLoader, RimStore, TpmQuoteVerifier, TrustedKeys, VendorTrustStore};
 use ferro_crypto::composite::CompositePublicKey;
+use ferro_crypto::tls::ProviderMode;
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
 use ferro_svid::Issuer;
 use tracing_subscriber::EnvFilter;
@@ -154,15 +158,58 @@ async fn main() -> anyhow::Result<()> {
         cmis::crl_publisher::DEFAULT_PUBLISH_INTERVAL,
     );
 
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        %addr,
-        "FerroGate CMIS — plaintext gRPC bring-up server (M2)"
-    );
+    serve_grpc(addr, state).await
+}
 
-    tonic::transport::Server::builder()
-        .add_service(MachineIdentitySvc::new(state).into_server())
-        .serve(addr)
-        .await?;
+/// Serve the `MachineIdentity` gRPC surface on `addr`.
+///
+/// F01 transport: with `CMIS_TLS_CERT` + `CMIS_TLS_KEY` configured the
+/// listener terminates hybrid-PQC TLS (`X25519MLKEM768`-only) via the shared
+/// `ferro-crypto` provider, so a legacy / non-PQC client fails the handshake
+/// and never reaches the gRPC layer. With neither set, the plaintext bring-up
+/// server is kept for local development (loud warning). Setting only one of
+/// the pair is a configuration error and aborts startup.
+async fn serve_grpc(addr: std::net::SocketAddr, state: Arc<CmisState>) -> anyhow::Result<()> {
+    let svc = MachineIdentitySvc::new(state).into_server();
+    let tls = match (
+        std::env::var_os("CMIS_TLS_CERT"),
+        std::env::var_os("CMIS_TLS_KEY"),
+    ) {
+        (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "CMIS_TLS_CERT and CMIS_TLS_KEY must be set together"
+            ))
+        }
+    };
+
+    if let Some((cert_path, key_path)) = tls {
+        let (cert_chain, key) = cmis::transport::load_pem_identity(&cert_path, &key_path)?;
+        let server_config =
+            ferro_crypto::transport::server_config(ProviderMode::HybridOnly, cert_chain, key)?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            %addr,
+            "FerroGate CMIS — hybrid-PQC TLS gRPC server (X25519MLKEM768-only)"
+        );
+        let incoming = cmis::transport::tls_incoming(listener, server_config);
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await?;
+    } else {
+        tracing::warn!(
+            version = env!("CARGO_PKG_VERSION"),
+            %addr,
+            "FerroGate CMIS — PLAINTEXT gRPC bring-up server (set CMIS_TLS_CERT + \
+             CMIS_TLS_KEY for hybrid-PQC TLS)"
+        );
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve(addr)
+            .await?;
+    }
     Ok(())
 }

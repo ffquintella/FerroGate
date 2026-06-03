@@ -40,6 +40,36 @@ on the EK cert.
   [roadmap.md](roadmap.md) §"Dropped scope") — sync from object storage to the
   watched path out of band if needed.
 
+## Transport security (hybrid-PQC TLS)
+
+All MIA→CMIS control-plane traffic runs over TLS 1.3 using the hybrid
+`X25519MLKEM768` group only (feature F01). The shared rustls configs are built
+by `ferro_crypto::transport::{server_config, client_config}`; the server
+listener glue is `cmis::transport`, the client dialer is
+`mia::client::connect_pinned`.
+
+- **CMIS server identity.** Configure the listener with `CMIS_TLS_CERT` (PEM
+  certificate chain: end-entity first, then any intermediates) and
+  `CMIS_TLS_KEY` (PEM private key — PKCS#8 / PKCS#1 / SEC1). Both must be set
+  together; setting only one aborts startup, and setting neither falls back to
+  a **plaintext** bring-up server (development only, logged as a warning). With
+  TLS on, the listener advertises only `X25519MLKEM768`, so a non-PQC client
+  fails the handshake before reaching the gRPC layer.
+- **MIA pin provisioning.** The MIA does not trust a CA hierarchy; it pins the
+  SHA-384 of the CMIS certificate's `SubjectPublicKeyInfo`. Compute the pin
+  from the deployed cert with `ferro_crypto::pin::SpkiPin::from_certificate_der`
+  (or its `to_hex`/`from_hex` round-trip) and hand the pin set to
+  `connect_pinned`. A server whose SPKI hash is not pinned — or that does not
+  speak the hybrid group — is rejected before any RPC.
+- **Telemetry.** Every accepted connection logs `kx_group = X25519MLKEM768`.
+  Operators confirm post-quantum coverage by asserting no accepted connection
+  ever logs a non-hybrid group (which, under the hybrid-only provider, cannot
+  occur — a downgrade attempt fails the handshake instead).
+- **Certificate rotation.** Replace the cert/key files and restart (or
+  hot-reload, when wired); update the MIA pin set to include the new SPKI pin
+  ahead of the cutover so both old and new certificates verify during the
+  overlap window.
+
 ## SVID rotation
 
 - At 60% of TTL the MIA performs a `Rotate` RPC. If PCRs and `policy_id` are
