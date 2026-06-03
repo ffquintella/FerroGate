@@ -75,7 +75,9 @@ async fn main() -> anyhow::Result<()> {
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), rim_store.clone());
 
     // M3 audit log: local-disk WORM store + in-process composite signer. The
-    // production swap (S3 Object Lock + TEE threshold signer) lands in M4.
+    // production swap to a TEE threshold signer lands with the hardware TEE
+    // driver work. `LocalDiskWormStore` is the shipped WORM tier; a native S3
+    // Object Lock store is dropped (see docs/roadmap.md "Dropped scope").
     let worm_root =
         std::env::var("CMIS_AUDIT_ROOT").unwrap_or_else(|_| "/var/lib/ferrogate/audit".to_string());
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(worm_root)?);
@@ -122,11 +124,11 @@ async fn main() -> anyhow::Result<()> {
     // store. With nothing configured the RIM allowlist stays empty and every
     // quote fails the RIM lookup (FAILED_PRECONDITION) — fail-closed by default.
     //
-    // The bundle is read from a local file. Sourcing it directly from S3 is NOT
-    // yet supported (see docs/roadmap.md F10); a deployment that stores the
-    // bundle in object storage syncs it to this path out of band. Because the
-    // bundle is composite-signed and verified before apply, that sync path is
-    // untrusted — only the signature gates what is admitted.
+    // The bundle is read from a local file. Native S3 sourcing is dropped (see
+    // docs/roadmap.md "Dropped scope"); a deployment that stores the bundle in
+    // object storage syncs it to this path out of band. Because the bundle is
+    // composite-signed and verified before apply, that sync path is untrusted —
+    // only the signature gates what is admitted.
     let _rim_watcher = match std::env::var("CMIS_RIM_BUNDLE") {
         Ok(path) if !path.is_empty() => {
             let trust = load_single_key_trust("CMIS_RIM_SIGNER_KID", "CMIS_RIM_SIGNER_PUB")?;

@@ -65,6 +65,28 @@ See [../crypto.md](../crypto.md) §"Hybrid TLS key exchange".
       12-byte nonces, exercising both decrypt (Valid + Invalid) and
       re-encrypt directions.
 
+### Live-transport wiring (M6)
+
+The criteria above all cover the `ferro-crypto` provider and verifier layer.
+The provider is not yet wired into the live gRPC transport: the CMIS gRPC
+listener runs plaintext in the bring-up binary and the MIA client does not
+terminate TLS. These criteria close that seam (sequenced in the roadmap under
+M6, "F01 — Hybrid PQC TLS transport (continued)").
+
+- [ ] The CMIS gRPC listener terminates TLS via
+      `ferrogate_provider(ProviderMode::HybridOnly)`, replacing the plaintext
+      `tonic` server in the bring-up binary.
+- [ ] The MIA gRPC client dials over the hybrid-PQC provider with SPKI pin
+      verification (`SpkiPinVerifier`); a non-hybrid or wrong-pin server is
+      rejected before any application RPC.
+- [ ] A legacy/non-PQC client cannot complete the handshake against the live
+      CMIS listener (negative test on the wired transport, not just the
+      standalone provider).
+- [ ] The negotiated named group is surfaced in an audit/telemetry field so
+      operators can confirm every accepted connection used `X25519MLKEM768`.
+- [ ] Transport configuration (server cert + MIA pin provisioning) is
+      documented in [../operations.md](../operations.md).
+
 ## Risks
 
 - **Spec churn.** The hybrid-design draft is not yet final; codepoints may

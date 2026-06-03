@@ -107,7 +107,7 @@ allowlist     = "/var/lib/ferrogate/rim/current.json"
 generations   = 6
 
 [audit]
-worm_bucket   = "s3://ferrogate-audit-prod"
+worm_dir      = "/var/lib/ferrogate/audit"      # local-disk WORM store (O_CREAT|O_EXCL)
 sigsum_log    = "https://sigsum.example.org/log1"
 ```
 

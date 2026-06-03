@@ -6,10 +6,11 @@
 //! that took a snapshot always see a consistent set; no synchronisation is
 //! required here.
 //!
-//! Production deployments will replace the local-file poll with a signed-S3
-//! refresh (sequenced in M5, see `docs/roadmap.md`); because the loader already
-//! verifies the composite signature before applying anything, the only change
-//! is where the bytes come from — the swap stays local to the loader.
+//! The manifest is read from a local file. Native S3 sourcing is dropped (see
+//! `docs/roadmap.md` "Dropped scope"); a deployment keeping the manifest in
+//! object storage syncs it to the watched path out of band. Because the loader
+//! verifies the composite signature before applying anything, that sync path is
+//! untrusted — only the signature gates what is admitted.
 
 use std::sync::Arc;
 use std::time::Duration;

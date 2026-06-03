@@ -5,9 +5,11 @@
 //! single write lock inside the loader, so in-flight `Attest` handlers always
 //! see a consistent generation set; no synchronisation is required here.
 //!
-//! Production deployments will eventually replace this with a `notify`-style
-//! filesystem watch and a signed-S3 refresh path (sequenced in M5); the seam
-//! is small enough that the swap is local to this module.
+//! Production deployments may replace this poll with a `notify`-style
+//! filesystem watch; the seam is small enough that the swap is local to this
+//! module. Native S3 sourcing is dropped (see docs/roadmap.md "Dropped scope")
+//! — a deployment keeping the bundle in object storage syncs it to the watched
+//! path out of band.
 
 use std::sync::Arc;
 use std::time::Duration;

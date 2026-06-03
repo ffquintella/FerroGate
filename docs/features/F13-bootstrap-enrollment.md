@@ -15,7 +15,8 @@ In:
 - Fleet manifest format (signed JSON / CBOR; SHA-384 of every accepted EK
   cert).
 - Offline signing tool that produces and updates the manifest.
-- CMIS startup load and signed-S3 refresh of the manifest.
+- CMIS startup load and hot-reload of the manifest from a local file. (Native
+  S3 refresh is dropped — see [../roadmap.md](../roadmap.md) §"Dropped scope".)
 - Pre-admission lookup at the start of `Attest`.
 - Audit events: `HostEnrolled`, `HostRejected`.
 
@@ -49,8 +50,9 @@ See [../operations.md](../operations.md) §"Bootstrapping a new host".
       asserts a single `HostRejected` leaf — no `AttestStart`.)
 - [x] Manifest refresh is atomic; in-flight attestations see a consistent
       snapshot. (`FleetStore` swaps an `Arc<EnrolledHosts>` under a write lock;
-      `apply_swaps_snapshot_atomically`. The signed-S3 source reuses the
-      loader's verify-then-swap path; the file watcher is the M5 stand-in.)
+      `apply_swaps_snapshot_atomically`. The manifest is reloaded from a local
+      file by the watcher; native S3 sourcing is dropped (see
+      [../roadmap.md](../roadmap.md) §"Dropped scope").)
 - [x] CLI tool can add and remove EK hashes and produce a properly signed
       bundle. (`fleet-manifest` `add`/`remove`/`sign`;
       `full_lifecycle_keygen_edit_sign_verify`.)

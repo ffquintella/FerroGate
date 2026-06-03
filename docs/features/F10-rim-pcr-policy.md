@@ -13,7 +13,10 @@ In:
 
 - RIM bundle format (signed JSON / CBOR) with explicit version, validity
   window, and approved PCR digest set.
-- Hot reload from a signed S3 object (or local file for development).
+- Hot reload of a signed bundle from a local file. (Native S3 sourcing is
+  dropped — see [../roadmap.md](../roadmap.md) §"Dropped scope". A deployment
+  keeping the bundle in object storage syncs it to the watched path out of
+  band; the composite signature, not the transport, gates what is admitted.)
 - Retention of 6 prior generations.
 - `policy_id` epoch bump as a first-class admin operation, audited.
 - Mapping at attestation time from PCR digest to `policy_id`.

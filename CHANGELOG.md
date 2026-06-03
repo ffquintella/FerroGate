@@ -8,6 +8,24 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.13.3] — 2026-06-03
+
+### Changed
+
+- **S3 / object-storage support is dropped and will not be implemented.**
+  Documented as a new "Dropped scope" section in
+  [docs/roadmap.md](docs/roadmap.md): native S3 sourcing (RIM bundles, fleet
+  manifests) and the S3 Object Lock WORM store are removed from all future
+  tasks. Every artefact is read from / written to a local file or directory;
+  a deployment that keeps artefacts in object storage syncs them to the local
+  path out of band, and because each is composite-signed (RIM, fleet manifest)
+  or write-once via `O_CREAT|O_EXCL` (`LocalDiskWormStore`), that sync path is
+  untrusted. The `AuditStore` / loader trait seams stay open for an
+  out-of-tree adapter, but no object-store impl is a FerroGate deliverable.
+  Updated the roadmap, design docs (architecture, audit, threat-model,
+  networking, cmis, operations), the F07/F10/F13 feature docs, and the
+  corresponding source doc-comments to match.
+
 ## [0.13.2] — 2026-06-02
 
 ### Added

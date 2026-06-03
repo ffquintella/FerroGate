@@ -15,6 +15,20 @@ roadmap state.
 - `[x]` — Done
 - `[!]` — Blocked (note why on the same line)
 
+## Dropped scope
+
+- **Native S3 / object-storage sourcing and the S3 Object Lock WORM store
+  are dropped and will not be implemented.** No HTTP/S3 client is pulled into
+  the workspace. Every artefact that an earlier plan sourced from S3 — RIM
+  bundles, fleet manifests, the audit WORM tier — is instead read from (or
+  written to) a **local file/directory**, and a deployment that keeps those
+  artefacts in object storage syncs them to that path out of band. This is
+  safe because each artefact is composite-signed and verified before use (RIM,
+  fleet manifest) or write-once via `O_CREAT|O_EXCL` (`LocalDiskWormStore`), so
+  the sync path is untrusted. The trait seams (`AuditStore`,
+  `RimLoader`/fleet loader verify-then-swap) remain open for an out-of-tree
+  object-store adapter, but no such adapter is a FerroGate deliverable.
+
 ---
 
 ## Milestone M0 — Workspace bootstrap
@@ -69,8 +83,9 @@ generational allowlist + hot reload) are all landed and tagged as `v0.2.0`.
 Verified on Linux (`docker/f02-dev`) with `cargo test --workspace
 --all-targets` (incl. the `swtpm` attest and seal tests), `clippy -D
 warnings`, and `fmt --check`. The remaining F10 work (`bump_epoch` admin
-RPC, signed-S3 refresh) is sequenced in M5 alongside the rest of the host
-operations track.
+RPC) is sequenced in M5 alongside the rest of the host operations track.
+(Signed-S3 refresh was originally planned here too; it is now dropped — see
+"Dropped scope" above.)
 
 ### F02 — TPM 2.0 attestation engine
 
@@ -104,9 +119,9 @@ operations track.
 - [x] RIM bundle format and loader. (`ferro-attest::rim_bundle` defines `RimBundle` (version, policy_id, validity window, approved SHA-384 digests) and the `SignedRimBundle` wire form; `ferro-attest::rim_loader::RimLoader::try_reload` reads, verifies, and applies an on-disk bundle.)
 - [x] RIM signature verification. (Composite Ed25519 + ML-DSA-65 over canonical JSON with domain-separation context `ferrogate-rim-v1`. Fail-closed: bundles without a recognised `signer_kid`, with a malformed signature, or with a tampered body are refused before any state changes. There is no path into the store that bypasses verification.)
 - [x] 6-generation retention. (`MAX_GENERATIONS = 6`; `RimStore::apply` pushes the new generation and prunes the oldest beyond the limit. Per-generation `not_before`/`not_after` windows are honoured at lookup time, and a non-monotonic version is rejected with `ApplyError::NonMonotonic`.)
-- [x] Hot reload from local file (S3 deferred to M5). (`cmis::rim_watcher::spawn` runs a small tokio task that periodically calls `try_reload`. The swap is atomic — a single `parking_lot::RwLock` write — so in-flight `Attest` handlers always see a consistent generation set. CMIS maps `RejectReason::NotInRim` to `FAILED_PRECONDITION` to match the documented error model.)
+- [x] Hot reload from local file (native S3 sourcing dropped, see "Dropped scope" above). (`cmis::rim_watcher::spawn` runs a small tokio task that periodically calls `try_reload`. The swap is atomic — a single `parking_lot::RwLock` write — so in-flight `Attest` handlers always see a consistent generation set. CMIS maps `RejectReason::NotInRim` to `FAILED_PRECONDITION` to match the documented error model.)
 
-**F10 (M2 subset) status: done.** Verified on Linux with `cargo test --workspace --all-targets`, `clippy -D warnings`, and `fmt --check`. The M5 follow-ons (`bump_epoch` admin RPC and signed-S3 refresh) remain explicitly out of M2 scope.
+**F10 (M2 subset) status: done.** Verified on Linux with `cargo test --workspace --all-targets`, `clippy -D warnings`, and `fmt --check`. The `bump_epoch` admin RPC was the remaining M5 follow-on (now done); signed-S3 refresh was originally planned here too but is dropped (see "Dropped scope" above).
 
 ## Milestone M3 — Audit log
 
@@ -117,12 +132,12 @@ Make the system externally observable before adding HA complexity.
 - [x] Event enum and CBOR encoding in `ferro-audit`. (`crates/ferro-audit/src/event.rs` defines the seven-variant `AuditEvent` mirroring `docs/audit.md`; encoding via `ciborium`. The fixed-size hash fields use the `Hash384` / `Bytes16` newtypes in `bytes.rs` so they serialise as compact CBOR byte strings rather than arrays-of-small-ints.)
 - [x] In-process Merkle tree with SHA3-384 leaves. (`crates/ferro-audit/src/merkle.rs` implements the RFC 6962 algorithms — domain-separated `leaf_hash(0x00 || …)` and `node_hash(0x01 || …)`, plus `inclusion_proof`, `consistency_proof`, and standalone verifiers usable by any third party.)
 - [x] STH structure and TEE-style signing stub (replaced in M4). (`crates/ferro-audit/src/sth.rs`: `SthBody { tree_size, root_hash, timestamp }` carried over the wire as canonical CBOR + a composite Ed25519 + ML-DSA-65 signature under domain context `ferrogate-sth-v1`. The signer is a trait; `InProcessSigner` is the M3 stub.)
-- [x] Backing-store abstraction with a local-disk WORM implementation for dev. (`crates/ferro-audit/src/store.rs`: `AuditStore` trait + `LocalDiskWormStore`. `O_CREAT|O_EXCL` makes a leaf or STH file uncoverwriteable. The S3 Object Lock implementation lands in M4.)
+- [x] Backing-store abstraction with a local-disk WORM implementation. (`crates/ferro-audit/src/store.rs`: `AuditStore` trait + `LocalDiskWormStore`. `O_CREAT|O_EXCL` makes a leaf or STH file uncoverwriteable. `LocalDiskWormStore` is the production WORM tier; a native S3 Object Lock store was originally planned for M4 but is dropped — see "Dropped scope" above. Deployments needing cloud durability sync the WORM directory to object storage out of band.)
 - [x] Inclusion and consistency proof endpoints on CMIS. (`ferro-proto` adds `LatestSth`, `InclusionProof`, `ConsistencyProof`, and `AppendAuditEvent` RPCs; `crates/cmis/src/service.rs` implements them against the shared `AuditLog`.)
 - [x] Property tests covering inclusion and consistency. (`crates/ferro-audit/src/log.rs` proptest: 24 cases, tree sizes 1..=12, asserts `verify_inclusion` holds for every leaf and `verify_consistency` holds for every `(m, n)` pair against the matching captured STH roots.)
 - [x] Forward MIA events into the CMIS audit stream. (`crates/mia/src/audit_client.rs::forward` encodes a `ferro_audit::AuditEvent` to CBOR and submits it through `AppendAuditEvent`. End-to-end driven in `crates/mia/tests/e2e_attest.rs::audit_log_records_attest_events_and_proofs_verify_offline`, which after an Attest fetches the STH, verifies the signature, fetches an inclusion proof, verifies offline, forwards a `LocalGrant`, and checks a consistency proof back to the prior STH.)
 
-**M3 status: complete.** Verified on Linux (`docker/f02-dev`) with `cargo test --workspace --all-targets`, `clippy -D warnings`, and `fmt --check`. The M4 follow-ons (Raft co-signed STHs, S3 Object Lock store, Sigsum / Rekor anchor publisher) remain explicitly out of M3 scope.
+**M3 status: complete.** Verified on Linux (`docker/f02-dev`) with `cargo test --workspace --all-targets`, `clippy -D warnings`, and `fmt --check`. The M4 follow-ons (Raft co-signed STHs, Sigsum / Rekor anchor publisher) remain explicitly out of M3 scope. (A native S3 Object Lock store was originally listed here as an M4 follow-on; it is now dropped — see "Dropped scope" above.)
 
 ## Milestone M4 — HA and TEE
 
@@ -157,9 +172,12 @@ Promote CMIS from a single replica into a TEE-attested cluster.
 **F07 (continued) status: done.** Co-signed STHs (M4) and the anchor
 publisher with persistent back-fill (M4) have landed and ship in `v0.3.0`.
 Production WORM is provided by `LocalDiskWormStore`'s `O_CREAT|O_EXCL`
-semantics; deployments that want a cloud-object backing store plug it in
-behind the existing `AuditStore` trait as deployment wiring (the seam —
-`record_cosigned_sth` / `record_sth` — is already in place). Concrete
+semantics. A native S3 Object Lock backing store is **dropped** (see "Dropped
+scope" above) — `LocalDiskWormStore` is the shipped WORM tier and deployments
+needing cloud durability sync its directory to object storage out of band. The
+`AuditStore` trait seam (`record_cosigned_sth` / `record_sth`) stays open for
+an out-of-tree adapter, but no object-store impl is a FerroGate deliverable.
+Concrete
 Sigsum / Rekor HTTP drivers (`Anchor` impls) plug in behind the existing
 trait the same way; both wire formats are short (`POST /api/v1/log/entries`
 for Rekor; the Sigsum `add-leaf` request for Sigsum) and add nothing the
@@ -266,9 +284,11 @@ gate runs on the PIE-by-default glibc build.
       `CompositeSecretKey::from_seed`.)
 - [x] CMIS load. (`FleetManifestLoader` + `fleet_watcher` poll/verify/hot-swap
       into the `FleetStore` held by `CmisState`; `main` loads from
-      `CMIS_FLEET_MANIFEST` fail-closed and spawns the watcher. Signed-S3
-      refresh reuses the loader's verify-then-swap path and is tracked under the
-      M5 follow-ons below.)
+      `CMIS_FLEET_MANIFEST` fail-closed and spawns the watcher. The manifest is
+      read from a local file; native S3 sourcing is dropped, see "Dropped scope"
+      above. A deployment keeping the manifest in object storage syncs it to the
+      configured path out of band — the composite signature gates what is
+      admitted, so the sync path is untrusted.)
 - [x] Pre-admission lookup at start of `Attest`. (`CmisState::check_enrollment`
       runs on the phase-2 EK hash before any TPM verification work; unenforced
       until a manifest is loaded, so a CMIS with no manifest behaves as before.)
@@ -286,31 +306,52 @@ and the `fleet-manifest` CLI lifecycle, plus `clippy -D warnings`.
 
 ### F10 — RIM and PCR policy (continued)
 
-- [~] Signed-S3 RIM refresh. **S3 sourcing is not supported yet** (deliberately
-      deferred — no HTTP/S3 client is pulled into the workspace). The signed,
-      hot, atomic refresh path *is* wired: `RimLoader` + `rim_watcher` are now
-      spawned from `cmis` `main` (env `CMIS_RIM_BUNDLE` + `CMIS_RIM_SIGNER_KID`/
-      `CMIS_RIM_SIGNER_PUB`, fail-closed) and load the bundle from a **local
-      file**. A deployment that keeps the bundle in object storage syncs it to
-      that path out of band; because the bundle is composite-signed and verified
-      before apply, the sync path is untrusted. A native S3 fetcher can later
-      slot in behind the same verify-then-swap seam.
+- [x] Signed RIM refresh from a local file. **Native S3 sourcing is dropped**
+      (see "Dropped scope" above — no HTTP/S3 client is pulled into the
+      workspace). The signed, hot, atomic refresh path is wired: `RimLoader` +
+      `rim_watcher` are spawned from `cmis` `main` (env `CMIS_RIM_BUNDLE` +
+      `CMIS_RIM_SIGNER_KID`/`CMIS_RIM_SIGNER_PUB`, fail-closed) and load the
+      bundle from a **local file**. A deployment that keeps the bundle in object
+      storage syncs it to that path out of band; because the bundle is
+      composite-signed and verified before apply, the sync path is untrusted.
 - [x] `bump_epoch` admin RPC with audit event and forced re-attestation.
       (`BumpEpoch` RPC → `CmisState::bump_epoch` advances a live `AtomicU64`
       epoch; the next `Rotate` for any host attested under the old epoch is
       refused (`FAILED_PRECONDITION`) via `decide_renewal`'s `EpochBump` branch.
       Records a `PolicyEpochBumped` audit event.)
 
-**F10 (continued) status: `bump_epoch` done; S3 sourcing deferred.** The policy
-epoch is now runtime-mutable: `bump_epoch` flips an `AtomicU64` and every host
-re-attests on its next rotate. RIM bundles load and hot-reload from a signed
-local file; fetching them directly from S3 is explicitly out of scope for now
-and documented as unsupported. Verified with the `mia` e2e harness
+**F10 (continued) status: done (`bump_epoch` + local-file RIM refresh; S3
+dropped).** The policy epoch is now runtime-mutable: `bump_epoch` flips an
+`AtomicU64` and every host re-attests on its next rotate. RIM bundles load and
+hot-reload from a signed local file; sourcing them directly from S3 is dropped
+and will not be implemented (see "Dropped scope" above). Verified with the
+`mia` e2e harness
 (`bump_epoch_forces_full_reattestation_on_next_rotate`: short-path rotate before
 the bump, `FAILED_PRECONDITION` after, one `PolicyEpochBumped` leaf) plus
 `clippy -D warnings`.
 
 ## Milestone M6 — Ceremony, drills, and production readiness
+
+### F01 — Hybrid PQC TLS transport (continued)
+
+Wire the existing `ferro-crypto` hybrid-PQC TLS provider into the live gRPC
+transport. The provider (`ferrogate_provider()`, `X25519MLKEM768` hybrid
+mode) and the SPKI-pinning verifier already exist from M1, but the CMIS gRPC
+listener still runs plaintext in the bring-up binary and the MIA client does
+not yet terminate TLS — the seam flagged in F04's status note.
+
+- [ ] Terminate hybrid-PQC TLS on the CMIS gRPC listener using
+      `ferro_crypto::ferrogate_provider()` (`X25519MLKEM768`-only), replacing
+      the plaintext `tonic` server in the bring-up binary.
+- [ ] MIA gRPC client dials over the hybrid-PQC provider with SPKI pin
+      verification (`ferro_crypto::pin`); a non-hybrid or wrong-pin server is
+      rejected.
+- [ ] Negative test on the live transport: a legacy/non-PQC client cannot
+      complete the handshake against the CMIS listener.
+- [ ] Surface the negotiated group in an audit/telemetry field so operators
+      can confirm every connection used the hybrid group.
+- [ ] Document the transport configuration (cert/pin provisioning) in
+      [operations.md](operations.md).
 
 ### F14 — Root key ceremony
 
