@@ -1412,7 +1412,7 @@ dependencies = [
  "p256",
  "parking_lot",
  "rand_core 0.6.4",
- "rcgen 0.13.2",
+ "rcgen",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1479,7 +1479,7 @@ dependencies = [
  "hex",
  "proptest",
  "rand_core 0.6.4",
- "rcgen 0.13.2",
+ "rcgen",
  "ring",
  "rustls",
  "rustls-pki-types",
@@ -1615,7 +1615,7 @@ dependencies = [
  "ferro-proto",
  "ferro-svid",
  "ferro-transport",
- "rcgen 0.13.2",
+ "rcgen",
  "rustls-pemfile",
  "rustls-pki-types",
  "tokio",
@@ -2014,7 +2014,7 @@ dependencies = [
  "lazy_static",
  "lz4-sys",
  "openraft",
- "rcgen 0.14.8",
+ "rcgen",
  "reqwest",
  "rusqlite",
  "rust-embed",
@@ -2705,7 +2705,7 @@ dependencies = [
  "hyper-util",
  "p256",
  "rand_core 0.6.4",
- "rcgen 0.13.2",
+ "rcgen",
  "ring",
  "rustls-pki-types",
  "serde",
@@ -3439,29 +3439,17 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
-dependencies = [
- "aws-lc-rs",
- "pem",
- "rustls-pki-types",
- "time",
- "yasna 0.5.2",
-]
-
-[[package]]
-name = "rcgen"
 version = "0.14.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
 dependencies = [
+ "aws-lc-rs",
  "pem",
  "ring",
  "rustls-pki-types",
  "time",
  "x509-parser 0.18.1",
- "yasna 0.6.0",
+ "yasna",
 ]
 
 [[package]]
@@ -5581,6 +5569,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
 dependencies = [
  "asn1-rs 0.7.2",
+ "aws-lc-rs",
  "data-encoding",
  "der-parser 10.0.0",
  "lazy_static",
@@ -5589,15 +5578,6 @@ dependencies = [
  "ring",
  "rusticata-macros",
  "thiserror 2.0.18",
- "time",
-]
-
-[[package]]
-name = "yasna"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
-dependencies = [
  "time",
 ]
 
