@@ -101,9 +101,87 @@ a policy over PCRs `{0, 4, 7, 8}`. On reboot:
 
 ## Configuration
 
-In production MIA is configured entirely by environment variable, read from the
-systemd `EnvironmentFile` at `/etc/ferrogate/mia.env` (the packaged template).
-The keys are documented inline in that template and in `crates/mia/src/main.rs`.
+MIA reads an optional TOML **configuration file** and overlays **environment
+variables** on top. The precedence, lowest to highest, is:
+
+```
+built-in defaults  <  configuration file  <  environment variables
+```
+
+so an explicitly-set `FERROGATE_*` / `RUST_LOG` variable always overrides the
+file, and a deployment that sets everything through the systemd
+`EnvironmentFile` (`/etc/ferrogate/mia.env`) keeps working with no file present.
+
+### Supported platforms
+
+MIA runs on **Linux, macOS, and Windows**. The helper-API transport and caller
+authentication differ per OS:
+
+| OS | transport | caller authentication | hardening |
+|----|-----------|------------------------|-----------|
+| Linux | Unix domain socket | `SO_PEERCRED` + IMA cross-check | seccomp / mlockall / privilege-drop |
+| macOS | Unix domain socket | peer-cred (`LOCAL_PEERPID`) + on-disk image SHA-384 (via `libproc`) | n/a |
+| Windows | named pipe | client PID + image SHA-384 + Authenticode | n/a |
+
+The TPM attestation loop is Linux-only; on macOS/Windows MIA runs as the
+helper-API surface. The startup hardening profile applies on Linux only.
+
+### Configuration file
+
+The file is discovered in this order:
+
+1. `mia --config <path>` (must exist),
+2. `$FERROGATE_CONFIG` (if set, must exist),
+3. the OS **system path**, then the **per-user path** (each loaded if present;
+   absent ⇒ env/defaults only).
+
+Per-OS locations:
+
+| OS | system path | per-user path |
+|----|-------------|---------------|
+| Linux | `/etc/ferrogate/mia.toml` | `$XDG_CONFIG_HOME/ferrogate/mia.toml` (or `~/.config/...`) |
+| macOS | `/Library/Application Support/FerroGate/mia.toml` | `~/Library/Application Support/FerroGate/mia.toml` |
+| Windows | `%ProgramData%\FerroGate\mia.toml` | `%APPDATA%\FerroGate\mia.toml` |
+
+A malformed file — including an unknown key — fails the daemon loudly at
+startup rather than being silently ignored. The packaged template (source:
+`crates/mia/dist/mia.toml`) is installed at the system path; every value is
+commented out, so a fresh install behaves exactly as defaults until edited:
+
+```toml
+log = "info"
+
+[cmis]
+endpoint = "https://cmis.example.com:8443"
+spki_pin = "<base64-sha384>"
+
+[helper]
+socket = "/run/ferrogate/mia.sock"   # presence enables the helper API
+socket_mode = "660"
+
+[allowlist]
+path = "/etc/ferrogate/allowlist.cbor"
+key  = "/etc/ferrogate/allowlist.pub"
+max_age_secs = 86400
+
+[attestation]
+ima_log = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements"
+```
+
+Each key has an environment-variable equivalent that overrides it:
+
+| TOML key | Environment variable |
+|----------|----------------------|
+| `log` | `RUST_LOG` |
+| `cmis.endpoint` | `FERROGATE_CMIS_ENDPOINT` |
+| `cmis.spki_pin` | `FERROGATE_CMIS_SPKI_PIN` |
+| `helper.socket` | `FERROGATE_HELPER_SOCKET` |
+| `helper.socket_mode` | `FERROGATE_HELPER_SOCKET_MODE` |
+| `helper.windows_group` | `FERROGATE_HELPER_WINDOWS_GROUP` |
+| `allowlist.path` | `FERROGATE_ALLOWLIST` |
+| `allowlist.key` | `FERROGATE_ALLOWLIST_KEY` |
+| `allowlist.max_age_secs` | `FERROGATE_ALLOWLIST_MAX_AGE_SECS` |
+| `attestation.ima_log` | `FERROGATE_IMA_LOG` |
 
 ### `mia setup` — interactive wizard
 
@@ -116,17 +194,26 @@ $ sudo mia setup
 `mia setup` is a rich-terminal, guided wizard (arrow keys / typed answers, with
 validation and per-field help) that walks through the agent's configuration —
 the CMIS server to connect to, the local helper API, the caller allowlist,
-attestation, and log verbosity — and writes `/etc/ferrogate/mia.env` in the
-documented, self-commenting form. Run against an existing file it pre-fills
-every prompt with the current value, so it doubles as an editor. Options:
+attestation, and log verbosity — and writes the **TOML configuration file** in
+the documented, self-commenting form. It writes the OS **system path** by
+default (see the per-OS table above) and prompts platform-appropriately (socket
+mode on Unix, the pipe group on Windows). Run against an existing file it
+pre-fills every prompt with the current value, so it doubles as an editor.
+Options:
 
-- `-o, --output <path>` — write somewhere other than `/etc/ferrogate/mia.env`.
+- `-u, --user` — write the per-user config path instead of the system path
+  (no elevation needed).
+- `-o, --output <path>` — write to a specific path.
 - `-f, --force` — overwrite an existing file without the extra confirmation.
 
 It requires a TTY; for unattended provisioning (configuration management),
-write `mia.env` directly from the template in `crates/mia/dist/mia.env`.
+write the TOML file directly from the template in `crates/mia/dist/mia.toml`.
 
-## Configuration sketch
+## Configuration sketch (aspirational)
+
+> Forward-looking superset showing where the schema is headed (hardening
+> toggles, multiple SPKI pins, CRL age). The authoritative, currently-honored
+> keys are the ones in **Configuration** above and in `crates/mia/dist/mia.toml`.
 
 ```toml
 [hardening]

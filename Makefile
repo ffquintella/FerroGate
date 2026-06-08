@@ -256,9 +256,12 @@ pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 	rm -rf $(MACOS_PKG_ROOT)
 	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/bin
 	install -d -m 0755 $(MACOS_PKG_ROOT)/etc/ferrogate
+	install -d -m 0755 "$(MACOS_PKG_ROOT)/Library/Application Support/FerroGate"
 	install -d -m 0755 $(MACOS_PKG_ROOT)/Library/LaunchDaemons
 	install -m 0755 target/release/$(PKG_CRATE) $(MACOS_PKG_ROOT)/usr/local/bin/$(PKG_CRATE)
 	install -m 0640 $(MACOS_DIST)/mia.env $(MACOS_PKG_ROOT)/etc/ferrogate/mia.env
+	# The TOML config goes to the macOS system config path (where mia discovers it).
+	install -m 0640 $(MACOS_DIST)/mia.toml "$(MACOS_PKG_ROOT)/Library/Application Support/FerroGate/mia.toml"
 	install -m 0644 $(MACOS_DIST)/com.ferrogate.mia.plist $(MACOS_PKG_ROOT)/Library/LaunchDaemons/$(MACOS_PKG_ID).plist
 	pkgbuild --root $(MACOS_PKG_ROOT) \
 		--scripts $(MACOS_DIST)/macos-scripts \

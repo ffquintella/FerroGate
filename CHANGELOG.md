@@ -10,6 +10,32 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **MIA runs on Linux, macOS, and Windows.** The daemon now wires up and serves
+  the helper API on all three platforms instead of only Linux: Linux uses
+  `SO_PEERCRED` + IMA, Windows uses the named-pipe transport with PID + image
+  hash + Authenticode, and macOS gains a new `MacCallerAuth` (peer-cred +
+  on-disk image SHA-384 via the `libproc` crate; FFI stays out of `mia`, which
+  remains `#![forbid(unsafe_code)]`). The startup hardening profile and TPM
+  attestation remain Linux-only; shutdown handles `SIGINT`/`SIGTERM` on Unix and
+  Ctrl-C on Windows.
+- **Per-OS configuration-file locations.** The config file is now discovered at
+  the OS-idiomatic system path then the per-user path — Linux
+  `/etc/ferrogate/mia.toml` / `~/.config/ferrogate/mia.toml`, macOS
+  `/Library/Application Support/FerroGate/mia.toml` / `~/Library/...`, Windows
+  `%ProgramData%\FerroGate\mia.toml` / `%APPDATA%\...` — in addition to
+  `--config` and `$FERROGATE_CONFIG`. `mia setup` now writes the **TOML config
+  file** (not the env file) to the system path by default, with `--user` for the
+  per-user path, prompting platform-appropriately (socket mode on Unix, pipe
+  group on Windows). New `helper.windows_group` key / `FERROGATE_HELPER_WINDOWS_GROUP`.
+- **MIA TOML configuration file.** MIA now reads an optional structured TOML
+  configuration file (`crates/mia/src/config.rs`) in addition to environment
+  variables, with precedence **defaults < config file < environment** — so
+  existing env-driven deployments (the systemd `EnvironmentFile`) are unchanged.
+  The file is discovered at `mia --config <path>`, then `$FERROGATE_CONFIG`,
+  then `/etc/ferrogate/mia.toml`; a malformed file (including an unknown key)
+  fails the daemon loudly at startup. Sections: `log`, `[cmis]`, `[helper]`,
+  `[allowlist]`, `[attestation]`. A documented template is shipped at
+  `/etc/ferrogate/mia.toml` (deb/rpm/macOS); source `crates/mia/dist/mia.toml`.
 - **`mia setup` interactive configuration wizard.** A guided, rich-terminal
   wizard (built on `inquire`) that walks an operator through configuring the
   Machine Identity Agent — the CMIS server to connect to, the local helper API,

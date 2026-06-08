@@ -46,6 +46,7 @@ serde_json         = { workspace = true }
 ciborium           = { workspace = true }
 base64             = { workspace = true }
 inquire            = { workspace = true }
+toml               = { workspace = true }
 
 [dev-dependencies]
 cmis              = { path = "../cmis" }
@@ -80,6 +81,11 @@ ferro-harden = { path = "../ferro-harden" }
 [target.'cfg(windows)'.dependencies]
 ferro-winauth = { path = "../ferro-winauth" }
 
+# macOS caller authentication resolves a peer PID to its executable path via
+# `libproc` (proc_pidpath); the FFI stays in that crate so `mia` is unsafe-free.
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 hex          = { workspace = true }
 sha2         = { workspace = true }
@@ -110,9 +116,10 @@ depends = "libc6 (>= 2.31), libtss2-esys-3.0.2-0, libssl3"
 assets = [
     ["../../target/release/mia", "usr/bin/", "755"],
     ["dist/mia.env", "etc/ferrogate/mia.env", "640"],
+    ["dist/mia.toml", "etc/ferrogate/mia.toml", "640"],
     ["../../docs/mia.md", "usr/share/doc/ferrogate-mia/mia.md", "644"],
 ]
-conf-files = ["/etc/ferrogate/mia.env"]
+conf-files = ["/etc/ferrogate/mia.env", "/etc/ferrogate/mia.toml"]
 # cargo-deb auto-generates the postinst/prerm maintainer scripts that register
 # the unit with systemd. enable/start are left to the operator (the agent needs
 # configuration in /etc/ferrogate/mia.env before it does anything useful).
@@ -128,6 +135,7 @@ license = "Apache-2.0"
 assets = [
     { source = "target/release/mia", dest = "/usr/bin/mia", mode = "755" },
     { source = "crates/mia/dist/mia.env", dest = "/etc/ferrogate/mia.env", mode = "640", config = true },
+    { source = "crates/mia/dist/mia.toml", dest = "/etc/ferrogate/mia.toml", mode = "640", config = true },
     { source = "crates/mia/dist/mia.service", dest = "/usr/lib/systemd/system/mia.service", mode = "644" },
     { source = "docs/mia.md", dest = "/usr/share/doc/ferrogate-mia/mia.md", mode = "644", doc = true },
 ]

@@ -22,6 +22,10 @@
 
 pub mod audit_client;
 pub mod client;
+
+/// The TOML configuration file and its merge with the environment.
+pub mod config;
+
 pub mod hardening;
 pub mod helper;
 pub mod scheduler;
