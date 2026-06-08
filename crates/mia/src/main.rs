@@ -236,10 +236,16 @@ where
         let key_path = config.allowlist.key.as_deref().context(
             "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing",
         )?;
-        let key_bytes = std::fs::read(key_path).context("reading allowlist key")?;
+        let key_bytes = std::fs::read(key_path).with_context(|| {
+            format!(
+                "reading allowlist key (allowlist.key) {}",
+                key_path.display()
+            )
+        })?;
         let trusted = CompositePublicKey::from_concat_bytes(&key_bytes)
             .map_err(|e| anyhow::anyhow!("trusted allowlist key: {e}"))?;
-        let bytes = std::fs::read(path).context("reading allowlist")?;
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading allowlist (allowlist.path) {}", path.display()))?;
         let al = Allowlist::load(&bytes, &trusted, clock(), max_age)
             .map_err(|e| anyhow::anyhow!("allowlist verification failed: {e}"))?;
         tracing::info!(trust_domain = al.trust_domain(), "loaded signed allowlist");

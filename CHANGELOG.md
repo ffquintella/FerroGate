@@ -8,6 +8,17 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added
+
+- **`GetEnrollmentKey` RPC + `mia setup` key fetch.** CMIS now serves its
+  enrollment public key (the composite key that signs caller allowlists, as
+  `from_concat_bytes` bytes) via a new `GetEnrollmentKey` gRPC. `mia setup`,
+  when an allowlist is configured and a CMIS endpoint + SPKI pin are present,
+  offers to fetch that key over the pinned hybrid-PQC TLS channel and write it
+  to `allowlist.key`. Also fixes the SPKI-pin format wording (lowercase-hex
+  SHA-384, not base64) and validates the pin in the wizard. The signed
+  allowlist *body* served from CMIS (per-host store + admin path) is planned.
+
 ### Fixed
 
 - **`mia setup` no longer double-prompts when editing an existing file.** The

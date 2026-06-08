@@ -26,8 +26,8 @@
 # bring-up only.
 [cmis]
 #endpoint = "https://cmis.example.com:8443"
-# Accepted CMIS SPKI pin (SHA-384, base64).
-#spki_pin = "<base64-sha384>"
+# Accepted CMIS SPKI pin (lowercase-hex SHA-384).
+#spki_pin = "<hex-sha384>"
 
 # --- Helper API (feature F08) -----------------------------------------------
 # The local helper listener: a Unix socket path (Linux/macOS) or a named-pipe

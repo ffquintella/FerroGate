@@ -13,6 +13,7 @@
   - [CMIS server](cmis.md)
   - [MIA agent](mia.md)
   - [Helper API](helper-api.md)
+  - [Allowlist provisioning](allowlist-provisioning.md)
   - [Audit log](audit.md)
 
 - Operations

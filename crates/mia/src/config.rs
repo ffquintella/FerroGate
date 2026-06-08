@@ -137,7 +137,7 @@ pub struct Config {
 pub struct CmisConfig {
     /// `https://host:port` endpoint (`https` ⇒ hybrid-PQC TLS, SPKI-pinned).
     pub endpoint: Option<String>,
-    /// Accepted CMIS SPKI pin (SHA-384, base64).
+    /// Accepted CMIS SPKI pin (lowercase-hex SHA-384).
     pub spki_pin: Option<String>,
 }
 

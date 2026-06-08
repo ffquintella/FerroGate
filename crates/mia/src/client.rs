@@ -47,6 +47,27 @@ pub async fn connect_pinned(
     Ok(MachineIdentityClient::new(channel))
 }
 
+/// Fetch the CMIS enrollment public key (the composite key that signs caller
+/// allowlists) from a pinned CMIS endpoint.
+///
+/// Returns the key as composite concat bytes — exactly what
+/// [`ferro_crypto::composite::CompositePublicKey::from_concat_bytes`] and the
+/// `allowlist.key` file expect. `endpoint` is an `https://host:port` authority
+/// and `pins` are the accepted SHA-384 SPKI pins of the CMIS certificate.
+pub async fn fetch_enrollment_key(endpoint: &str, pins: Vec<SpkiPin>) -> anyhow::Result<Vec<u8>> {
+    use ferro_proto::v1::GetEnrollmentKeyRequest;
+
+    let mut client = connect_pinned(endpoint, pins).await?;
+    let resp = client
+        .get_enrollment_key(Request::new(GetEnrollmentKeyRequest {}))
+        .await?
+        .into_inner();
+    if resp.public_key.is_empty() {
+        anyhow::bail!("CMIS returned an empty enrollment key");
+    }
+    Ok(resp.public_key)
+}
+
 /// A produced PCR quote and the raw values backing it.
 pub struct QuoteEvidence {
     /// Marshaled `TPMS_ATTEST`.

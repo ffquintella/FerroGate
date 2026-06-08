@@ -153,7 +153,7 @@ log = "info"
 
 [cmis]
 endpoint = "https://cmis.example.com:8443"
-spki_pin = "<base64-sha384>"
+spki_pin = "<hex-sha384>"
 
 [helper]
 socket = "/run/ferrogate/mia.sock"   # presence enables the helper API
@@ -204,7 +204,15 @@ Options:
 - `-u, --user` — write the per-user config path instead of the system path
   (no elevation needed).
 - `-o, --output <path>` — write to a specific path.
-- `-f, --force` — overwrite an existing file without the extra confirmation.
+- `-f, --force` — skip the final write confirmation.
+
+When you configure an allowlist *and* have supplied a CMIS endpoint + SPKI pin,
+the wizard offers to **fetch the enrollment public key from CMIS** (the
+`GetEnrollmentKey` RPC, over the pinned hybrid-PQC TLS channel) and write it to
+your `allowlist.key`. This is the key that signs the allowlist, so the agent can
+verify it. The signed allowlist *body* itself (the CBOR at `allowlist.path`) is
+issued by CMIS per host and must still be provided out of band today — serving
+it from CMIS is planned (it needs a per-host allowlist store and an admin path).
 
 It requires a TTY; for unattended provisioning (configuration management),
 write the TOML file directly from the template in `crates/mia/dist/mia.toml`.

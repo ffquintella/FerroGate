@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use ferro_crypto::pin::SpkiPin;
 use inquire::validator::Validation;
 use inquire::{Confirm, Text};
 
@@ -100,9 +101,12 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let proceed = if force {
         true
     } else {
-        match Confirm::new(&format!("Write this configuration to {}?", output.display()))
-            .with_default(true)
-            .prompt()
+        match Confirm::new(&format!(
+            "Write this configuration to {}?",
+            output.display()
+        ))
+        .with_default(true)
+        .prompt()
         {
             Ok(v) => v,
             Err(
@@ -195,9 +199,19 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
         .as_deref()
         .is_some_and(|e| e.starts_with("https://"))
     {
-        let pin = Text::new("CMIS SPKI pin (SHA-384, base64):")
+        let pin = Text::new("CMIS SPKI pin (lowercase-hex SHA-384):")
             .with_default(existing.cmis.spki_pin.as_deref().unwrap_or_default())
-            .with_help_message("leave blank to pin from a server cert PEM at deploy time")
+            .with_help_message("the ferrogate CLI prints/derives this; needed to fetch keys here")
+            .with_validator(|input: &str| {
+                let t = input.trim();
+                if t.is_empty() || SpkiPin::from_hex(t).is_ok() {
+                    Ok(Validation::Valid)
+                } else {
+                    Ok(Validation::Invalid(
+                        "must be a lowercase-hex SHA-384 (96 hex chars), or blank".into(),
+                    ))
+                }
+            })
             .prompt()?;
         s.cmis_spki_pin = non_empty(pin);
     }
@@ -277,6 +291,29 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
             .prompt()?;
         s.allowlist_key = non_empty(key);
 
+        // Offer to fetch the enrollment key from CMIS now (needs endpoint + pin).
+        if let (Some(key_path), Some(endpoint), Some(pin)) = (
+            s.allowlist_key.as_deref(),
+            s.cmis_endpoint.as_deref(),
+            s.cmis_spki_pin.as_deref(),
+        ) {
+            let fetch = Confirm::new(&format!("Fetch this key from {endpoint} now?"))
+                .with_default(true)
+                .with_help_message("downloads the CMIS enrollment public key over pinned TLS")
+                .prompt()?;
+            if fetch {
+                match fetch_enrollment_key_to(endpoint, pin, Path::new(key_path)) {
+                    Ok(()) => println!("  ✓ wrote {key_path}"),
+                    Err(e) => {
+                        // Non-fatal: keep configuring; the operator can retry or
+                        // place the key out of band.
+                        println!("  ! could not fetch the key: {e:#}");
+                        println!("    (continuing — provide {key_path} another way)");
+                    }
+                }
+            }
+        }
+
         let age_default = existing
             .allowlist
             .max_age_secs
@@ -348,6 +385,34 @@ fn dist_sibling(name: &str) -> String {
 /// Choose a prompt default: the existing path if set, else `fallback`.
 fn path_default(existing: Option<&Path>, fallback: String) -> String {
     existing.map_or(fallback, |p| p.display().to_string())
+}
+
+/// Fetch the CMIS enrollment public key over pinned TLS and write it to
+/// `key_path` (composite concat bytes). Spins a short-lived current-thread
+/// runtime since the wizard is otherwise synchronous.
+fn fetch_enrollment_key_to(endpoint: &str, pin_hex: &str, key_path: &Path) -> anyhow::Result<()> {
+    let pin =
+        SpkiPin::from_hex(pin_hex.trim()).map_err(|e| anyhow::anyhow!("invalid SPKI pin: {e}"))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building runtime")?;
+    let key = rt.block_on(crate::client::fetch_enrollment_key(endpoint, vec![pin]))?;
+
+    if let Some(parent) = key_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    std::fs::write(key_path, &key).with_context(|| format!("writing {}", key_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Public key material — world-readable is fine.
+        let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o644));
+    }
+    Ok(())
 }
 
 /// The platform-appropriate service-restart hint shown after writing (Linux).
@@ -456,11 +521,11 @@ fn render(s: &Settings) -> String {
         "endpoint",
         "https://cmis.example.com:8443",
     ));
-    out.push_str("# Accepted CMIS SPKI pin (SHA-384, base64).\n");
+    out.push_str("# Accepted CMIS SPKI pin (lowercase-hex SHA-384).\n");
     out.push_str(&str_line(
         s.cmis_spki_pin.as_deref(),
         "spki_pin",
-        "<base64-sha384>",
+        "<hex-sha384>",
     ));
     out.push('\n');
 
