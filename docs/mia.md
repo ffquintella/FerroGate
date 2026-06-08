@@ -201,10 +201,12 @@ mode on Unix, the pipe group on Windows). Run against an existing file it
 pre-fills every prompt with the current value, so it doubles as an editor.
 Options:
 
-- `-u, --user` — write the per-user config path instead of the system path
+- `-u, --user` — target the per-user config path instead of the system path
   (no elevation needed).
-- `-o, --output <path>` — write to a specific path.
-- `-f, --force` — skip the final write confirmation.
+- `-o, --output <path>` — target a specific path.
+- `-c, --clean` — delete the stored configuration instead of writing one
+  (honours `--user`/`--output` to choose which file; prompts unless `--force`).
+- `-f, --force` — skip the confirmation prompt (write or clean).
 
 When you configure an allowlist *and* have supplied a CMIS endpoint + SPKI pin,
 the wizard offers to **fetch the enrollment public key from CMIS** (the

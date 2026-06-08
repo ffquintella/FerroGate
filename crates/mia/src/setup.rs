@@ -34,6 +34,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let mut explicit_output: Option<PathBuf> = None;
     let mut user_scope = false;
     let mut force = false;
+    let mut clean = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -48,6 +49,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
             }
             "-u" | "--user" => user_scope = true,
             "-f" | "--force" => force = true,
+            "-c" | "--clean" => clean = true,
             other => anyhow::bail!("unknown argument: {other}\n\n{USAGE}"),
         }
     }
@@ -59,6 +61,13 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     } else {
         system_config_path()
     };
+
+    // `--clean` removes the stored config instead of writing one. It shares the
+    // same path resolution (--user / --output), so it deletes whatever the
+    // matching `mia setup` would have written.
+    if clean {
+        return clean_config(&output, force);
+    }
 
     // A wizard with no TTY would deadlock or error obscurely; fail with a clear
     // message and point at the non-interactive path instead.
@@ -366,8 +375,16 @@ fn default_socket() -> String {
     r"\\.\pipe\ferrogate-mia".to_string()
 }
 
-/// The platform's default helper listener address (Unix socket).
-#[cfg(not(windows))]
+/// The platform's default helper listener address (macOS Unix socket). macOS
+/// has no `/run`; daemons use `/var/run`, matching the launchd plist's
+/// `FERROGATE_HELPER_SOCKET` (`crates/mia/dist/com.ferrogate.mia.plist`).
+#[cfg(target_os = "macos")]
+fn default_socket() -> String {
+    "/var/run/ferrogate/mia.sock".to_string()
+}
+
+/// The platform's default helper listener address (Linux/other Unix socket).
+#[cfg(not(any(target_os = "macos", windows)))]
 fn default_socket() -> String {
     "/run/ferrogate/mia.sock".to_string()
 }
@@ -535,7 +552,7 @@ fn render(s: &Settings) -> String {
     out.push_str(&str_line(
         s.helper_socket.as_deref(),
         "socket",
-        "/run/ferrogate/mia.sock",
+        &default_socket(),
     ));
     out.push_str("# Unix only. Octal socket mode. Default: 660.\n");
     out.push_str(&str_line(
@@ -605,7 +622,52 @@ fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-const USAGE: &str = "usage: mia setup [--user] [--output <path>] [--force]";
+/// Remove the stored configuration file at `path`. Prompts for confirmation
+/// (a TTY is required) unless `force` is set. A missing file is reported and
+/// treated as success — `--clean` is idempotent.
+fn clean_config(path: &Path, force: bool) -> anyhow::Result<()> {
+    if !path.exists() {
+        println!("Nothing to clean — no configuration at {}.", path.display());
+        return Ok(());
+    }
+
+    if !force {
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            anyhow::bail!(
+                "refusing to delete {} without confirmation (no TTY). \
+                 Re-run with --force to delete non-interactively.",
+                path.display()
+            );
+        }
+        let proceed = match Confirm::new(&format!("Delete the configuration at {}?", path.display()))
+            .with_default(false)
+            .prompt()
+        {
+            Ok(v) => v,
+            Err(
+                inquire::InquireError::OperationCanceled
+                | inquire::InquireError::OperationInterrupted,
+            ) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !proceed {
+            println!("Aborted — nothing deleted.");
+            return Ok(());
+        }
+    }
+
+    std::fs::remove_file(path).with_context(|| {
+        format!(
+            "deleting {} (the system path needs elevation — re-run with `sudo`/as admin, \
+             use --user for the per-user file, or --output to target a specific path)",
+            path.display()
+        )
+    })?;
+    println!("✓ Removed {}", path.display());
+    Ok(())
+}
+
+const USAGE: &str = "usage: mia setup [--user] [--output <path>] [--force] [--clean]";
 
 fn print_help() {
     println!(
@@ -620,10 +682,14 @@ fn print_help() {
          By default it writes the OS system path:\n\
          \x20 {}\n\
          \n\
+         With --clean it deletes that file instead of writing one (honouring\n\
+         --user / --output to choose which).\n\
+         \n\
          options:\n\
-         \x20 -u, --user            write the per-user config path instead\n\
-         \x20 -o, --output <path>   write to a specific path\n\
-         \x20 -f, --force           skip the final write confirmation\n\
+         \x20 -u, --user            target the per-user config path instead\n\
+         \x20 -o, --output <path>   target a specific path\n\
+         \x20 -c, --clean           delete the stored configuration\n\
+         \x20 -f, --force           skip the confirmation prompt (write or clean)\n\
          \x20 -h, --help            show this help\n",
         system_config_path().display(),
     );
@@ -675,6 +741,22 @@ mod tests {
         assert!(matches!(octal_validator("999"), Ok(Validation::Invalid(_))));
         assert!(matches!(uint_validator("86400"), Ok(Validation::Valid)));
         assert!(matches!(uint_validator("-1"), Ok(Validation::Invalid(_))));
+    }
+
+    #[test]
+    fn clean_config_removes_file_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("mia-clean-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mia.toml");
+        std::fs::write(&path, "log = 'info'\n").unwrap();
+
+        // force=true skips the prompt; the file is removed.
+        clean_config(&path, true).unwrap();
+        assert!(!path.exists());
+        // Cleaning an already-absent file is a no-op success.
+        clean_config(&path, true).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

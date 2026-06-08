@@ -65,6 +65,11 @@ docs: ## Serve the Docsify documentation site locally (PORT=3000 by default)
 CARGO_VERSION := $(shell awk '/^\[workspace.package\]/{p=1} p&&/^version/{gsub(/[" ]/,"",$$3); print $$3; exit}' Cargo.toml)
 IMAGE ?= ferrogate:$(CARGO_VERSION)
 
+# Host OS/arch, used by the install and packaging targets to pick OS-appropriate
+# locations and binary names.
+UNAME_S := $(shell uname -s)
+HOST_ARCH := $(shell uname -m)
+
 docker-image: ## Build the linux/amd64 ferrogate runtime image (IMAGE=tag to override)
 	docker buildx build --platform linux/amd64 \
 		-f docker/ferrogate.Dockerfile \
@@ -172,26 +177,49 @@ formal-cryptoverif: ## Run the CryptoVerif hybrid AKE proof
 # ── Local install ─────────────────────────────────────────────────────────────
 #
 # `make mia-install` compiles the `mia` Machine Identity Agent in release mode
-# and installs the stripped binary into $(PREFIX)/bin (default /usr/local/bin).
+# and installs the stripped binary to an OS-appropriate location:
+#
+#   macOS / Linux : $(PREFIX)/bin/mia      (PREFIX defaults to /usr/local, so
+#                   /usr/local/bin/mia — the path the macOS launchd plist and
+#                   the .deb/.rpm/.pkg packages also use)
+#   Windows       : $(PREFIX)\mia.exe      (PREFIX defaults to
+#                   %LOCALAPPDATA%\Programs\FerroGate; run under MSYS2/Git-Bash)
+#
 # Override the location with PREFIX=... (e.g. PREFIX=$$HOME/.local for a
-# user-only install that needs no sudo). If the destination isn't writable the
-# copy is retried with sudo.
-PREFIX ?= /usr/local
-BINDIR := $(PREFIX)/bin
+# user-only Unix install that needs no sudo). On Unix, a destination that isn't
+# writable is retried with sudo.
+ifneq (,$(filter MINGW% MSYS% CYGWIN% Windows%,$(UNAME_S)))
+  MIA_OS  := windows
+  PREFIX  ?= $(LOCALAPPDATA)/Programs/FerroGate
+  BINDIR  := $(PREFIX)
+  MIA_BIN := mia.exe
+else
+  MIA_OS  := unix
+  PREFIX  ?= /usr/local
+  BINDIR  := $(PREFIX)/bin
+  MIA_BIN := mia
+endif
 
-mia-install: ## Compile mia in release mode and install it to $(PREFIX)/bin (PREFIX=... to override)
+mia-install: ## Compile mia in release mode and install it to an OS-appropriate location (PREFIX=... to override)
 	cargo build --release -p mia --bin mia
-	strip target/release/mia
+	strip target/release/$(MIA_BIN)
+ifeq ($(MIA_OS),windows)
+	@mkdir -p "$(BINDIR)"
+	@cp -f target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"
+	@echo "==> installed mia to $(BINDIR)/$(MIA_BIN)"
+	@echo "    Add $(BINDIR) to your PATH if it isn't already."
+else
 	@if [ -w "$(BINDIR)" ] || { [ ! -e "$(BINDIR)" ] && [ -w "$(PREFIX)" ]; }; then \
 	  install -d -m 0755 "$(BINDIR)"; \
-	  install -m 0755 target/release/mia "$(BINDIR)/mia"; \
+	  install -m 0755 target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"; \
 	else \
 	  echo "==> $(BINDIR) not writable; installing with sudo"; \
 	  sudo install -d -m 0755 "$(BINDIR)"; \
-	  sudo install -m 0755 target/release/mia "$(BINDIR)/mia"; \
+	  sudo install -m 0755 target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"; \
 	fi
-	@echo "==> installed mia to $(BINDIR)/mia"
+	@echo "==> installed mia to $(BINDIR)/$(MIA_BIN)"
 	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
+endif
 
 # ── Client packaging: rpm / deb / msi / pkg ───────────────────────────────────
 #
@@ -212,8 +240,6 @@ mia-install: ## Compile mia in release mode and install it to $(PREFIX)/bin (PRE
 # v3, the .pkg on macOS (no TPM there — mia runs as the helper-API surface).
 # Outputs land under target/debian, target/generate-rpm, target/wix, target/macos.
 PKG_CRATE := mia
-UNAME_S   := $(shell uname -s)
-HOST_ARCH := $(shell uname -m)
 # RPM/DEB ship for amd64 only; mia links the x86_64 Linux TPM ESAPI stack.
 RPM_ARCH  := x86_64
 
