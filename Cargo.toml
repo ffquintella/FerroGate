@@ -74,7 +74,7 @@ subtle        = "2.6"
 hex           = "0.4"
 fips204       = "0.4"
 base64        = "0.22"
-der           = { version = "0.7", features = ["alloc", "derive", "oid"] }
+der           = { version = "0.8", features = ["alloc", "derive", "oid"] }
 p256          = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 # TLS stack (F01)
