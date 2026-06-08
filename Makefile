@@ -1,6 +1,6 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs docker-image docker-image-push \
-        docker-repo-setup docker-repo-show mia-install \
+        docker-repo-setup docker-repo-show mia-install mia-uninstall \
         pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools pkg-sdk release deploy-release
 
 # Default target: list available targets with their descriptions.
@@ -69,6 +69,10 @@ IMAGE ?= ferrogate:$(CARGO_VERSION)
 # locations and binary names.
 UNAME_S := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
+
+# Client assets (service definitions, env/config templates) and the daemon label.
+MIA_DIST  := crates/mia/dist
+MIA_LABEL := com.ferrogate.mia
 
 docker-image: ## Build the linux/amd64 ferrogate runtime image (IMAGE=tag to override)
 	docker buildx build --platform linux/amd64 \
@@ -176,31 +180,39 @@ formal-cryptoverif: ## Run the CryptoVerif hybrid AKE proof
 
 # ── Local install ─────────────────────────────────────────────────────────────
 #
-# `make mia-install` compiles the `mia` Machine Identity Agent in release mode
-# and installs the stripped binary to an OS-appropriate location:
+# `make mia-install` compiles the `mia` Machine Identity Agent in release mode,
+# installs the stripped binary to an OS-appropriate location, AND registers the
+# OS service so it runs as a daemon:
 #
-#   macOS / Linux : $(PREFIX)/bin/mia      (PREFIX defaults to /usr/local, so
-#                   /usr/local/bin/mia — the path the macOS launchd plist and
-#                   the .deb/.rpm/.pkg packages also use)
-#   Windows       : $(PREFIX)\mia.exe      (PREFIX defaults to
-#                   %LOCALAPPDATA%\Programs\FerroGate; run under MSYS2/Git-Bash)
+#   macOS : /usr/local/bin/mia  + launchd job at
+#           /Library/LaunchDaemons/com.ferrogate.mia.plist (bootstrapped+started)
+#   Linux : /usr/local/bin/mia  + systemd unit /etc/systemd/system/mia.service
+#           (daemon-reload + enable --now)
+#   Windows : $(PREFIX)\mia.exe (binary only; the service is registered by the
+#           .msi — run `make pkg-msi`). PREFIX defaults to
+#           %LOCALAPPDATA%\Programs\FerroGate; run under MSYS2/Git-Bash.
 #
-# Override the location with PREFIX=... (e.g. PREFIX=$$HOME/.local for a
-# user-only Unix install that needs no sudo). On Unix, a destination that isn't
-# writable is retried with sudo.
+# Override the binary location with PREFIX=... (e.g. PREFIX=$$HOME/.local for a
+# user-only Unix install). The privileged steps (binary into a non-writable dir,
+# service registration) run via sudo when not already root.
 ifneq (,$(filter MINGW% MSYS% CYGWIN% Windows%,$(UNAME_S)))
   MIA_OS  := windows
   PREFIX  ?= $(LOCALAPPDATA)/Programs/FerroGate
   BINDIR  := $(PREFIX)
   MIA_BIN := mia.exe
+else ifeq ($(UNAME_S),Darwin)
+  MIA_OS  := macos
+  PREFIX  ?= /usr/local
+  BINDIR  := $(PREFIX)/bin
+  MIA_BIN := mia
 else
-  MIA_OS  := unix
+  MIA_OS  := linux
   PREFIX  ?= /usr/local
   BINDIR  := $(PREFIX)/bin
   MIA_BIN := mia
 endif
 
-mia-install: ## Compile mia in release mode and install it to an OS-appropriate location (PREFIX=... to override)
+mia-install: ## Compile mia in release mode, install it, and register the OS service (PREFIX=... to override)
 	cargo build --release -p mia --bin mia
 	strip target/release/$(MIA_BIN)
 ifeq ($(MIA_OS),windows)
@@ -208,6 +220,7 @@ ifeq ($(MIA_OS),windows)
 	@cp -f target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"
 	@echo "==> installed mia to $(BINDIR)/$(MIA_BIN)"
 	@echo "    Add $(BINDIR) to your PATH if it isn't already."
+	@echo "    Windows service registration is handled by the .msi — run 'make pkg-msi'."
 else
 	@if [ -w "$(BINDIR)" ] || { [ ! -e "$(BINDIR)" ] && [ -w "$(PREFIX)" ]; }; then \
 	  install -d -m 0755 "$(BINDIR)"; \
@@ -218,7 +231,58 @@ else
 	  sudo install -m 0755 target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"; \
 	fi
 	@echo "==> installed mia to $(BINDIR)/$(MIA_BIN)"
+endif
+ifeq ($(MIA_OS),macos)
+	@echo "==> registering launchd daemon $(MIA_LABEL)"
+	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO sh -c "sed 's|<string>/usr/local/bin/mia</string>|<string>$(BINDIR)/$(MIA_BIN)</string>|' $(MIA_DIST)/$(MIA_LABEL).plist > /Library/LaunchDaemons/$(MIA_LABEL).plist"; \
+	  $$SUDO chmod 0644 /Library/LaunchDaemons/$(MIA_LABEL).plist; \
+	  $$SUDO mkdir -p /var/run/ferrogate /var/log/ferrogate; \
+	  $$SUDO launchctl bootout system /Library/LaunchDaemons/$(MIA_LABEL).plist 2>/dev/null || true; \
+	  $$SUDO launchctl bootstrap system /Library/LaunchDaemons/$(MIA_LABEL).plist; \
+	  $$SUDO launchctl kickstart -k system/$(MIA_LABEL)
+	@echo "==> launchd job $(MIA_LABEL) loaded and started"
+	@echo "    Configure it with: sudo mia setup   (writes the system TOML the daemon reads)"
 	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
+endif
+ifeq ($(MIA_OS),linux)
+	@echo "==> installing systemd unit mia.service"
+	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO sh -c "sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/$(MIA_BIN)|' $(MIA_DIST)/mia.service > /etc/systemd/system/mia.service"; \
+	  $$SUDO chmod 0644 /etc/systemd/system/mia.service; \
+	  $$SUDO systemctl daemon-reload; \
+	  $$SUDO systemctl enable --now mia.service \
+	    || echo "   (enable failed — configure /etc/ferrogate then: sudo systemctl enable --now mia)"
+	@echo "==> systemd unit mia.service installed"
+	@echo "    Configure it with: sudo mia setup   (writes the system TOML the daemon reads)"
+	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
+endif
+
+# `make mia-uninstall` reverses `mia-install`: it deregisters the OS service and
+# removes the installed binary. It leaves configuration, the env file, logs, and
+# the socket alone (use `mia setup --clean` to remove the config). Each step
+# tolerates an already-absent target, so it is safe to run repeatedly.
+mia-uninstall: ## Stop/deregister the mia service and remove the installed binary (PREFIX=... to override)
+ifeq ($(MIA_OS),windows)
+	@rm -f "$(BINDIR)/$(MIA_BIN)" && echo "==> removed $(BINDIR)/$(MIA_BIN)" || true
+	@echo "    Windows service deregistration is handled by the .msi uninstaller."
+else ifeq ($(MIA_OS),macos)
+	@echo "==> deregistering launchd daemon $(MIA_LABEL)"
+	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO launchctl bootout system /Library/LaunchDaemons/$(MIA_LABEL).plist 2>/dev/null || true; \
+	  $$SUDO rm -f /Library/LaunchDaemons/$(MIA_LABEL).plist; \
+	  $$SUDO rm -f "$(BINDIR)/$(MIA_BIN)"
+	@echo "==> removed launchd job and $(BINDIR)/$(MIA_BIN)"
+	@echo "    Config, logs, and the socket are left in place (run 'sudo mia setup --clean' to drop the config)."
+else
+	@echo "==> deregistering systemd unit mia.service"
+	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO systemctl disable --now mia.service 2>/dev/null || true; \
+	  $$SUDO rm -f /etc/systemd/system/mia.service; \
+	  $$SUDO systemctl daemon-reload 2>/dev/null || true; \
+	  $$SUDO rm -f "$(BINDIR)/$(MIA_BIN)"
+	@echo "==> removed systemd unit and $(BINDIR)/$(MIA_BIN)"
+	@echo "    Config, logs, and the socket are left in place (run 'sudo mia setup --clean' to drop the config)."
 endif
 
 # ── Client packaging: rpm / deb / msi / pkg ───────────────────────────────────
