@@ -1,6 +1,6 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs docker-image docker-image-push \
-        docker-repo-setup docker-repo-show \
+        docker-repo-setup docker-repo-show mia-install \
         pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools pkg-sdk release deploy-release
 
 # Default target: list available targets with their descriptions.
@@ -168,6 +168,30 @@ formal-cryptoverif: ## Run the CryptoVerif hybrid AKE proof
 	else \
 		echo "SKIP: cryptoverif not on PATH (see formal/README.md to install)"; \
 	fi
+
+# ── Local install ─────────────────────────────────────────────────────────────
+#
+# `make mia-install` compiles the `mia` Machine Identity Agent in release mode
+# and installs the stripped binary into $(PREFIX)/bin (default /usr/local/bin).
+# Override the location with PREFIX=... (e.g. PREFIX=$$HOME/.local for a
+# user-only install that needs no sudo). If the destination isn't writable the
+# copy is retried with sudo.
+PREFIX ?= /usr/local
+BINDIR := $(PREFIX)/bin
+
+mia-install: ## Compile mia in release mode and install it to $(PREFIX)/bin (PREFIX=... to override)
+	cargo build --release -p mia --bin mia
+	strip target/release/mia
+	@if [ -w "$(BINDIR)" ] || { [ ! -e "$(BINDIR)" ] && [ -w "$(PREFIX)" ]; }; then \
+	  install -d -m 0755 "$(BINDIR)"; \
+	  install -m 0755 target/release/mia "$(BINDIR)/mia"; \
+	else \
+	  echo "==> $(BINDIR) not writable; installing with sudo"; \
+	  sudo install -d -m 0755 "$(BINDIR)"; \
+	  sudo install -m 0755 target/release/mia "$(BINDIR)/mia"; \
+	fi
+	@echo "==> installed mia to $(BINDIR)/mia"
+	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
 
 # ── Client packaging: rpm / deb / msi / pkg ───────────────────────────────────
 #
