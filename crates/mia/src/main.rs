@@ -8,6 +8,11 @@
 //! refuses to mint (`no_host_svid`) while still enforcing caller
 //! authentication and the signed allowlist — a fail-safe, deployable surface.
 //!
+//! The binary also exposes an interactive `mia setup` subcommand: a
+//! rich-terminal wizard (see [`mia::setup`]) that walks an operator through the
+//! configuration below and writes the systemd `EnvironmentFile`
+//! (`/etc/ferrogate/mia.env`). With no subcommand, `mia` is the daemon.
+//!
 //! Configuration is by environment variable:
 //!
 //! - `FERROGATE_HELPER_SOCKET` — socket path; its presence enables the helper
@@ -28,6 +33,26 @@
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
+    // Subcommand dispatch. `mia` with no subcommand is the daemon (the systemd
+    // ExecStart); `mia setup` is the interactive configuration wizard, which
+    // must run BEFORE logging init, hardening, and the async runtime — it is
+    // synchronous terminal I/O and must not inherit the seccomp profile or the
+    // dropped privileges the daemon installs.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("setup") => return mia::setup::run(&args[1..]),
+        Some("-h" | "--help") => {
+            print_usage();
+            return Ok(());
+        }
+        Some("--version" | "-V") => {
+            println!("mia {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(other) => anyhow::bail!("unknown subcommand: {other}\n\nrun `mia --help` for usage"),
+        None => {}
+    }
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
@@ -52,6 +77,26 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(run())
+}
+
+/// Top-level CLI usage banner.
+fn print_usage() {
+    println!(
+        "mia {} — FerroGate Machine Identity Agent\n\
+         \n\
+         usage: mia [<command>]\n\
+         \n\
+         commands:\n\
+         \x20 (none)   run the agent daemon (configured by environment variable)\n\
+         \x20 setup    interactive wizard that writes the agent's config file\n\
+         \n\
+         options:\n\
+         \x20 -h, --help      show this help\n\
+         \x20 -V, --version   print the version\n\
+         \n\
+         Run `mia setup --help` for the wizard's options.",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 /// Daemon entry point. Starts the helper API when `FERROGATE_HELPER_SOCKET` is

@@ -8,6 +8,21 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added
+
+- **`mia setup` interactive configuration wizard.** A guided, rich-terminal
+  wizard (built on `inquire`) that walks an operator through configuring the
+  Machine Identity Agent — the CMIS server to connect to, the local helper API,
+  the caller allowlist, attestation, and log verbosity — and writes the systemd
+  `EnvironmentFile` (`/etc/ferrogate/mia.env`) in the documented, self-commenting
+  template form. Run against an existing file it pre-fills every prompt, so it
+  doubles as an editor. `--output <path>` targets a different file, `--force`
+  skips the overwrite confirmation. Requires a TTY; unattended provisioning
+  should write `mia.env` from the template directly.
+- **`make mia-install`.** Compiles `mia` in release mode and installs the
+  stripped binary to `$(PREFIX)/bin` (default `/usr/local/bin`), falling back to
+  `sudo` when the destination is not writable.
+
 ## [0.15.0] — 2026-06-03
 
 ### Added

@@ -99,6 +99,33 @@ a policy over PCRs `{0, 4, 7, 8}`. On reboot:
 - If the unseal fails (PCR drift, lid open, kernel update), the cached SVID
   is treated as gone and a full re-attestation runs.
 
+## Configuration
+
+In production MIA is configured entirely by environment variable, read from the
+systemd `EnvironmentFile` at `/etc/ferrogate/mia.env` (the packaged template).
+The keys are documented inline in that template and in `crates/mia/src/main.rs`.
+
+### `mia setup` — interactive wizard
+
+Rather than hand-editing the env file, run the bundled wizard:
+
+```console
+$ sudo mia setup
+```
+
+`mia setup` is a rich-terminal, guided wizard (arrow keys / typed answers, with
+validation and per-field help) that walks through the agent's configuration —
+the CMIS server to connect to, the local helper API, the caller allowlist,
+attestation, and log verbosity — and writes `/etc/ferrogate/mia.env` in the
+documented, self-commenting form. Run against an existing file it pre-fills
+every prompt with the current value, so it doubles as an editor. Options:
+
+- `-o, --output <path>` — write somewhere other than `/etc/ferrogate/mia.env`.
+- `-f, --force` — overwrite an existing file without the extra confirmation.
+
+It requires a TTY; for unattended provisioning (configuration management),
+write `mia.env` directly from the template in `crates/mia/dist/mia.env`.
+
 ## Configuration sketch
 
 ```toml

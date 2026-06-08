@@ -26,6 +26,9 @@ pub mod hardening;
 pub mod helper;
 pub mod scheduler;
 
+/// Interactive `mia setup` configuration wizard (rich-terminal prompts).
+pub mod setup;
+
 /// TPM 2.0 attestation glue and PCR sealing (features F02/F04). Linux-only:
 /// needs a TSS2 stack.
 #[cfg(target_os = "linux")]
