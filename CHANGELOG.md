@@ -8,6 +8,14 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Fixed
+
+- **`mia setup` no longer double-prompts when editing an existing file.** The
+  final "Write this configuration to …?" prompt is now the single point of
+  consent; the redundant secondary "… exists — overwrite?" prompt (which always
+  triggered because the wizard pre-fills from the existing file, and aborted on
+  a natural "No") is removed. `--force` now skips the single write confirmation.
+
 ### Added
 
 - **MIA runs on Linux, macOS, and Windows.** The daemon now wires up and serves

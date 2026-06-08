@@ -94,25 +94,30 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     print!("{rendered}");
     println!("────────────────────────────────────────\n");
 
-    let proceed = match Confirm::new(&format!(
-        "Write this configuration to {}?",
-        output.display()
-    ))
-    .with_default(true)
-    .prompt()
-    {
-        Ok(v) => v,
-        Err(
-            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
-        ) => false,
-        Err(e) => return Err(e.into()),
+    // The write prompt is the single point of consent (it already names the
+    // destination, whose prior existence was announced above). `--force` skips
+    // it for scripted runs.
+    let proceed = if force {
+        true
+    } else {
+        match Confirm::new(&format!("Write this configuration to {}?", output.display()))
+            .with_default(true)
+            .prompt()
+        {
+            Ok(v) => v,
+            Err(
+                inquire::InquireError::OperationCanceled
+                | inquire::InquireError::OperationInterrupted,
+            ) => false,
+            Err(e) => return Err(e.into()),
+        }
     };
     if !proceed {
         println!("Aborted — no changes written.");
         return Ok(());
     }
 
-    write_file(&output, &rendered, force)?;
+    write_file(&output, &rendered)?;
     println!("\n✓ Wrote {}", output.display());
     println!("  Review it, then (re)start the agent:  {}", restart_hint());
     Ok(())
@@ -510,22 +515,10 @@ fn render(s: &Settings) -> String {
     out
 }
 
-/// Write `content` to `path`, creating parent directories. Refuses to clobber
-/// an existing file unless `force`, after the caller already confirmed intent.
-/// On Unix the file is created with mode `0640`.
-fn write_file(path: &Path, content: &str, force: bool) -> anyhow::Result<()> {
-    if path.exists() && !force {
-        let overwrite = Confirm::new(&format!("{} exists — overwrite?", path.display()))
-            .with_default(false)
-            .prompt()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if !overwrite {
-            anyhow::bail!(
-                "not overwriting {} (pass --force to skip this check)",
-                path.display()
-            );
-        }
-    }
+/// Write `content` to `path`, creating parent directories. The caller already
+/// obtained consent (the write prompt names this exact path), so this
+/// overwrites unconditionally. On Unix the file is created with mode `0640`.
+fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -565,7 +558,7 @@ fn print_help() {
          options:\n\
          \x20 -u, --user            write the per-user config path instead\n\
          \x20 -o, --output <path>   write to a specific path\n\
-         \x20 -f, --force           overwrite an existing file without the extra prompt\n\
+         \x20 -f, --force           skip the final write confirmation\n\
          \x20 -h, --help            show this help\n",
         system_config_path().display(),
     );
