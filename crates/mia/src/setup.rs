@@ -85,7 +85,14 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     if output.exists() {
         println!("(existing file found — prompts are pre-filled with its current values)");
     }
-    println!("Press Esc at any prompt to abort without writing.\n");
+    println!("Press Esc at any prompt to abort without writing.");
+
+    // The default destination is a root-owned system directory. If it isn't
+    // writable by the current user, surface that NOW — otherwise the operator
+    // fills out the whole wizard only to have the mid-wizard key fetch and the
+    // final config write both fail with "Permission denied".
+    warn_if_target_unwritable(&output);
+    println!();
 
     let existing = load_existing(&output);
     let settings = match prompt_all(&existing) {
@@ -644,6 +651,48 @@ fn render(s: &Settings) -> String {
     out.push_str(&str_line(s.ima_log.as_deref(), "ima_log", DEFAULT_IMA_LOG));
 
     out
+}
+
+/// Warn (but don't abort) if the wizard's destination directory isn't writable
+/// by the current user — typically the root-owned system config path opened
+/// without elevation. Continues so the operator can still preview the rendered
+/// config; the actual write remains the point that enforces permissions.
+fn warn_if_target_unwritable(output: &Path) {
+    // Probe the nearest existing ancestor: the parent may not exist yet, in
+    // which case writability is decided by whichever directory we'd create it
+    // under.
+    let mut dir = output.parent();
+    while let Some(d) = dir {
+        if d.as_os_str().is_empty() {
+            return;
+        }
+        if d.exists() {
+            if !dir_is_writable(d) {
+                println!(
+                    "\n⚠ {} isn't writable by the current user.\n\
+                     \x20 Fetching keys into it and writing the config will fail with a\n\
+                     \x20 permission error. Re-run with `sudo`/as admin, or use --user for a\n\
+                     \x20 per-user file, or --output to write somewhere you can write.",
+                    d.display()
+                );
+            }
+            return;
+        }
+        dir = d.parent();
+    }
+}
+
+/// Whether `dir` is writable by the current user, probed by creating and
+/// removing a temporary file (the only portable, ownership-aware check).
+fn dir_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".mia-setup-write-probe.{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Write `content` to `path`, creating parent directories. The caller already
