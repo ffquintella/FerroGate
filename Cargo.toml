@@ -90,7 +90,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 rustls-pemfile = "2"
 hyper-util   = { version = "0.1", features = ["tokio"] }
 tower        = { version = "0.4", features = ["util"] }
-rcgen        = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen        = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 aws-lc-rs    = "1"
 wycheproof   = "0.6"
 
