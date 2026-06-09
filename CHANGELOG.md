@@ -21,6 +21,13 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **mia no longer crash-loops when the allowlist file is absent.** With
+  `allowlist.path` configured and `allowlist.fetch` on, if CMIS has no allowlist
+  for the host and none was ever written to disk, the daemon read the missing
+  `allowlist.cbor` as a fatal error and exited — launchd/systemd then restarted
+  it every few seconds. The loader now treats a `NotFound` allowlist file as
+  deny-all (fail closed) with a warning, matching the documented contract;
+  other read errors and present-but-invalid allowlists still fail loudly.
 - **`mia setup` no longer double-prompts when editing an existing file.** The
   final "Write this configuration to …?" prompt is now the single point of
   consent; the redundant secondary "… exists — overwrite?" prompt (which always

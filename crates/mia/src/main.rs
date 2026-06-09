@@ -452,24 +452,41 @@ where
     maybe_fetch_allowlist(config, host_spiffe_id.as_deref()).await;
 
     // Allowlist: configured ⇒ load and verify (fail loudly); absent ⇒ deny all.
+    // A configured path whose file does not yet exist also denies all (fail
+    // closed) rather than crashing: CMIS may have no allowlist for this host and
+    // none was ever written, so `maybe_fetch_allowlist` left the path empty.
     let allowlist = if let Some(path) = config.allowlist.path.as_deref() {
-        let key_path = config.allowlist.key.as_deref().context(
-            "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing",
-        )?;
-        let key_bytes = std::fs::read(key_path).with_context(|| {
-            format!(
-                "reading allowlist key (allowlist.key) {}",
-                key_path.display()
-            )
-        })?;
-        let trusted = CompositePublicKey::from_concat_bytes(&key_bytes)
-            .map_err(|e| anyhow::anyhow!("trusted allowlist key: {e}"))?;
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading allowlist (allowlist.path) {}", path.display()))?;
-        let al = Allowlist::load(&bytes, &trusted, clock(), max_age)
-            .map_err(|e| anyhow::anyhow!("allowlist verification failed: {e}"))?;
-        tracing::info!(trust_domain = al.trust_domain(), "loaded signed allowlist");
-        Some(al)
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let key_path = config.allowlist.key.as_deref().context(
+                    "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing",
+                )?;
+                let key_bytes = std::fs::read(key_path).with_context(|| {
+                    format!(
+                        "reading allowlist key (allowlist.key) {}",
+                        key_path.display()
+                    )
+                })?;
+                let trusted = CompositePublicKey::from_concat_bytes(&key_bytes)
+                    .map_err(|e| anyhow::anyhow!("trusted allowlist key: {e}"))?;
+                let al = Allowlist::load(&bytes, &trusted, clock(), max_age)
+                    .map_err(|e| anyhow::anyhow!("allowlist verification failed: {e}"))?;
+                tracing::info!(trust_domain = al.trust_domain(), "loaded signed allowlist");
+                Some(al)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "allowlist.path configured but no file present; helper API denies all callers (fail closed)"
+                );
+                None
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("reading allowlist (allowlist.path) {}", path.display())
+                });
+            }
+        }
     } else {
         tracing::warn!("no allowlist configured; helper API denies all callers (fail closed)");
         None
