@@ -14,7 +14,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use base64::Engine as _;
 use ferro_attest::{
-    credential_secret_matches, verify_aik_signature, PcrSet, QuoteVerification, RejectReason,
+    credential_secret_matches, verify_aik_signature, verify_host_key_csr,
+    verify_host_key_evidence, PcrSet, QuoteVerification, RejectReason,
 };
 use ferro_audit::{AuditEvent, Hash384};
 use ferro_crypto::composite::CompositePublicKey;
@@ -38,7 +39,7 @@ use sha2::{Digest, Sha384};
 
 use crate::fleet_manifest::EnrollmentDecision;
 use crate::pcr::aggregate_digest;
-use crate::state::{CmisState, IssuedRecord};
+use crate::state::{CmisState, HostKeyBinding, IssuedRecord};
 
 /// gRPC front end over a shared [`CmisState`].
 #[derive(Clone)]
@@ -189,6 +190,13 @@ async fn run_attest(
         return Err(Status::invalid_argument("expected attest init"));
     };
 
+    // Profile split (F15): a TPM-less host sets `host_key` and runs a 3-phase
+    // handshake with no credential-activation round. Branch before any
+    // TPM-specific work.
+    if let Some(host_key) = init.host_key {
+        return run_attest_host_key(state, inbound, tx, &nonce, host_key, now).await;
+    }
+
     // F13 pre-admission: gate the host on the offline-signed fleet manifest
     // *before* any TPM verification work runs. The EK-cert hash is the only
     // input. With no manifest configured this is a no-op; once one is loaded an
@@ -338,6 +346,157 @@ async fn run_attest(
         .await;
 
     tracing::info!(spiffe_id = %issued.spiffe_id, "issued SVID via full attestation");
+    send(tx, RespPhase::Svid(to_bundle(&issued))).await?;
+    Ok(())
+}
+
+/// The synthetic policy id stamped on SVIDs issued through the TPM-less
+/// host-key profile (F15). It records, in the issued credential and the audit
+/// log, that this host proved a hardware-bound key but **not** measured boot —
+/// a lower assurance tier than an EK-rooted, RIM-checked TPM quote. Policy can
+/// key on this prefix to refuse host-key SVIDs in sensitive trust domains.
+const HOST_KEY_POLICY_ID: &str = "host-key";
+
+/// Drive the 3-phase host-key handshake (feature F15): the nonce was already
+/// sent, here we verify the phase-2 evidence, gate on the fleet manifest, then
+/// take the phase-4 CSR (there is no phase-3 credential activation) and issue.
+#[allow(clippy::too_many_lines)] // linear handshake, mirrors run_attest
+async fn run_attest_host_key(
+    state: Arc<CmisState>,
+    inbound: &mut Streaming<AttestRequest>,
+    tx: &mpsc::Sender<Result<AttestResponse, Status>>,
+    nonce: &[u8],
+    evidence: ferro_proto::v1::HostKeyEvidence,
+    now: i64,
+) -> Result<(), Status> {
+    let facts = evidence.facts.unwrap_or_default();
+
+    // Cryptographic verification: the facts hash to the claimed fingerprint and
+    // the signature over `nonce ‖ H` checks out under the presented key.
+    let verified = verify_host_key_evidence(
+        &facts.board_serial,
+        &facts.platform_uuid,
+        &facts.disk_serial,
+        &evidence.fingerprint,
+        &evidence.sep_pub,
+        nonce,
+        &evidence.signature,
+    )
+    .map_err(|reason| {
+        tracing::warn!(%reason, "host-key phase 2 verification failed");
+        audit_fail(&state, "host-key-verify-failed", now);
+        Status::permission_denied("attestation failed")
+    })?;
+
+    // Pre-admission: the fingerprint must be enrolled in the offline-signed
+    // fleet manifest, exactly like an EK hash. The fingerprint is a 48-byte
+    // SHA-384, so it shares the EK-hash admission set.
+    let fp_sha = Hash384(verified.fingerprint);
+    match state.check_enrollment(&verified.fingerprint) {
+        EnrollmentDecision::Rejected => {
+            tracing::warn!("pre-admission: host fingerprint not in fleet manifest");
+            audit_record(
+                &state,
+                AuditEvent::HostRejected {
+                    ek_sha: fp_sha,
+                    reason: "not-enrolled".to_string(),
+                },
+                now,
+            );
+            return Err(Status::permission_denied("attestation failed"));
+        }
+        EnrollmentDecision::Enrolled => {
+            audit_record(&state, AuditEvent::HostEnrolled { ek_sha: fp_sha }, now);
+        }
+        EnrollmentDecision::NotEnforced => {}
+    }
+
+    // Bind the fingerprint to the presented machine key: an operator
+    // pre-registered key must match exactly; otherwise the key is trusted on
+    // first use and pinned. A key that differs from the bound one is a rebind
+    // attempt — refuse it.
+    match state.bind_host_key(&verified.fingerprint, &evidence.sep_pub) {
+        HostKeyBinding::Mismatch => {
+            tracing::warn!("host-key binding mismatch: presented key != bound key");
+            audit_record(
+                &state,
+                AuditEvent::HostRejected {
+                    ek_sha: fp_sha,
+                    reason: "key-rebind".to_string(),
+                },
+                now,
+            );
+            return Err(Status::permission_denied("attestation failed"));
+        }
+        binding => {
+            tracing::debug!(?binding, "host-key binding accepted");
+        }
+    }
+
+    audit_record(
+        &state,
+        AuditEvent::AttestStart {
+            ek_sha: fp_sha,
+            aik_sha: Hash384(sha384(&evidence.sep_pub)),
+            policy_id: HOST_KEY_POLICY_ID.to_string(),
+        },
+        now,
+    );
+
+    // Phase 4 — composite CSR, bound to the machine key (no phase-3 activation).
+    let ReqPhase::Csr(csr) = next_request(inbound).await? else {
+        audit_fail(&state, "csr-expected", now);
+        return Err(Status::invalid_argument("expected CSR"));
+    };
+    if let Err(reason) = verify_host_key_csr(&evidence.sep_pub, &csr.composite_pub, &csr.aik_sig) {
+        tracing::warn!(%reason, "host-key phase 4 CSR signature failed");
+        audit_fail(&state, "host-key-csr-sig-invalid", now);
+        return Err(Status::permission_denied("attestation failed"));
+    }
+
+    match CompositePublicKey::from_concat_bytes(&csr.composite_pub) {
+        Ok(pk) => state.register_child_key(&pk),
+        Err(e) => tracing::warn!(error = %e, "could not publish host child-token key"),
+    }
+
+    // No PCRs exist on this profile; reuse the fingerprint as the stable
+    // `pcr_digest` so the subject UUID and renewal-drift logic stay well-defined.
+    let params = IssueParams {
+        ek_cert_sha384: verified.fingerprint,
+        pcr_digest: verified.fingerprint,
+        policy_id: HOST_KEY_POLICY_ID.to_string(),
+        dpop_jkt: csr.dpop_jkt,
+        ttl_secs: state.config.svid_ttl_secs,
+        tee_evidence_id: None,
+    };
+    let issued = state.issuer.issue(&params, now).map_err(|e| {
+        tracing::error!(error = %e, "host-key SVID issuance failed");
+        audit_fail(&state, "issuance-failed", now);
+        Status::unavailable("issuer temporarily unavailable")
+    })?;
+
+    audit_record(
+        &state,
+        AuditEvent::SvidIssued {
+            cert_sha: Hash384(sha384(issued.jws.as_bytes())),
+            spiffe_id: issued.spiffe_id.clone(),
+        },
+        now,
+    );
+
+    state
+        .record(IssuedRecord {
+            params: params.clone(),
+            last_attestation: LastAttestation {
+                at: now,
+                pcr_digest: verified.fingerprint,
+                policy_epoch: state.current_epoch(),
+            },
+            bundle: issued.clone(),
+        })
+        .await;
+
+    tracing::info!(spiffe_id = %issued.spiffe_id, "issued SVID via host-key attestation (F15)");
     send(tx, RespPhase::Svid(to_bundle(&issued))).await?;
     Ok(())
 }

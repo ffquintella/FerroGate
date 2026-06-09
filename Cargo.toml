@@ -16,6 +16,8 @@ members = [
     "crates/ferro-ceremony",
     "crates/ferro-winauth",
     "crates/ferro-harden",
+    "crates/ferro-machineid",
+    "crates/ferro-sep",
     "crates/ferrogate-cli",
     "tools/fleet-manifest",
     "tools/offline-signer",

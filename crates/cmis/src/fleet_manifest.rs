@@ -25,7 +25,7 @@
 //!
 //! [`snapshot`]: FleetStore::snapshot
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,6 +44,22 @@ pub const FLEET_SIGNING_CONTEXT: &[u8] = b"ferrogate-fleet-v1";
 /// Length of a hex-encoded SHA-384 (48 bytes ⇒ 96 lowercase-hex chars).
 const EK_SHA_HEX_LEN: usize = 96;
 
+/// Decode one 96-char-hex host-identity digest (EK hash or machine fingerprint)
+/// into its 48 raw bytes, with a `kind`-tagged error for the audit trail.
+fn decode_host_digest(h: &str, kind: &str, i: usize) -> Result<[u8; 48], FleetError> {
+    let h = h.trim();
+    if h.len() != EK_SHA_HEX_LEN {
+        return Err(FleetError::BadEkHash(format!(
+            "{kind}[{i}]: expected {EK_SHA_HEX_LEN} hex chars, got {}",
+            h.len()
+        )));
+    }
+    let bytes = hex::decode(h).map_err(|e| FleetError::BadEkHash(format!("{kind}[{i}]: {e}")))?;
+    let mut d = [0u8; 48];
+    d.copy_from_slice(&bytes);
+    Ok(d)
+}
+
 /// The publishable contents of one fleet manifest generation.
 ///
 /// Field declaration order is the canonical key order the signature covers
@@ -61,6 +77,31 @@ pub struct FleetManifest {
     pub issued_at: i64,
     /// SHA-384 of every approved EK certificate, lowercase hex (96 chars each).
     pub enrolled_ek_sha384: Vec<String>,
+    /// SHA-384 hardware fingerprints of every approved TPM-less host (feature
+    /// F15), lowercase hex (96 chars each). Gated on the same pre-admission
+    /// check as EK hashes — both are 48-byte host-identity digests.
+    ///
+    /// Skipped from the canonical JSON when empty, so a manifest that predates
+    /// F15 (or simply enrolls no host-key hosts) signs and verifies exactly as
+    /// before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enrolled_machine_id: Vec<String>,
+    /// Pre-registered machine public keys (feature F15): an operator-asserted
+    /// `fingerprint → machine key` binding. A host whose fingerprint appears
+    /// here is enrolled **and** must present exactly this key, closing the
+    /// trust-on-first-use window. Listing the fingerprint here is sufficient
+    /// for admission; it need not also appear in `enrolled_machine_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enrolled_machine_pubkey: Vec<MachinePubkey>,
+}
+
+/// An operator-asserted binding of a host fingerprint to its machine key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachinePubkey {
+    /// Hardware fingerprint `H`, lowercase hex (96 chars).
+    pub fingerprint: String,
+    /// The host machine key's DER `SubjectPublicKeyInfo`, base64url (no pad).
+    pub sep_pub_b64: String,
 }
 
 impl FleetManifest {
@@ -72,25 +113,38 @@ impl FleetManifest {
     /// Resolve the manifest into the lookup-optimised [`EnrolledHosts`] set,
     /// decoding and validating each hex digest to 48 bytes.
     pub fn to_enrolled(&self) -> Result<EnrolledHosts, FleetError> {
-        let mut hashes = HashSet::with_capacity(self.enrolled_ek_sha384.len());
+        let mut hashes =
+            HashSet::with_capacity(self.enrolled_ek_sha384.len() + self.enrolled_machine_id.len());
+        // EK-certificate hashes (TPM hosts) and hardware fingerprints (TPM-less
+        // host-key hosts, F15) are both 48-byte host-identity digests gated by
+        // the same admission check, so they share one lookup set.
         for (i, h) in self.enrolled_ek_sha384.iter().enumerate() {
-            let h = h.trim();
-            if h.len() != EK_SHA_HEX_LEN {
+            hashes.insert(decode_host_digest(h, "ek", i)?);
+        }
+        for (i, h) in self.enrolled_machine_id.iter().enumerate() {
+            hashes.insert(decode_host_digest(h, "machine", i)?);
+        }
+        // Pre-registered machine keys: the fingerprint is auto-enrolled and the
+        // public key is pinned.
+        let mut prereg = HashMap::with_capacity(self.enrolled_machine_pubkey.len());
+        for (i, mpk) in self.enrolled_machine_pubkey.iter().enumerate() {
+            let fp = decode_host_digest(&mpk.fingerprint, "machine_pubkey", i)?;
+            let pk = URL_SAFE_NO_PAD
+                .decode(mpk.sep_pub_b64.trim().as_bytes())
+                .map_err(|e| FleetError::BadEkHash(format!("machine_pubkey[{i}] key: {e}")))?;
+            if pk.is_empty() {
                 return Err(FleetError::BadEkHash(format!(
-                    "ek[{i}]: expected {EK_SHA_HEX_LEN} hex chars, got {}",
-                    h.len()
+                    "machine_pubkey[{i}]: empty key"
                 )));
             }
-            let bytes =
-                hex::decode(h).map_err(|e| FleetError::BadEkHash(format!("ek[{i}]: {e}")))?;
-            let mut d = [0u8; 48];
-            d.copy_from_slice(&bytes);
-            hashes.insert(d);
+            hashes.insert(fp);
+            prereg.insert(fp, pk);
         }
         Ok(EnrolledHosts {
             version: self.version,
             enforced: true,
             hashes,
+            prereg,
         })
     }
 }
@@ -163,6 +217,8 @@ pub struct EnrolledHosts {
     version: u64,
     enforced: bool,
     hashes: HashSet<[u8; 48]>,
+    /// Operator-asserted `fingerprint → machine key (DER SPKI)` bindings.
+    prereg: HashMap<[u8; 48], Vec<u8>>,
 }
 
 impl EnrolledHosts {
@@ -174,7 +230,16 @@ impl EnrolledHosts {
             version: 0,
             enforced: false,
             hashes: HashSet::new(),
+            prereg: HashMap::new(),
         }
+    }
+
+    /// The operator pre-registered machine key (DER SPKI) for `fp`, if any.
+    /// When present, the host-key handshake requires an exact match instead of
+    /// trusting the key on first use.
+    #[must_use]
+    pub fn preregistered(&self, fp: &[u8; 48]) -> Option<&[u8]> {
+        self.prereg.get(fp).map(Vec::as_slice)
     }
 
     /// Whether this set enforces a manifest (vs. admitting every host).
@@ -286,6 +351,13 @@ impl FleetStore {
     #[must_use]
     pub fn decide(&self, ek_sha: &[u8; 48]) -> EnrollmentDecision {
         self.snapshot().decide(ek_sha)
+    }
+
+    /// The operator pre-registered machine key for fingerprint `fp`, if the
+    /// active manifest binds one (feature F15).
+    #[must_use]
+    pub fn preregistered(&self, fp: &[u8; 48]) -> Option<Vec<u8>> {
+        self.snapshot().preregistered(fp).map(<[u8]>::to_vec)
     }
 }
 
@@ -431,6 +503,8 @@ mod tests {
             trust_domain: "ferrogate.test".to_string(),
             issued_at: 1_700_000_000,
             enrolled_ek_sha384: eks.iter().map(|b| ek_hex(*b)).collect(),
+            enrolled_machine_id: Vec::new(),
+            enrolled_machine_pubkey: Vec::new(),
         }
     }
 
@@ -493,6 +567,53 @@ mod tests {
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts.decide(&[0xAA; 48]), EnrollmentDecision::Enrolled);
         assert_eq!(hosts.decide(&[0xCC; 48]), EnrollmentDecision::Rejected);
+    }
+
+    #[test]
+    fn machine_ids_enroll_alongside_ek_hashes() {
+        let mut m = sample(1, &[0xAA]);
+        m.enrolled_machine_id = vec![ek_hex(0xCC)];
+        let hosts = m.to_enrolled().unwrap();
+        assert_eq!(hosts.len(), 2);
+        // EK host and host-key host both admitted from the one set.
+        assert_eq!(hosts.decide(&[0xAA; 48]), EnrollmentDecision::Enrolled);
+        assert_eq!(hosts.decide(&[0xCC; 48]), EnrollmentDecision::Enrolled);
+        assert_eq!(hosts.decide(&[0xBB; 48]), EnrollmentDecision::Rejected);
+    }
+
+    #[test]
+    fn preregistered_pubkey_enrolls_and_pins() {
+        let mut m = sample(1, &[]);
+        let fp = ek_hex(0xDD);
+        m.enrolled_machine_pubkey = vec![MachinePubkey {
+            fingerprint: fp.clone(),
+            sep_pub_b64: URL_SAFE_NO_PAD.encode([0x99u8; 91]),
+        }];
+        let hosts = m.to_enrolled().unwrap();
+        // The fingerprint is auto-enrolled...
+        assert_eq!(hosts.decide(&[0xDD; 48]), EnrollmentDecision::Enrolled);
+        // ...and its key is pinned for the host-key handshake.
+        assert_eq!(hosts.preregistered(&[0xDD; 48]), Some(&[0x99u8; 91][..]));
+        assert_eq!(hosts.preregistered(&[0xEE; 48]), None);
+    }
+
+    #[test]
+    fn empty_machine_ids_omitted_from_canonical_json() {
+        // A manifest with no host-key hosts must serialise identically to a
+        // pre-F15 manifest, so existing signatures still verify.
+        let json = String::from_utf8(sample(1, &[0xAA]).canonical_json().unwrap()).unwrap();
+        assert!(!json.contains("enrolled_machine_id"));
+    }
+
+    #[test]
+    fn machine_id_signature_roundtrips() {
+        let (sk, pk) = keypair();
+        let mut m = sample(2, &[0xAA]);
+        m.enrolled_machine_id = vec![ek_hex(0xCC)];
+        let signed = SignedFleetManifest::sign(m, "fleet-1", &sk).unwrap();
+        let trust = trust_with("fleet-1", pk);
+        let verified = signed.verify(&trust).expect("verify ok");
+        assert_eq!(verified.enrolled_machine_id.len(), 1);
     }
 
     #[test]

@@ -1513,6 +1513,8 @@ version = "0.15.6"
 dependencies = [
  "base64 0.22.1",
  "ferro-crypto",
+ "ferro-machineid",
+ "ferro-sep",
  "hex",
  "p256",
  "parking_lot",
@@ -1613,6 +1615,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-machineid"
+version = "0.15.6"
+dependencies = [
+ "hex",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ferro-proto"
 version = "0.15.6"
 dependencies = [
@@ -1634,6 +1645,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ferro-sep"
+version = "0.15.6"
+dependencies = [
+ "core-foundation",
+ "getrandom 0.2.17",
+ "hex",
+ "p256",
+ "security-framework",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2864,8 +2888,10 @@ dependencies = [
  "ferro-child-verify",
  "ferro-crypto",
  "ferro-harden",
+ "ferro-machineid",
  "ferro-proto",
  "ferro-raft",
+ "ferro-sep",
  "ferro-svid",
  "ferro-svid-verify",
  "ferro-transport",

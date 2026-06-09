@@ -152,6 +152,9 @@ fn print_usage() {
 
 /// Daemon entry point. Starts the helper API when a helper socket is
 /// configured, otherwise prints a banner and exits.
+// The serve path holds a composite key (~4 KB ML-DSA) across awaits during
+// attestation; the large future is inherent, not a bug.
+#[allow(clippy::large_futures)]
 async fn run(config: mia::config::Config) -> anyhow::Result<()> {
     if config.helper_socket().is_none() {
         println!(
@@ -192,6 +195,7 @@ fn build_auth(_config: &mia::config::Config) -> mia::helper::auth::WindowsCaller
 /// transport `HelperServer` resolves from the target (UDS on Unix, a named pipe
 /// on Windows).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[allow(clippy::large_futures)] // attestation future holds a composite key
 async fn start_helper_api(config: &mia::config::Config) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let socket_path = config
@@ -201,9 +205,110 @@ async fn start_helper_api(config: &mia::config::Config) -> anyhow::Result<()> {
     serve(config, socket_path, build_auth(config)).await
 }
 
+/// Resolve where the persistent machine signing key lives — beside the system
+/// config (e.g. `/Library/Application Support/FerroGate/host-key.bin` on macOS).
+fn host_key_path() -> std::path::PathBuf {
+    mia::config::system_config_path()
+        .parent()
+        .map_or_else(
+            || std::path::PathBuf::from("mia-host-key.bin"),
+            |d| d.join("host-key.bin"),
+        )
+}
+
+/// Bootstrap the host SVID via the TPM-less **host-key** attestation profile
+/// (feature F15) and build the child-token minter the helper API mints with.
+///
+/// Returns `None` — with a logged reason — when CMIS is not configured, the
+/// platform has no hardware fingerprint, or attestation fails. In every such
+/// case the helper API still starts; it just refuses to mint (`no_host_svid`)
+/// until a later attempt succeeds.
+///
+/// The signing key is a persistent [`ferro_sep::SoftwareMachineKey`]. Upgrading
+/// the daemon to a non-exportable Secure-Enclave key needs keychain-backed
+/// persistence in `ferro-sep` (see docs/features/F15.md) — the SEP backend's
+/// cryptographic core is already proven by `ferro-sep`'s live test.
+#[allow(clippy::too_many_lines)] // linear bootstrap: dial → attest → build minter
+#[allow(clippy::large_futures)] // holds a composite key (~4 KB ML-DSA) across awaits
+async fn bootstrap_host_svid(
+    config: &mia::config::Config,
+) -> Option<mia::helper::ChildTokenMinter> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use ferro_crypto::pin::SpkiPin;
+    use ferro_sep::MachineKey as _;
+    use mia::helper::{ChildTokenMinter, MinterConfig};
+    use sha2::{Digest, Sha256, Sha384};
+
+    let endpoint = config.cmis.endpoint.as_deref()?;
+    let Some(pin_hex) = config.cmis.spki_pin.as_deref() else {
+        tracing::error!("cmis.endpoint is set but cmis.spki_pin is missing; cannot attest");
+        return None;
+    };
+    let pin = match SpkiPin::from_hex(pin_hex.trim()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "cmis.spki_pin is not a valid SHA-384 SPKI pin");
+            return None;
+        }
+    };
+
+    let facts = match ferro_machineid::collect_facts() {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot collect a hardware fingerprint; host-key attestation skipped");
+            return None;
+        }
+    };
+    let key_path = host_key_path();
+    let key = match ferro_sep::SoftwareMachineKey::open_or_create(&key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, path = %key_path.display(), "cannot open machine signing key");
+            return None;
+        }
+    };
+
+    // Host DPoP confirmation key thumbprint. A host-bound stand-in derived from
+    // the machine key until the host DPoP key (F09) is wired; CMIS records it as
+    // the SVID's `cnf.jkt`.
+    let dpop_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(key.public_spki_der()));
+
+    let mut client = match mia::client::connect_pinned(endpoint, vec![pin]).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, %endpoint, "could not connect to CMIS for attestation");
+            return None;
+        }
+    };
+    let attested = match mia::client::run_attest_host_key(&mut client, &facts, &key, dpop_jkt).await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "host-key attestation failed");
+            return None;
+        }
+    };
+
+    let mut parent = [0u8; 48];
+    parent.copy_from_slice(&Sha384::digest(attested.bundle.jws.as_bytes()));
+    let cfg = MinterConfig {
+        host_spiffe_id: attested.bundle.spiffe_id.clone(),
+        parent_svid_sha384: parent,
+        kid: ferro_svid::child_signing_kid(&attested.svid_public),
+    };
+    tracing::info!(
+        spiffe_id = %attested.bundle.spiffe_id,
+        fingerprint = %facts.fingerprint().to_hex(),
+        "host SVID obtained via host-key attestation; token minting enabled"
+    );
+    Some(ChildTokenMinter::new(attested.svid_secret, cfg))
+}
+
 /// Bind and serve the helper API with the given caller authenticator. Shared by
 /// every supported platform.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[allow(clippy::large_futures)] // attestation future holds a composite key
 async fn serve<A>(
     config: &mia::config::Config,
     socket_path: std::path::PathBuf,
@@ -266,17 +371,20 @@ where
         read_timeout: Duration::from_secs(5),
     };
 
-    // No minter yet: the host SVID composite key arrives with the attestation
-    // loop (F04). Until then the server authenticates and authorizes callers
-    // but refuses to mint with `no_host_svid`. The CRL cache (feature F11)
-    // starts empty — once the attestation loop lands it will be fed by a puller
-    // (`mia::helper::crl::spawn_puller`) against the host's CMIS endpoint; until
-    // then an empty cache simply means the (absent) minter stays disabled.
+    // Attest to CMIS to obtain the host SVID and build the token minter. When
+    // CMIS isn't configured or attestation fails, `minter` is `None` and the
+    // helper API still serves but refuses to mint (`no_host_svid`).
+    let minter = bootstrap_host_svid(config).await;
+    if minter.is_none() {
+        tracing::warn!(
+            "host SVID not present; token minting disabled (returns no_host_svid) until a future attestation succeeds"
+        );
+    }
+
+    // The CRL cache (feature F11) starts empty; wiring the puller
+    // (`mia::helper::crl::spawn_puller`) against the CMIS endpoint is a follow-up.
     let crl = Arc::new(CrlCache::new());
-    let server = HelperServer::bind(helper_config, auth, None, allowlist, crl, audit_tx, clock)?;
-    tracing::warn!(
-        "host SVID not present; token minting disabled (returns no_host_svid) until attestation lands"
-    );
+    let server = HelperServer::bind(helper_config, auth, minter, allowlist, crl, audit_tx, clock)?;
     tracing::info!(listener = %socket_path.display(), "helper API listening");
 
     server.serve_with_shutdown(shutdown_signal()).await;

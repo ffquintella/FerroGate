@@ -12,7 +12,9 @@ authors.workspace      = true
 workspace = true
 
 [dependencies]
-ferro-crypto = { path = "../ferro-crypto" }
+ferro-crypto    = { path = "../ferro-crypto" }
+ferro-sep       = { path = "../ferro-sep" }
+ferro-machineid = { path = "../ferro-machineid" }
 
 thiserror   = { workspace = true }
 sha2        = { workspace = true }

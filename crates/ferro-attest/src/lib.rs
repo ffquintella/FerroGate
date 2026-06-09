@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aik;
+pub mod host_key;
 pub mod rim;
 pub mod rim_bundle;
 pub mod rim_loader;
@@ -36,6 +37,9 @@ pub use rim::{
 };
 pub use rim_bundle::{BundleError, RimBundle, SignedRimBundle, TrustedKeys, RIM_SIGNING_CONTEXT};
 pub use rim_loader::{ReloadError, ReloadOutcome, RimLoader};
+pub use host_key::{
+    verify_host_key_csr, verify_host_key_evidence, HostKeyRejection, VerifiedHostKey,
+};
 pub use vendor::{ChainError, Vendor, VendorMatch, VendorTrustStore};
 pub use verify::{
     credential_secret_matches, verify_aik_signature, PcrSet, QuoteVerification, RejectReason,

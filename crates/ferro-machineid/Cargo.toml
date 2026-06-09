@@ -1,0 +1,25 @@
+[package]
+name        = "ferro-machineid"
+description = "FerroGate — stable hardware fingerprint for the TPM-less host-key attestation profile (F15)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lib]
+name = "ferro_machineid"
+path = "src/lib.rs"
+
+# This crate reads only *public* hardware identifiers (board serial, platform
+# UUID, boot-disk serial) — never secret key material. It stays
+# `#![forbid(unsafe_code)]`: on macOS the values come from `/usr/sbin/ioreg`
+# (absolute path, so PATH cannot be hijacked); on Linux from sysfs/DMI.
+[lints]
+workspace = true
+
+[dependencies]
+sha2      = { workspace = true }
+hex       = { workspace = true }
+thiserror = { workspace = true }

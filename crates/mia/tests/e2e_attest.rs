@@ -709,6 +709,8 @@ fn enroll_eks(state: &CmisState, ek_certs: &[&[u8]]) {
             .iter()
             .map(|c| hex::encode(Sha384::digest(c)))
             .collect(),
+        enrolled_machine_id: Vec::new(),
+        enrolled_machine_pubkey: Vec::new(),
     };
     state.fleet().apply(manifest.to_enrolled().unwrap());
 }
