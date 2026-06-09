@@ -133,6 +133,36 @@ full how-it-works, the OpenSSL pin recipe, and troubleshooting.
   epoch bump" above. Every host attested under the old epoch re-attests at its
   next rotation; the global audit log records the bump (`PolicyEpochBumped`).
 
+## Caller allowlists
+
+Each MIA host gates its helper API with a **signed caller allowlist** — the
+`(uid, binary-SHA-384)` pairs allowed to mint child tokens. CMIS stores, signs,
+and serves these per host; operators manage them with the `ferrogate allowlist`
+commands. The issuer secret never leaves CMIS — the CLI submits entries and CMIS
+signs them with the enrollment key.
+
+- Allowlists are keyed by the host's **EK-derived UUID**
+  (`ferro_svid::host_uuid_from_ek_digest`), so a host can be provisioned before
+  it attests. Name the host with `--host <uuid>`, `--ek-cert <pem>`, or
+  `--ek-sha384 <hex>`.
+- Provision and edit:
+  - `ferrogate allowlist set --host <uuid> --bin <uid>:<path>` — replace a host's
+    allowlist (the CLI hashes the binary; `--entry <uid>:<sha384>` takes a
+    precomputed hash).
+  - `ferrogate allowlist add/remove …` — read-modify-write a single entry; CMIS
+    re-signs.
+- Inspect and retrieve:
+  - `ferrogate allowlist show --host <uuid>` / `ferrogate allowlist list`.
+  - `ferrogate allowlist get --host <uuid> --out allowlist.cbor` — fetch the raw
+    signed CBOR to place at a host's `allowlist.path` (a MIA with `GetAllowlist`
+    reachability can fetch it directly instead).
+- `Set`/`Delete`/`ListAllowlists` are admin RPCs authenticated as operator
+  actions at the transport, exactly like revocation; `GetAllowlist` is
+  unauthenticated (the body is signature-protected and not secret). Each set or
+  delete records an audit event (`AllowlistSet` / `AllowlistDeleted`). CMIS
+  stamps a validity window (default one day, capped at 30); re-issue rather than
+  mint long-lived lists. Full workflow: [allowlist-provisioning.md](allowlist-provisioning.md).
+
 ## Root key rotation
 
 The composite issuance key is rotated annually in an air-gapped ceremony:

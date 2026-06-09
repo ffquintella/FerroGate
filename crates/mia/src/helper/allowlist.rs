@@ -1,83 +1,26 @@
-//! The signed caller allowlist.
+//! The signed caller allowlist — MIA-side runtime verifier.
 //!
 //! Only `(uid, bin_sha384)` pairs present in the allowlist may obtain a token.
-//! The allowlist is signed by CMIS at host enrollment and re-verified before
-//! use; verification **fails closed** — any decode, signature, or freshness
-//! error yields no usable allowlist, so the server denies every caller rather
-//! than fall back to an unauthenticated state.
+//! The allowlist is signed by CMIS (see [`ferro_svid::Issuer::sign_allowlist`])
+//! and re-verified here before use; verification **fails closed** — any decode,
+//! signature, or freshness error yields no usable allowlist, so the server
+//! denies every caller rather than fall back to an unauthenticated state.
 //!
-//! On-disk form is a CBOR [`SignedAllowlist`]: a canonical-CBOR-encoded
-//! [`AllowlistDoc`] body plus a detached composite signature over those exact
-//! bytes under [`ALLOWLIST_SIGNING_CONTEXT`]. CBOR (rather than the TOML the
-//! prose docs sketch) gives an unambiguous canonical byte string to sign,
-//! matching the rest of FerroGate's signed-artefact idiom.
+//! The wire model ([`AllowlistDoc`], [`SignedAllowlist`], `sign`/`encode`) lives
+//! in `ferro-svid` so CMIS and the MIA share one definition; it is re-exported
+//! here for convenience. This module owns the freshness-checked, membership-set
+//! [`Allowlist`] that the helper API consults.
 
 use std::collections::HashSet;
 
-use ferro_crypto::composite::{CompositePublicKey, CompositeSecretKey, CompositeSignature};
-use serde::{Deserialize, Serialize};
+use ferro_crypto::composite::CompositePublicKey;
 
-/// Domain-separation context the allowlist signature covers. Distinct from the
-/// SVID and child-token contexts so a signature cannot be reinterpreted.
-pub const ALLOWLIST_SIGNING_CONTEXT: &[u8] = b"ferrogate-allowlist-v1";
-
-/// One permitted caller: a uid plus the IMA hash of its binary (hex).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AllowEntry {
-    /// Permitted user id.
-    pub uid: u32,
-    /// Lowercase hex `SHA-384` of the permitted binary.
-    pub bin_sha: String,
-}
-
-/// The signed body: who may call, under which trust domain, and how long the
-/// allowlist remains valid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AllowlistDoc {
-    /// Trust domain this allowlist was issued for.
-    pub trust_domain: String,
-    /// Issuance time, Unix seconds.
-    pub issued_at: i64,
-    /// Hard expiry, Unix seconds — the server refuses the file past this.
-    pub not_after: i64,
-    /// Permitted callers.
-    pub entries: Vec<AllowEntry>,
-}
-
-/// The on-disk artefact: a CBOR `AllowlistDoc` body and its composite signature.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedAllowlist {
-    /// Canonical CBOR encoding of the [`AllowlistDoc`].
-    pub body: Vec<u8>,
-    /// Composite signature (`classical || pqc`) over `body`.
-    pub signature: Vec<u8>,
-}
-
-/// Allowlist load/verify failures. Every variant denies all callers.
-#[derive(Debug, thiserror::Error)]
-pub enum AllowlistError {
-    /// The outer `SignedAllowlist` or inner `AllowlistDoc` CBOR was malformed.
-    #[error("cbor: {0}")]
-    Cbor(String),
-    /// The signature bytes were not a valid composite signature.
-    #[error("malformed signature")]
-    MalformedSignature,
-    /// The signature did not verify under the trusted key.
-    #[error("bad signature")]
-    BadSignature,
-    /// An entry's `bin_sha` was not 48 bytes of hex.
-    #[error("malformed entry hash")]
-    MalformedEntry,
-    /// `now` is past `not_after`.
-    #[error("expired")]
-    Expired,
-    /// `now` is before `issued_at` (clock skew / not yet valid).
-    #[error("not yet valid")]
-    NotYetValid,
-    /// The allowlist is older than the configured maximum age.
-    #[error("too old")]
-    TooOld,
-}
+// Re-export the shared wire model so existing `mia::helper::allowlist::*` users
+// (and tests) keep working unchanged.
+pub use ferro_svid::allowlist::{
+    decode, encode, sign, AllowEntry, AllowlistDoc, AllowlistError, SignedAllowlist,
+    ALLOWLIST_SIGNING_CONTEXT,
+};
 
 /// A verified, in-memory allowlist ready for `O(1)` membership checks.
 #[derive(Debug, Clone)]
@@ -99,18 +42,9 @@ impl Allowlist {
         now: i64,
         max_age_secs: i64,
     ) -> Result<Self, AllowlistError> {
-        let signed: SignedAllowlist =
-            ciborium::from_reader(bytes).map_err(|e| AllowlistError::Cbor(e.to_string()))?;
-
-        let sig = CompositeSignature::from_concat_bytes(&signed.signature)
-            .map_err(|_| AllowlistError::MalformedSignature)?;
-        trusted
-            .verify(ALLOWLIST_SIGNING_CONTEXT, &signed.body, &sig)
-            .map_err(|_| AllowlistError::BadSignature)?;
-
-        // Only parse the body *after* the signature checks out.
-        let doc: AllowlistDoc = ciborium::from_reader(&signed.body[..])
-            .map_err(|e| AllowlistError::Cbor(e.to_string()))?;
+        let signed = ferro_svid::allowlist::decode(bytes)?;
+        // Signature is checked before the body is parsed/trusted.
+        let doc = ferro_svid::allowlist::verify(&signed, trusted)?;
 
         if now < doc.issued_at {
             return Err(AllowlistError::NotYetValid);
@@ -155,33 +89,10 @@ impl Allowlist {
     }
 }
 
-/// Encode and sign an [`AllowlistDoc`] with `signer`. Used by the enrollment
-/// tooling and by tests; the MIA itself only ever *verifies*.
-pub fn sign(
-    doc: &AllowlistDoc,
-    signer: &CompositeSecretKey,
-) -> Result<SignedAllowlist, AllowlistError> {
-    let mut body = Vec::with_capacity(256);
-    ciborium::into_writer(doc, &mut body).map_err(|e| AllowlistError::Cbor(e.to_string()))?;
-    let sig = signer
-        .sign(ALLOWLIST_SIGNING_CONTEXT, &body)
-        .map_err(|_| AllowlistError::BadSignature)?;
-    Ok(SignedAllowlist {
-        body,
-        signature: sig.to_concat_bytes(),
-    })
-}
-
-/// Serialize a [`SignedAllowlist`] to its on-disk CBOR bytes.
-pub fn encode(signed: &SignedAllowlist) -> Result<Vec<u8>, AllowlistError> {
-    let mut out = Vec::with_capacity(signed.body.len() + signed.signature.len() + 32);
-    ciborium::into_writer(signed, &mut out).map_err(|e| AllowlistError::Cbor(e.to_string()))?;
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferro_crypto::composite::CompositeSecretKey;
 
     fn keypair() -> (CompositeSecretKey, CompositePublicKey) {
         CompositeSecretKey::generate().unwrap()

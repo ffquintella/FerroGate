@@ -270,6 +270,107 @@ async fn https_without_pin_or_readable_cert_errors_clearly() {
 }
 
 #[tokio::test]
+async fn allowlist_set_show_list_get_delete_roundtrip() {
+    let addr = spawn_plaintext_cmis().await;
+    let endpoint = format!("http://{addr}");
+    let host = "11111111-1111-8111-8111-111111111111";
+    let bin_sha = hex::encode([0xAA; 48]);
+
+    let run = |args: Vec<String>| {
+        let endpoint = endpoint.clone();
+        async move {
+            let mut full = vec!["--endpoint".to_string(), endpoint, "allowlist".to_string()];
+            full.extend(args);
+            Command::new(ferrogate_bin())
+                .args(&full)
+                .output()
+                .await
+                .expect("run ferrogate")
+        }
+    };
+
+    // set
+    let out = run(vec![
+        "set".into(),
+        "--host".into(),
+        host.into(),
+        "--entry".into(),
+        format!("1000:{bin_sha}"),
+        "--ttl".into(),
+        "3600".into(),
+    ])
+    .await;
+    assert!(
+        out.status.success(),
+        "allowlist set must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // show — should list the entry we set
+    let out = run(vec!["show".into(), "--host".into(), host.into()]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "show must succeed");
+    assert!(
+        stdout.contains(&bin_sha) && stdout.contains("uid=1000"),
+        "show must reflect the set entry: {stdout}"
+    );
+
+    // list — host appears
+    let out = run(vec!["list".into()]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.contains(host), "list: {stdout}");
+
+    // get --out — writes valid signed CBOR that the MIA verifier accepts under
+    // the enrollment key.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let cbor_path = std::env::temp_dir().join(format!("ferrogate-cli-al-{nanos}.cbor"));
+    let out = run(vec![
+        "get".into(),
+        "--host".into(),
+        host.into(),
+        "--out".into(),
+        cbor_path.to_string_lossy().into_owned(),
+    ])
+    .await;
+    assert!(out.status.success(), "get --out must succeed");
+    let bytes = std::fs::read(&cbor_path).expect("read written cbor");
+    let signed = ferro_svid::allowlist::decode(&bytes).expect("decode served allowlist");
+    let doc = ferro_svid::allowlist::decode_body(&signed.body).expect("decode body");
+    assert_eq!(doc.entries.len(), 1);
+    assert_eq!(doc.entries[0].uid, 1000);
+    let _ = std::fs::remove_file(&cbor_path);
+
+    // delete
+    let out = run(vec!["delete".into(), "--host".into(), host.into()]).await;
+    assert!(out.status.success(), "delete must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("deleted"), "delete output: {stdout}");
+
+    // show after delete fails (nothing stored)
+    let out = run(vec!["show".into(), "--host".into(), host.into()]).await;
+    assert!(!out.status.success(), "show after delete must fail");
+}
+
+#[tokio::test]
+async fn allowlist_help_needs_no_connection() {
+    // No endpoint, no server — `allowlist help` must still print usage.
+    let out = Command::new(ferrogate_bin())
+        .args(["allowlist", "help"])
+        .output()
+        .await
+        .expect("run ferrogate");
+    assert!(out.status.success(), "allowlist help must succeed offline");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("manage per-host signed caller allowlists"),
+        "allowlist help output: {stdout}"
+    );
+}
+
+#[tokio::test]
 async fn plaintext_http_status_still_works() {
     let addr = spawn_plaintext_cmis().await;
 

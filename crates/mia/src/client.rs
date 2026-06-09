@@ -71,6 +71,31 @@ pub async fn fetch_enrollment_key(endpoint: &str, pins: Vec<SpkiPin>) -> anyhow:
     Ok(resp.public_key)
 }
 
+/// Fetch this host's signed caller allowlist body from a pinned CMIS endpoint,
+/// keyed by its EK-derived `host_uuid`.
+///
+/// Returns the CBOR `SignedAllowlist` bytes ready to write to `allowlist.path`,
+/// or `None` when CMIS has no allowlist stored for this host (an empty response
+/// is not an error — the daemon then falls back to whatever is already on disk,
+/// or fails closed). The bytes are integrity-protected by their signature, so
+/// fetching them over the pinned channel needs no further authentication.
+pub async fn fetch_allowlist(
+    endpoint: &str,
+    pins: Vec<SpkiPin>,
+    host_uuid: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    use ferro_proto::v1::GetAllowlistRequest;
+
+    let mut client = connect_pinned(endpoint, pins).await?;
+    let resp = client
+        .get_allowlist(Request::new(GetAllowlistRequest {
+            host_uuid: host_uuid.to_string(),
+        }))
+        .await?
+        .into_inner();
+    Ok((!resp.signed_allowlist.is_empty()).then_some(resp.signed_allowlist))
+}
+
 /// A produced PCR quote and the raw values backing it.
 pub struct QuoteEvidence {
     /// Marshaled `TPMS_ATTEST`.

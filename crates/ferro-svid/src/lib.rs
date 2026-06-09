@@ -7,6 +7,8 @@
 //!
 //! This crate owns:
 //!
+//! - [`allowlist`] — the signed caller-allowlist wire model CMIS serves and the
+//!   MIA verifies.
 //! - [`claims`] — the `ferrogate-svid-v1` payload schema.
 //! - [`envelope`] — compact-JWS encode/decode and the signing transcript.
 //! - [`spiffe`] — SPIFFE-ID derivation from `SHA-384(ek_cert)`.
@@ -20,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod allowlist;
 pub mod claims;
 pub mod crl;
 pub mod envelope;
@@ -45,6 +48,9 @@ pub const MAX_TTL_SECS: u64 = 3600;
 /// `nbf` lookback applied at issuance to tolerate modest host clock skew.
 pub const NBF_LOOKBACK_SECS: i64 = 60;
 
+pub use allowlist::{
+    AllowEntry, AllowlistDoc, AllowlistError, SignedAllowlist, ALLOWLIST_SIGNING_CONTEXT,
+};
 pub use claims::{AttestClaims, Cnf, SvidClaims};
 pub use crl::{
     CrlBody, CrlEntry, CrlError, RevocationTarget, SignedCrl, CRL_ENTRY_TTL_SECS, CRL_MAX_AGE_SECS,

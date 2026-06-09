@@ -230,9 +230,7 @@ fn host_key_path() -> std::path::PathBuf {
 /// cryptographic core is already proven by `ferro-sep`'s live test.
 #[allow(clippy::too_many_lines)] // linear bootstrap: dial → attest → build minter
 #[allow(clippy::large_futures)] // holds a composite key (~4 KB ML-DSA) across awaits
-async fn bootstrap_host_svid(
-    config: &mia::config::Config,
-) -> Option<mia::helper::ChildTokenMinter> {
+async fn bootstrap_host_svid(config: &mia::config::Config) -> Option<HostSession> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use ferro_crypto::pin::SpkiPin;
@@ -302,7 +300,107 @@ async fn bootstrap_host_svid(
         fingerprint = %facts.fingerprint().to_hex(),
         "host SVID obtained via host-key attestation; token minting enabled"
     );
-    Some(ChildTokenMinter::new(attested.svid_secret, cfg))
+    Some(HostSession {
+        spiffe_id: attested.bundle.spiffe_id.clone(),
+        minter: ChildTokenMinter::new(attested.svid_secret, cfg),
+    })
+}
+
+/// The outcome of a successful host attestation: the token minter the helper API
+/// mints with, plus the host's SVID SPIFFE id (its EK/fingerprint-derived
+/// identity, used to key the host's allowlist fetch).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+struct HostSession {
+    minter: mia::helper::ChildTokenMinter,
+    spiffe_id: String,
+}
+
+/// Extract the host UUID from a host SVID SPIFFE id (`spiffe://<td>/host/<uuid>`)
+/// — the key CMIS stores a host's allowlist under.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn host_uuid_from_spiffe_id(spiffe_id: &str) -> Option<&str> {
+    spiffe_id
+        .rsplit_once("/host/")
+        .map(|(_, uuid)| uuid)
+        .filter(|u| !u.is_empty())
+}
+
+/// If `allowlist.fetch` is enabled, fetch this host's signed allowlist from CMIS
+/// (keyed by its EK-derived host UUID) and write it to `allowlist.path` before
+/// the daemon loads it. Every failure mode is non-fatal and logged: the daemon
+/// then falls back to whatever is already on disk (or fails closed if nothing
+/// is), exactly as if auto-fetch were off.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+async fn maybe_fetch_allowlist(config: &mia::config::Config, host_spiffe_id: Option<&str>) {
+    use ferro_crypto::pin::SpkiPin;
+
+    if !config.allowlist.fetch {
+        return;
+    }
+    let Some(path) = config.allowlist.path.as_deref() else {
+        tracing::warn!("allowlist.fetch is set but allowlist.path is unset; nothing to write");
+        return;
+    };
+    let Some(spiffe_id) = host_spiffe_id else {
+        tracing::warn!(
+            "allowlist.fetch is set but no host SVID this start; keeping any existing allowlist"
+        );
+        return;
+    };
+    let Some(host_uuid) = host_uuid_from_spiffe_id(spiffe_id) else {
+        tracing::warn!(%spiffe_id, "could not derive host UUID from SVID; skipping allowlist fetch");
+        return;
+    };
+    let (Some(endpoint), Some(pin_hex)) = (
+        config.cmis.endpoint.as_deref(),
+        config.cmis.spki_pin.as_deref(),
+    ) else {
+        tracing::warn!("allowlist.fetch is set but cmis.endpoint/spki_pin are missing; skipping");
+        return;
+    };
+    let pin = match SpkiPin::from_hex(pin_hex.trim()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "cmis.spki_pin invalid; skipping allowlist fetch");
+            return;
+        }
+    };
+
+    match mia::client::fetch_allowlist(endpoint, vec![pin], host_uuid).await {
+        Ok(Some(bytes)) => {
+            if let Err(e) = write_allowlist_file(path, &bytes) {
+                tracing::warn!(error = %e, path = %path.display(), "could not write fetched allowlist; keeping existing file");
+            } else {
+                tracing::info!(%host_uuid, path = %path.display(), bytes = bytes.len(), "fetched signed allowlist from CMIS");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(%host_uuid, "CMIS has no allowlist for this host; keeping any existing file");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "allowlist fetch failed; keeping any existing file");
+        }
+    }
+}
+
+/// Write the signed allowlist CBOR to `path`, creating parent dirs. The body is
+/// integrity-protected by its signature (not secret), so `0644` like the key.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn write_allowlist_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+    }
+    Ok(())
 }
 
 /// Bind and serve the helper API with the given caller authenticator. Shared by
@@ -335,6 +433,23 @@ where
             tracing::info!(?event, "helper-api audit event");
         }
     });
+
+    // Attest to CMIS first: a successful attestation yields the host SVID (and
+    // thus the EK-derived identity that keys this host's allowlist) and the
+    // token minter. When CMIS isn't configured or attestation fails, there is no
+    // session — the helper API still serves but refuses to mint (`no_host_svid`).
+    let session = bootstrap_host_svid(config).await;
+    let host_spiffe_id = session.as_ref().map(|s| s.spiffe_id.clone());
+    let minter = session.map(|s| s.minter);
+    if minter.is_none() {
+        tracing::warn!(
+            "host SVID not present; token minting disabled (returns no_host_svid) until a future attestation succeeds"
+        );
+    }
+
+    // Optionally refresh the on-disk allowlist from CMIS before loading it, so
+    // the served body stays in sync with what the operator provisioned.
+    maybe_fetch_allowlist(config, host_spiffe_id.as_deref()).await;
 
     // Allowlist: configured ⇒ load and verify (fail loudly); absent ⇒ deny all.
     let allowlist = if let Some(path) = config.allowlist.path.as_deref() {
@@ -370,16 +485,6 @@ where
         max_concurrent: 64,
         read_timeout: Duration::from_secs(5),
     };
-
-    // Attest to CMIS to obtain the host SVID and build the token minter. When
-    // CMIS isn't configured or attestation fails, `minter` is `None` and the
-    // helper API still serves but refuses to mint (`no_host_svid`).
-    let minter = bootstrap_host_svid(config).await;
-    if minter.is_none() {
-        tracing::warn!(
-            "host SVID not present; token minting disabled (returns no_host_svid) until a future attestation succeeds"
-        );
-    }
 
     // The CRL cache (feature F11) starts empty; wiring the puller
     // (`mia::helper::crl::spawn_puller`) against the CMIS endpoint is a follow-up.
@@ -424,4 +529,25 @@ async fn shutdown_signal() {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("received Ctrl-C; shutting down");
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod tests {
+    use super::host_uuid_from_spiffe_id;
+
+    #[test]
+    fn extracts_host_uuid_from_spiffe_id() {
+        let uuid = "11111111-1111-8111-8111-111111111111";
+        assert_eq!(
+            host_uuid_from_spiffe_id(&format!("spiffe://ferrogate.test/host/{uuid}")),
+            Some(uuid)
+        );
+    }
+
+    #[test]
+    fn rejects_ids_without_a_host_segment() {
+        assert_eq!(host_uuid_from_spiffe_id("spiffe://ferrogate.test/cmis"), None);
+        assert_eq!(host_uuid_from_spiffe_id("spiffe://ferrogate.test/host/"), None);
+        assert_eq!(host_uuid_from_spiffe_id(""), None);
+    }
 }

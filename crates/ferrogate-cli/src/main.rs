@@ -27,6 +27,8 @@
 
 #![forbid(unsafe_code)]
 
+mod allowlist;
+
 use ferro_crypto::pin::SpkiPin;
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
 use ferro_proto::v1::{
@@ -53,6 +55,8 @@ fn usage() -> &'static str {
      \x20 revoke-svid <cert_sha> [reason]  revoke one SVID by lowercase-hex SHA-384\n\
      \x20 revoke-host <spiffe_id> [reason] revoke every SVID + child token for a host\n\
      \x20 bump-epoch [reason]              advance the RIM policy epoch (mass re-attest)\n\
+     \x20 allowlist <subcommand> ...       manage per-host signed caller allowlists\n\
+     \x20                                  (run `ferrogate allowlist help` for details)\n\
      \n\
      options:\n\
      \x20 --endpoint <url>   CMIS gRPC endpoint (default http://127.0.0.1:8443,\n\
@@ -97,11 +101,18 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // `allowlist` help works without a connection, so short-circuit before the
+    // dial when the operator only wants the subcommand reference.
+    if command == "allowlist" && matches!(rest.first().map(String::as_str), None | Some("help" | "-h" | "--help")) {
+        println!("{}", allowlist::usage());
+        return Ok(());
+    }
+
     // Reject an unknown command before dialing CMIS, so a typo gives a usage
     // error rather than a connection failure.
     if !matches!(
         command.as_str(),
-        "status" | "list-svids" | "revoke-svid" | "revoke-host" | "bump-epoch"
+        "status" | "list-svids" | "revoke-svid" | "revoke-host" | "bump-epoch" | "allowlist"
     ) {
         anyhow::bail!("unknown command: {command}\n\n{}", usage());
     }
@@ -114,6 +125,12 @@ async fn run() -> anyhow::Result<()> {
         "revoke-svid" => revoke_svid(&mut client, rest).await,
         "revoke-host" => revoke_host(&mut client, rest).await,
         "bump-epoch" => bump_epoch(&mut client, rest).await,
+        "allowlist" => {
+            let (sub, sub_args) = rest
+                .split_first()
+                .expect("allowlist with no subcommand handled above");
+            allowlist::run(&mut client, sub, sub_args).await
+        }
         _ => unreachable!("command validated above"),
     }
 }

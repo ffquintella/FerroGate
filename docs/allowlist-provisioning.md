@@ -37,8 +37,10 @@ issuer composite key                   mia setup
    GetEnrollmentKey RPC  ───────────────►  writes allowlist.key
    (public key, concat bytes)                  (CompositePublicKey concat bytes)
                                                │
-   (allowlist body, today out of band) ───►  allowlist.path
-                                               │
+   SetAllowlist (admin: ferrogate CLI)         │
+     └─ issuer signs + stores per host         │
+   GetAllowlist RPC  ───────────────────►    allowlist.path
+   (signed CBOR body, by host UUID)             │
                                           daemon: Allowlist::load(body, key)
                                                └─ verify → permit listed callers
 ```
@@ -52,6 +54,14 @@ issuer composite key                   mia setup
   It is public key material, so no authentication is required to read it.
 - **`mia setup`** fetches it over the **SPKI-pinned** hybrid-PQC TLS channel and
   writes `allowlist.key`.
+- **The allowlist body is served by CMIS too.** An operator stores a host's
+  allowlist with `ferrogate allowlist set` (the `SetAllowlist` admin RPC): CMIS
+  stamps its trust domain + validity window, signs the entries with the issuer
+  key, and persists the signed CBOR keyed by the host's **EK-derived UUID**
+  (`ferro_svid::host_uuid_from_ek_digest`). The body is fetched with
+  `GetAllowlist` — unauthenticated, because it is integrity-protected by its
+  signature and is not secret, and keying by EK-UUID lets a host be provisioned
+  *before* it has attested (no SPIFFE id needed).
 
 ## Security implications
 
@@ -110,13 +120,47 @@ In the wizard:
    or place the file out of band.
 
 Then provide the signed allowlist body at `allowlist.path` (issued by CMIS for
-this host; see "Limitations") and restart the agent:
+this host — see "Managing allowlists" below) and restart the agent:
 
 | OS | restart |
 |----|---------|
 | Linux | `sudo systemctl restart mia` |
 | macOS | `sudo launchctl kickstart -k system/com.ferrogate.mia` |
 | Windows | `Restart-Service mia` |
+
+### Managing allowlists: the `ferrogate allowlist` commands
+
+An operator creates, edits, inspects, and removes per-host allowlists with the
+`ferrogate` CLI. CMIS does the signing — the issuer secret never leaves the
+server. A host is named by its EK-derived UUID; pass it directly with `--host`,
+or let the CLI derive it from the EK certificate (`--ek-cert <pem>`) or that
+cert's SHA-384 (`--ek-sha384 <hex>`).
+
+```console
+# Replace a host's allowlist with exactly these callers. `--bin` hashes the
+# binary for you; `--entry` takes a precomputed uid:SHA-384 pair.
+$ ferrogate allowlist set --host <uuid> --bin 1000:/usr/bin/foo --ttl 86400
+
+# Add/remove callers in place (read-modify-write, re-signed by CMIS):
+$ ferrogate allowlist add    --host <uuid> --entry 1001:<sha384hex>
+$ ferrogate allowlist remove --host <uuid> --uid 1001
+
+# Inspect:
+$ ferrogate allowlist show <…> --host <uuid>   # decoded entries + validity
+$ ferrogate allowlist list                     # every provisioned host
+
+# Retrieve the raw signed CBOR to place at a host's allowlist.path, then delete:
+$ ferrogate allowlist get --host <uuid> --out allowlist.cbor
+$ ferrogate allowlist delete --host <uuid>
+```
+
+A MIA host can also fetch its own body automatically instead of having it
+delivered out of band: set **`allowlist.fetch = true`** (or
+`FERROGATE_ALLOWLIST_FETCH=true`, or answer the `mia setup` prompt). At each
+start — once attestation has supplied the host's identity — the daemon calls
+`GetAllowlist` keyed by its own EK-derived UUID and writes `allowlist.path`
+before loading it. A fetch failure is non-fatal: the daemon falls back to
+whatever is already at `path` (or fails closed if nothing is).
 
 ### Verifying
 
@@ -140,13 +184,24 @@ any integrity-preserving channel is fine.
 | `allowlist verification failed: expired` / `too old` | `not_after` passed, or older than `max_age_secs` | Re-issue a fresh allowlist; check clock skew |
 | fetch fails with a TLS/pin error | wrong or missing SPKI pin, unreachable endpoint | Re-verify the pin out of band; confirm the endpoint |
 
+## Storage & authorization
+
+- **Persistence.** CMIS stores allowlists in the same backend as issued SVIDs:
+  a process-local map on a single replica, or the Raft-replicated
+  `host_allowlists` keyspace on a clustered deployment (strongly-consistent
+  reads, so a follower never serves a stale body after a leader upsert).
+- **Validity.** `SetAllowlist` stamps `issued_at = now` and
+  `not_after = now + ttl` (default one day, capped at 30 days). Re-issue rather
+  than mint long-lived lists so the MIA's freshness check stays meaningful.
+- **Admin authorization.** `SetAllowlist`/`DeleteAllowlist`/`ListAllowlists` are
+  admin RPCs, authenticated out of band as operator actions exactly like
+  `RevokeSvid`/`BumpEpoch` (transport-level: SPKI-pinned TLS + network/proxy
+  controls). `GetAllowlist` is deliberately unauthenticated. Every set/delete is
+  recorded in the audit log (`AllowlistSet`/`AllowlistDeleted`, host UUID + entry
+  count only — no PII).
+
 ## Limitations (current)
 
-- **The allowlist *body* is not yet served by CMIS.** `GetEnrollmentKey`
-  provisions the verification key; the signed allowlist itself is provisioned
-  out of band today. Serving it from CMIS needs a per-host allowlist store and an
-  operator admin path, and must resolve how a host identifies itself *before*
-  attestation has assigned it a SPIFFE ID. Tracked as future work.
 - **No dedicated enrollment key.** The issuer key doubles as the allowlist
   signer (safe via context separation); a separate, independently-rotatable
   enrollment key is a possible future hardening.

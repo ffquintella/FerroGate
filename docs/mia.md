@@ -163,6 +163,7 @@ socket_mode = "660"
 path = "/etc/ferrogate/allowlist.cbor"
 key  = "/etc/ferrogate/allowlist.pub"
 max_age_secs = 86400
+fetch = false   # fetch this host's allowlist from CMIS at startup and write `path`
 
 [attestation]
 ima_log = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements"
@@ -181,6 +182,7 @@ Each key has an environment-variable equivalent that overrides it:
 | `allowlist.path` | `FERROGATE_ALLOWLIST` |
 | `allowlist.key` | `FERROGATE_ALLOWLIST_KEY` |
 | `allowlist.max_age_secs` | `FERROGATE_ALLOWLIST_MAX_AGE_SECS` |
+| `allowlist.fetch` | `FERROGATE_ALLOWLIST_FETCH` |
 | `attestation.ima_log` | `FERROGATE_IMA_LOG` |
 
 ### `mia setup` — interactive wizard
@@ -213,8 +215,14 @@ the wizard offers to **fetch the enrollment public key from CMIS** (the
 `GetEnrollmentKey` RPC, over the pinned hybrid-PQC TLS channel) and write it to
 your `allowlist.key`. This is the key that signs the allowlist, so the agent can
 verify it. The signed allowlist *body* itself (the CBOR at `allowlist.path`) is
-issued by CMIS per host and must still be provided out of band today — serving
-it from CMIS is planned (it needs a per-host allowlist store and an admin path).
+also issued and served by CMIS per host: an operator stores it with
+`ferrogate allowlist set` and the body is fetched with the `GetAllowlist` RPC,
+keyed by the host's EK-derived UUID. The wizard additionally offers to enable
+**`allowlist.fetch`** — when set, the daemon pulls this host's allowlist from
+CMIS at every start (after attestation supplies its identity) and writes
+`allowlist.path` before loading, so it stays in sync without out-of-band
+delivery. See [allowlist-provisioning.md](allowlist-provisioning.md) for the full
+workflow.
 
 It requires a TTY; for unattended provisioning (configuration management),
 write the TOML file directly from the template in `crates/mia/dist/mia.toml`.

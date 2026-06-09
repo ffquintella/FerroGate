@@ -49,6 +49,12 @@
 #key = "/etc/ferrogate/allowlist.pub"
 # Maximum accepted allowlist age in seconds. Default: 86400.
 #max_age_secs = 86400
+# Fetch this host's signed allowlist from CMIS at startup (the GetAllowlist RPC,
+# keyed by the host's EK-derived UUID) and write it to `path` before loading, so
+# the on-disk artefact stays in sync with what the operator provisioned. Needs
+# cmis.endpoint + cmis.spki_pin and a successful attestation; a fetch failure is
+# non-fatal and falls back to whatever is already at `path`. Default: false.
+#fetch = false
 
 # --- Attestation ------------------------------------------------------------
 [attestation]

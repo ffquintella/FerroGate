@@ -159,6 +159,16 @@ impl Cluster {
             .await?;
         self.client
             .execute(
+                "CREATE TABLE IF NOT EXISTS host_allowlists ( \
+                    host_uuid TEXT PRIMARY KEY, \
+                    payload BLOB NOT NULL, \
+                    updated_at INTEGER NOT NULL \
+                )",
+                Vec::<hiqlite::Param>::new(),
+            )
+            .await?;
+        self.client
+            .execute(
                 "CREATE TABLE IF NOT EXISTS rim_state ( \
                     id INTEGER PRIMARY KEY CHECK (id = 1), \
                     version INTEGER NOT NULL DEFAULT 0 \
@@ -304,6 +314,70 @@ impl Cluster {
         Ok(affected > 0)
     }
 
+    /// Insert or replace one host's signed caller allowlist. Payload bytes are
+    /// opaque to the cluster — CMIS owns the CBOR `SignedAllowlist` schema.
+    pub async fn upsert_allowlist(
+        &self,
+        host_uuid: &str,
+        payload: &[u8],
+        now_unix: i64,
+    ) -> Result<(), ClusterError> {
+        self.client
+            .execute(
+                "INSERT INTO host_allowlists (host_uuid, payload, updated_at) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (host_uuid) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+                vec![
+                    Param::from(host_uuid.to_string()),
+                    Param::from(payload.to_vec()),
+                    Param::from(now_unix),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Strongly-consistent fetch of one host's allowlist payload (forces a read
+    /// through the leader, so a follower never serves a stale allowlist after a
+    /// successful upsert on the leader).
+    pub async fn fetch_allowlist_consistent(
+        &self,
+        host_uuid: &str,
+    ) -> Result<Option<Vec<u8>>, ClusterError> {
+        let rows: Vec<RawAllowlistRow> = self
+            .client
+            .query_consistent_map(
+                "SELECT host_uuid, payload, updated_at FROM host_allowlists WHERE host_uuid = $1",
+                vec![Param::from(host_uuid.to_string())],
+            )
+            .await?;
+        Ok(rows.into_iter().next().map(|r| r.payload))
+    }
+
+    /// All stored `(host_uuid, payload)` allowlist pairs.
+    pub async fn list_allowlists(&self) -> Result<Vec<(String, Vec<u8>)>, ClusterError> {
+        let rows: Vec<RawAllowlistRow> = self
+            .client
+            .query_map(
+                "SELECT host_uuid, payload, updated_at FROM host_allowlists",
+                Vec::<hiqlite::Param>::new(),
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.host_uuid, r.payload)).collect())
+    }
+
+    /// Delete one host's allowlist. Returns whether a row was removed.
+    pub async fn delete_allowlist(&self, host_uuid: &str) -> Result<bool, ClusterError> {
+        let affected = self
+            .client
+            .execute(
+                "DELETE FROM host_allowlists WHERE host_uuid = $1",
+                vec![Param::from(host_uuid.to_string())],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
     /// Current RIM policy epoch.
     pub async fn current_rim_version(&self) -> Result<u64, ClusterError> {
         let row: RimRow = self
@@ -349,6 +423,24 @@ impl<'r> From<&'r mut hiqlite::Row<'_>> for RawSvidRow {
     fn from(row: &'r mut hiqlite::Row<'_>) -> Self {
         Self {
             spiffe_id: row.get("spiffe_id"),
+            payload: row.get("payload"),
+            updated_at: row.get("updated_at"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RawAllowlistRow {
+    host_uuid: String,
+    payload: Vec<u8>,
+    #[allow(dead_code)]
+    updated_at: i64,
+}
+
+impl<'r> From<&'r mut hiqlite::Row<'_>> for RawAllowlistRow {
+    fn from(row: &'r mut hiqlite::Row<'_>) -> Self {
+        Self {
+            host_uuid: row.get("host_uuid"),
             payload: row.get("payload"),
             updated_at: row.get("updated_at"),
         }

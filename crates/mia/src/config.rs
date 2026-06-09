@@ -168,6 +168,13 @@ pub struct AllowlistConfig {
     /// Maximum accepted allowlist age in seconds; default
     /// [`DEFAULT_ALLOWLIST_MAX_AGE_SECS`].
     pub max_age_secs: Option<i64>,
+    /// When `true`, the daemon fetches this host's signed allowlist from CMIS
+    /// (the `GetAllowlist` RPC, keyed by the host's EK-derived UUID) at startup
+    /// and writes it to `path` before loading — so the on-disk artefact stays in
+    /// sync with what the operator provisioned. Requires `cmis.endpoint` +
+    /// `cmis.spki_pin` and a successful attestation; a fetch failure is
+    /// non-fatal and falls back to whatever is already at `path`.
+    pub fetch: bool,
 }
 
 /// `[attestation]` — attestation inputs.
@@ -270,6 +277,9 @@ impl Config {
                 .context("FERROGATE_ALLOWLIST_MAX_AGE_SECS is not an integer")?;
             self.allowlist.max_age_secs = Some(n);
         }
+        if let Some(v) = get("FERROGATE_ALLOWLIST_FETCH") {
+            self.allowlist.fetch = parse_bool_env("FERROGATE_ALLOWLIST_FETCH", &v)?;
+        }
         if let Some(v) = get("FERROGATE_IMA_LOG") {
             self.attestation.ima_log = Some(PathBuf::from(v));
         }
@@ -306,6 +316,16 @@ impl Config {
         self.allowlist
             .max_age_secs
             .unwrap_or(DEFAULT_ALLOWLIST_MAX_AGE_SECS)
+    }
+}
+
+/// Parse a boolean environment value, accepting the usual truthy/falsy spellings
+/// so an operator can write `1`, `true`, `yes`, or `on` (and their opposites).
+fn parse_bool_env(name: &str, raw: &str) -> anyhow::Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => anyhow::bail!("{name} must be a boolean (true/false), got `{other}`"),
     }
 }
 

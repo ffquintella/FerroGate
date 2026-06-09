@@ -149,6 +149,7 @@ struct Settings {
     allowlist: Option<String>,
     allowlist_key: Option<String>,
     allowlist_max_age: Option<String>,
+    allowlist_fetch: bool,
     ima_log: Option<String>,
 }
 
@@ -356,6 +357,21 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
             .with_validator(uint_validator)
             .prompt()?;
         s.allowlist_max_age = non_empty(age);
+
+        // Offer to keep the on-disk allowlist in sync with CMIS automatically.
+        // This happens at daemon start (after attestation supplies the host's
+        // identity), so it needs a CMIS endpoint + pin — not at setup time.
+        if s.cmis_endpoint.is_some() && s.cmis_spki_pin.is_some() {
+            s.allowlist_fetch = Confirm::new("Fetch the signed allowlist from CMIS on each start?")
+                .with_default(existing.allowlist.fetch)
+                .with_help_message(
+                    "daemon pulls this host's allowlist (by EK-UUID) and overwrites the path above",
+                )
+                .prompt()?;
+        } else {
+            // Preserve any existing setting when CMIS details are absent this run.
+            s.allowlist_fetch = existing.allowlist.fetch;
+        }
     }
 
     // ── Attestation (Linux IMA) ──────────────────────────────────────────────
@@ -612,6 +628,15 @@ fn render(s: &Settings) -> String {
         "max_age_secs",
         "86400",
     ));
+    out.push_str(
+        "# Fetch this host's allowlist from CMIS at startup (by EK-UUID) and write it\n\
+         # to `path` before loading. Needs cmis.endpoint + spki_pin. Default: false.\n",
+    );
+    if s.allowlist_fetch {
+        out.push_str("fetch = true\n");
+    } else {
+        out.push_str("#fetch = false\n");
+    }
     out.push('\n');
 
     out.push_str("[attestation]\n");

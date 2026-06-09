@@ -2,6 +2,7 @@
 
 use ferro_crypto::composite::{CompositeError, CompositePublicKey, CompositeSecretKey};
 
+use crate::allowlist::{self, AllowEntry, AllowlistDoc, AllowlistError, SignedAllowlist};
 use crate::claims::{AttestClaims, Cnf, SvidClaims};
 use crate::crl::{CrlBody, CrlError, SignedCrl};
 use crate::envelope::{self, EnvelopeError, JwsHeader};
@@ -56,6 +57,9 @@ pub enum IssueError {
     /// CRL signing failed.
     #[error("crl: {0}")]
     Crl(#[from] CrlError),
+    /// Allowlist signing/encoding failed.
+    #[error("allowlist: {0}")]
+    Allowlist(#[from] AllowlistError),
 }
 
 /// The CMIS issuance authority: a composite signing key plus the trust-domain
@@ -116,6 +120,26 @@ impl Issuer {
     /// published JWK set (feature F11).
     pub fn sign_crl(&self, body: CrlBody) -> Result<SignedCrl, IssueError> {
         Ok(SignedCrl::sign(body, self.kid.clone(), &self.secret)?)
+    }
+
+    /// Sign a caller allowlist for a host. Stamps this issuer's `trust_domain`
+    /// into the body (so it always matches the SVIDs the same key issues) and
+    /// the supplied validity window, then signs with the composite issuance key
+    /// under the allowlist domain-separation context. The MIA verifies the
+    /// result with the public half published over `GetEnrollmentKey`.
+    pub fn sign_allowlist(
+        &self,
+        entries: Vec<AllowEntry>,
+        issued_at: i64,
+        not_after: i64,
+    ) -> Result<SignedAllowlist, IssueError> {
+        let doc = AllowlistDoc {
+            trust_domain: self.trust_domain.clone(),
+            issued_at,
+            not_after,
+            entries,
+        };
+        Ok(allowlist::sign(&doc, &self.secret)?)
     }
 
     /// Mint an SVID. `now` is the reference clock in Unix seconds.

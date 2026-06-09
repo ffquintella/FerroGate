@@ -63,12 +63,24 @@ The MIA shares `ferro-crypto`, `ferro-proto`, and `ferro-audit` but not
 
 ## gRPC surface (proto3)
 
+A representative subset (the authoritative service is
+`crates/ferro-proto/proto/machine_identity.proto`):
+
 ```proto
 service MachineIdentity {
-  rpc Attest    (stream AttestRequest) returns (stream AttestResponse);
-  rpc FetchSVID (FetchRequest)         returns (SVIDBundle);
-  rpc Rotate    (RotateRequest)        returns (SVIDBundle);
-  rpc JWKS      (JWKSRequest)          returns (JWKSResponse);
+  rpc Attest           (stream AttestRequest) returns (stream AttestResponse);
+  rpc FetchSVID        (FetchRequest)         returns (SVIDBundle);
+  rpc Rotate           (RotateRequest)        returns (SVIDBundle);
+  rpc JWKS             (JWKSRequest)          returns (JWKSResponse);
+
+  // Caller-allowlist provisioning (see allowlist-provisioning.md).
+  rpc GetEnrollmentKey (GetEnrollmentKeyRequest) returns (GetEnrollmentKeyResponse);
+  rpc GetAllowlist     (GetAllowlistRequest)     returns (GetAllowlistResponse);
+  rpc SetAllowlist     (SetAllowlistRequest)     returns (SetAllowlistResponse);    // admin
+  rpc DeleteAllowlist  (DeleteAllowlistRequest)  returns (DeleteAllowlistResponse); // admin
+  rpc ListAllowlists   (ListAllowlistsRequest)   returns (ListAllowlistsResponse);  // admin
+
+  // (plus the revocation, audit-log, and health RPCs.)
 }
 ```
 
@@ -80,6 +92,11 @@ service MachineIdentity {
   interaction is needed.
 - `JWKS` carries the composite verification key set plus an extension
   `x-ferrogate-crl` containing a signed CRL delta.
+- `GetEnrollmentKey`/`GetAllowlist` are unauthenticated (public key material and
+  signature-protected allowlist bodies); `Set`/`Delete`/`ListAllowlists` are
+  admin RPCs authenticated out of band like revocation. Allowlists are keyed by
+  EK-derived host UUID and stored in the same backend as issued SVIDs (the
+  `host_allowlists` Raft keyspace when clustered).
 
 ## Configuration sketch
 

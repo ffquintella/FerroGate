@@ -19,11 +19,14 @@ workspace = true
 ferro-proto     = { path = "../ferro-proto" }
 ferro-crypto    = { path = "../ferro-crypto" }
 ferro-transport = { path = "../ferro-transport" }
+ferro-svid      = { path = "../ferro-svid" }
 
 tokio          = { workspace = true }
 tonic          = { workspace = true }
 anyhow         = { workspace = true }
 rustls-pemfile = { workspace = true }
+sha2           = { workspace = true }
+hex            = { workspace = true }
 
 [dev-dependencies]
 ferro-crypto = { path = "../ferro-crypto" }

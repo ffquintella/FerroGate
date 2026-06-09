@@ -23,13 +23,15 @@ use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
 use ferro_proto::v1::{
-    AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, BumpEpochRequest,
-    BumpEpochResponse, Challenge, ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest,
-    GetEnrollmentKeyRequest, GetEnrollmentKeyResponse, HealthRequest, HealthResponse,
-    InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest,
-    LatestSthResponse, ListSvidsRequest, ListSvidsResponse, NodeRole as ProtoNodeRole, Nonce,
-    RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest, SignedTreeHead,
-    SvidBundle, SvidSummary,
+    AllowlistSummary, AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse,
+    BumpEpochRequest, BumpEpochResponse, Challenge, ConsistencyProofRequest,
+    ConsistencyProofResponse, DeleteAllowlistRequest, DeleteAllowlistResponse, FetchRequest,
+    GetAllowlistRequest, GetAllowlistResponse, GetEnrollmentKeyRequest, GetEnrollmentKeyResponse,
+    HealthRequest, HealthResponse, InclusionProofRequest, InclusionProofResponse, JwksRequest,
+    JwksResponse, LatestSthRequest, LatestSthResponse, ListAllowlistsRequest,
+    ListAllowlistsResponse, ListSvidsRequest, ListSvidsResponse, NodeRole as ProtoNodeRole, Nonce,
+    RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest, SetAllowlistRequest,
+    SetAllowlistResponse, SignedTreeHead, SvidBundle, SvidSummary,
 };
 use ferro_raft::NodeRole;
 use ferro_svid::{
@@ -71,6 +73,15 @@ impl MachineIdentitySvc {
         })
     }
 }
+
+/// Default caller-allowlist validity when the operator does not specify a TTL
+/// (one day) — matches the MIA's default `allowlist.max_age_secs`.
+const DEFAULT_ALLOWLIST_TTL_SECS: i64 = 86_400;
+
+/// Upper bound on a caller-allowlist validity window (30 days). Operators
+/// re-issue rather than mint long-lived lists, keeping the signed artefact
+/// short enough that the MIA's freshness check stays meaningful.
+const MAX_ALLOWLIST_TTL_SECS: i64 = 30 * 86_400;
 
 /// Validate and decode a lowercase-hex `SHA-384` (96 hex chars ⇒ 48 bytes).
 #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
@@ -608,6 +619,140 @@ impl MachineIdentity for MachineIdentitySvc {
         // context, so reuse is safe). Publish the public half as concat bytes.
         let public_key = self.state.issuer.public_key().to_concat_bytes();
         Ok(Response::new(GetEnrollmentKeyResponse { public_key }))
+    }
+
+    async fn get_allowlist(
+        &self,
+        request: Request<GetAllowlistRequest>,
+    ) -> Result<Response<GetAllowlistResponse>, Status> {
+        let host_uuid = request.into_inner().host_uuid;
+        if host_uuid.trim().is_empty() {
+            return Err(Status::invalid_argument("empty host_uuid"));
+        }
+        // Unauthenticated by design: the body is integrity-protected by its
+        // signature and is not secret. Absent ⇒ empty bytes, not an error, so a
+        // host can poll before one is provisioned.
+        let signed_allowlist = self.state.get_allowlist(&host_uuid).await.unwrap_or_default();
+        Ok(Response::new(GetAllowlistResponse { signed_allowlist }))
+    }
+
+    async fn set_allowlist(
+        &self,
+        request: Request<SetAllowlistRequest>,
+    ) -> Result<Response<SetAllowlistResponse>, Status> {
+        let req = request.into_inner();
+        let now = unix_now();
+
+        if req.host_uuid.trim().is_empty() {
+            return Err(Status::invalid_argument("empty host_uuid"));
+        }
+        // Validate every entry up front so a malformed list never reaches the
+        // signer (and the MIA later rejects nothing it could have caught here).
+        let mut entries = Vec::with_capacity(req.entries.len());
+        for e in &req.entries {
+            // Reuse the 96-hex-char SHA-384 check; the MIA decodes `bin_sha`
+            // exactly the same way.
+            parse_cert_sha(&e.bin_sha)
+                .map_err(|_| Status::invalid_argument("entry bin_sha must be hex SHA-384"))?;
+            entries.push(ferro_svid::AllowEntry {
+                uid: e.uid,
+                bin_sha: e.bin_sha.trim().to_string(),
+            });
+        }
+
+        // Clamp the validity window to something sane; 0 ⇒ a default day.
+        let ttl = if req.ttl_secs <= 0 {
+            DEFAULT_ALLOWLIST_TTL_SECS
+        } else {
+            req.ttl_secs.min(MAX_ALLOWLIST_TTL_SECS)
+        };
+        let not_after = now.saturating_add(ttl);
+        let entry_count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+
+        let signed = self
+            .state
+            .issuer
+            .sign_allowlist(entries, now, not_after)
+            .map_err(|e| {
+                tracing::error!(error = %e, "allowlist signing failed");
+                Status::internal("allowlist signing failed")
+            })?;
+        let bytes = ferro_svid::allowlist::encode(&signed).map_err(|e| {
+            tracing::error!(error = %e, "allowlist encode failed");
+            Status::internal("allowlist encode failed")
+        })?;
+
+        self.state.put_allowlist(&req.host_uuid, bytes, now).await;
+        audit_record(
+            &self.state,
+            AuditEvent::AllowlistSet {
+                host_uuid: req.host_uuid.clone(),
+                entry_count,
+                not_after,
+            },
+            now,
+        );
+        tracing::info!(host_uuid = %req.host_uuid, entry_count, not_after, "allowlist set");
+        Ok(Response::new(SetAllowlistResponse {
+            issued_at: now,
+            not_after,
+        }))
+    }
+
+    async fn delete_allowlist(
+        &self,
+        request: Request<DeleteAllowlistRequest>,
+    ) -> Result<Response<DeleteAllowlistResponse>, Status> {
+        let host_uuid = request.into_inner().host_uuid;
+        if host_uuid.trim().is_empty() {
+            return Err(Status::invalid_argument("empty host_uuid"));
+        }
+        let existed = self.state.delete_allowlist(&host_uuid).await;
+        if existed {
+            let now = unix_now();
+            audit_record(
+                &self.state,
+                AuditEvent::AllowlistDeleted {
+                    host_uuid: host_uuid.clone(),
+                },
+                now,
+            );
+            tracing::info!(%host_uuid, "allowlist deleted");
+        }
+        Ok(Response::new(DeleteAllowlistResponse { existed }))
+    }
+
+    async fn list_allowlists(
+        &self,
+        _request: Request<ListAllowlistsRequest>,
+    ) -> Result<Response<ListAllowlistsResponse>, Status> {
+        let items = self
+            .state
+            .list_allowlists()
+            .await
+            .into_iter()
+            .filter_map(|(host_uuid, bytes)| {
+                // Decode for metadata only — this is our own stored, already
+                // signed artefact, so a re-verify here would be redundant. A row
+                // that fails to decode is logged and skipped, never failing the
+                // whole listing (mirrors `list_svids`).
+                match ferro_svid::allowlist::decode(&bytes)
+                    .and_then(|s| ferro_svid::allowlist::decode_body(&s.body))
+                {
+                    Ok(doc) => Some(AllowlistSummary {
+                        host_uuid,
+                        issued_at: doc.issued_at,
+                        not_after: doc.not_after,
+                        entry_count: u32::try_from(doc.entries.len()).unwrap_or(u32::MAX),
+                    }),
+                    Err(e) => {
+                        tracing::error!(error = %e, %host_uuid, "stored allowlist failed to decode");
+                        None
+                    }
+                }
+            })
+            .collect();
+        Ok(Response::new(ListAllowlistsResponse { items }))
     }
 
     async fn revoke_svid(

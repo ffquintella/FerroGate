@@ -118,6 +118,12 @@ pub struct CmisState {
     /// the pin through the Raft store so every replica enforces the same binding
     /// is a documented deployment seam.
     host_key_pins: Mutex<HashMap<[u8; 48], Vec<u8>>>,
+    /// Per-host signed caller allowlists, keyed by EK-derived host UUID. Used by
+    /// the `Backend::Local` arm only; clustered deployments replicate them
+    /// through the `host_allowlists` Raft keyspace instead (see
+    /// [`CmisState::put_allowlist`]). The stored value is the opaque CBOR
+    /// `SignedAllowlist` the issuer minted.
+    allowlists_local: Mutex<HashMap<String, Vec<u8>>>,
     backend: Backend,
 }
 
@@ -171,6 +177,7 @@ impl CmisState {
             published_crl: RwLock::new(None),
             fleet: FleetStore::unenforced(),
             host_key_pins: Mutex::new(HashMap::new()),
+            allowlists_local: Mutex::new(HashMap::new()),
             backend: Backend::Local(Mutex::new(HashMap::new())),
         }
     }
@@ -200,6 +207,7 @@ impl CmisState {
             published_crl: RwLock::new(None),
             fleet: FleetStore::unenforced(),
             host_key_pins: Mutex::new(HashMap::new()),
+            allowlists_local: Mutex::new(HashMap::new()),
             backend: Backend::Cluster(cluster),
         }
     }
@@ -505,6 +513,74 @@ impl CmisState {
                     self.record(rec).await;
                 }
             }
+        }
+    }
+
+    /// Store or replace a host's signed caller allowlist, keyed by its
+    /// EK-derived host UUID. `signed_bytes` is the opaque CBOR `SignedAllowlist`
+    /// the issuer minted; the cluster (or local map) treats it as a blob.
+    pub async fn put_allowlist(&self, host_uuid: &str, signed_bytes: Vec<u8>, now: i64) {
+        match &self.backend {
+            Backend::Local(_) => {
+                self.allowlists_local
+                    .lock()
+                    .insert(host_uuid.to_string(), signed_bytes);
+            }
+            Backend::Cluster(c) => {
+                if let Err(e) = c.upsert_allowlist(host_uuid, &signed_bytes, now).await {
+                    tracing::error!(error = %e, %host_uuid, "cluster allowlist upsert failed");
+                }
+            }
+        }
+    }
+
+    /// Fetch a host's stored signed allowlist bytes, if any. Cluster reads are
+    /// strongly-consistent, mirroring [`CmisState::lookup`].
+    pub async fn get_allowlist(&self, host_uuid: &str) -> Option<Vec<u8>> {
+        match &self.backend {
+            Backend::Local(_) => self.allowlists_local.lock().get(host_uuid).cloned(),
+            Backend::Cluster(c) => match c.fetch_allowlist_consistent(host_uuid).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::error!(error = %e, %host_uuid, "cluster allowlist fetch failed");
+                    None
+                }
+            },
+        }
+    }
+
+    /// Delete a host's stored allowlist. Returns whether one existed.
+    pub async fn delete_allowlist(&self, host_uuid: &str) -> bool {
+        match &self.backend {
+            Backend::Local(_) => self.allowlists_local.lock().remove(host_uuid).is_some(),
+            Backend::Cluster(c) => match c.delete_allowlist(host_uuid).await {
+                Ok(existed) => existed,
+                Err(e) => {
+                    tracing::error!(error = %e, %host_uuid, "cluster allowlist delete failed");
+                    false
+                }
+            },
+        }
+    }
+
+    /// Enumerate every stored `(host_uuid, signed_bytes)` allowlist. Mirrors
+    /// [`CmisState::list_svids`]: the local map on a single replica, the full
+    /// replicated set on a cluster.
+    pub async fn list_allowlists(&self) -> Vec<(String, Vec<u8>)> {
+        match &self.backend {
+            Backend::Local(_) => self
+                .allowlists_local
+                .lock()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Backend::Cluster(c) => match c.list_allowlists().await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(error = %e, "cluster list_allowlists failed");
+                    Vec::new()
+                }
+            },
         }
     }
 

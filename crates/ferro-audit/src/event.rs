@@ -84,6 +84,20 @@ pub enum AuditEvent {
         /// Short, stable opcode for why (e.g. `"rim-policy-change"`).
         reason: String,
     },
+    /// A host's signed caller allowlist was stored or replaced (admin RPC).
+    AllowlistSet {
+        /// EK-derived host UUID the allowlist is keyed by.
+        host_uuid: String,
+        /// Number of permitted callers in the new allowlist.
+        entry_count: u32,
+        /// Hard expiry CMIS stamped, Unix seconds.
+        not_after: i64,
+    },
+    /// A host's stored allowlist was deleted (admin RPC).
+    AllowlistDeleted {
+        /// EK-derived host UUID whose allowlist was removed.
+        host_uuid: String,
+    },
     /// A threshold key share was used to reconstruct the issuance key.
     KeyShareUsed {
         /// Which share (0..=4 in the 3-of-5 scheme).

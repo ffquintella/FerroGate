@@ -26,8 +26,10 @@ caller's identity from kernel-attested sources:
 3. It cross-checks `bin_sha` against the IMA runtime measurement log at
    `/sys/kernel/security/ima/binary_runtime_measurements`. IMA is
    kernel-enforced and cannot be forged from userspace.
-4. The pair `(uid, bin_sha)` is looked up in the host allowlist. The
-   allowlist is signed by CMIS at host enrollment; the MIA verifies the
+4. The pair `(uid, bin_sha)` is looked up in the host allowlist. The allowlist
+   is signed and served by CMIS, keyed by the host's EK-derived UUID (the
+   `GetAllowlist` RPC; provisioned with `ferrogate allowlist set` — see
+   [allowlist-provisioning.md](allowlist-provisioning.md)); the MIA verifies the
    signature before each access and **fails closed** — any decode, signature,
    or freshness failure leaves no usable allowlist, so every caller is denied.
 

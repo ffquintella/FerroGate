@@ -33,6 +33,30 @@ service MachineIdentity {
   // allowlist it later loads. Unauthenticated: this is public key material.
   rpc GetEnrollmentKey (GetEnrollmentKeyRequest) returns (GetEnrollmentKeyResponse);
 
+  // ---- Caller allowlists ----
+
+  // Fetch the signed caller allowlist for a host, keyed by its EK-derived host
+  // UUID (`ferro_svid::host_uuid_from_ek_digest`). Returns the CBOR
+  // `SignedAllowlist` bytes, or empty when none is stored. Unauthenticated: the
+  // body is integrity-protected by its signature and is not secret, and a host
+  // can be provisioned before it has attested (no SPIFFE id required).
+  rpc GetAllowlist (GetAllowlistRequest) returns (GetAllowlistResponse);
+
+  // Admin RPC: store or replace the caller allowlist for a host. CMIS stamps
+  // the issuer trust domain and the validity window, signs the supplied entries
+  // with the enrollment key (context `ferrogate-allowlist-v1`), and persists the
+  // signed body. Authenticated out of band as an operator action.
+  rpc SetAllowlist (SetAllowlistRequest) returns (SetAllowlistResponse);
+
+  // Admin RPC: delete a host's stored allowlist. Authenticated out of band as an
+  // operator action.
+  rpc DeleteAllowlist (DeleteAllowlistRequest) returns (DeleteAllowlistResponse);
+
+  // Admin RPC: enumerate the host UUIDs that have a stored allowlist, with
+  // validity and entry-count metadata. Authenticated out of band as an operator
+  // action.
+  rpc ListAllowlists (ListAllowlistsRequest) returns (ListAllowlistsResponse);
+
   // ---- Revocation (F11) ----
 
   // Admin RPC: revoke a single SVID by the lowercase-hex SHA-384 of its compact
@@ -205,6 +229,58 @@ message GetEnrollmentKeyResponse {
   // The CMIS enrollment public key as composite concat bytes
   // (ed25519 || ml-dsa-65), i.e. `CompositePublicKey::from_concat_bytes`.
   bytes public_key = 1;
+}
+
+// ---- Caller allowlists -------------------------------------------------
+
+// One permitted caller: a uid plus the lowercase-hex SHA-384 of its binary.
+// Mirrors `ferro_svid::allowlist::AllowEntry`.
+message AllowEntryMsg {
+  uint32 uid = 1;
+  string bin_sha = 2; // lowercase hex SHA-384 (96 chars)
+}
+
+message GetAllowlistRequest {
+  string host_uuid = 1; // EK-derived host UUID
+}
+
+message GetAllowlistResponse {
+  // CBOR `SignedAllowlist` bytes, or empty when no allowlist is stored.
+  bytes signed_allowlist = 1;
+}
+
+message SetAllowlistRequest {
+  string host_uuid = 1;              // EK-derived host UUID
+  repeated AllowEntryMsg entries = 2; // permitted callers
+  int64 ttl_secs = 3;                // validity window; CMIS stamps issued_at/not_after
+}
+
+message SetAllowlistResponse {
+  int64 issued_at = 1; // unix seconds CMIS stamped
+  int64 not_after = 2; // unix seconds CMIS stamped
+}
+
+message DeleteAllowlistRequest {
+  string host_uuid = 1;
+}
+
+message DeleteAllowlistResponse {
+  bool existed = 1; // whether a stored allowlist was removed
+}
+
+message ListAllowlistsRequest {}
+
+// Compact view of one stored allowlist — never re-derives membership, just
+// enough for an operator to see what is provisioned.
+message AllowlistSummary {
+  string host_uuid = 1;
+  int64 issued_at = 2;
+  int64 not_after = 3;
+  uint32 entry_count = 4;
+}
+
+message ListAllowlistsResponse {
+  repeated AllowlistSummary items = 1;
 }
 
 // ---- Revocation (F11) --------------------------------------------------
