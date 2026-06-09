@@ -208,9 +208,20 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
         .as_deref()
         .is_some_and(|e| e.starts_with("https://"))
     {
+        println!(
+            "  The SPKI pin authenticates the CMIS server by its public key — the\n\
+             \x20 SHA-384 of the certificate's SubjectPublicKeyInfo, pinned directly\n\
+             \x20 rather than trusted via a CA chain. Ask your CMIS operator for it,\n\
+             \x20 or compute it from the deployed server certificate:\n\
+             \x20   openssl x509 -in cmis.crt -pubkey -noout \\\n\
+             \x20     | openssl pkey -pubin -outform der \\\n\
+             \x20     | openssl dgst -sha384 -binary | xxd -p -c 256\n\
+             \x20 (see docs/transport-tls.md). Required here so this host can fetch\n\
+             \x20 keys from CMIS over the pinned TLS channel."
+        );
         let pin = Text::new("CMIS SPKI pin (lowercase-hex SHA-384):")
             .with_default(existing.cmis.spki_pin.as_deref().unwrap_or_default())
-            .with_help_message("the ferrogate CLI prints/derives this; needed to fetch keys here")
+            .with_help_message("96 hex chars; pins the CMIS TLS cert by public key, not by CA")
             .with_validator(|input: &str| {
                 let t = input.trim();
                 if t.is_empty() || SpkiPin::from_hex(t).is_ok() {
@@ -279,6 +290,17 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
 
     // ── Allowlist ────────────────────────────────────────────────────────────
     println!("\n— Caller allowlist (signed list of vetted local callers) —");
+    println!(
+        "  The helper API mints child tokens only for callers named on this list;\n\
+         \x20 with no allowlist configured it fails closed and denies everyone. The\n\
+         \x20 list is a CBOR document that CMIS issues per host and signs with its\n\
+         \x20 enrollment key. You provide two files:\n\
+         \x20   • path — the signed allowlist body (supplied out of band today;\n\
+         \x20     ask your CMIS operator for this host's allowlist)\n\
+         \x20   • key  — the CMIS enrollment public key that signed it, so the\n\
+         \x20     agent can verify the signature (the wizard can fetch this for you\n\
+         \x20     below if you gave a CMIS endpoint + SPKI pin above)."
+    );
     let configure_allowlist = Confirm::new("Configure a signed caller allowlist?")
         .with_default(existing.allowlist.path.is_some())
         .with_help_message("absent ⇒ the helper API denies every caller (fail closed)")
@@ -289,6 +311,7 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
                 existing.allowlist.path.as_deref(),
                 dist_sibling("allowlist.cbor"),
             ))
+            .with_help_message("the signed list CMIS issued for this host (place it here)")
             .prompt()?;
         s.allowlist = non_empty(path);
 
@@ -297,6 +320,7 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
                 existing.allowlist.key.as_deref(),
                 dist_sibling("allowlist.pub"),
             ))
+            .with_help_message("public key that verifies the allowlist signature")
             .prompt()?;
         s.allowlist_key = non_empty(key);
 
