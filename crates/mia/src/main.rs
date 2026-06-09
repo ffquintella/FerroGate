@@ -27,6 +27,9 @@
 //!   enables the helper API. Absent ⇒ the daemon logs a banner and exits.
 //! - `FERROGATE_HELPER_SOCKET_MODE` (`helper.socket_mode`) — octal socket mode
 //!   (default `660`).
+//! - `FERROGATE_HELPER_SOCKET_GID` (`helper.socket_gid`) — numeric gid to own
+//!   the socket so that group's members may open it (Unix only; set by
+//!   `make mia-install` to the dedicated FerroGate group).
 //! - `FERROGATE_ALLOWLIST` (`allowlist.path`) — path to the signed CBOR
 //!   allowlist. Absent ⇒ the API denies every caller (fail closed).
 //! - `FERROGATE_ALLOWLIST_KEY` (`allowlist.key`) — path to the trusted CMIS
@@ -627,7 +630,7 @@ where
         // `socket_mode`/`socket_gid` are Unix-only; `windows_group` is
         // Windows-only. Each transport ignores the fields that don't apply.
         socket_mode: config.socket_mode()?,
-        socket_gid: None,
+        socket_gid: config.socket_gid()?,
         windows_group: config.helper.windows_group.clone(),
         max_concurrent: 64,
         read_timeout: Duration::from_secs(5),

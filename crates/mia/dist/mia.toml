@@ -37,6 +37,12 @@
 #socket = "/run/ferrogate/mia.sock"
 # Unix only. Octal socket mode (as a string). Default: "660".
 #socket_mode = "660"
+# Unix only. Numeric gid that owns the socket; members of that group may open
+# it (with the default 0660 mode). `make mia-install` creates a dedicated
+# FerroGate group and sets this via FERROGATE_HELPER_SOCKET_GID, so you don't
+# normally set it here. A group *name* is not accepted (the daemon is
+# unsafe-free and won't call getgrnam); use the numeric gid.
+#socket_gid = "555"
 # Windows only. Local group whose members may open the pipe (blank => default
 # pipe DACL).
 #windows_group = "FerroGateClients"

@@ -201,15 +201,18 @@ ifneq (,$(filter MINGW% MSYS% CYGWIN% Windows%,$(UNAME_S)))
   BINDIR  := $(PREFIX)
   MIA_BIN := mia.exe
 else ifeq ($(UNAME_S),Darwin)
-  MIA_OS  := macos
-  PREFIX  ?= /usr/local
-  BINDIR  := $(PREFIX)/bin
-  MIA_BIN := mia
+  MIA_OS    := macos
+  PREFIX    ?= /usr/local
+  BINDIR    := $(PREFIX)/bin
+  MIA_BIN   := mia
+  # macOS service-account groups conventionally carry a leading underscore.
+  MIA_GROUP := _ferrogate
 else
-  MIA_OS  := linux
-  PREFIX  ?= /usr/local
-  BINDIR  := $(PREFIX)/bin
-  MIA_BIN := mia
+  MIA_OS    := linux
+  PREFIX    ?= /usr/local
+  BINDIR    := $(PREFIX)/bin
+  MIA_BIN   := mia
+  MIA_GROUP := ferrogate
 endif
 
 mia-install: ## Compile mia in release mode, install it, and register the OS service (PREFIX=... to override)
@@ -242,12 +245,17 @@ endif
 ifeq ($(MIA_OS),macos)
 	@echo "==> registering launchd daemon $(MIA_LABEL)"
 	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
-	  $$SUDO sh -c "sed 's|<string>/usr/local/bin/mia</string>|<string>$(BINDIR)/$(MIA_BIN)</string>|' $(MIA_DIST)/$(MIA_LABEL).plist > /Library/LaunchDaemons/$(MIA_LABEL).plist"; \
-	  $$SUDO chmod 0644 /Library/LaunchDaemons/$(MIA_LABEL).plist; \
+	  DEST=/Library/LaunchDaemons/$(MIA_LABEL).plist; \
+	  GID=$$( $$SUDO ./scripts/ferrogate-group.sh $(MIA_GROUP) ); \
+	  $$SUDO sh -c "sed 's|<string>/usr/local/bin/mia</string>|<string>$(BINDIR)/$(MIA_BIN)</string>|' $(MIA_DIST)/$(MIA_LABEL).plist > $$DEST"; \
+	  $$SUDO chmod 0644 $$DEST; \
+	  $$SUDO /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:FERROGATE_HELPER_SOCKET_GID string $$GID" $$DEST 2>/dev/null \
+	    || $$SUDO /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:FERROGATE_HELPER_SOCKET_GID $$GID" $$DEST; \
 	  $$SUDO mkdir -p /var/run/ferrogate /var/log/ferrogate; \
-	  $$SUDO launchctl bootout system /Library/LaunchDaemons/$(MIA_LABEL).plist 2>/dev/null || true; \
-	  $$SUDO launchctl bootstrap system /Library/LaunchDaemons/$(MIA_LABEL).plist; \
-	  $$SUDO launchctl kickstart -k system/$(MIA_LABEL)
+	  $$SUDO launchctl bootout system $$DEST 2>/dev/null || true; \
+	  $$SUDO launchctl bootstrap system $$DEST; \
+	  $$SUDO launchctl kickstart -k system/$(MIA_LABEL); \
+	  echo "==> helper socket will be owned by group $(MIA_GROUP) (gid $$GID), mode 0660"
 	@echo "==> launchd job $(MIA_LABEL) loaded and started"
 	@echo "    Configure it with: sudo mia setup   (writes the system TOML the daemon reads)"
 	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
@@ -255,11 +263,16 @@ endif
 ifeq ($(MIA_OS),linux)
 	@echo "==> installing systemd unit mia.service"
 	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  GID=$$( $$SUDO ./scripts/ferrogate-group.sh $(MIA_GROUP) ); \
 	  $$SUDO sh -c "sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/$(MIA_BIN)|' $(MIA_DIST)/mia.service > /etc/systemd/system/mia.service"; \
 	  $$SUDO chmod 0644 /etc/systemd/system/mia.service; \
+	  $$SUDO mkdir -p /etc/systemd/system/mia.service.d; \
+	  printf '[Service]\nEnvironment=FERROGATE_HELPER_SOCKET_GID=%s\n# 0755 so group members can traverse /run/ferrogate to the 0660 socket.\nRuntimeDirectoryMode=0755\n' "$$GID" \
+	    | $$SUDO tee /etc/systemd/system/mia.service.d/10-helper-group.conf >/dev/null; \
 	  $$SUDO systemctl daemon-reload; \
 	  $$SUDO systemctl enable --now mia.service \
-	    || echo "   (enable failed — configure /etc/ferrogate then: sudo systemctl enable --now mia)"
+	    || echo "   (enable failed — configure /etc/ferrogate then: sudo systemctl enable --now mia)"; \
+	  echo "==> helper socket will be owned by group $(MIA_GROUP) (gid $$GID), mode 0660"
 	@echo "==> systemd unit mia.service installed"
 	@echo "    Configure it with: sudo mia setup   (writes the system TOML the daemon reads)"
 	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
@@ -286,6 +299,7 @@ else
 	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
 	  $$SUDO systemctl disable --now mia.service 2>/dev/null || true; \
 	  $$SUDO rm -f /etc/systemd/system/mia.service; \
+	  $$SUDO rm -rf /etc/systemd/system/mia.service.d; \
 	  $$SUDO systemctl daemon-reload 2>/dev/null || true; \
 	  $$SUDO rm -f "$(BINDIR)/$(MIA_BIN)"
 	@echo "==> removed systemd unit and $(BINDIR)/$(MIA_BIN)"

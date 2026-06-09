@@ -155,6 +155,14 @@ pub struct HelperConfig {
     /// **Unix only.** Octal socket mode as a string (e.g. `"660"`); default
     /// [`DEFAULT_SOCKET_MODE`].
     pub socket_mode: Option<String>,
+    /// **Unix only.** Numeric gid to `chown` the socket to, as a string (e.g.
+    /// `"555"`). Members of that group may then open the socket (with the
+    /// default `0o660` mode). `None`/blank ⇒ the socket keeps the daemon's
+    /// primary group. A *group name* is intentionally not accepted here:
+    /// resolving one needs `getgrnam`, and `mia` is `#![forbid(unsafe_code)]`,
+    /// so the installer resolves the FerroGate group name to its gid and passes
+    /// the number (see `make mia-install`).
+    pub socket_gid: Option<String>,
     /// **Windows only.** Local group whose members may open the pipe (e.g.
     /// `FerroGateClients`). `None` ⇒ the pipe's default DACL applies.
     pub windows_group: Option<String>,
@@ -276,6 +284,9 @@ impl Config {
         if let Some(v) = get("FERROGATE_HELPER_SOCKET_MODE") {
             self.helper.socket_mode = Some(v);
         }
+        if let Some(v) = get("FERROGATE_HELPER_SOCKET_GID") {
+            self.helper.socket_gid = Some(v);
+        }
         if let Some(v) = get("FERROGATE_HELPER_WINDOWS_GROUP") {
             self.helper.windows_group = Some(v);
         }
@@ -329,6 +340,19 @@ impl Config {
             Some(s) => u32::from_str_radix(s.trim().trim_start_matches("0o"), 8)
                 .with_context(|| format!("helper.socket_mode {s:?} is not an octal mode")),
             None => Ok(DEFAULT_SOCKET_MODE),
+        }
+    }
+
+    /// The gid to `chown` the helper socket to, parsed from `helper.socket_gid`.
+    /// A blank value is treated as unset. `None` ⇒ leave the socket's group as
+    /// the daemon's primary group.
+    pub fn socket_gid(&self) -> anyhow::Result<Option<u32>> {
+        match self.helper.socket_gid.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(s) => s
+                .parse::<u32>()
+                .map(Some)
+                .with_context(|| format!("helper.socket_gid {s:?} is not a numeric gid")),
         }
     }
 
@@ -498,6 +522,31 @@ mod tests {
     fn bad_octal_socket_mode_errors() {
         let c = Config::from_toml("[helper]\nsocket_mode = \"999\"").unwrap();
         assert!(c.socket_mode().is_err());
+    }
+
+    #[test]
+    fn socket_gid_parses_and_defaults() {
+        // Unset ⇒ None.
+        assert_eq!(Config::default().socket_gid().unwrap(), None);
+        // Numeric ⇒ Some(gid).
+        let c = Config::from_toml("[helper]\nsocket_gid = \"555\"").unwrap();
+        assert_eq!(c.socket_gid().unwrap(), Some(555));
+        // Blank ⇒ treated as unset.
+        let c = Config::from_toml("[helper]\nsocket_gid = \"  \"").unwrap();
+        assert_eq!(c.socket_gid().unwrap(), None);
+        // Non-numeric (e.g. a group name) is rejected — the installer resolves
+        // names to gids, the daemon only accepts the number.
+        let c = Config::from_toml("[helper]\nsocket_gid = \"_ferrogate\"").unwrap();
+        assert!(c.socket_gid().is_err());
+    }
+
+    #[test]
+    fn socket_gid_env_override() {
+        let mut c = Config::default();
+        let env: HashMap<&str, &str> = HashMap::from([("FERROGATE_HELPER_SOCKET_GID", "777")]);
+        c.apply_overrides(|k| env.get(k).map(|s| (*s).to_string()))
+            .unwrap();
+        assert_eq!(c.socket_gid().unwrap(), Some(777));
     }
 
     #[test]
