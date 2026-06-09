@@ -88,7 +88,7 @@ crosses the host boundary. See [helper-api.md](helper-api.md).
         MIA ──(gRPC/TLS :8443)─────▶ CMIS         [client → server]
    operator ──(gRPC/TLS :8443)─────▶ CMIS         [admin RPCs]
        CMIS ◀─(Raft :9443 + API)──▶ CMIS (peers)  [bidirectional mesh]
-       CMIS ──(HTTPS)─────────────▶ S3 Object-Lock, Sigsum log  [audit egress]
+       CMIS ──(HTTPS)─────────────▶ Sigsum log                  [audit egress]
 ```
 
 ## Firewall rules
@@ -108,7 +108,6 @@ crosses the host boundary. See [helper-api.md](helper-api.md).
 | Destination | Port | Purpose |
 |-------------|------|---------|
 | Other CMIS nodes | TCP `9443` + management API port | Raft mesh |
-| S3 Object-Lock (WORM) endpoint | TCP `443` | Audit log persistence |
 | Sigsum log | TCP `443` | Audit notarization |
 
 > Restrict `9443` and the management API port to the CMIS peer set (security
@@ -128,7 +127,9 @@ helper socket/pipe.
 ### Load balancer
 
 - Forward TCP `8443` to the CMIS pool with **TLS passthrough** (L4). Do not
-  terminate TLS or downgrade to HTTP/1.1.
+  terminate TLS or downgrade to HTTP/1.1. TLS is terminated on the CMIS node
+  itself (hybrid-PQC, `X25519MLKEM768`-only) — see
+  [transport-tls.md](transport-tls.md).
 - Health-check the pool via the gRPC `Health` RPC, not an HTTP path.
 
 ## Quick reference
@@ -138,5 +139,5 @@ helper socket/pipe.
 | `8443/tcp` | CMIS | MIA clients, operators | Public (behind L4 LB) |
 | `9443/tcp` | CMIS | CMIS peers only | Private |
 | *(mgmt API)/tcp* | CMIS | CMIS peers only | Private |
-| `443/tcp` (egress) | CMIS | → S3, Sigsum | Egress |
+| `443/tcp` (egress) | CMIS | → Sigsum | Egress |
 | UDS / named pipe | MIA | Local apps | Host-local, no firewall |

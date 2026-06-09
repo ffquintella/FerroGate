@@ -99,7 +99,131 @@ a policy over PCRs `{0, 4, 7, 8}`. On reboot:
 - If the unseal fails (PCR drift, lid open, kernel update), the cached SVID
   is treated as gone and a full re-attestation runs.
 
-## Configuration sketch
+## Configuration
+
+MIA reads an optional TOML **configuration file** and overlays **environment
+variables** on top. The precedence, lowest to highest, is:
+
+```
+built-in defaults  <  configuration file  <  environment variables
+```
+
+so an explicitly-set `FERROGATE_*` / `RUST_LOG` variable always overrides the
+file, and a deployment that sets everything through the systemd
+`EnvironmentFile` (`/etc/ferrogate/mia.env`) keeps working with no file present.
+
+### Supported platforms
+
+MIA runs on **Linux, macOS, and Windows**. The helper-API transport and caller
+authentication differ per OS:
+
+| OS | transport | caller authentication | hardening |
+|----|-----------|------------------------|-----------|
+| Linux | Unix domain socket | `SO_PEERCRED` + IMA cross-check | seccomp / mlockall / privilege-drop |
+| macOS | Unix domain socket | peer-cred (`LOCAL_PEERPID`) + on-disk image SHA-384 (via `libproc`) | n/a |
+| Windows | named pipe | client PID + image SHA-384 + Authenticode | n/a |
+
+The TPM attestation loop is Linux-only; on macOS/Windows MIA runs as the
+helper-API surface. The startup hardening profile applies on Linux only.
+
+### Configuration file
+
+The file is discovered in this order:
+
+1. `mia --config <path>` (must exist),
+2. `$FERROGATE_CONFIG` (if set, must exist),
+3. the OS **system path**, then the **per-user path** (each loaded if present;
+   absent ⇒ env/defaults only).
+
+Per-OS locations:
+
+| OS | system path | per-user path |
+|----|-------------|---------------|
+| Linux | `/etc/ferrogate/mia.toml` | `$XDG_CONFIG_HOME/ferrogate/mia.toml` (or `~/.config/...`) |
+| macOS | `/Library/Application Support/FerroGate/mia.toml` | `~/Library/Application Support/FerroGate/mia.toml` |
+| Windows | `%ProgramData%\FerroGate\mia.toml` | `%APPDATA%\FerroGate\mia.toml` |
+
+A malformed file — including an unknown key — fails the daemon loudly at
+startup rather than being silently ignored. The packaged template (source:
+`crates/mia/dist/mia.toml`) is installed at the system path; every value is
+commented out, so a fresh install behaves exactly as defaults until edited:
+
+```toml
+log = "info"
+
+[cmis]
+endpoint = "https://cmis.example.com:8443"
+spki_pin = "<hex-sha384>"
+
+[helper]
+socket = "/run/ferrogate/mia.sock"   # presence enables the helper API
+socket_mode = "660"
+
+[allowlist]
+path = "/etc/ferrogate/allowlist.cbor"
+key  = "/etc/ferrogate/allowlist.pub"
+max_age_secs = 86400
+
+[attestation]
+ima_log = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements"
+```
+
+Each key has an environment-variable equivalent that overrides it:
+
+| TOML key | Environment variable |
+|----------|----------------------|
+| `log` | `RUST_LOG` |
+| `cmis.endpoint` | `FERROGATE_CMIS_ENDPOINT` |
+| `cmis.spki_pin` | `FERROGATE_CMIS_SPKI_PIN` |
+| `helper.socket` | `FERROGATE_HELPER_SOCKET` |
+| `helper.socket_mode` | `FERROGATE_HELPER_SOCKET_MODE` |
+| `helper.windows_group` | `FERROGATE_HELPER_WINDOWS_GROUP` |
+| `allowlist.path` | `FERROGATE_ALLOWLIST` |
+| `allowlist.key` | `FERROGATE_ALLOWLIST_KEY` |
+| `allowlist.max_age_secs` | `FERROGATE_ALLOWLIST_MAX_AGE_SECS` |
+| `attestation.ima_log` | `FERROGATE_IMA_LOG` |
+
+### `mia setup` — interactive wizard
+
+Rather than hand-editing the env file, run the bundled wizard:
+
+```console
+$ sudo mia setup
+```
+
+`mia setup` is a rich-terminal, guided wizard (arrow keys / typed answers, with
+validation and per-field help) that walks through the agent's configuration —
+the CMIS server to connect to, the local helper API, the caller allowlist,
+attestation, and log verbosity — and writes the **TOML configuration file** in
+the documented, self-commenting form. It writes the OS **system path** by
+default (see the per-OS table above) and prompts platform-appropriately (socket
+mode on Unix, the pipe group on Windows). Run against an existing file it
+pre-fills every prompt with the current value, so it doubles as an editor.
+Options:
+
+- `-u, --user` — target the per-user config path instead of the system path
+  (no elevation needed).
+- `-o, --output <path>` — target a specific path.
+- `-c, --clean` — delete the stored configuration instead of writing one
+  (honours `--user`/`--output` to choose which file; prompts unless `--force`).
+- `-f, --force` — skip the confirmation prompt (write or clean).
+
+When you configure an allowlist *and* have supplied a CMIS endpoint + SPKI pin,
+the wizard offers to **fetch the enrollment public key from CMIS** (the
+`GetEnrollmentKey` RPC, over the pinned hybrid-PQC TLS channel) and write it to
+your `allowlist.key`. This is the key that signs the allowlist, so the agent can
+verify it. The signed allowlist *body* itself (the CBOR at `allowlist.path`) is
+issued by CMIS per host and must still be provided out of band today — serving
+it from CMIS is planned (it needs a per-host allowlist store and an admin path).
+
+It requires a TTY; for unattended provisioning (configuration management),
+write the TOML file directly from the template in `crates/mia/dist/mia.toml`.
+
+## Configuration sketch (aspirational)
+
+> Forward-looking superset showing where the schema is headed (hardening
+> toggles, multiple SPKI pins, CRL age). The authoritative, currently-honored
+> keys are the ones in **Configuration** above and in `crates/mia/dist/mia.toml`.
 
 ```toml
 [hardening]
@@ -114,6 +238,9 @@ ek_vendor_roots     = ["/etc/ferrogate/roots/infineon.pem",
 tpm_device          = "/dev/tpmrm0"
 
 [cmis]
+# Dialed over hybrid-PQC TLS via mia::client::connect_pinned. The endpoint is
+# trusted by SPKI pin, not by CA chain; compute pins with the OpenSSL recipe in
+# transport-tls.md. Multiple pins allow overlap during certificate rotation.
 endpoint            = "https://cmis.prod.ferrogate.internal:8443"
 spki_pins_sha384    = ["<pin1>", "<pin2>"]
 hybrid_tls_only     = true

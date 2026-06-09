@@ -16,8 +16,23 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-ferro-proto = { path = "../ferro-proto" }
+ferro-proto     = { path = "../ferro-proto" }
+ferro-crypto    = { path = "../ferro-crypto" }
+ferro-transport = { path = "../ferro-transport" }
 
-tokio  = { workspace = true }
-tonic  = { workspace = true }
-anyhow = { workspace = true }
+tokio          = { workspace = true }
+tonic          = { workspace = true }
+anyhow         = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+ferro-crypto = { path = "../ferro-crypto" }
+cmis         = { path = "../cmis" }
+ferro-attest = { path = "../ferro-attest" }
+ferro-audit  = { path = "../ferro-audit" }
+ferro-svid   = { path = "../ferro-svid" }
+
+rustls-pki-types = { workspace = true }
+tokio            = { workspace = true, features = ["process"] }
+tokio-stream     = { workspace = true }
+rcgen            = { workspace = true }

@@ -10,9 +10,10 @@
 //! per-leaf index assigned to a caller matches the leaf the tree records;
 //! readers (proofs, latest STH) may race appends.
 //!
-//! Production deployments will swap [`crate::sth::InProcessSigner`] for the
-//! TEE-resident threshold signer and [`crate::store::LocalDiskWormStore`] for
-//! the S3 Object Lock store; the facade is unchanged.
+//! Production deployments swap [`crate::sth::InProcessSigner`] for the
+//! TEE-resident threshold signer; the facade is unchanged.
+//! [`crate::store::LocalDiskWormStore`] is the shipped WORM tier — a native S3
+//! Object Lock store is dropped (see `docs/roadmap.md` "Dropped scope").
 
 use std::sync::Arc;
 

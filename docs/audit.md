@@ -39,13 +39,16 @@ Every second, or every 1024 entries (whichever comes first), the replica:
 3. Signs the STH with the composite issuance key inside the TEE.
 4. Replicates the STH and leaves to Raft peers; a quorum must co-sign before
    publication.
-5. Commits the leaves and STH to S3 (Object Lock Compliance mode); the
-   replicated copy is durably held in the hiqlite-backed Raft state machine
-   shared with the rest of CMIS.
+5. Commits the leaves and STH to the local-disk WORM store (`LocalDiskWormStore`,
+   write-once via `O_CREAT|O_EXCL`); the replicated copy is durably held in the
+   hiqlite-backed Raft state machine shared with the rest of CMIS. (A native S3
+   Object Lock store was originally planned but is dropped — see
+   [roadmap.md](roadmap.md) §"Dropped scope". Deployments needing cloud
+   durability sync the WORM directory to object storage out of band.)
 
 Once per minute the latest STH is anchored to a public transparency log
 (Sigsum or Rekor). The anchor receipt is recorded as a separate audit
-artefact so that mutual divergence between the WORM bucket and the public
+artefact so that mutual divergence between the WORM store and the public
 log is itself detectable.
 
 ## Inclusion proofs
@@ -63,7 +66,7 @@ by checking the consistency proof; any deletion or reordering breaks it.
 
 | Property | How |
 |----------|-----|
-| Append-only | S3 Object Lock Compliance mode prevents deletion until retention expires (default: 10 years) |
+| Append-only | Local-disk WORM store writes each leaf/STH once via `O_CREAT|O_EXCL`; an existing file is never reopened for write |
 | Cannot rewrite history | STH signed inside TEE with a key whose private half is not extractable |
 | Cross-replica consistency | Raft quorum must co-sign each STH before publication |
 | Public verifiability | STHs anchored to an external Merkle transparency log |

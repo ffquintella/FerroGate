@@ -73,7 +73,18 @@ fn full_lifecycle_keygen_edit_sign_verify() {
         ])
         .0
     );
-    assert!(run(&["add", "--manifest", manifest_s, "--ek", &ek_a, "--ek", &ek_b]).0);
+    assert!(
+        run(&[
+            "add",
+            "--manifest",
+            manifest_s,
+            "--ek",
+            &ek_a,
+            "--ek",
+            &ek_b
+        ])
+        .0
+    );
     assert!(run(&["remove", "--manifest", manifest_s, "--ek", &ek_b]).0);
 
     // Sign with the seed; emit the signed bundle.
@@ -130,7 +141,15 @@ fn verify_rejects_wrong_key() {
     let seed = "2".repeat(64);
     run(&["new", "--version", "1", "--trust-domain", "t", "--out", m]);
     run(&[
-        "sign", "--manifest", m, "--seed", &seed, "--kid", "k", "--out", s,
+        "sign",
+        "--manifest",
+        m,
+        "--seed",
+        &seed,
+        "--kid",
+        "k",
+        "--out",
+        s,
     ]);
 
     // A pubkey from a *different* seed must fail verification.

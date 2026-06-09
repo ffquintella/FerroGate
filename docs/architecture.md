@@ -19,8 +19,8 @@
                        │
             ┌──────────▼──────────┐
             │ hiqlite (SQLite +   │
-            │ Raft) · S3 Object-  │
-            │ Lock (WORM)         │
+            │ Raft) · local-disk  │
+            │ WORM store          │
             └──────────┬──────────┘
                        │
             ┌──────────▼──────────┐
@@ -55,8 +55,13 @@
 ### Audit Notary
 
 - Per-shard Merkle tree of audit events, signed in the TEE every second.
-- Backing store: S3 Object Lock in Compliance mode for the WORM tier, with the
-  replicated copy living in the hiqlite-backed Raft state machine.
+- Backing store: a local-disk WORM tier (`LocalDiskWormStore`, write-once via
+  `O_CREAT|O_EXCL`), with the replicated copy living in the hiqlite-backed Raft
+  state machine. (A native S3 Object Lock store was originally planned but is
+  dropped — see [roadmap.md](roadmap.md) §"Dropped scope". Deployments needing
+  cloud durability sync the WORM directory to object storage out of band; the
+  write-once semantics and STH signatures gate integrity, so that path is
+  untrusted.)
 - Signed Tree Heads (STH) are published to a public transparency log
   (Sigsum / Rekor) once per minute.
 

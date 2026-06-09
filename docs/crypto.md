@@ -62,6 +62,10 @@ ML-KEM cannot weaken the session, and vice versa.
 In production CMIS refuses any other named group; falling back to pure-X25519
 is a configuration-only escape hatch for dev environments.
 
+For the live wiring — how the CMIS listener terminates this transport, how the
+MIA pins the server, and how to configure both — see
+[transport-tls.md](transport-tls.md).
+
 ## Key sizes and wire impact
 
 | Object | Bytes | Notes |

@@ -1,14 +1,17 @@
 //! `cmis` — Central Machine Identity Service binary.
 //!
 //! A thin wrapper: assemble [`cmis::CmisState`] and serve the
-//! [`cmis::MachineIdentitySvc`] gRPC surface. The M2 bring-up server listens in
-//! plaintext gRPC; hybrid-PQC TLS termination (F01) and a TEE-resident issuance
-//! key (F06) are layered on in later milestones, as is a configured phase-3
-//! credential maker. Until then `JWKS` is fully functional and `Attest` will
-//! report the credential service as unavailable.
+//! [`cmis::MachineIdentitySvc`] gRPC surface. The listener terminates
+//! hybrid-PQC TLS (F01, `X25519MLKEM768`-only) when `CMIS_TLS_CERT` +
+//! `CMIS_TLS_KEY` are configured, falling back to a plaintext bring-up server
+//! for local development otherwise. A TEE-resident issuance key (F06) and a
+//! configured phase-3 credential maker are layered on in later milestones;
+//! until then `JWKS` is fully functional and `Attest` will report the
+//! credential service as unavailable.
 
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,8 +19,9 @@ use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::fleet_manifest::FleetManifestLoader;
 use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
 use ferro_attest::{RimLoader, RimStore, TpmQuoteVerifier, TrustedKeys, VendorTrustStore};
-use ferro_crypto::composite::CompositePublicKey;
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
+use ferro_crypto::composite::CompositePublicKey;
+use ferro_crypto::tls::ProviderMode;
 use ferro_svid::Issuer;
 use tracing_subscriber::EnvFilter;
 
@@ -46,10 +50,8 @@ impl CredentialMaker for UnconfiguredCredentialMaker {
 /// fleet manifest and the F10 RIM bundle; production sources these from the
 /// F14 ceremony's published root key.
 fn load_single_key_trust(kid_var: &str, pub_var: &str) -> anyhow::Result<TrustedKeys> {
-    let kid =
-        std::env::var(kid_var).map_err(|_| anyhow::anyhow!("{kid_var} missing"))?;
-    let pub_hex =
-        std::env::var(pub_var).map_err(|_| anyhow::anyhow!("{pub_var} missing"))?;
+    let kid = std::env::var(kid_var).map_err(|_| anyhow::anyhow!("{kid_var} missing"))?;
+    let pub_hex = std::env::var(pub_var).map_err(|_| anyhow::anyhow!("{pub_var} missing"))?;
     let pub_bytes =
         hex::decode(pub_hex.trim()).map_err(|e| anyhow::anyhow!("{pub_var} hex: {e}"))?;
     let pk = CompositePublicKey::from_concat_bytes(&pub_bytes)
@@ -75,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), rim_store.clone());
 
     // M3 audit log: local-disk WORM store + in-process composite signer. The
-    // production swap (S3 Object Lock + TEE threshold signer) lands in M4.
+    // production swap to a TEE threshold signer lands with the hardware TEE
+    // driver work. `LocalDiskWormStore` is the shipped WORM tier; a native S3
+    // Object Lock store is dropped (see docs/roadmap.md "Dropped scope").
     let worm_root =
         std::env::var("CMIS_AUDIT_ROOT").unwrap_or_else(|_| "/var/lib/ferrogate/audit".to_string());
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(worm_root)?);
@@ -122,11 +126,11 @@ async fn main() -> anyhow::Result<()> {
     // store. With nothing configured the RIM allowlist stays empty and every
     // quote fails the RIM lookup (FAILED_PRECONDITION) — fail-closed by default.
     //
-    // The bundle is read from a local file. Sourcing it directly from S3 is NOT
-    // yet supported (see docs/roadmap.md F10); a deployment that stores the
-    // bundle in object storage syncs it to this path out of band. Because the
-    // bundle is composite-signed and verified before apply, that sync path is
-    // untrusted — only the signature gates what is admitted.
+    // The bundle is read from a local file. Native S3 sourcing is dropped (see
+    // docs/roadmap.md "Dropped scope"); a deployment that stores the bundle in
+    // object storage syncs it to this path out of band. Because the bundle is
+    // composite-signed and verified before apply, that sync path is untrusted —
+    // only the signature gates what is admitted.
     let _rim_watcher = match std::env::var("CMIS_RIM_BUNDLE") {
         Ok(path) if !path.is_empty() => {
             let trust = load_single_key_trust("CMIS_RIM_SIGNER_KID", "CMIS_RIM_SIGNER_PUB")?;
@@ -152,15 +156,58 @@ async fn main() -> anyhow::Result<()> {
         cmis::crl_publisher::DEFAULT_PUBLISH_INTERVAL,
     );
 
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        %addr,
-        "FerroGate CMIS — plaintext gRPC bring-up server (M2)"
-    );
+    serve_grpc(addr, state).await
+}
 
-    tonic::transport::Server::builder()
-        .add_service(MachineIdentitySvc::new(state).into_server())
-        .serve(addr)
-        .await?;
+/// Serve the `MachineIdentity` gRPC surface on `addr`.
+///
+/// F01 transport: with `CMIS_TLS_CERT` + `CMIS_TLS_KEY` configured the
+/// listener terminates hybrid-PQC TLS (`X25519MLKEM768`-only) via the shared
+/// `ferro-crypto` provider, so a legacy / non-PQC client fails the handshake
+/// and never reaches the gRPC layer. With neither set, the plaintext bring-up
+/// server is kept for local development (loud warning). Setting only one of
+/// the pair is a configuration error and aborts startup.
+async fn serve_grpc(addr: std::net::SocketAddr, state: Arc<CmisState>) -> anyhow::Result<()> {
+    let svc = MachineIdentitySvc::new(state).into_server();
+    let tls = match (
+        std::env::var_os("CMIS_TLS_CERT"),
+        std::env::var_os("CMIS_TLS_KEY"),
+    ) {
+        (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "CMIS_TLS_CERT and CMIS_TLS_KEY must be set together"
+            ))
+        }
+    };
+
+    if let Some((cert_path, key_path)) = tls {
+        let (cert_chain, key) = cmis::transport::load_pem_identity(&cert_path, &key_path)?;
+        let server_config =
+            ferro_crypto::transport::server_config(ProviderMode::HybridOnly, cert_chain, key)?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            %addr,
+            "FerroGate CMIS — hybrid-PQC TLS gRPC server (X25519MLKEM768-only)"
+        );
+        let incoming = cmis::transport::tls_incoming(listener, server_config);
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await?;
+    } else {
+        tracing::warn!(
+            version = env!("CARGO_PKG_VERSION"),
+            %addr,
+            "FerroGate CMIS — PLAINTEXT gRPC bring-up server (set CMIS_TLS_CERT + \
+             CMIS_TLS_KEY for hybrid-PQC TLS)"
+        );
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve(addr)
+            .await?;
+    }
     Ok(())
 }

@@ -154,12 +154,12 @@ impl SealedShare {
 
     /// Decode the share's `y` vector.
     fn share_bytes(&self) -> Result<Vec<u8>> {
-        STANDARD.decode(self.share.as_bytes()).map_err(|e| {
-            CeremonyError::Malformed {
+        STANDARD
+            .decode(self.share.as_bytes())
+            .map_err(|e| CeremonyError::Malformed {
                 what: "sealed share",
                 detail: format!("share base64: {e}"),
-            }
-        })
+            })
     }
 
     /// Reconstruct the [`Share`] this envelope carries, after checking integrity.
@@ -211,7 +211,14 @@ impl SealedShareSet {
             .iter()
             .zip(holders)
             .map(|(share, holder)| {
-                SealedShare::seal(root_kid.clone(), threshold, total, share, holder, created_at)
+                SealedShare::seal(
+                    root_kid.clone(),
+                    threshold,
+                    total,
+                    share,
+                    holder,
+                    created_at,
+                )
             })
             .collect();
         Ok(Self { shares })
@@ -250,13 +257,14 @@ impl SealedShareSet {
             .iter()
             .map(SealedShare::to_share)
             .collect::<Result<_>>()?;
-        let secret =
-            shamir::combine(&raw).map_err(|e| CeremonyError::Shamir(e.to_string()))?;
+        let secret = shamir::combine(&raw).map_err(|e| CeremonyError::Shamir(e.to_string()))?;
         let arr: [u8; ROOT_SEED_LEN] =
-            secret.try_into().map_err(|v: Vec<u8>| CeremonyError::Malformed {
-                what: "reconstructed seed",
-                detail: format!("expected {ROOT_SEED_LEN} bytes, got {}", v.len()),
-            })?;
+            secret
+                .try_into()
+                .map_err(|v: Vec<u8>| CeremonyError::Malformed {
+                    what: "reconstructed seed",
+                    detail: format!("expected {ROOT_SEED_LEN} bytes, got {}", v.len()),
+                })?;
         Ok(Zeroizing::new(arr))
     }
 }
@@ -324,7 +332,11 @@ mod tests {
     fn combine_rejects_mixed_roots() {
         let a = SealedShareSet::seal("root-a", &seed(), 3, &holders(), 1000).unwrap();
         let b = SealedShareSet::seal("root-b", &seed(), 3, &holders(), 1000).unwrap();
-        let mixed = vec![a.shares[0].clone(), a.shares[1].clone(), b.shares[2].clone()];
+        let mixed = vec![
+            a.shares[0].clone(),
+            a.shares[1].clone(),
+            b.shares[2].clone(),
+        ];
         assert!(SealedShareSet::combine(&mixed).is_err());
     }
 }

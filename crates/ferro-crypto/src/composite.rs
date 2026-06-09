@@ -279,9 +279,8 @@ impl CompositeSecretKey {
 
         let classical_sk = EdSk::from_bytes(&ed_seed);
         let classical_vk = classical_sk.verifying_key();
-        let (pqc_public, pqc_secret) = <ml_dsa_65::KG as fips204::traits::KeyGen>::keygen_from_seed(
-            &ml_seed,
-        );
+        let (pqc_public, pqc_secret) =
+            <ml_dsa_65::KG as fips204::traits::KeyGen>::keygen_from_seed(&ml_seed);
 
         let sk = Self {
             ed25519: classical_sk,

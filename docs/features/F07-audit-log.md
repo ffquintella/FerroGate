@@ -15,8 +15,11 @@ In:
 - Append-only event API on CMIS and forwarded events from MIA.
 - SHA3-384 leaf hashing; binary Merkle tree.
 - STH structure `{ tree_size, root_hash, timestamp }` signed via F03.
-- Backing store: S3 Object Lock (Compliance, 10-year retention) for the WORM
-  tier; the replicated copy lives in the hiqlite-backed Raft state machine.
+- Backing store: a local-disk WORM tier (`LocalDiskWormStore`, write-once via
+  `O_CREAT|O_EXCL`); the replicated copy lives in the hiqlite-backed Raft state
+  machine. (A native S3 Object Lock store was originally planned but is dropped
+  — see [../roadmap.md](../roadmap.md) §"Dropped scope". Deployments needing
+  cloud durability sync the WORM directory to object storage out of band.)
 - Sigsum / Rekor anchor every minute.
 - Inclusion and consistency proof endpoints.
 
@@ -65,10 +68,11 @@ See [../audit.md](../audit.md).
 - [x] WORM backing store prevents deletion in a unit test.
       (`crates/ferro-audit/src/store.rs::leaf_append_is_worm` proves a
       previously-written leaf cannot be re-appended; the same `O_CREAT|O_EXCL`
-      invariant covers the `sth/` and `cosigned/` subdirs. Cloud-object WORM
-      — S3 Object Lock (Compliance) or equivalent — plugs in behind the
-      existing `AuditStore` trait as per-deployment wiring and is not part
-      of the audit crate's API surface.)
+      invariant covers the `sth/` and `cosigned/` subdirs. `LocalDiskWormStore`
+      is the shipped WORM tier; a native S3 Object Lock store is dropped (see
+      [../roadmap.md](../roadmap.md) §"Dropped scope"). The `AuditStore` trait
+      seam stays open for an out-of-tree cloud-object adapter, but no such
+      adapter is a FerroGate deliverable.)
 - [x] An anchor receipt appears in the configured Sigsum log within 90 s of
       STH publication. (`crates/ferro-audit/src/anchor.rs` — the publisher
       surface lands; per-log-family HTTP drivers (Sigsum, Rekor) plug in

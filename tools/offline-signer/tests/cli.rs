@@ -162,9 +162,18 @@ fn split_combine_cross_sign_and_minutes_round_trip() {
     assert_eq!(jwks.preferred().unwrap().kid, "root-2026");
 
     // Build minutes with three participants, each signs, all must verify.
-    let p1 = format!("alice|share-holder|op-1|{}", pubkey_for("01".repeat(32).as_str()));
-    let p2 = format!("bob|share-holder|op-2|{}", pubkey_for("02".repeat(32).as_str()));
-    let p3 = format!("carol|witness|op-3|{}", pubkey_for("03".repeat(32).as_str()));
+    let p1 = format!(
+        "alice|share-holder|op-1|{}",
+        pubkey_for("01".repeat(32).as_str())
+    );
+    let p2 = format!(
+        "bob|share-holder|op-2|{}",
+        pubkey_for("02".repeat(32).as_str())
+    );
+    let p3 = format!(
+        "carol|witness|op-3|{}",
+        pubkey_for("03".repeat(32).as_str())
+    );
     let minutes_path = dir.join("minutes.json");
     let minutes_s = minutes_path.to_str().unwrap();
     let (ok, _, stderr) = run(&[

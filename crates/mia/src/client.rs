@@ -10,6 +10,7 @@
 //! against a real TPM (Linux) or a software stand-in (tests).
 
 use ferro_crypto::composite::{CompositePublicKey, CompositeSecretKey};
+use ferro_crypto::pin::SpkiPin;
 use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
@@ -18,6 +19,54 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
+
+/// Dial a CMIS `MachineIdentity` endpoint over the FerroGate hybrid-PQC
+/// transport (feature F01), authenticating the server by SPKI pin.
+///
+/// `endpoint` is an `https://host:port` authority; `pins` are the accepted
+/// SHA-384 SPKI pins of the CMIS certificate. The returned client is backed by
+/// a [`Channel`] whose connections:
+///
+/// - use the `X25519MLKEM768`-only provider, so a non-hybrid CMIS is rejected
+///   at the handshake; and
+/// - trust the server by SPKI pin, not a CA chain, so a wrong-pin (or
+///   otherwise-valid-but-unpinned) server is rejected before any application
+///   RPC — the hostname is used only for SNI/routing.
+///
+/// # Panics
+///
+/// Panics if `pins` is empty; see [`ferro_crypto::transport::client_config`].
+pub async fn connect_pinned(
+    endpoint: &str,
+    pins: Vec<SpkiPin>,
+) -> anyhow::Result<MachineIdentityClient<Channel>> {
+    // The dialer itself is not MIA-specific — it lives in `ferro-transport`
+    // and returns a bare `Channel`, shared with the `ferrogate` operator CLI.
+    // Here we just wrap it in the generated `MachineIdentity` client.
+    let channel = ferro_transport::connect_pinned(endpoint, pins).await?;
+    Ok(MachineIdentityClient::new(channel))
+}
+
+/// Fetch the CMIS enrollment public key (the composite key that signs caller
+/// allowlists) from a pinned CMIS endpoint.
+///
+/// Returns the key as composite concat bytes — exactly what
+/// [`ferro_crypto::composite::CompositePublicKey::from_concat_bytes`] and the
+/// `allowlist.key` file expect. `endpoint` is an `https://host:port` authority
+/// and `pins` are the accepted SHA-384 SPKI pins of the CMIS certificate.
+pub async fn fetch_enrollment_key(endpoint: &str, pins: Vec<SpkiPin>) -> anyhow::Result<Vec<u8>> {
+    use ferro_proto::v1::GetEnrollmentKeyRequest;
+
+    let mut client = connect_pinned(endpoint, pins).await?;
+    let resp = client
+        .get_enrollment_key(Request::new(GetEnrollmentKeyRequest {}))
+        .await?
+        .into_inner();
+    if resp.public_key.is_empty() {
+        anyhow::bail!("CMIS returned an empty enrollment key");
+    }
+    Ok(resp.public_key)
+}
 
 /// A produced PCR quote and the raw values backing it.
 pub struct QuoteEvidence {

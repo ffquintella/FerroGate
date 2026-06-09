@@ -24,10 +24,11 @@ use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityS
 use ferro_proto::v1::{
     AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse, BumpEpochRequest,
     BumpEpochResponse, Challenge, ConsistencyProofRequest, ConsistencyProofResponse, FetchRequest,
-    HealthRequest, HealthResponse, InclusionProofRequest, InclusionProofResponse, JwksRequest,
-    JwksResponse, LatestSthRequest, LatestSthResponse, ListSvidsRequest, ListSvidsResponse,
-    NodeRole as ProtoNodeRole, Nonce, RevokeHostRequest, RevokeResponse, RevokeSvidRequest,
-    RotateRequest, SignedTreeHead, SvidBundle, SvidSummary,
+    GetEnrollmentKeyRequest, GetEnrollmentKeyResponse, HealthRequest, HealthResponse,
+    InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest,
+    LatestSthResponse, ListSvidsRequest, ListSvidsResponse, NodeRole as ProtoNodeRole, Nonce,
+    RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest, SignedTreeHead,
+    SvidBundle, SvidSummary,
 };
 use ferro_raft::NodeRole;
 use ferro_svid::{
@@ -437,6 +438,17 @@ impl MachineIdentity for MachineIdentitySvc {
         let json = serde_json::to_string(&self.state.published_jwks())
             .map_err(|_| Status::internal("jwks encode"))?;
         Ok(Response::new(JwksResponse { jwks_json: json }))
+    }
+
+    async fn get_enrollment_key(
+        &self,
+        _request: Request<GetEnrollmentKeyRequest>,
+    ) -> Result<Response<GetEnrollmentKeyResponse>, Status> {
+        // The enrollment key that signs caller allowlists is the issuer's
+        // composite key (allowlist signatures use a distinct domain-separation
+        // context, so reuse is safe). Publish the public half as concat bytes.
+        let public_key = self.state.issuer.public_key().to_concat_bytes();
+        Ok(Response::new(GetEnrollmentKeyResponse { public_key }))
     }
 
     async fn revoke_svid(

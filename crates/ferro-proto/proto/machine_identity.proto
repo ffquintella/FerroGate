@@ -27,6 +27,12 @@ service MachineIdentity {
   // (feature F11).
   rpc JWKS (JWKSRequest) returns (JWKSResponse);
 
+  // Returns the CMIS enrollment public key — the composite public key (raw
+  // `classical || pqc` concat bytes) that signs caller allowlists. A host
+  // agent writes this to its `allowlist.key` so it can verify the signed
+  // allowlist it later loads. Unauthenticated: this is public key material.
+  rpc GetEnrollmentKey (GetEnrollmentKeyRequest) returns (GetEnrollmentKeyResponse);
+
   // ---- Revocation (F11) ----
 
   // Admin RPC: revoke a single SVID by the lowercase-hex SHA-384 of its compact
@@ -161,6 +167,14 @@ message JWKSRequest {}
 
 message JWKSResponse {
   string jwks_json = 1;
+}
+
+message GetEnrollmentKeyRequest {}
+
+message GetEnrollmentKeyResponse {
+  // The CMIS enrollment public key as composite concat bytes
+  // (ed25519 || ml-dsa-65), i.e. `CompositePublicKey::from_concat_bytes`.
+  bytes public_key = 1;
 }
 
 // ---- Revocation (F11) --------------------------------------------------

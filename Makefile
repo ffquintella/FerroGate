@@ -1,7 +1,7 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs docker-image docker-image-push \
-        docker-repo-setup docker-repo-show \
-        pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools
+        docker-repo-setup docker-repo-show mia-install mia-uninstall \
+        pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools pkg-sdk release deploy-release
 
 # Default target: list available targets with their descriptions.
 .DEFAULT_GOAL := help
@@ -64,6 +64,15 @@ docs: ## Serve the Docsify documentation site locally (PORT=3000 by default)
 # [workspace.package] section (e.g. 0.12.0).
 CARGO_VERSION := $(shell awk '/^\[workspace.package\]/{p=1} p&&/^version/{gsub(/[" ]/,"",$$3); print $$3; exit}' Cargo.toml)
 IMAGE ?= ferrogate:$(CARGO_VERSION)
+
+# Host OS/arch, used by the install and packaging targets to pick OS-appropriate
+# locations and binary names.
+UNAME_S := $(shell uname -s)
+HOST_ARCH := $(shell uname -m)
+
+# Client assets (service definitions, env/config templates) and the daemon label.
+MIA_DIST  := crates/mia/dist
+MIA_LABEL := com.ferrogate.mia
 
 docker-image: ## Build the linux/amd64 ferrogate runtime image (IMAGE=tag to override)
 	docker buildx build --platform linux/amd64 \
@@ -169,6 +178,113 @@ formal-cryptoverif: ## Run the CryptoVerif hybrid AKE proof
 		echo "SKIP: cryptoverif not on PATH (see formal/README.md to install)"; \
 	fi
 
+# ── Local install ─────────────────────────────────────────────────────────────
+#
+# `make mia-install` compiles the `mia` Machine Identity Agent in release mode,
+# installs the stripped binary to an OS-appropriate location, AND registers the
+# OS service so it runs as a daemon:
+#
+#   macOS : /usr/local/bin/mia  + launchd job at
+#           /Library/LaunchDaemons/com.ferrogate.mia.plist (bootstrapped+started)
+#   Linux : /usr/local/bin/mia  + systemd unit /etc/systemd/system/mia.service
+#           (daemon-reload + enable --now)
+#   Windows : $(PREFIX)\mia.exe (binary only; the service is registered by the
+#           .msi — run `make pkg-msi`). PREFIX defaults to
+#           %LOCALAPPDATA%\Programs\FerroGate; run under MSYS2/Git-Bash.
+#
+# Override the binary location with PREFIX=... (e.g. PREFIX=$$HOME/.local for a
+# user-only Unix install). The privileged steps (binary into a non-writable dir,
+# service registration) run via sudo when not already root.
+ifneq (,$(filter MINGW% MSYS% CYGWIN% Windows%,$(UNAME_S)))
+  MIA_OS  := windows
+  PREFIX  ?= $(LOCALAPPDATA)/Programs/FerroGate
+  BINDIR  := $(PREFIX)
+  MIA_BIN := mia.exe
+else ifeq ($(UNAME_S),Darwin)
+  MIA_OS  := macos
+  PREFIX  ?= /usr/local
+  BINDIR  := $(PREFIX)/bin
+  MIA_BIN := mia
+else
+  MIA_OS  := linux
+  PREFIX  ?= /usr/local
+  BINDIR  := $(PREFIX)/bin
+  MIA_BIN := mia
+endif
+
+mia-install: ## Compile mia in release mode, install it, and register the OS service (PREFIX=... to override)
+	cargo build --release -p mia --bin mia
+	strip target/release/$(MIA_BIN)
+ifeq ($(MIA_OS),windows)
+	@mkdir -p "$(BINDIR)"
+	@cp -f target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"
+	@echo "==> installed mia to $(BINDIR)/$(MIA_BIN)"
+	@echo "    Add $(BINDIR) to your PATH if it isn't already."
+	@echo "    Windows service registration is handled by the .msi — run 'make pkg-msi'."
+else
+	@if [ -w "$(BINDIR)" ] || { [ ! -e "$(BINDIR)" ] && [ -w "$(PREFIX)" ]; }; then \
+	  install -d -m 0755 "$(BINDIR)"; \
+	  install -m 0755 target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"; \
+	else \
+	  echo "==> $(BINDIR) not writable; installing with sudo"; \
+	  sudo install -d -m 0755 "$(BINDIR)"; \
+	  sudo install -m 0755 target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"; \
+	fi
+	@echo "==> installed mia to $(BINDIR)/$(MIA_BIN)"
+endif
+ifeq ($(MIA_OS),macos)
+	@echo "==> registering launchd daemon $(MIA_LABEL)"
+	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO sh -c "sed 's|<string>/usr/local/bin/mia</string>|<string>$(BINDIR)/$(MIA_BIN)</string>|' $(MIA_DIST)/$(MIA_LABEL).plist > /Library/LaunchDaemons/$(MIA_LABEL).plist"; \
+	  $$SUDO chmod 0644 /Library/LaunchDaemons/$(MIA_LABEL).plist; \
+	  $$SUDO mkdir -p /var/run/ferrogate /var/log/ferrogate; \
+	  $$SUDO launchctl bootout system /Library/LaunchDaemons/$(MIA_LABEL).plist 2>/dev/null || true; \
+	  $$SUDO launchctl bootstrap system /Library/LaunchDaemons/$(MIA_LABEL).plist; \
+	  $$SUDO launchctl kickstart -k system/$(MIA_LABEL)
+	@echo "==> launchd job $(MIA_LABEL) loaded and started"
+	@echo "    Configure it with: sudo mia setup   (writes the system TOML the daemon reads)"
+	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
+endif
+ifeq ($(MIA_OS),linux)
+	@echo "==> installing systemd unit mia.service"
+	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO sh -c "sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/$(MIA_BIN)|' $(MIA_DIST)/mia.service > /etc/systemd/system/mia.service"; \
+	  $$SUDO chmod 0644 /etc/systemd/system/mia.service; \
+	  $$SUDO systemctl daemon-reload; \
+	  $$SUDO systemctl enable --now mia.service \
+	    || echo "   (enable failed — configure /etc/ferrogate then: sudo systemctl enable --now mia)"
+	@echo "==> systemd unit mia.service installed"
+	@echo "    Configure it with: sudo mia setup   (writes the system TOML the daemon reads)"
+	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
+endif
+
+# `make mia-uninstall` reverses `mia-install`: it deregisters the OS service and
+# removes the installed binary. It leaves configuration, the env file, logs, and
+# the socket alone (use `mia setup --clean` to remove the config). Each step
+# tolerates an already-absent target, so it is safe to run repeatedly.
+mia-uninstall: ## Stop/deregister the mia service and remove the installed binary (PREFIX=... to override)
+ifeq ($(MIA_OS),windows)
+	@rm -f "$(BINDIR)/$(MIA_BIN)" && echo "==> removed $(BINDIR)/$(MIA_BIN)" || true
+	@echo "    Windows service deregistration is handled by the .msi uninstaller."
+else ifeq ($(MIA_OS),macos)
+	@echo "==> deregistering launchd daemon $(MIA_LABEL)"
+	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO launchctl bootout system /Library/LaunchDaemons/$(MIA_LABEL).plist 2>/dev/null || true; \
+	  $$SUDO rm -f /Library/LaunchDaemons/$(MIA_LABEL).plist; \
+	  $$SUDO rm -f "$(BINDIR)/$(MIA_BIN)"
+	@echo "==> removed launchd job and $(BINDIR)/$(MIA_BIN)"
+	@echo "    Config, logs, and the socket are left in place (run 'sudo mia setup --clean' to drop the config)."
+else
+	@echo "==> deregistering systemd unit mia.service"
+	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO systemctl disable --now mia.service 2>/dev/null || true; \
+	  $$SUDO rm -f /etc/systemd/system/mia.service; \
+	  $$SUDO systemctl daemon-reload 2>/dev/null || true; \
+	  $$SUDO rm -f "$(BINDIR)/$(MIA_BIN)"
+	@echo "==> removed systemd unit and $(BINDIR)/$(MIA_BIN)"
+	@echo "    Config, logs, and the socket are left in place (run 'sudo mia setup --clean' to drop the config)."
+endif
+
 # ── Client packaging: rpm / deb / msi / pkg ───────────────────────────────────
 #
 # Builds OS installer packages for the FerroGate *client* — the `mia` Machine
@@ -188,7 +304,8 @@ formal-cryptoverif: ## Run the CryptoVerif hybrid AKE proof
 # v3, the .pkg on macOS (no TPM there — mia runs as the helper-API surface).
 # Outputs land under target/debian, target/generate-rpm, target/wix, target/macos.
 PKG_CRATE := mia
-UNAME_S   := $(shell uname -s)
+# RPM/DEB ship for amd64 only; mia links the x86_64 Linux TPM ESAPI stack.
+RPM_ARCH  := x86_64
 
 pkg-tools: ## Install the cargo packaging tools (cargo-deb, cargo-generate-rpm, cargo-wix)
 	cargo install cargo-deb cargo-generate-rpm cargo-wix
@@ -198,12 +315,17 @@ pkg-deb: ## Build the mia .deb package (Linux; needs cargo-deb)
 	cargo deb -p $(PKG_CRATE)
 	@echo "==> .deb written under target/debian/"
 
-pkg-rpm: ## Build the mia .rpm package (Linux; needs cargo-generate-rpm)
+pkg-rpm: ## Build the mia .rpm package for x86_64/amd64 (Fedora/RHEL/SUSE)
+ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
 	@command -v cargo-generate-rpm >/dev/null 2>&1 || { echo "ERROR: cargo-generate-rpm not found — run 'make pkg-tools'"; exit 1; }
 	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE)
 	strip target/release/$(PKG_CRATE)
-	cargo generate-rpm -p crates/$(PKG_CRATE)
-	@echo "==> .rpm written under target/generate-rpm/"
+	cargo generate-rpm -p crates/$(PKG_CRATE) -a $(RPM_ARCH)
+	@echo "==> $(RPM_ARCH) .rpm written under target/generate-rpm/"
+else
+	@echo "==> host is $(UNAME_S)/$(HOST_ARCH), not Linux/x86_64; building the amd64 .rpm in a linux/amd64 container"
+	./scripts/build-rpm-amd64.sh
+endif
 
 pkg-msi: ## Build the mia .msi installer (Windows; needs cargo-wix + WiX Toolset)
 	@command -v cargo-wix >/dev/null 2>&1 || { echo "ERROR: cargo-wix not found — run 'make pkg-tools'"; exit 1; }
@@ -224,9 +346,12 @@ pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 	rm -rf $(MACOS_PKG_ROOT)
 	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/bin
 	install -d -m 0755 $(MACOS_PKG_ROOT)/etc/ferrogate
+	install -d -m 0755 "$(MACOS_PKG_ROOT)/Library/Application Support/FerroGate"
 	install -d -m 0755 $(MACOS_PKG_ROOT)/Library/LaunchDaemons
 	install -m 0755 target/release/$(PKG_CRATE) $(MACOS_PKG_ROOT)/usr/local/bin/$(PKG_CRATE)
 	install -m 0640 $(MACOS_DIST)/mia.env $(MACOS_PKG_ROOT)/etc/ferrogate/mia.env
+	# The TOML config goes to the macOS system config path (where mia discovers it).
+	install -m 0640 $(MACOS_DIST)/mia.toml "$(MACOS_PKG_ROOT)/Library/Application Support/FerroGate/mia.toml"
 	install -m 0644 $(MACOS_DIST)/com.ferrogate.mia.plist $(MACOS_PKG_ROOT)/Library/LaunchDaemons/$(MACOS_PKG_ID).plist
 	pkgbuild --root $(MACOS_PKG_ROOT) \
 		--scripts $(MACOS_DIST)/macos-scripts \
@@ -249,3 +374,49 @@ pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi/Windo
 	  *)      echo "Host is $(UNAME_S): build the .msi here with 'make pkg-msi'."; \
 	          $(MAKE) --no-print-directory pkg-msi ;; \
 	esac
+
+# ── Integration SDK + release bundle ──────────────────────────────────────────
+#
+# `make pkg-sdk` bundles the relying-party / verifier-side crates into a
+# self-contained Cargo workspace tarball (ferrogate-sdk-rust-<version>.tgz) that
+# a third party can drop in and `cargo build`. See scripts/pack-sdk.sh.
+#
+# `make release` produces the artifacts published to a GitHub Release: the mia
+# .deb, the mia .rpm, and the SDK .tgz. It is the entry point the release
+# workflow (.github/workflows/release.yml) runs on a `releases/*` tag. On Linux
+# it builds all three; off Linux it builds only the SDK (deb/rpm need a Linux
+# host) and says so.
+#
+# `make deploy-release` cuts the release: it creates the annotated
+# `releases/v<workspace-version>` tag and pushes it to origin, which is what
+# triggers the Release workflow (the workflow then checks the tag out and runs
+# `make release` to build + publish the artifacts). Bump the workspace version
+# and commit first; this target only tags and pushes.
+pkg-sdk: ## Build the ferrogate-sdk-rust integration tarball (.tgz)
+	bash scripts/pack-sdk.sh
+
+release: ## Build the GitHub Release artifacts (mia .deb + .rpm + SDK .tgz)
+	@case "$(UNAME_S)" in \
+	  Linux) $(MAKE) --no-print-directory pkg-deb pkg-rpm pkg-sdk; \
+	         echo ""; echo "==> Release artifacts:"; \
+	         ls -1 target/debian/*.deb target/generate-rpm/*.rpm target/sdk/*.tgz 2>/dev/null ;; \
+	  *)     echo "Host is $(UNAME_S): the .deb/.rpm must be built on Linux."; \
+	         echo "Building the SDK tarball only."; \
+	         $(MAKE) --no-print-directory pkg-sdk ;; \
+	esac
+
+deploy-release: ## Tag releases/v<workspace-version> and push it to trigger the Release workflow
+	@VERSION="$(CARGO_VERSION)"; TAG="releases/v$$VERSION"; \
+	if [ -z "$$VERSION" ]; then \
+	  echo "error: could not read the workspace version from Cargo.toml." >&2; exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+	  echo "error: working tree is dirty; commit the version bump before tagging." >&2; exit 1; \
+	fi; \
+	if git rev-parse -q --verify "refs/tags/$$TAG" >/dev/null 2>&1; then \
+	  echo "error: tag $$TAG already exists (bump the workspace version first)." >&2; exit 1; \
+	fi; \
+	echo "==> Tagging $$TAG at $$(git rev-parse --short HEAD) and pushing to origin"; \
+	echo "    (this triggers .github/workflows/release.yml, which runs 'make release')"; \
+	git tag -a "$$TAG" -m "Release v$$VERSION"; \
+	git push origin "$$TAG"

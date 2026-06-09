@@ -11,8 +11,8 @@
 //!
 //! Production deployments run a small async watcher task in CMIS that polls
 //! the bundle's mtime and calls `try_reload` whenever it changes; in tests we
-//! call it directly. The S3-backed refresh path is sequenced in M5 (see
-//! `docs/roadmap.md`).
+//! call it directly. The bundle is always read from a local file — native
+//! S3-backed refresh is dropped (see `docs/roadmap.md` "Dropped scope").
 
 use std::path::{Path, PathBuf};
 

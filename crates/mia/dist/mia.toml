@@ -1,0 +1,56 @@
+# FerroGate Machine Identity Agent (MIA) — configuration file (TOML).
+#
+# This is an OPTIONAL structured alternative to the environment-file template
+# (mia.env). MIA discovers it at `--config <path>`, then $FERROGATE_CONFIG, then
+# the OS system path, then the per-user path:
+#
+#   Linux    /etc/ferrogate/mia.toml                       ~/.config/ferrogate/mia.toml
+#   macOS    /Library/Application Support/FerroGate/...     ~/Library/Application Support/FerroGate/...
+#   Windows  %ProgramData%\FerroGate\mia.toml               %APPDATA%\FerroGate\mia.toml
+#
+# Precedence is
+#
+#     built-in defaults  <  this file  <  environment variables
+#
+# so an explicitly-set FERROGATE_* / RUST_LOG variable always overrides the
+# value here. Every key below is optional; omit a key to take its default.
+# Generate or edit this file interactively with `mia setup`.
+
+# Tracing verbosity (tracing EnvFilter syntax). Overridden by $RUST_LOG.
+# Default: "info".
+#log = "info"
+
+# --- CMIS server ------------------------------------------------------------
+# The Central Machine Identity Service this agent attests to. An https:// URL
+# is dialed over hybrid-PQC TLS and pinned by SPKI; http:// is plaintext
+# bring-up only.
+[cmis]
+#endpoint = "https://cmis.example.com:8443"
+# Accepted CMIS SPKI pin (lowercase-hex SHA-384).
+#spki_pin = "<hex-sha384>"
+
+# --- Helper API (feature F08) -----------------------------------------------
+# The local helper listener: a Unix socket path (Linux/macOS) or a named-pipe
+# name (Windows, e.g. \\.\pipe\ferrogate-mia). Setting `socket` ENABLES the
+# helper API; with none configured the daemon logs a banner and exits.
+[helper]
+#socket = "/run/ferrogate/mia.sock"
+# Unix only. Octal socket mode (as a string). Default: "660".
+#socket_mode = "660"
+# Windows only. Local group whose members may open the pipe (blank => default
+# pipe DACL).
+#windows_group = "FerroGateClients"
+
+# --- Allowlist --------------------------------------------------------------
+# Signed CBOR allowlist of vetted local callers. With no `path`, the helper API
+# denies every caller (fail closed). `key` is required whenever `path` is set.
+[allowlist]
+#path = "/etc/ferrogate/allowlist.cbor"
+#key = "/etc/ferrogate/allowlist.pub"
+# Maximum accepted allowlist age in seconds. Default: 86400.
+#max_age_secs = 86400
+
+# --- Attestation ------------------------------------------------------------
+[attestation]
+# Override the IMA runtime-measurement log path.
+#ima_log = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements"

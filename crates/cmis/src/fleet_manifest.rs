@@ -81,7 +81,8 @@ impl FleetManifest {
                     h.len()
                 )));
             }
-            let bytes = hex::decode(h).map_err(|e| FleetError::BadEkHash(format!("ek[{i}]: {e}")))?;
+            let bytes =
+                hex::decode(h).map_err(|e| FleetError::BadEkHash(format!("ek[{i}]: {e}")))?;
             let mut d = [0u8; 48];
             d.copy_from_slice(&bytes);
             hashes.insert(d);

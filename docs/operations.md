@@ -6,7 +6,9 @@
    manufacture, burning it into TPM NV storage.
 2. **Fleet manifest.** The fleet owner publishes an offline-signed manifest
    listing the SHA-384 of every accepted EK certificate. CMIS loads this
-   manifest on startup and refreshes it from a signed S3 object.
+   manifest on startup and hot-reloads it from a local file (a deployment that
+   keeps it in object storage syncs it to that path out of band; the composite
+   signature, not the transport, gates what is admitted).
 3. **First boot.** The MIA reads the EK certificate and connects to CMIS
    over hybrid-PQC TLS (server-auth only; the client has no identity yet).
 4. **Pre-admission check.** CMIS looks up `SHA-384(ek_cert)` in the active
@@ -34,8 +36,40 @@ on the EK cert.
   configured-but-unloadable manifest aborts startup (fail-closed).
 - **Refreshes are atomic.** A newer manifest is verified and hot-swapped under a
   write lock, so in-flight attestations see a consistent enrolment snapshot. The
-  current file-watcher stands in for the signed-S3 refresh (M5 follow-on), which
-  reuses the same verify-then-swap path.
+  manifest is read from a local file; native S3 sourcing is dropped (see
+  [roadmap.md](roadmap.md) §"Dropped scope") — sync from object storage to the
+  watched path out of band if needed.
+
+## Transport security (hybrid-PQC TLS)
+
+All MIA→CMIS control-plane traffic runs over TLS 1.3 using the hybrid
+`X25519MLKEM768` group only (feature F01). The shared rustls configs are built
+by `ferro_crypto::transport::{server_config, client_config}`; the server
+listener glue is `cmis::transport`, the client dialer is
+`mia::client::connect_pinned`. See [transport-tls.md](transport-tls.md) for the
+full how-it-works, the OpenSSL pin recipe, and troubleshooting.
+
+- **CMIS server identity.** Configure the listener with `CMIS_TLS_CERT` (PEM
+  certificate chain: end-entity first, then any intermediates) and
+  `CMIS_TLS_KEY` (PEM private key — PKCS#8 / PKCS#1 / SEC1). Both must be set
+  together; setting only one aborts startup, and setting neither falls back to
+  a **plaintext** bring-up server (development only, logged as a warning). With
+  TLS on, the listener advertises only `X25519MLKEM768`, so a non-PQC client
+  fails the handshake before reaching the gRPC layer.
+- **MIA pin provisioning.** The MIA does not trust a CA hierarchy; it pins the
+  SHA-384 of the CMIS certificate's `SubjectPublicKeyInfo`. Compute the pin
+  from the deployed cert with `ferro_crypto::pin::SpkiPin::from_certificate_der`
+  (or its `to_hex`/`from_hex` round-trip) and hand the pin set to
+  `connect_pinned`. A server whose SPKI hash is not pinned — or that does not
+  speak the hybrid group — is rejected before any RPC.
+- **Telemetry.** Every accepted connection logs `kx_group = X25519MLKEM768`.
+  Operators confirm post-quantum coverage by asserting no accepted connection
+  ever logs a non-hybrid group (which, under the hybrid-only provider, cannot
+  occur — a downgrade attempt fails the handshake instead).
+- **Certificate rotation.** Replace the cert/key files and restart (or
+  hot-reload, when wired); update the MIA pin set to include the new SPKI pin
+  ahead of the cutover so both old and new certificates verify during the
+  overlap window.
 
 ## SVID rotation
 
@@ -57,10 +91,11 @@ on the EK cert.
   hot-swaps any strictly-newer signed bundle (verified before apply, atomic).
   With `CMIS_RIM_BUNDLE` unset the allowlist is empty and every quote fails the
   RIM lookup (`FAILED_PRECONDITION`) — fail-closed by default.
-- **S3 sourcing is not supported yet.** The bundle is read from a local file; a
-  deployment that keeps it in object storage syncs it to that path out of band.
-  Because the bundle is composite-signed and verified before apply, that sync
-  path is untrusted — only the signature gates what is admitted.
+- **Native S3 sourcing is dropped** (see [roadmap.md](roadmap.md) §"Dropped
+  scope"). The bundle is read from a local file; a deployment that keeps it in
+  object storage syncs it to that path out of band. Because the bundle is
+  composite-signed and verified before apply, that sync path is untrusted —
+  only the signature gates what is admitted.
 - **Epoch bump (mass re-attestation).** For a compromised RIM generation or a
   vulnerable kernel image, the operator calls the `BumpEpoch(reason)` admin RPC
   (authenticated as an operator action at the transport). It advances the live

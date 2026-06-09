@@ -1,0 +1,23 @@
+[package]
+name        = "ferro-transport"
+description = "FerroGate — shared client-side dialer for the hybrid-PQC gRPC transport (F01)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferro-crypto = { path = "../ferro-crypto" }
+
+tokio            = { workspace = true }
+tokio-rustls     = { workspace = true }
+rustls-pki-types = { workspace = true }
+hyper-util       = { workspace = true }
+tower            = { workspace = true }
+tonic            = { workspace = true }
+anyhow           = { workspace = true }

@@ -8,6 +8,189 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Added
+
+- **`GetEnrollmentKey` RPC + `mia setup` key fetch.** CMIS now serves its
+  enrollment public key (the composite key that signs caller allowlists, as
+  `from_concat_bytes` bytes) via a new `GetEnrollmentKey` gRPC. `mia setup`,
+  when an allowlist is configured and a CMIS endpoint + SPKI pin are present,
+  offers to fetch that key over the pinned hybrid-PQC TLS channel and write it
+  to `allowlist.key`. Also fixes the SPKI-pin format wording (lowercase-hex
+  SHA-384, not base64) and validates the pin in the wizard. The signed
+  allowlist *body* served from CMIS (per-host store + admin path) is planned.
+
+### Fixed
+
+- **`mia setup` no longer double-prompts when editing an existing file.** The
+  final "Write this configuration to …?" prompt is now the single point of
+  consent; the redundant secondary "… exists — overwrite?" prompt (which always
+  triggered because the wizard pre-fills from the existing file, and aborted on
+  a natural "No") is removed. `--force` now skips the single write confirmation.
+
+### Added
+
+- **MIA runs on Linux, macOS, and Windows.** The daemon now wires up and serves
+  the helper API on all three platforms instead of only Linux: Linux uses
+  `SO_PEERCRED` + IMA, Windows uses the named-pipe transport with PID + image
+  hash + Authenticode, and macOS gains a new `MacCallerAuth` (peer-cred +
+  on-disk image SHA-384 via the `libproc` crate; FFI stays out of `mia`, which
+  remains `#![forbid(unsafe_code)]`). The startup hardening profile and TPM
+  attestation remain Linux-only; shutdown handles `SIGINT`/`SIGTERM` on Unix and
+  Ctrl-C on Windows.
+- **Per-OS configuration-file locations.** The config file is now discovered at
+  the OS-idiomatic system path then the per-user path — Linux
+  `/etc/ferrogate/mia.toml` / `~/.config/ferrogate/mia.toml`, macOS
+  `/Library/Application Support/FerroGate/mia.toml` / `~/Library/...`, Windows
+  `%ProgramData%\FerroGate\mia.toml` / `%APPDATA%\...` — in addition to
+  `--config` and `$FERROGATE_CONFIG`. `mia setup` now writes the **TOML config
+  file** (not the env file) to the system path by default, with `--user` for the
+  per-user path, prompting platform-appropriately (socket mode on Unix, pipe
+  group on Windows). New `helper.windows_group` key / `FERROGATE_HELPER_WINDOWS_GROUP`.
+- **MIA TOML configuration file.** MIA now reads an optional structured TOML
+  configuration file (`crates/mia/src/config.rs`) in addition to environment
+  variables, with precedence **defaults < config file < environment** — so
+  existing env-driven deployments (the systemd `EnvironmentFile`) are unchanged.
+  The file is discovered at `mia --config <path>`, then `$FERROGATE_CONFIG`,
+  then `/etc/ferrogate/mia.toml`; a malformed file (including an unknown key)
+  fails the daemon loudly at startup. Sections: `log`, `[cmis]`, `[helper]`,
+  `[allowlist]`, `[attestation]`. A documented template is shipped at
+  `/etc/ferrogate/mia.toml` (deb/rpm/macOS); source `crates/mia/dist/mia.toml`.
+- **`mia setup` interactive configuration wizard.** A guided, rich-terminal
+  wizard (built on `inquire`) that walks an operator through configuring the
+  Machine Identity Agent — the CMIS server to connect to, the local helper API,
+  the caller allowlist, attestation, and log verbosity — and writes the systemd
+  `EnvironmentFile` (`/etc/ferrogate/mia.env`) in the documented, self-commenting
+  template form. Run against an existing file it pre-fills every prompt, so it
+  doubles as an editor. `--output <path>` targets a different file, `--force`
+  skips the overwrite confirmation. Requires a TTY; unattended provisioning
+  should write `mia.env` from the template directly.
+- **`make mia-install`.** Compiles `mia` in release mode and installs the
+  stripped binary to `$(PREFIX)/bin` (default `/usr/local/bin`), falling back to
+  `sudo` when the destination is not writable.
+
+## [0.15.0] — 2026-06-03
+
+### Added
+
+- **F01 hybrid-PQC TLS in the `ferrogate` operator CLI.** The CLI can now dial
+  CMIS over the hybrid-PQC TLS transport with SPKI pinning, closing the gap that
+  left the in-container CLI broken once CMIS terminates TLS by default.
+  - An `https://` endpoint is dialed over TLS 1.3 / `X25519MLKEM768`-only and
+    authenticated by SPKI pin (not a CA chain); `http://` (or a bare authority)
+    keeps the plaintext dev/bring-up path unchanged.
+  - New `--spki-pin <hex>` (repeatable) / `$FERROGATE_CMIS_SPKI_PIN`
+    (comma-separated) and `--tls-cert <path>` / `$FERROGATE_CMIS_TLS_CERT`
+    flags. Pin resolution precedence: explicit pins → first certificate of the
+    server-cert PEM (defaulting to `/etc/ferrogate/tls/cmis.crt`, the path the
+    `puppet-ferrogate` module mounts) → a clear error. So
+    `ferrogate --endpoint https://127.0.0.1:8443 status` works inside the cmis
+    container with no extra flags.
+- **New `ferro-transport` crate.** The client-side pinned dialer (formerly the
+  body of `mia::client::connect_pinned`) now lives in
+  `ferro_transport::connect_pinned`, returning a bare tonic `Channel`. It is
+  shared by the MIA agent and the `ferrogate` CLI, keeping
+  `ferro-crypto::transport` free of tonic/tokio-rustls and avoiding a `mia`
+  dependency in the CLI. `mia::client::connect_pinned` delegates to it; MIA
+  behaviour and its `tls_transport.rs` tests are unchanged.
+
+### Changed
+
+- `docs/transport-tls.md` documents the CLI's TLS support (endpoint scheme,
+  pin-resolution precedence, the in-container zero-config default) and notes the
+  earlier plaintext-only caveat is resolved; the code map and troubleshooting
+  tables gained CLI / `ferro-transport` rows.
+
+## [0.14.0] — 2026-06-03
+
+### Added
+
+- **Transport security documentation.** New
+  [docs/transport-tls.md](docs/transport-tls.md): how the F01 hybrid-PQC TLS
+  transport works (TLS 1.3, `X25519MLKEM768`-only, SPKI pinning, ALPN h2, code
+  map) and how to configure it end to end — `CMIS_TLS_CERT` / `CMIS_TLS_KEY`,
+  generating a server cert, the OpenSSL SPKI-pin recipe, `connect_pinned`
+  usage, telemetry/verification, certificate + pin rotation, and
+  troubleshooting. Linked from the sidebar and cross-referenced from the
+  operations, crypto, cmis, mia, and networking docs.
+
+### Changed
+
+- Reformatted the workspace with `cargo fmt` so `cargo fmt --check` passes
+  cleanly (no behavioural change).
+
+## [0.13.4] — 2026-06-03
+
+### Added
+
+- **F01 hybrid-PQC TLS on the live gRPC transport.** The `ferro-crypto`
+  hybrid-PQC provider and SPKI-pin verifier are now wired into the actual
+  transport on both sides, closing the seam flagged in F04's status note.
+  - New `ferro_crypto::transport` module with shared rustls config builders
+    `server_config` / `client_config` (TLS 1.3 only, `X25519MLKEM768`-only,
+    ALPN `h2`), plus `is_hybrid_group` / `group_label` telemetry helpers.
+  - `cmis::transport::tls_incoming` terminates TLS via a `tokio_rustls` accept
+    loop and feeds handshake-complete connections to tonic's
+    `serve_with_incoming`; logs the negotiated key-exchange group per accepted
+    connection. The `cmis` binary enables TLS when `CMIS_TLS_CERT` +
+    `CMIS_TLS_KEY` are set, falling back to the plaintext bring-up server
+    (dev-only, loud warning) otherwise.
+  - `mia::client::connect_pinned` dials CMIS over a custom `tokio_rustls`
+    connector with SPKI pinning; a non-hybrid or wrong-pin server is rejected
+    before any RPC.
+  - Tests: `crates/mia/tests/tls_transport.rs` (pinned-hybrid JWKS over the
+    live listener, legacy non-PQC client rejected, wrong-pin rejected) and the
+    `transport_builders_negotiate_the_hybrid_group` handshake test.
+  - Operator guidance in [docs/operations.md](docs/operations.md) §"Transport
+    security (hybrid-PQC TLS)".
+
+### Changed
+
+- Enabled tonic's `tls` feature and promoted `tokio-rustls` to a regular
+  dependency of `cmis`/`mia`; added `hyper-util`, `tower`, and `rustls-pemfile`
+  workspace dependencies for the transport glue.
+
+## [0.13.3] — 2026-06-03
+
+### Changed
+
+- **S3 / object-storage support is dropped and will not be implemented.**
+  Documented as a new "Dropped scope" section in
+  [docs/roadmap.md](docs/roadmap.md): native S3 sourcing (RIM bundles, fleet
+  manifests) and the S3 Object Lock WORM store are removed from all future
+  tasks. Every artefact is read from / written to a local file or directory;
+  a deployment that keeps artefacts in object storage syncs them to the local
+  path out of band, and because each is composite-signed (RIM, fleet manifest)
+  or write-once via `O_CREAT|O_EXCL` (`LocalDiskWormStore`), that sync path is
+  untrusted. The `AuditStore` / loader trait seams stay open for an
+  out-of-tree adapter, but no object-store impl is a FerroGate deliverable.
+  Updated the roadmap, design docs (architecture, audit, threat-model,
+  networking, cmis, operations), the F07/F10/F13 feature docs, and the
+  corresponding source doc-comments to match.
+
+## [0.13.2] — 2026-06-02
+
+### Added
+
+- **Release pipeline.** A `Release` GitHub Actions workflow now fires on
+  `releases/**` tags and publishes the mia `.deb` and `.rpm` packages plus a
+  `ferrogate-sdk-rust-<version>.tgz` integration SDK to the GitHub Release.
+  New `make release` / `make pkg-sdk` targets build the same artifacts locally;
+  the SDK bundles the verifier-side crates (`ferro-proto`, `ferro-svid`,
+  `ferro-svid-verify`, `ferro-child-verify`, `ferro-attest`, `ferro-crypto`)
+  as a self-contained Cargo workspace.
+
+### Removed
+
+- The standalone `CI` workflow (`.github/workflows/ci.yml`).
+
+## [0.13.1] — 2026-06-02
+
+### Added
+
+- **`ferrogate -V` / `--version`.** The operator CLI now reports its version
+  (sourced from the workspace `CARGO_PKG_VERSION`) via `-V`, `--version`, or
+  the `version` subcommand.
+
 ## [0.13.0] — 2026-06-02 — Operator CLI
 
 ### Added

@@ -9,7 +9,7 @@
 | A3 | Compromised CMIS operator | Steal signing key from disk or RAM | TEE-resident keys; Shamir 3-of-5 sealed to enclave measurements; mlocked, zeroize-on-drop reconstruction |
 | A4 | Cryptographically Relevant Quantum Computer | Break ECC/RSA retroactively | ML-DSA-65 for signatures, ML-KEM-768 for KEX; both hybridized with classical (AND-combiner) |
 | A5 | Malicious peer host | Replay another node's TPM quote | Per-session 32-byte server nonce; EK certificate pinning; TPM2_ActivateCredential proof-of-residency |
-| A6 | Insider with SIEM write access | Tamper with audit trail | Merkle-chained STH signed inside TEE; WORM bucket (S3 Object Lock Compliance); public transparency anchor |
+| A6 | Insider with SIEM write access | Tamper with audit trail | Merkle-chained STH signed inside TEE; write-once local-disk WORM store (`O_CREAT|O_EXCL`); public transparency anchor |
 | A7 | Local userspace attacker | Steal token from MIA UDS socket | SO_PEERCRED + IMA runtime hash + signed allowlist; DPoP sender-constraint |
 
 ## Security goals

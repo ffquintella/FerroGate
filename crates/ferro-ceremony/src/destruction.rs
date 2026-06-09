@@ -45,7 +45,8 @@ pub struct DestructionRecord {
 /// if any byte survives non-zero or the bytes still parse as a usable share.
 pub fn destroy_media(path: impl AsRef<Path>, now: i64) -> Result<DestructionRecord> {
     let path = path.as_ref();
-    let original = fs::read(path).map_err(|e| CeremonyError::Io(format!("read {}: {e}", path.display())))?;
+    let original =
+        fs::read(path).map_err(|e| CeremonyError::Io(format!("read {}: {e}", path.display())))?;
     // Capture metadata while the share is still intact. We tolerate a medium
     // that no longer parses (already partly damaged) — destruction still runs.
     let (root_kid, holder, index) = match SealedShare::from_json(&original) {
@@ -91,8 +92,8 @@ fn overwrite_zeros(path: &Path, len: usize) -> Result<()> {
 /// re-audit a previously-destroyed medium.
 pub fn verify_destruction(path: impl AsRef<Path>) -> Result<()> {
     let path: PathBuf = path.as_ref().to_path_buf();
-    let after =
-        fs::read(&path).map_err(|e| CeremonyError::Io(format!("read-back {}: {e}", path.display())))?;
+    let after = fs::read(&path)
+        .map_err(|e| CeremonyError::Io(format!("read-back {}: {e}", path.display())))?;
 
     if let Some(pos) = after.iter().position(|&b| b != 0) {
         return Err(CeremonyError::NotDestroyed(format!(
@@ -130,7 +131,14 @@ mod tests {
 
     #[test]
     fn destroy_zeroizes_and_verifies() {
-        let set = SealedShareSet::seal("root-x", &[7u8; 32], 3, &["a".into(), "b".into(), "c".into()], 1000).unwrap();
+        let set = SealedShareSet::seal(
+            "root-x",
+            &[7u8; 32],
+            3,
+            &["a".into(), "b".into(), "c".into()],
+            1000,
+        )
+        .unwrap();
         let json = set.shares[0].to_json().unwrap();
         let path = scratch_file("ok", &json);
 
@@ -153,7 +161,14 @@ mod tests {
 
     #[test]
     fn verify_destruction_rejects_a_live_share() {
-        let set = SealedShareSet::seal("root-y", &[9u8; 32], 3, &["a".into(), "b".into(), "c".into()], 1000).unwrap();
+        let set = SealedShareSet::seal(
+            "root-y",
+            &[9u8; 32],
+            3,
+            &["a".into(), "b".into(), "c".into()],
+            1000,
+        )
+        .unwrap();
         let path = scratch_file("live", &set.shares[0].to_json().unwrap());
         assert!(matches!(
             verify_destruction(&path),

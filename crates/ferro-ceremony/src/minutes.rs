@@ -177,15 +177,16 @@ impl SignedMinutes {
                 .signatures
                 .iter()
                 .find(|s| s.kid == participant.kid)
-                .ok_or_else(|| CeremonyError::Signature(format!(
-                    "missing signature from {:?}",
-                    participant.kid
-                )))?;
+                .ok_or_else(|| {
+                    CeremonyError::Signature(format!(
+                        "missing signature from {:?}",
+                        participant.kid
+                    ))
+                })?;
             let pk = decode_pub(&participant.pubkey)?;
             let sig = decode_sig(&entry.sig)?;
-            pk.verify(MINUTES_CONTEXT, &msg, &sig).map_err(|e| {
-                CeremonyError::Signature(format!("{:?}: {e}", participant.kid))
-            })?;
+            pk.verify(MINUTES_CONTEXT, &msg, &sig)
+                .map_err(|e| CeremonyError::Signature(format!("{:?}: {e}", participant.kid)))?;
         }
         // Reject signatures attributed to non-participants.
         for entry in &self.signatures {

@@ -1,0 +1,56 @@
+name: Release
+
+# Fires when a release tag is pushed under the `releases/` namespace, e.g.
+#   git tag releases/v0.13.1 && git push origin releases/v0.13.1
+# Builds the mia .deb and .rpm packages and the ferrogate-sdk-rust .tgz, then
+# attaches them to the GitHub Release for the tag.
+on:
+  push:
+    tags:
+      - "releases/**"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  release:
+    name: build and publish release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libtss2-dev
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm
+
+      - name: Build release artifacts
+        run: make release
+
+      - name: Collect artifacts
+        id: artifacts
+        run: |
+          mkdir -p dist
+          cp target/debian/*.deb            dist/
+          cp target/generate-rpm/*.rpm      dist/
+          cp target/sdk/ferrogate-sdk-rust-*.tgz dist/
+          echo "Artifacts:"
+          ls -1 dist/
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

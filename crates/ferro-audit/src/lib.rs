@@ -13,8 +13,9 @@
 //!   `ferrogate-sth-v1`. The signer is a trait; the in-process implementation
 //!   is the M3 stub, replaced by the TEE-resident threshold signer in M4.
 //! - [`store`] — backing-store abstraction with a local-disk WORM
-//!   implementation for dev. Production swaps in the S3 Object Lock store
-//!   (M4) without changing callers.
+//!   implementation ([`store::LocalDiskWormStore`]), the shipped WORM tier.
+//!   A native S3 Object Lock store is dropped (see `docs/roadmap.md`
+//!   "Dropped scope"); the trait seam stays open for an out-of-tree adapter.
 //! - [`log`] — the [`log::AuditLog`] facade tying tree + store + signer
 //!   together with a thread-safe append API.
 //! - [`anchor`] — the M4 external-transparency anchor publisher: an

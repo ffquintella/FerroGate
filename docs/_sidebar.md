@@ -3,6 +3,7 @@
 - Core design
   - [Architecture](architecture.md)
   - [Networking & ports](networking.md)
+  - [Transport security (TLS)](transport-tls.md)
   - [Threat model](threat-model.md)
   - [Attestation protocol](protocol.md)
   - [Cryptography](crypto.md)
@@ -12,6 +13,7 @@
   - [CMIS server](cmis.md)
   - [MIA agent](mia.md)
   - [Helper API](helper-api.md)
+  - [Allowlist provisioning](allowlist-provisioning.md)
   - [Audit log](audit.md)
 
 - Operations

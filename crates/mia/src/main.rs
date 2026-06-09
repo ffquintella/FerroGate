@@ -8,18 +8,34 @@
 //! refuses to mint (`no_host_svid`) while still enforcing caller
 //! authentication and the signed allowlist — a fail-safe, deployable surface.
 //!
-//! Configuration is by environment variable:
+//! The binary also exposes an interactive `mia setup` subcommand: a
+//! rich-terminal wizard (see [`mia::setup`]) that walks an operator through the
+//! configuration below. With no subcommand, `mia` is the daemon.
 //!
-//! - `FERROGATE_HELPER_SOCKET` — socket path; its presence enables the helper
-//!   API. Absent ⇒ the daemon logs a banner and exits.
-//! - `FERROGATE_HELPER_SOCKET_MODE` — octal mode for the socket (default `660`).
-//! - `FERROGATE_ALLOWLIST` — path to the signed CBOR allowlist. Absent ⇒ the
-//!   API denies every caller (fail closed).
-//! - `FERROGATE_ALLOWLIST_KEY` — path to the trusted CMIS enrollment public key
-//!   (composite concat bytes) used to verify the allowlist. Required whenever
-//!   `FERROGATE_ALLOWLIST` is set.
-//! - `FERROGATE_ALLOWLIST_MAX_AGE_SECS` — max allowlist age (default `86400`).
-//! - `FERROGATE_IMA_LOG` — override the IMA runtime-measurement log path.
+//! ## Configuration
+//!
+//! MIA reads an optional TOML configuration file ([`mia::config`]) and overlays
+//! environment variables on top, so the precedence is
+//! **defaults < config file < environment**. The file is found at
+//! `--config <path>`, then `$FERROGATE_CONFIG`, then `/etc/ferrogate/mia.toml`
+//! (absent ⇒ env/defaults only). A deployment that sets everything through the
+//! systemd `EnvironmentFile` keeps working with no file present.
+//!
+//! The environment variables (each also a TOML key — see `dist/mia.toml`):
+//!
+//! - `FERROGATE_HELPER_SOCKET` (`helper.socket`) — socket path; its presence
+//!   enables the helper API. Absent ⇒ the daemon logs a banner and exits.
+//! - `FERROGATE_HELPER_SOCKET_MODE` (`helper.socket_mode`) — octal socket mode
+//!   (default `660`).
+//! - `FERROGATE_ALLOWLIST` (`allowlist.path`) — path to the signed CBOR
+//!   allowlist. Absent ⇒ the API denies every caller (fail closed).
+//! - `FERROGATE_ALLOWLIST_KEY` (`allowlist.key`) — path to the trusted CMIS
+//!   enrollment public key used to verify the allowlist. Required whenever the
+//!   allowlist is set.
+//! - `FERROGATE_ALLOWLIST_MAX_AGE_SECS` (`allowlist.max_age_secs`) — max
+//!   allowlist age (default `86400`).
+//! - `FERROGATE_IMA_LOG` (`attestation.ima_log`) — override the IMA
+//!   runtime-measurement log path.
 //!
 //! `unsafe` is forbidden in this crate (see `docs/features/F12-mia-hardening.md`).
 
@@ -28,7 +44,37 @@
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Subcommand dispatch. `mia` with no subcommand is the daemon (the systemd
+    // ExecStart); `mia setup` is the interactive configuration wizard, which
+    // must run BEFORE logging init, hardening, and the async runtime — it is
+    // synchronous terminal I/O and must not inherit the seccomp profile or the
+    // dropped privileges the daemon installs.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("setup") => return mia::setup::run(&args[1..]),
+        Some("-h" | "--help") => {
+            print_usage();
+            return Ok(());
+        }
+        Some("--version" | "-V") => {
+            println!("mia {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // A bare non-flag token is an unknown subcommand; flags (e.g. --config)
+        // belong to the daemon and are parsed below.
+        Some(other) if !other.starts_with('-') => {
+            anyhow::bail!("unknown subcommand: {other}\n\nrun `mia --help` for usage")
+        }
+        _ => {}
+    }
+
+    // Resolve the configuration before logging/hardening: the file gives us the
+    // log directive, and a malformed file must fail loudly and early.
+    let config_path = parse_config_flag(&args)?;
+    let (config, source) = mia::config::Config::load(config_path.as_deref())?;
+
+    let filter =
+        EnvFilter::try_new(config.log_directive()).unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     tracing::info!(
@@ -36,6 +82,11 @@ fn main() -> anyhow::Result<()> {
         component = "mia",
         "FerroGate Machine Identity Agent"
     );
+    if let Some(path) = &source {
+        tracing::info!(config = %path.display(), "loaded configuration file");
+    } else {
+        tracing::debug!("no configuration file; using environment and defaults");
+    }
 
     // Apply the hardening profile (feature F12) on the single startup thread,
     // *before* building the async runtime — so the seccomp filter is inherited
@@ -44,6 +95,8 @@ fn main() -> anyhow::Result<()> {
     // harden must not serve.
     #[cfg(target_os = "linux")]
     mia::hardening::harden()?;
+    #[cfg(not(target_os = "linux"))]
+    tracing::debug!("hardening profile (seccomp/mlockall/privilege-drop) applies on Linux only");
 
     // Build the multi-threaded runtime by hand (rather than `#[tokio::main]`) so
     // hardening runs first. `enable_all` wires the I/O and time drivers the
@@ -51,36 +104,122 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run())
+    runtime.block_on(run(config))
 }
 
-/// Daemon entry point. Starts the helper API when `FERROGATE_HELPER_SOCKET` is
-/// set, otherwise prints a banner and exits.
-async fn run() -> anyhow::Result<()> {
-    let Some(socket) = std::env::var_os("FERROGATE_HELPER_SOCKET") else {
+/// Parse the daemon's `--config`/`-c <path>` flag from `args`. Returns the
+/// requested path, if any. Errors on a missing argument or an unknown flag.
+fn parse_config_flag(args: &[String]) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let mut config = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-c" | "--config" => {
+                let path = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--config requires a path argument"))?;
+                config = Some(std::path::PathBuf::from(path));
+            }
+            other => anyhow::bail!("unknown option: {other}\n\nrun `mia --help` for usage"),
+        }
+    }
+    Ok(config)
+}
+
+/// Top-level CLI usage banner.
+fn print_usage() {
+    println!(
+        "mia {} — FerroGate Machine Identity Agent\n\
+         \n\
+         usage: mia [--config <path>]\n\
+         \x20      mia <command>\n\
+         \n\
+         commands:\n\
+         \x20 (none)   run the agent daemon\n\
+         \x20 setup    interactive wizard that writes the agent's config file\n\
+         \n\
+         options:\n\
+         \x20 -c, --config <path>   TOML config file (default {}, then\n\
+         \x20                       $FERROGATE_CONFIG; environment variables override it)\n\
+         \x20 -h, --help            show this help\n\
+         \x20 -V, --version         print the version\n\
+         \n\
+         Run `mia setup --help` for the wizard's options.",
+        env!("CARGO_PKG_VERSION"),
+        mia::config::system_config_path().display(),
+    );
+}
+
+/// Daemon entry point. Starts the helper API when a helper socket is
+/// configured, otherwise prints a banner and exits.
+async fn run(config: mia::config::Config) -> anyhow::Result<()> {
+    if config.helper_socket().is_none() {
         println!(
-            "mia v{} — daemon idle; set FERROGATE_HELPER_SOCKET to start the helper API.",
+            "mia v{} — daemon idle; set a helper socket (helper.socket / \
+             FERROGATE_HELPER_SOCKET) to start the helper API.",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
-    };
-    start_helper_api(std::path::PathBuf::from(socket)).await
+    }
+    start_helper_api(&config).await
 }
 
+/// Build the platform's caller authenticator (Linux: SO_PEERCRED + IMA).
 #[cfg(target_os = "linux")]
-async fn start_helper_api(socket_path: std::path::PathBuf) -> anyhow::Result<()> {
-    use std::time::Duration;
-
-    use anyhow::Context as _;
-    use std::sync::Arc;
-
-    use ferro_crypto::composite::CompositePublicKey;
+fn build_auth(config: &mia::config::Config) -> mia::helper::auth::ImaCallerAuth {
     use mia::helper::auth::ImaCallerAuth;
+    match config.attestation.ima_log.as_deref() {
+        Some(p) => ImaCallerAuth::with_ima_log(p.to_path_buf()),
+        None => ImaCallerAuth::new(),
+    }
+}
+
+/// Build the platform's caller authenticator (macOS: peer-cred + image hash).
+#[cfg(target_os = "macos")]
+fn build_auth(_config: &mia::config::Config) -> mia::helper::auth::MacCallerAuth {
+    mia::helper::auth::MacCallerAuth::new()
+}
+
+/// Build the platform's caller authenticator (Windows: PID + image hash +
+/// Authenticode).
+#[cfg(windows)]
+fn build_auth(_config: &mia::config::Config) -> mia::helper::auth::WindowsCallerAuth {
+    mia::helper::auth::WindowsCallerAuth::new()
+}
+
+/// Start the local helper API. Supported on Linux, macOS, and Windows; the only
+/// per-OS difference is the caller authenticator ([`build_auth`]) and the
+/// transport `HelperServer` resolves from the target (UDS on Unix, a named pipe
+/// on Windows).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+async fn start_helper_api(config: &mia::config::Config) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let socket_path = config
+        .helper_socket()
+        .context("internal: start_helper_api called without a helper socket")?
+        .to_path_buf();
+    serve(config, socket_path, build_auth(config)).await
+}
+
+/// Bind and serve the helper API with the given caller authenticator. Shared by
+/// every supported platform.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+async fn serve<A>(
+    config: &mia::config::Config,
+    socket_path: std::path::PathBuf,
+    auth: A,
+) -> anyhow::Result<()>
+where
+    A: mia::helper::auth::CallerAuth,
+{
+    use anyhow::Context as _;
+    use ferro_crypto::composite::CompositePublicKey;
     use mia::helper::{system_clock, Allowlist, CrlCache, HelperServer, HelperServerConfig};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
-    let socket_mode = env_octal("FERROGATE_HELPER_SOCKET_MODE", 0o660)?;
-    let max_age = env_i64("FERROGATE_ALLOWLIST_MAX_AGE_SECS", 86_400)?;
+    let max_age = config.allowlist_max_age();
     let clock = system_clock();
 
     // Audit sink: a forwarder task drains helper events. For now it logs them;
@@ -93,34 +232,36 @@ async fn start_helper_api(socket_path: std::path::PathBuf) -> anyhow::Result<()>
     });
 
     // Allowlist: configured ⇒ load and verify (fail loudly); absent ⇒ deny all.
-    let allowlist = if let Some(path) = std::env::var_os("FERROGATE_ALLOWLIST") {
-        let key_path = std::env::var_os("FERROGATE_ALLOWLIST_KEY")
-            .context("FERROGATE_ALLOWLIST is set but FERROGATE_ALLOWLIST_KEY is missing")?;
-        let key_bytes = std::fs::read(&key_path).context("reading FERROGATE_ALLOWLIST_KEY")?;
+    let allowlist = if let Some(path) = config.allowlist.path.as_deref() {
+        let key_path = config.allowlist.key.as_deref().context(
+            "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing",
+        )?;
+        let key_bytes = std::fs::read(key_path).with_context(|| {
+            format!(
+                "reading allowlist key (allowlist.key) {}",
+                key_path.display()
+            )
+        })?;
         let trusted = CompositePublicKey::from_concat_bytes(&key_bytes)
             .map_err(|e| anyhow::anyhow!("trusted allowlist key: {e}"))?;
-        let bytes = std::fs::read(&path).context("reading FERROGATE_ALLOWLIST")?;
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading allowlist (allowlist.path) {}", path.display()))?;
         let al = Allowlist::load(&bytes, &trusted, clock(), max_age)
             .map_err(|e| anyhow::anyhow!("allowlist verification failed: {e}"))?;
         tracing::info!(trust_domain = al.trust_domain(), "loaded signed allowlist");
         Some(al)
     } else {
-        tracing::warn!(
-            "no FERROGATE_ALLOWLIST configured; helper API denies all callers (fail closed)"
-        );
+        tracing::warn!("no allowlist configured; helper API denies all callers (fail closed)");
         None
     };
 
-    let auth = match std::env::var_os("FERROGATE_IMA_LOG") {
-        Some(p) => ImaCallerAuth::with_ima_log(std::path::PathBuf::from(p)),
-        None => ImaCallerAuth::new(),
-    };
-
-    let config = HelperServerConfig {
+    let helper_config = HelperServerConfig {
         socket_path: socket_path.clone(),
-        socket_mode,
+        // `socket_mode`/`socket_gid` are Unix-only; `windows_group` is
+        // Windows-only. Each transport ignores the fields that don't apply.
+        socket_mode: config.socket_mode()?,
         socket_gid: None,
-        windows_group: None,
+        windows_group: config.helper.windows_group.clone(),
         max_concurrent: 64,
         read_timeout: Duration::from_secs(5),
     };
@@ -132,29 +273,27 @@ async fn start_helper_api(socket_path: std::path::PathBuf) -> anyhow::Result<()>
     // (`mia::helper::crl::spawn_puller`) against the host's CMIS endpoint; until
     // then an empty cache simply means the (absent) minter stays disabled.
     let crl = Arc::new(CrlCache::new());
-    let server = HelperServer::bind(config, auth, None, allowlist, crl, audit_tx, clock)?;
+    let server = HelperServer::bind(helper_config, auth, None, allowlist, crl, audit_tx, clock)?;
     tracing::warn!(
         "host SVID not present; token minting disabled (returns no_host_svid) until attestation lands"
     );
-    let mode_octal = format!("{socket_mode:o}");
-    tracing::info!(socket = %socket_path.display(), mode = mode_octal.as_str(), "helper API listening");
+    tracing::info!(listener = %socket_path.display(), "helper API listening");
 
     server.serve_with_shutdown(shutdown_signal()).await;
     tracing::info!("helper API shut down cleanly");
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::unused_async)] // async to match the Linux signature at the call site
-async fn start_helper_api(_socket_path: std::path::PathBuf) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "the helper API requires Linux (SO_PEERCRED + IMA caller attestation); \
-         this platform is unsupported"
-    )
+/// Fallback for platforms with no helper transport (neither Unix nor Windows).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[allow(clippy::unused_async)] // async to match the cross-platform signature
+async fn start_helper_api(_config: &mia::config::Config) -> anyhow::Result<()> {
+    anyhow::bail!("unsupported platform: mia's helper API runs on Linux, macOS, and Windows")
 }
 
-/// Resolve when the process receives `SIGINT` (Ctrl-C) or `SIGTERM`.
-#[cfg(target_os = "linux")]
+/// Resolve when the process is asked to stop: `SIGINT`/`SIGTERM` on Unix,
+/// Ctrl-C / Ctrl-Break on Windows.
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -172,23 +311,9 @@ async fn shutdown_signal() {
     }
 }
 
-/// Parse an octal `u32` from an environment variable, or use `default`.
-#[cfg(target_os = "linux")]
-fn env_octal(key: &str, default: u32) -> anyhow::Result<u32> {
-    match std::env::var(key) {
-        Ok(s) => u32::from_str_radix(s.trim_start_matches("0o"), 8)
-            .map_err(|e| anyhow::anyhow!("{key} is not octal: {e}")),
-        Err(_) => Ok(default),
-    }
-}
-
-/// Parse an `i64` from an environment variable, or use `default`.
-#[cfg(target_os = "linux")]
-fn env_i64(key: &str, default: i64) -> anyhow::Result<i64> {
-    match std::env::var(key) {
-        Ok(s) => s
-            .parse()
-            .map_err(|e| anyhow::anyhow!("{key} is not an integer: {e}")),
-        Err(_) => Ok(default),
-    }
+/// Resolve when the process receives Ctrl-C / Ctrl-Break (Windows).
+#[cfg(windows)]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("received Ctrl-C; shutting down");
 }

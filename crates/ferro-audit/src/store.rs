@@ -1,15 +1,17 @@
 //! Backing-store abstraction for the audit log.
 //!
-//! Production deployments use S3 with Object Lock Compliance mode (10-year
-//! retention) for the WORM tier; the replicated copy lives in the
-//! hiqlite-backed Raft state machine. The M3 surface defines [`AuditStore`]
-//! and ships [`LocalDiskWormStore`], a local-filesystem implementation
-//! suitable for dev and CI.
+//! [`LocalDiskWormStore`] is the shipped WORM tier; the replicated copy lives
+//! in the hiqlite-backed Raft state machine. A native S3 Object Lock store was
+//! originally planned but is dropped (see `docs/roadmap.md` "Dropped scope");
+//! deployments needing cloud durability sync the WORM directory to object
+//! storage out of band. The [`AuditStore`] trait seam stays open for an
+//! out-of-tree adapter, but no object-store impl is a FerroGate deliverable.
 //!
 //! The WORM property here is enforced by `OpenOptions::create_new(true)`:
 //! once a leaf file (or an STH file) exists, the store refuses to overwrite
-//! it and returns [`AuditStoreError::AlreadyExists`]. Real WORM (object lock
-//! / hardware write-protect) lives in the production store.
+//! it and returns [`AuditStoreError::AlreadyExists`]. Stronger media-level
+//! write-protection (immutable mounts, hardware WORM) is a deployment concern
+//! layered under the same directory.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -59,8 +61,8 @@ pub trait AuditStore: Send + Sync {
 
     /// Persist a co-signed tree head (quorum artefact), keyed by its
     /// `tree_size`. Defaults to a not-supported error so existing stores
-    /// remain valid without M4 changes; the [`LocalDiskWormStore`] (and the
-    /// future S3 Object Lock store) override it.
+    /// remain valid without M4 changes; the [`LocalDiskWormStore`] (and any
+    /// out-of-tree backing store) override it.
     fn record_cosigned_sth(&self, sth: &CoSignedTreeHead) -> Result<(), AuditStoreError> {
         let _ = sth;
         Err(AuditStoreError::Unsupported(

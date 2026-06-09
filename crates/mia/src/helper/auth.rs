@@ -283,6 +283,64 @@ mod windows_auth {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub use macos_auth::MacCallerAuth;
+
+#[cfg(target_os = "macos")]
+mod macos_auth {
+    use super::{AuthError, CallerAuth, CallerIdentity, PeerCred};
+    use sha2::{Digest, Sha384};
+
+    /// The macOS caller authenticator: `getpeereid`/`LOCAL_PEERPID` peer
+    /// credentials plus an on-disk image hash.
+    ///
+    /// From the peer PID (read by the UDS transport) it resolves the caller's
+    /// executable path via `libproc` (`proc_pidpath`), hashes the image
+    /// (`SHA-384`, the allowlist's `bin_sha`), and reports `(pid, uid, gid)`
+    /// from the socket credentials. This is the analogue of
+    /// [`WindowsCallerAuth::without_authenticode`](super::WindowsCallerAuth):
+    /// it establishes binary identity but does **not** verify a code signature
+    /// (macOS has no IMA-equivalent runtime measurement). All FFI lives in the
+    /// external `libproc` crate, so `mia` itself stays `#![forbid(unsafe_code)]`.
+    pub struct MacCallerAuth {
+        _private: (),
+    }
+
+    impl MacCallerAuth {
+        /// Construct the authenticator.
+        #[must_use]
+        pub fn new() -> Self {
+            Self { _private: () }
+        }
+    }
+
+    impl Default for MacCallerAuth {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl CallerAuth for MacCallerAuth {
+        fn identify(&self, cred: PeerCred) -> Result<CallerIdentity, AuthError> {
+            let pid = cred.pid.ok_or(AuthError::PeerCredUnavailable)?;
+            let partial = Some((pid, cred.uid));
+            let pid_i32 = i32::try_from(pid).map_err(|_| AuthError::ExeUnreadable { partial })?;
+
+            let path = libproc::proc_pid::pidpath(pid_i32)
+                .map_err(|_| AuthError::ExeUnreadable { partial })?;
+            let bytes = std::fs::read(&path).map_err(|_| AuthError::ExeUnreadable { partial })?;
+            let bin_sha: [u8; 48] = Sha384::digest(&bytes).into();
+
+            Ok(CallerIdentity {
+                pid,
+                uid: cred.uid,
+                gid: cred.gid,
+                bin_sha,
+            })
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::ImaCallerAuth;
 
