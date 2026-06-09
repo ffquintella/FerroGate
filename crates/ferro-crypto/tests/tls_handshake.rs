@@ -36,7 +36,7 @@ fn make_server_identity() -> TestServerIdentity {
     let ck = rcgen::generate_simple_self_signed(vec!["cmis.test.ferrogate.invalid".to_string()])
         .expect("rcgen self-signed cert");
     let cert_der: CertificateDer<'static> = ck.cert.der().clone();
-    let key_pem = ck.key_pair.serialize_pem();
+    let key_pem = ck.signing_key.serialize_pem();
     let key_der: PrivateKeyDer<'static> =
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from_pem_slice(key_pem.as_bytes()).unwrap());
     let pin = SpkiPin::from_certificate_der(cert_der.as_ref()).unwrap();

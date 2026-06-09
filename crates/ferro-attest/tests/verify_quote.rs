@@ -139,7 +139,7 @@ struct Ek {
 }
 
 fn build_ek_chain() -> Ek {
-    use rcgen::{date_time_ymd, BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rcgen::{date_time_ymd, BasicConstraints, CertificateParams, Issuer, IsCa, KeyPair};
 
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -152,7 +152,8 @@ fn build_ek_chain() -> Ek {
     let mut leaf_params = CertificateParams::new(vec!["ek.host".to_string()]).unwrap();
     leaf_params.not_before = date_time_ymd(2020, 1, 1);
     leaf_params.not_after = date_time_ymd(2035, 1, 1);
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+    let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
 
     Ek {
         leaf_der: leaf_cert.der().to_vec(),

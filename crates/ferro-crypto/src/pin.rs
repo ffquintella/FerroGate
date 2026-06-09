@@ -204,7 +204,7 @@ mod tests {
     use super::*;
 
     /// Tiny rcgen self-signed cert helper to keep tests focused on pin logic.
-    fn sample_cert() -> rcgen::CertifiedKey {
+    fn sample_cert() -> rcgen::CertifiedKey<rcgen::KeyPair> {
         rcgen::generate_simple_self_signed(vec!["test.ferrogate.invalid".to_string()])
             .expect("rcgen self-signed cert")
     }

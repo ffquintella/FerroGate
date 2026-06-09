@@ -56,7 +56,7 @@ fn make_identity() -> (
         .expect("rcgen self-signed cert");
     let cert: CertificateDer<'static> = ck.cert.der().clone();
     let cert_pem = ck.cert.pem();
-    let key_pem = ck.key_pair.serialize_pem();
+    let key_pem = ck.signing_key.serialize_pem();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from_pem_slice(key_pem.as_bytes()).unwrap());
     let pin = SpkiPin::from_certificate_der(cert.as_ref()).unwrap();
     (vec![cert], key, pin, cert_pem)

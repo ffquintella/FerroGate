@@ -124,7 +124,7 @@ fn marshal_signature(hash_alg: u16, r: &[u8], s: &[u8]) -> Vec<u8> {
 }
 
 fn build_ek_chain() -> (Vec<u8>, Vec<u8>) {
-    use rcgen::{date_time_ymd, BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rcgen::{date_time_ymd, BasicConstraints, CertificateParams, Issuer, IsCa, KeyPair};
     let ca_key = KeyPair::generate().unwrap();
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -135,7 +135,8 @@ fn build_ek_chain() -> (Vec<u8>, Vec<u8>) {
     let mut leaf = CertificateParams::new(vec!["ek.host".to_string()]).unwrap();
     leaf.not_before = date_time_ymd(2020, 1, 1);
     leaf.not_after = date_time_ymd(2035, 1, 1);
-    let leaf_cert = leaf.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+    let ca_issuer = Issuer::from_params(&ca, &ca_key);
+    let leaf_cert = leaf.signed_by(&leaf_key, &ca_issuer).unwrap();
     (leaf_cert.der().to_vec(), ca_cert.der().to_vec())
 }
 
