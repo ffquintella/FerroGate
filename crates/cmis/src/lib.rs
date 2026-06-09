@@ -25,7 +25,7 @@ pub mod transport;
 pub use credential::{CredentialError, CredentialMaker, WrappedCredential};
 pub use fleet_manifest::{
     EnrolledHosts, EnrollmentDecision, FleetManifest, FleetManifestLoader, FleetStore,
-    SignedFleetManifest,
+    MachinePubkey, SignedFleetManifest,
 };
 pub use service::MachineIdentitySvc;
 pub use state::{CmisConfig, CmisState, IssuedRecord};

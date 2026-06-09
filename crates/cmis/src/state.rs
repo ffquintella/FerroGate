@@ -109,7 +109,29 @@ pub struct CmisState {
     /// a signed manifest is loaded via the [`FleetStore`] handle, so a CMIS with
     /// no manifest configured behaves exactly as it did pre-F13.
     fleet: FleetStore,
+    /// Trust-on-first-use bindings for the TPM-less host-key profile (F15):
+    /// `fingerprint → machine key (DER SPKI)`. The first attestation for a
+    /// fingerprint pins its key; later attestations must present the same key.
+    /// A pre-registered key in the fleet manifest overrides this (no TOFU).
+    ///
+    /// Process-local, like the revocation and child-key registries: replicating
+    /// the pin through the Raft store so every replica enforces the same binding
+    /// is a documented deployment seam.
+    host_key_pins: Mutex<HashMap<[u8; 48], Vec<u8>>>,
     backend: Backend,
+}
+
+/// The outcome of binding a host fingerprint to its presented machine key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyBinding {
+    /// First time this fingerprint was seen; its key is now pinned (TOFU).
+    FirstSeen,
+    /// The presented key matches the previously pinned (TOFU) key.
+    Pinned,
+    /// The presented key matches the operator pre-registered key.
+    PreRegistered,
+    /// The presented key does not match the bound key — reject and audit.
+    Mismatch,
 }
 
 /// The mutable revocation working set.
@@ -148,6 +170,7 @@ impl CmisState {
             revocations: Mutex::new(Revocations::default()),
             published_crl: RwLock::new(None),
             fleet: FleetStore::unenforced(),
+            host_key_pins: Mutex::new(HashMap::new()),
             backend: Backend::Local(Mutex::new(HashMap::new())),
         }
     }
@@ -176,6 +199,7 @@ impl CmisState {
             revocations: Mutex::new(Revocations::default()),
             published_crl: RwLock::new(None),
             fleet: FleetStore::unenforced(),
+            host_key_pins: Mutex::new(HashMap::new()),
             backend: Backend::Cluster(cluster),
         }
     }
@@ -198,6 +222,32 @@ impl CmisState {
     #[must_use]
     pub fn check_enrollment(&self, ek_sha: &[u8; 48]) -> EnrollmentDecision {
         self.fleet.decide(ek_sha)
+    }
+
+    /// Bind a TPM-less host's fingerprint to its presented machine key (feature
+    /// F15). If the active fleet manifest pre-registers a key for this
+    /// fingerprint, require an exact match. Otherwise trust the key on first use
+    /// and pin it for every later attestation. A presented key that differs
+    /// from the bound one returns [`HostKeyBinding::Mismatch`] and is rejected
+    /// by the caller.
+    pub fn bind_host_key(&self, fingerprint: &[u8; 48], sep_pub: &[u8]) -> HostKeyBinding {
+        // Operator pre-registration takes precedence over TOFU.
+        if let Some(expected) = self.fleet.preregistered(fingerprint) {
+            return if expected == sep_pub {
+                HostKeyBinding::PreRegistered
+            } else {
+                HostKeyBinding::Mismatch
+            };
+        }
+        let mut pins = self.host_key_pins.lock();
+        match pins.get(fingerprint) {
+            Some(existing) if existing.as_slice() == sep_pub => HostKeyBinding::Pinned,
+            Some(_) => HostKeyBinding::Mismatch,
+            None => {
+                pins.insert(*fingerprint, sep_pub.to_vec());
+                HostKeyBinding::FirstSeen
+            }
+        }
     }
 
     /// The JWK set published over the `JWKS` RPC.

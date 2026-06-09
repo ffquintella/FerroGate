@@ -14,7 +14,10 @@ use ferro_crypto::pin::SpkiPin;
 use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
-use ferro_proto::v1::{AttestInit, AttestRequest, ChallengeResponse, Csr, PcrValue, SvidBundle};
+use ferro_proto::v1::{
+    AttestInit, AttestRequest, ChallengeResponse, Csr, HostKeyEvidence, MachineFacts, PcrValue,
+    SvidBundle,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
@@ -160,6 +163,7 @@ pub async fn run_attest<T: AttestEvidence>(
                 value,
             })
             .collect(),
+        host_key: None,
     };
     send(&tx, ReqPhase::Init(init)).await?;
 
@@ -180,6 +184,85 @@ pub async fn run_attest<T: AttestEvidence>(
         CompositeSecretKey::generate().map_err(|e| AttestClientError::KeyGen(e.to_string()))?;
     let composite_pub = svid_public.to_concat_bytes();
     let aik_sig = evidence.sign_aik(&composite_pub)?;
+    send(
+        &tx,
+        ReqPhase::Csr(Csr {
+            composite_pub,
+            dpop_jkt,
+            aik_sig,
+        }),
+    )
+    .await?;
+
+    // Receive the issued SVID.
+    let bundle = match next(&mut responses).await? {
+        RespPhase::Svid(b) => b,
+        other => return Err(unexpected("svid", &other)),
+    };
+
+    drop(tx);
+    Ok(AttestedSvid {
+        bundle,
+        svid_secret,
+        svid_public,
+    })
+}
+
+/// Run the TPM-less **host-key** handshake (feature F15): a 3-phase variant of
+/// [`run_attest`] with no phase-3 credential activation.
+///
+/// `facts` are this machine's hardware identifiers (see `ferro-machineid`);
+/// `key` is the machine signing key — a [`ferro_sep::enclave::SecureEnclaveKey`]
+/// on a SEP-equipped Mac, or a [`ferro_sep::SoftwareMachineKey`] elsewhere. The
+/// fingerprint `H` is derived from `facts`; `key` signs `nonce ‖ H` in phase 2
+/// and the composite CSR in phase 4.
+pub async fn run_attest_host_key(
+    client: &mut MachineIdentityClient<Channel>,
+    facts: &ferro_machineid::MachineFacts,
+    key: &dyn ferro_sep::MachineKey,
+    dpop_jkt: String,
+) -> Result<AttestedSvid, AttestClientError> {
+    let (tx, rx) = mpsc::channel::<AttestRequest>(8);
+    let mut responses = client
+        .attest(Request::new(ReceiverStream::new(rx)))
+        .await?
+        .into_inner();
+
+    // Phase 1.5 — receive the server nonce.
+    let nonce = match next(&mut responses).await? {
+        RespPhase::Nonce(n) => n.nonce,
+        other => return Err(unexpected("nonce", &other)),
+    };
+
+    // Phase 2 — sign nonce ‖ H with the machine key and send the evidence.
+    let fingerprint = facts.fingerprint();
+    let sig = key
+        .sign(&ferro_sep::host_key_binding(&nonce, fingerprint.as_bytes()))
+        .map_err(|e| AttestClientError::Evidence(anyhow::Error::new(e)))?;
+    let facts = facts.normalised();
+    let init = AttestInit {
+        host_key: Some(HostKeyEvidence {
+            fingerprint: fingerprint.as_bytes().to_vec(),
+            facts: Some(MachineFacts {
+                board_serial: facts.board_serial,
+                platform_uuid: facts.platform_uuid,
+                disk_serial: facts.disk_serial,
+            }),
+            sep_pub: key.public_spki_der(),
+            signature: sig,
+        }),
+        ..Default::default()
+    };
+    send(&tx, ReqPhase::Init(init)).await?;
+
+    // Phase 4 — generate the composite SVID key, machine-key-sign it, send CSR.
+    // (No phase-3 challenge: residency is not separately proven on this profile.)
+    let (svid_secret, svid_public) =
+        CompositeSecretKey::generate().map_err(|e| AttestClientError::KeyGen(e.to_string()))?;
+    let composite_pub = svid_public.to_concat_bytes();
+    let aik_sig = key
+        .sign(&composite_pub)
+        .map_err(|e| AttestClientError::Evidence(anyhow::Error::new(e)))?;
     send(
         &tx,
         ReqPhase::Csr(Csr {

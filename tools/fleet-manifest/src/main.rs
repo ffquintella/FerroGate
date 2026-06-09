@@ -34,7 +34,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use cmis::fleet_manifest::{FleetManifest, SignedFleetManifest};
+use cmis::fleet_manifest::{FleetManifest, MachinePubkey, SignedFleetManifest};
 use ferro_attest::TrustedKeys;
 use ferro_crypto::composite::{CompositePublicKey, CompositeSecretKey};
 use rand_core::{OsRng, RngCore as _};
@@ -155,6 +155,17 @@ fn canonical_ek(value: &str) -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
+/// Canonicalise a host-key hardware fingerprint (feature F15): a 48-byte
+/// SHA-384 in lowercase hex.
+fn canonical_fingerprint(value: &str) -> Result<String> {
+    let s = resolve(value)?;
+    let bytes = hex::decode(&s).with_context(|| format!("fingerprint {s:?} is not hex"))?;
+    if bytes.len() != 48 {
+        bail!("fingerprint must be 48 bytes (SHA-384), got {}", bytes.len());
+    }
+    Ok(hex::encode(bytes))
+}
+
 /// Resolve a 32-byte master seed from an inline hex value or `@path`.
 fn resolve_seed(value: &str) -> Result<[u8; 32]> {
     let s = resolve(value)?;
@@ -231,6 +242,8 @@ fn cmd_new(opts: &Opts) -> Result<()> {
         trust_domain,
         issued_at,
         enrolled_ek_sha384: Vec::new(),
+        enrolled_machine_id: Vec::new(),
+        enrolled_machine_pubkey: Vec::new(),
     };
     match opts.opt("out") {
         Some(path) => {
@@ -246,24 +259,66 @@ fn cmd_add(opts: &Opts) -> Result<()> {
     let path = opts.get("manifest")?;
     let mut manifest = read_manifest(path)?;
     let eks = opts.all("ek");
-    if eks.is_empty() {
-        bail!("add needs at least one --ek <hex|@file>");
+    // `--machine <hex>` enrolls a TPM-less host by its hardware fingerprint H
+    // (feature F15): a 96-char lowercase-hex SHA-384, as printed by `mia` /
+    // `ferro_machineid::Fingerprint::to_hex`.
+    let machines = opts.all("machine");
+    if eks.is_empty() && machines.is_empty() {
+        bail!("add needs at least one --ek <hex|@file> or --machine <hex>");
     }
     let mut added = 0usize;
     for ek in eks {
         let canon = canonical_ek(ek)?;
         if manifest.enrolled_ek_sha384.iter().any(|e| e == &canon) {
-            eprintln!("already enrolled: {canon}");
+            eprintln!("already enrolled (ek): {canon}");
         } else {
             manifest.enrolled_ek_sha384.push(canon);
             added += 1;
         }
     }
+    for m in machines {
+        let canon = canonical_fingerprint(m)?;
+        if manifest.enrolled_machine_id.iter().any(|e| e == &canon) {
+            eprintln!("already enrolled (machine): {canon}");
+        } else {
+            manifest.enrolled_machine_id.push(canon);
+            added += 1;
+        }
+    }
+    // `--machine-pubkey <fingerprint-hex>:<sep_pub-b64url>` pre-registers a
+    // machine key (F15), pinning the host to exactly this key from its first
+    // attestation. The base64url is `ferro_sep`'s DER SPKI, no padding.
+    for mpk in opts.all("machine-pubkey") {
+        let (fp, b64) = mpk
+            .split_once(':')
+            .context("--machine-pubkey must be <fingerprint-hex>:<sep_pub-b64url>")?;
+        let fingerprint = canonical_fingerprint(fp)?;
+        if b64.trim().is_empty() {
+            bail!("--machine-pubkey: empty public key for {fingerprint}");
+        }
+        if manifest
+            .enrolled_machine_pubkey
+            .iter()
+            .any(|e| e.fingerprint == fingerprint)
+        {
+            eprintln!("already pre-registered (machine-pubkey): {fingerprint}");
+        } else {
+            manifest.enrolled_machine_pubkey.push(MachinePubkey {
+                fingerprint,
+                sep_pub_b64: b64.trim().to_string(),
+            });
+            added += 1;
+        }
+    }
     manifest.enrolled_ek_sha384.sort();
+    manifest.enrolled_machine_id.sort();
+    manifest
+        .enrolled_machine_pubkey
+        .sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
     write_manifest(path, &manifest)?;
     eprintln!(
         "added {added}; manifest now has {} enrolled host(s)",
-        manifest.enrolled_ek_sha384.len()
+        manifest.enrolled_ek_sha384.len() + manifest.enrolled_machine_id.len()
     );
     Ok(())
 }
@@ -337,9 +392,17 @@ fn cmd_show(opts: &Opts) -> Result<()> {
     println!("version       {}", manifest.version);
     println!("trust_domain  {}", manifest.trust_domain);
     println!("issued_at     {}", manifest.issued_at);
-    println!("enrolled      {}", manifest.enrolled_ek_sha384.len());
+    println!("enrolled ek   {}", manifest.enrolled_ek_sha384.len());
     for ek in &manifest.enrolled_ek_sha384 {
         println!("  {ek}");
+    }
+    println!("enrolled mid  {}", manifest.enrolled_machine_id.len());
+    for m in &manifest.enrolled_machine_id {
+        println!("  {m}");
+    }
+    println!("prereg pubkey {}", manifest.enrolled_machine_pubkey.len());
+    for mpk in &manifest.enrolled_machine_pubkey {
+        println!("  {} -> {}", mpk.fingerprint, mpk.sep_pub_b64);
     }
     Ok(())
 }

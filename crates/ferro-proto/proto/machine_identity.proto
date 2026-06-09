@@ -95,6 +95,10 @@ message AttestRequest {
 }
 
 // Phase 2 — hardware and boot attestation evidence.
+//
+// A host presents exactly one profile. The TPM fields (1–6) carry an EK/AIK
+// quote (feature F02). A TPM-less host (feature F15) leaves those empty and
+// sets `host_key` instead; CMIS branches on its presence.
 message AttestInit {
   bytes ek_cert = 1;                  // DER EK certificate
   repeated bytes ek_intermediates = 2; // DER intermediate CA certs
@@ -102,6 +106,10 @@ message AttestInit {
   bytes quote_blob = 4;               // marshaled TPMS_ATTEST
   bytes signature = 5;                // marshaled TPMT_SIGNATURE
   repeated PcrValue pcr_values = 6;   // raw PCR values for digest recompute
+
+  // TPM-less host-key profile (F15). When set, fields 1–6 are ignored and the
+  // handshake skips phase-3 credential activation.
+  HostKeyEvidence host_key = 7;
 }
 
 message PcrValue {
@@ -109,16 +117,38 @@ message PcrValue {
   bytes value = 2;
 }
 
+// Stable, burned-in hardware identifiers a TPM-less host's identity is derived
+// from. The verifier recomputes the fingerprint from these and confirms it
+// matches `HostKeyEvidence.fingerprint`.
+message MachineFacts {
+  string board_serial = 1;   // IOPlatformSerialNumber / DMI board serial
+  string platform_uuid = 2;  // IOPlatformUUID / DMI product_uuid
+  string disk_serial = 3;    // boot-disk hardware serial
+}
+
+// Phase 2 evidence for the TPM-less host-key profile (F15). The signing key is
+// an ECDSA P-256 key held in the host's Secure Enclave (macOS) or a protected
+// file (other platforms); `sep_pub` is its DER SubjectPublicKeyInfo.
+message HostKeyEvidence {
+  bytes fingerprint = 1;     // SHA-384 hardware fingerprint H (48 bytes)
+  MachineFacts facts = 2;    // raw identifiers, so the server can recompute H
+  bytes sep_pub = 3;         // DER SPKI of the machine key (≈ aik_pub)
+  bytes signature = 4;       // X9.62 DER ECDSA-P256 over (nonce ‖ H)
+}
+
 // Phase 3 — the secret released by TPM2_ActivateCredential.
 message ChallengeResponse {
   bytes secret = 1;
 }
 
-// Phase 4 — TPM-bound composite CSR.
+// Phase 4 — hardware-bound composite CSR.
 message Csr {
   bytes composite_pub = 1; // concat composite public key (1984 bytes)
   string dpop_jkt = 2;     // DPoP key thumbprint, base64url
-  bytes aik_sig = 3;       // AIK signature over SHA-384(composite_pub)
+  // Hardware signature binding the composite key to the host's hardware key.
+  // TPM profile: AIK signature over SHA-384(composite_pub). Host-key profile
+  // (F15): X9.62 DER ECDSA-P256 signature over composite_pub by the SEP key.
+  bytes aik_sig = 3;
 }
 
 // ---- Attest: server -> client ------------------------------------------

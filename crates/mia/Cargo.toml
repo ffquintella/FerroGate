@@ -26,6 +26,8 @@ ferro-attest = { path = "../ferro-attest" }
 ferro-audit  = { path = "../ferro-audit" }
 ferro-proto  = { path = "../ferro-proto" }
 ferro-svid   = { path = "../ferro-svid" }
+ferro-sep       = { path = "../ferro-sep" }
+ferro-machineid = { path = "../ferro-machineid" }
 
 tokio              = { workspace = true }
 tokio-stream       = { workspace = true }

@@ -1,0 +1,35 @@
+[package]
+name        = "ferro-sep"
+description = "FerroGate — machine signing key for the TPM-less host-key profile (software + macOS Secure Enclave) (F15)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lib]
+name = "ferro_sep"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The live Secure Enclave backend (macOS only). Off by default so the portable
+# software backend and every downstream crate build and test everywhere without
+# Security.framework. Enable on a signed/notarised `mia` build to get a
+# hardware-bound, non-exportable key. See `src/enclave.rs`.
+secure-enclave = ["dep:security-framework", "dep:core-foundation"]
+
+[dependencies]
+p256      = { workspace = true }
+sha2      = { workspace = true }
+hex       = { workspace = true }
+thiserror = { workspace = true }
+getrandom = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", optional = true }
+core-foundation    = { version = "0.10", optional = true }
