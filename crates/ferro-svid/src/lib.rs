@@ -49,7 +49,8 @@ pub const MAX_TTL_SECS: u64 = 3600;
 pub const NBF_LOOKBACK_SECS: i64 = 60;
 
 pub use allowlist::{
-    AllowEntry, AllowlistDoc, AllowlistError, SignedAllowlist, ALLOWLIST_SIGNING_CONTEXT,
+    AllowEntry, AllowlistDoc, AllowlistError, ProposalDoc, SignedAllowlist,
+    ALLOWLIST_SIGNING_CONTEXT, PROPOSAL_SIGNING_CONTEXT,
 };
 pub use claims::{AttestClaims, Cnf, SvidClaims};
 pub use crl::{

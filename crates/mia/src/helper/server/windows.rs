@@ -57,6 +57,7 @@ impl<A: CallerAuth> HelperServer<A> {
                 crl,
                 audit_tx,
                 clock,
+                ledger: crate::helper::ledger::CallerLedger::new(),
             }),
         })
     }
@@ -64,6 +65,12 @@ impl<A: CallerAuth> HelperServer<A> {
     /// Replace the live allowlist (e.g. after a signed refresh from CMIS).
     pub async fn set_allowlist(&self, allowlist: Option<Allowlist>) {
         self.shared.set_allowlist(allowlist).await;
+    }
+
+    /// A handle to the observed-caller ledger, for the allowlist-propose task.
+    #[must_use]
+    pub fn ledger(&self) -> crate::helper::ledger::CallerLedger {
+        self.shared.ledger.clone()
     }
 
     /// The bound pipe name (for diagnostics / tests).

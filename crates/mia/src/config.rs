@@ -114,6 +114,9 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o660;
 /// Default maximum accepted allowlist age, in seconds.
 pub const DEFAULT_ALLOWLIST_MAX_AGE_SECS: i64 = 86_400;
 
+/// Default interval between allowlist proposals when `allowlist.propose` is on.
+pub const DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS: u64 = 300;
+
 /// The fully parsed configuration. Every value is optional: an absent value
 /// falls back to its built-in default at the point of use.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize)]
@@ -175,6 +178,17 @@ pub struct AllowlistConfig {
     /// `cmis.spki_pin` and a successful attestation; a fetch failure is
     /// non-fatal and falls back to whatever is already at `path`.
     pub fetch: bool,
+    /// When `true`, the daemon periodically proposes the local callers it has
+    /// observed (granted *and* denied) to CMIS (the `ProposeAllowlist` RPC). On
+    /// a host with no allowlist yet CMIS may auto-adopt the first proposal
+    /// (first-use bootstrap); otherwise it queues it for operator review.
+    /// Requires `cmis.endpoint` + `cmis.spki_pin` and a host SVID. Opt-in
+    /// (default `false`) — enable it to let a fresh host bootstrap its own
+    /// allowlist instead of an operator hand-enumerating callers.
+    pub propose: bool,
+    /// How often (seconds) to propose the observed caller set when `propose` is
+    /// enabled. `None` ⇒ [`DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS`].
+    pub propose_interval_secs: Option<u64>,
 }
 
 /// `[attestation]` — attestation inputs.
@@ -280,6 +294,15 @@ impl Config {
         if let Some(v) = get("FERROGATE_ALLOWLIST_FETCH") {
             self.allowlist.fetch = parse_bool_env("FERROGATE_ALLOWLIST_FETCH", &v)?;
         }
+        if let Some(v) = get("FERROGATE_ALLOWLIST_PROPOSE") {
+            self.allowlist.propose = parse_bool_env("FERROGATE_ALLOWLIST_PROPOSE", &v)?;
+        }
+        if let Some(v) = get("FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS") {
+            let n: u64 = v
+                .parse()
+                .context("FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS is not an integer")?;
+            self.allowlist.propose_interval_secs = Some(n);
+        }
         if let Some(v) = get("FERROGATE_IMA_LOG") {
             self.attestation.ima_log = Some(PathBuf::from(v));
         }
@@ -316,6 +339,16 @@ impl Config {
         self.allowlist
             .max_age_secs
             .unwrap_or(DEFAULT_ALLOWLIST_MAX_AGE_SECS)
+    }
+
+    /// The allowlist-propose interval; default
+    /// [`DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS`], clamped to ≥ 1s.
+    #[must_use]
+    pub fn allowlist_propose_interval(&self) -> u64 {
+        self.allowlist
+            .propose_interval_secs
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS)
     }
 }
 

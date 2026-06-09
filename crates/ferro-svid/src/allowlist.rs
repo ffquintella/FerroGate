@@ -21,6 +21,12 @@ use serde::{Deserialize, Serialize};
 /// SVID and child-token contexts so a signature cannot be reinterpreted.
 pub const ALLOWLIST_SIGNING_CONTEXT: &[u8] = b"ferrogate-allowlist-v1";
 
+/// Domain-separation context a host-driven allowlist *proposal* signature
+/// covers. Distinct from [`ALLOWLIST_SIGNING_CONTEXT`] so a proposal signed by a
+/// host's machine key can never be mistaken for an allowlist signed by the CMIS
+/// enrollment key (and vice versa).
+pub const PROPOSAL_SIGNING_CONTEXT: &[u8] = b"ferrogate-allowlist-proposal-v1";
+
 /// One permitted caller: a uid plus the IMA hash of its binary (hex).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllowEntry {
@@ -41,6 +47,24 @@ pub struct AllowlistDoc {
     /// Hard expiry, Unix seconds — the server refuses the file past this.
     pub not_after: i64,
     /// Permitted callers.
+    pub entries: Vec<AllowEntry>,
+}
+
+/// A host-driven proposal of the callers a host observes locally (feature:
+/// host-driven allowlist bootstrap). Unlike [`AllowlistDoc`] this is *not* signed
+/// by CMIS — the host signs the canonical CBOR with its machine key, and CMIS
+/// verifies that signature against the key bound by the proposing SVID's
+/// `cnf.jkt` before either auto-adopting it (first-use bootstrap) or queuing it
+/// for operator review. CMIS, not the host, stamps the trust domain and validity
+/// window when it turns an accepted proposal into a [`SignedAllowlist`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalDoc {
+    /// EK/fingerprint-derived host UUID the proposal is for. CMIS rejects the
+    /// proposal unless this matches the proposing SVID's host UUID.
+    pub host_uuid: String,
+    /// Proposal time, Unix seconds — CMIS layers a freshness check on this.
+    pub issued_at: i64,
+    /// The callers the host observed and proposes to allow.
     pub entries: Vec<AllowEntry>,
 }
 
@@ -132,6 +156,35 @@ pub fn verify(
     decode_body(&signed.body)
 }
 
+/// Canonical CBOR of a [`ProposalDoc`] — the exact bytes the host signs and CMIS
+/// verifies. Kept separate from [`encode`] so the signed proposal body is an
+/// unambiguous byte string, matching the allowlist idiom.
+pub fn encode_proposal(doc: &ProposalDoc) -> Result<Vec<u8>, AllowlistError> {
+    let mut body = Vec::with_capacity(256);
+    ciborium::into_writer(doc, &mut body).map_err(|e| AllowlistError::Cbor(e.to_string()))?;
+    Ok(body)
+}
+
+/// Parse a [`ProposalDoc`] from its canonical CBOR bytes. Does **not** verify the
+/// host signature — the caller checks that against the proposing SVID's bound key
+/// (see [`proposal_signing_input`]).
+pub fn decode_proposal(body: &[u8]) -> Result<ProposalDoc, AllowlistError> {
+    ciborium::from_reader(body).map_err(|e| AllowlistError::Cbor(e.to_string()))
+}
+
+/// The byte string a host machine key signs (and CMIS verifies) for a proposal:
+/// the domain-separation context followed by the canonical CBOR `body`. The host
+/// signs this with `ferro_sep::MachineKey::sign` (ECDSA-P256/SHA-256) and CMIS
+/// verifies it with `ferro_sep::verify_p256`, so neither crate needs the other's
+/// key types — this helper just pins the exact pre-image both sides hash over.
+#[must_use]
+pub fn proposal_signing_input(body: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(PROPOSAL_SIGNING_CONTEXT.len() + body.len());
+    input.extend_from_slice(PROPOSAL_SIGNING_CONTEXT);
+    input.extend_from_slice(body);
+    input
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +240,34 @@ mod tests {
             decode(&[0xFF, 0x00, 0x42]).unwrap_err(),
             AllowlistError::Cbor(_)
         ));
+    }
+
+    #[test]
+    fn proposal_encode_decode_roundtrip() {
+        let doc = ProposalDoc {
+            host_uuid: "5376139b-0117-8e2d-8049-1ab7b32e7d9a".into(),
+            issued_at: 1000,
+            entries: vec![AllowEntry {
+                uid: 501,
+                bin_sha: hex::encode([0xAB; 48]),
+            }],
+        };
+        let body = encode_proposal(&doc).unwrap();
+        assert_eq!(decode_proposal(&body).unwrap(), doc);
+    }
+
+    #[test]
+    fn proposal_signing_input_is_context_prefixed_and_distinct() {
+        let body = encode_proposal(&ProposalDoc {
+            host_uuid: "h".into(),
+            issued_at: 1,
+            entries: vec![],
+        })
+        .unwrap();
+        let input = proposal_signing_input(&body);
+        assert!(input.starts_with(PROPOSAL_SIGNING_CONTEXT));
+        assert_eq!(&input[PROPOSAL_SIGNING_CONTEXT.len()..], &body[..]);
+        // The proposal context must not collide with the allowlist context.
+        assert_ne!(PROPOSAL_SIGNING_CONTEXT, ALLOWLIST_SIGNING_CONTEXT);
     }
 }

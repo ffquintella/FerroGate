@@ -164,6 +164,7 @@ path = "/etc/ferrogate/allowlist.cbor"
 key  = "/etc/ferrogate/allowlist.pub"
 max_age_secs = 86400
 fetch = false   # fetch this host's allowlist from CMIS at startup and write `path`
+propose = false # propose the callers this host observes back to CMIS (bootstrap)
 
 [attestation]
 ima_log = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements"
@@ -183,6 +184,8 @@ Each key has an environment-variable equivalent that overrides it:
 | `allowlist.key` | `FERROGATE_ALLOWLIST_KEY` |
 | `allowlist.max_age_secs` | `FERROGATE_ALLOWLIST_MAX_AGE_SECS` |
 | `allowlist.fetch` | `FERROGATE_ALLOWLIST_FETCH` |
+| `allowlist.propose` | `FERROGATE_ALLOWLIST_PROPOSE` |
+| `allowlist.propose_interval_secs` | `FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS` |
 | `attestation.ima_log` | `FERROGATE_IMA_LOG` |
 
 ### `mia setup` — interactive wizard
@@ -223,6 +226,29 @@ CMIS at every start (after attestation supplies its identity) and writes
 `allowlist.path` before loading, so it stays in sync without out-of-band
 delivery. See [allowlist-provisioning.md](allowlist-provisioning.md) for the full
 workflow.
+
+**`allowlist.propose`** closes the bootstrap gap from the other direction. With
+it enabled the daemon periodically sends CMIS the local callers it has actually
+observed — every `(uid, binary SHA-384)` it authenticates, *granted or denied* —
+via the `ProposeAllowlist` RPC. The proposal is signed by the host machine key
+and accompanied by the host SVID, so CMIS can prove which attested host sent it
+(there is no mTLS; the SVID is the in-band proof). What CMIS does with it is set
+by its `CMIS_ALLOWLIST_PROPOSALS` policy:
+
+- `bootstrap` (default) — auto-adopt the proposal **only** when the host has no
+  allowlist yet (trust-on-first-use). It is signed and served immediately, so a
+  freshly installed host populates its own allowlist instead of an operator
+  hand-enumerating callers. Any later change to an existing allowlist is queued.
+- `off` — never auto-adopt; every proposal is queued for review.
+- `always` — auto-adopt every proposal (weakest; a compromised-but-attesting
+  host can grant itself callers).
+
+Queued proposals are reviewed by an operator with `ferrogate allowlist
+proposals` / `review <host>` / `approve <host>` / `reject <host>`. Because a
+deny-all host denies (and therefore records) every legitimate caller, those
+denials are exactly the entries a first proposal carries. The presented SVID is
+the one obtained at startup, so proposals stop being accepted once it expires
+until mia restarts.
 
 It requires a TTY; for unattended provisioning (configuration management),
 write the TOML file directly from the template in `crates/mia/dist/mia.toml`.

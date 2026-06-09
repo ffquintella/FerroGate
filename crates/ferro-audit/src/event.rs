@@ -98,6 +98,31 @@ pub enum AuditEvent {
         /// EK-derived host UUID whose allowlist was removed.
         host_uuid: String,
     },
+    /// A host proposed a caller allowlist that was queued for operator review
+    /// (an allowlist already exists, or policy declines to auto-adopt).
+    AllowlistProposed {
+        /// EK-derived host UUID the proposal is for.
+        host_uuid: String,
+        /// Number of proposed callers.
+        entry_count: u32,
+        /// SVID subject (SPIFFE id) that submitted the proposal.
+        proposer_spiffe_id: String,
+    },
+    /// A host's proposal was signed and stored immediately as the live allowlist
+    /// (first-use bootstrap, TOFU) under the configured proposal policy.
+    AllowlistAutoAdopted {
+        /// EK-derived host UUID the allowlist is keyed by.
+        host_uuid: String,
+        /// Number of permitted callers in the adopted allowlist.
+        entry_count: u32,
+        /// Hard expiry CMIS stamped, Unix seconds.
+        not_after: i64,
+    },
+    /// An operator rejected a host's pending allowlist proposal (admin RPC).
+    AllowlistProposalRejected {
+        /// EK-derived host UUID whose pending proposal was dropped.
+        host_uuid: String,
+    },
     /// A threshold key share was used to reconstruct the issuance key.
     KeyShareUsed {
         /// Which share (0..=4 in the 3-of-5 scheme).

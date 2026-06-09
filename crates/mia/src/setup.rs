@@ -157,6 +157,7 @@ struct Settings {
     allowlist_key: Option<String>,
     allowlist_max_age: Option<String>,
     allowlist_fetch: bool,
+    allowlist_propose: bool,
     ima_log: Option<String>,
 }
 
@@ -375,9 +376,20 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
                     "daemon pulls this host's allowlist (by EK-UUID) and overwrites the path above",
                 )
                 .prompt()?;
+
+            // Offer host-driven bootstrap: propose the callers this host observes
+            // back to CMIS, which can auto-adopt the first one (TOFU) or queue it
+            // for review. Lets a fresh host populate its own allowlist.
+            s.allowlist_propose = Confirm::new("Propose observed callers to CMIS (bootstrap)?")
+                .with_default(existing.allowlist.propose)
+                .with_help_message(
+                    "daemon periodically sends the (uid, binary-hash) callers it sees, SVID-signed",
+                )
+                .prompt()?;
         } else {
-            // Preserve any existing setting when CMIS details are absent this run.
+            // Preserve any existing settings when CMIS details are absent this run.
             s.allowlist_fetch = existing.allowlist.fetch;
+            s.allowlist_propose = existing.allowlist.propose;
         }
     }
 
@@ -549,6 +561,7 @@ fn load_existing(path: &Path) -> Config {
 /// Render the documented, self-commenting TOML config file. Keys the operator
 /// set are active assignments; everything else stays as a commented template
 /// line so the file remains a reference.
+#[allow(clippy::too_many_lines)] // a flat sequence of TOML-emitting blocks.
 fn render(s: &Settings) -> String {
     // A quoted (TOML literal-string) value line, or a commented placeholder.
     fn str_line(set: Option<&str>, key: &str, placeholder: &str) -> String {
@@ -643,6 +656,17 @@ fn render(s: &Settings) -> String {
         out.push_str("fetch = true\n");
     } else {
         out.push_str("#fetch = false\n");
+    }
+    out.push_str(
+        "# Propose the local callers this host observes (granted and denied) to CMIS\n\
+         # periodically. CMIS auto-adopts the first proposal on a host with no\n\
+         # allowlist (bootstrap/TOFU) or queues it for operator review. Needs\n\
+         # cmis.endpoint + spki_pin and a host SVID. Default: false.\n",
+    );
+    if s.allowlist_propose {
+        out.push_str("propose = true\n");
+    } else {
+        out.push_str("#propose = false\n");
     }
     out.push('\n');
 

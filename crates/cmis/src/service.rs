@@ -18,30 +18,32 @@ use ferro_attest::{
     verify_host_key_evidence, PcrSet, QuoteVerification, RejectReason,
 };
 use ferro_audit::{AuditEvent, Hash384};
-use ferro_crypto::composite::CompositePublicKey;
+use ferro_crypto::composite::{CompositePublicKey, CompositeSignature};
 use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
 use ferro_proto::v1::{
-    AllowlistSummary, AppendAuditRequest, AppendAuditResponse, AttestRequest, AttestResponse,
-    BumpEpochRequest, BumpEpochResponse, Challenge, ConsistencyProofRequest,
-    ConsistencyProofResponse, DeleteAllowlistRequest, DeleteAllowlistResponse, FetchRequest,
-    GetAllowlistRequest, GetAllowlistResponse, GetEnrollmentKeyRequest, GetEnrollmentKeyResponse,
-    HealthRequest, HealthResponse, InclusionProofRequest, InclusionProofResponse, JwksRequest,
-    JwksResponse, LatestSthRequest, LatestSthResponse, ListAllowlistsRequest,
-    ListAllowlistsResponse, ListSvidsRequest, ListSvidsResponse, NodeRole as ProtoNodeRole, Nonce,
-    RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest, SetAllowlistRequest,
-    SetAllowlistResponse, SignedTreeHead, SvidBundle, SvidSummary,
+    AllowEntryMsg, AllowlistSummary, AppendAuditRequest, AppendAuditResponse, AttestRequest,
+    AttestResponse, BumpEpochRequest, BumpEpochResponse, Challenge, ConsistencyProofRequest,
+    ConsistencyProofResponse, DeleteAllowlistRequest, DeleteAllowlistResponse,
+    DeleteProposalRequest, DeleteProposalResponse, FetchRequest, GetAllowlistRequest,
+    GetAllowlistResponse, GetEnrollmentKeyRequest, GetEnrollmentKeyResponse, HealthRequest,
+    HealthResponse, InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse,
+    LatestSthRequest, LatestSthResponse, ListAllowlistsRequest, ListAllowlistsResponse,
+    ListProposalsRequest, ListProposalsResponse, ListSvidsRequest, ListSvidsResponse,
+    NodeRole as ProtoNodeRole, Nonce, PendingProposal, ProposeAllowlistRequest,
+    ProposeAllowlistResponse, RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest,
+    SetAllowlistRequest, SetAllowlistResponse, SignedTreeHead, SvidBundle, SvidSummary,
 };
 use ferro_raft::NodeRole;
 use ferro_svid::{
     decide_renewal, IssueParams, IssuedSvid, LastAttestation, RenewalDecision, RevocationTarget,
 };
-use sha2::{Digest, Sha384};
+use sha2::{Digest, Sha256, Sha384};
 
 use crate::fleet_manifest::EnrollmentDecision;
 use crate::pcr::aggregate_digest;
-use crate::state::{CmisState, HostKeyBinding, IssuedRecord};
+use crate::state::{CmisState, HostKeyBinding, IssuedRecord, ProposalPolicy};
 
 /// gRPC front end over a shared [`CmisState`].
 #[derive(Clone)]
@@ -150,6 +152,77 @@ fn sha384(bytes: &[u8]) -> [u8; 48] {
     let mut out = [0u8; 48];
     out.copy_from_slice(&Sha384::digest(bytes));
     out
+}
+
+/// Verify a presented host SVID JWS was issued by this CMIS and is currently
+/// valid, returning `(host_uuid, cnf.jkt, subject_spiffe_id)`. Used by
+/// `ProposeAllowlist` to bind a proposal to an attested host in-band (there is
+/// no mTLS; the SVID is the host's bearer of identity here). Verifies only
+/// against the current issuer key — a host presenting a rotated/cross-signed
+/// SVID re-attests rather than proposes, which is acceptable at bootstrap time.
+#[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
+fn verify_proposing_svid(
+    state: &CmisState,
+    svid_jws: &str,
+    now: i64,
+) -> Result<(String, String, String), Status> {
+    let decoded = ferro_svid::envelope::decode(svid_jws)
+        .map_err(|_| Status::unauthenticated("malformed svid"))?;
+    let sig = CompositeSignature::from_concat_bytes(&decoded.signature)
+        .map_err(|_| Status::unauthenticated("malformed svid signature"))?;
+    state
+        .issuer
+        .public_key()
+        .verify(
+            ferro_svid::SVID_SIGNING_CONTEXT,
+            decoded.signing_input.as_bytes(),
+            &sig,
+        )
+        .map_err(|_| Status::unauthenticated("svid not issued by this cmis"))?;
+    let claims = decoded.claims;
+    if now < claims.nbf || now > claims.exp {
+        return Err(Status::unauthenticated("svid is not currently valid"));
+    }
+    let host_uuid = claims
+        .sub
+        .rsplit_once("/host/")
+        .map(|(_, u)| u.to_string())
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| Status::unauthenticated("svid subject is not a host id"))?;
+    Ok((host_uuid, claims.cnf.jkt, claims.sub))
+}
+
+/// Decode the entry set of a stored, already-signed live allowlist (metadata
+/// only — no re-verify, it is our own artefact). `None` on any decode failure.
+fn decode_live_entries(bytes: &[u8]) -> Option<Vec<ferro_svid::AllowEntry>> {
+    ferro_svid::allowlist::decode(bytes)
+        .and_then(|s| ferro_svid::allowlist::decode_body(&s.body))
+        .ok()
+        .map(|doc| doc.entries)
+}
+
+/// Order-insensitive equality of two `(uid, bin_sha)` entry sets.
+fn entries_match(a: &[ferro_svid::AllowEntry], b: &[ferro_svid::AllowEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<_> = a.iter().map(|e| (e.uid, e.bin_sha.as_str())).collect();
+    let mut b: Vec<_> = b.iter().map(|e| (e.uid, e.bin_sha.as_str())).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
+}
+
+/// CBOR-encode proposed entries for the pending-proposal store.
+fn encode_allow_entries(entries: &[ferro_svid::AllowEntry]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(128);
+    ciborium::into_writer(entries, &mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// Decode proposed entries previously stored by [`encode_allow_entries`].
+fn decode_allow_entries(bytes: &[u8]) -> Result<Vec<ferro_svid::AllowEntry>, String> {
+    ciborium::from_reader(bytes).map_err(|e| e.to_string())
 }
 
 /// Pull the next request from the stream, mapping disconnect/None to an error.
@@ -753,6 +826,206 @@ impl MachineIdentity for MachineIdentitySvc {
             })
             .collect();
         Ok(Response::new(ListAllowlistsResponse { items }))
+    }
+
+    #[allow(clippy::too_many_lines)] // one linear verify→policy→store flow.
+    async fn propose_allowlist(
+        &self,
+        request: Request<ProposeAllowlistRequest>,
+    ) -> Result<Response<ProposeAllowlistResponse>, Status> {
+        use ferro_proto::v1::propose_allowlist_response::Outcome;
+        let req = request.into_inner();
+        let now = unix_now();
+
+        // 1. Verify the presenting SVID was issued by this CMIS and is still
+        //    valid; pull out the host UUID and the DPoP key thumbprint it binds.
+        let (svid_host_uuid, cnf_jkt, proposer_spiffe_id) =
+            verify_proposing_svid(&self.state, &req.svid_jws, now)?;
+
+        // 2. The presented machine key must be the one the SVID is bound to.
+        let computed_jkt = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(&req.sep_pub));
+        if computed_jkt != cnf_jkt {
+            return Err(Status::unauthenticated("sep_pub does not match svid cnf.jkt"));
+        }
+
+        // 3. The proposal signature must verify under that key, over the
+        //    domain-separated signing input.
+        let signing_input = ferro_svid::allowlist::proposal_signing_input(&req.signed_proposal);
+        ferro_sep::verify_p256(&req.sep_pub, &signing_input, &req.proposal_sig)
+            .map_err(|_| Status::unauthenticated("proposal signature did not verify"))?;
+
+        // 4. Decode the proposal and bind it to the attested host.
+        let proposal = ferro_svid::allowlist::decode_proposal(&req.signed_proposal)
+            .map_err(|_| Status::invalid_argument("malformed proposal body"))?;
+        if proposal.host_uuid != svid_host_uuid {
+            return Err(Status::permission_denied(
+                "proposal host_uuid does not match the proposing SVID",
+            ));
+        }
+        // Light replay guard; the SVID's own validity is the real freshness
+        // anchor (it is short-lived and was checked above).
+        if proposal.issued_at > now.saturating_add(300) {
+            return Err(Status::invalid_argument("proposal issued_at is in the future"));
+        }
+        // Validate entries exactly as `set_allowlist` does.
+        let mut entries = Vec::with_capacity(proposal.entries.len());
+        for e in &proposal.entries {
+            parse_cert_sha(&e.bin_sha)
+                .map_err(|_| Status::invalid_argument("entry bin_sha must be hex SHA-384"))?;
+            entries.push(ferro_svid::AllowEntry {
+                uid: e.uid,
+                bin_sha: e.bin_sha.trim().to_string(),
+            });
+        }
+        let entry_count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+
+        // 5. Compare against the current live allowlist, and apply policy.
+        let current = self.state.get_allowlist(&proposal.host_uuid).await;
+        let current_entries = current.as_deref().and_then(decode_live_entries);
+        if current_entries
+            .as_ref()
+            .is_some_and(|cur| entries_match(cur, &entries))
+        {
+            return Ok(Response::new(ProposeAllowlistResponse {
+                outcome: Outcome::Unchanged as i32,
+                issued_at: 0,
+                not_after: 0,
+            }));
+        }
+
+        let has_existing = current.is_some();
+        let policy = self.state.config.allowlist_proposal_policy;
+        let auto_adopt = match policy {
+            ProposalPolicy::Off => false,
+            ProposalPolicy::BootstrapOnly => !has_existing,
+            ProposalPolicy::Always => true,
+        };
+
+        if auto_adopt {
+            let not_after = now.saturating_add(DEFAULT_ALLOWLIST_TTL_SECS);
+            let signed = self
+                .state
+                .issuer
+                .sign_allowlist(entries, now, not_after)
+                .map_err(|e| {
+                    tracing::error!(error = %e, "allowlist signing failed");
+                    Status::internal("allowlist signing failed")
+                })?;
+            let bytes = ferro_svid::allowlist::encode(&signed).map_err(|e| {
+                tracing::error!(error = %e, "allowlist encode failed");
+                Status::internal("allowlist encode failed")
+            })?;
+            self.state
+                .put_allowlist(&proposal.host_uuid, bytes, now)
+                .await;
+            // A previously queued proposal for this host is now moot.
+            self.state.delete_proposal(&proposal.host_uuid).await;
+            audit_record(
+                &self.state,
+                AuditEvent::AllowlistAutoAdopted {
+                    host_uuid: proposal.host_uuid.clone(),
+                    entry_count,
+                    not_after,
+                },
+                now,
+            );
+            tracing::info!(host_uuid = %proposal.host_uuid, entry_count, not_after, "allowlist proposal auto-adopted (bootstrap)");
+            return Ok(Response::new(ProposeAllowlistResponse {
+                outcome: Outcome::AutoAdopted as i32,
+                issued_at: now,
+                not_after,
+            }));
+        }
+
+        // Queue for operator review. Store the proposed entries as CBOR.
+        let entries_cbor = encode_allow_entries(&entries).map_err(|e| {
+            tracing::error!(error = %e, "proposal entries encode failed");
+            Status::internal("proposal encode failed")
+        })?;
+        self.state
+            .put_proposal(
+                &proposal.host_uuid,
+                crate::state::ProposalRecord {
+                    entries_cbor,
+                    proposer_spiffe_id: proposer_spiffe_id.clone(),
+                    proposed_at: now,
+                },
+            )
+            .await;
+        audit_record(
+            &self.state,
+            AuditEvent::AllowlistProposed {
+                host_uuid: proposal.host_uuid.clone(),
+                entry_count,
+                proposer_spiffe_id,
+            },
+            now,
+        );
+        tracing::info!(host_uuid = %proposal.host_uuid, entry_count, "allowlist proposal queued for review");
+        Ok(Response::new(ProposeAllowlistResponse {
+            outcome: Outcome::Pending as i32,
+            issued_at: 0,
+            not_after: 0,
+        }))
+    }
+
+    async fn list_proposals(
+        &self,
+        _request: Request<ListProposalsRequest>,
+    ) -> Result<Response<ListProposalsResponse>, Status> {
+        let items = self
+            .state
+            .list_proposals()
+            .await
+            .into_iter()
+            .filter_map(|(host_uuid, rec)| {
+                // Decode the stored entries for the operator; a row that fails to
+                // decode is logged and skipped, never failing the whole listing.
+                match decode_allow_entries(&rec.entries_cbor) {
+                    Ok(entries) => Some(PendingProposal {
+                        host_uuid,
+                        entries: entries
+                            .into_iter()
+                            .map(|e| AllowEntryMsg {
+                                uid: e.uid,
+                                bin_sha: e.bin_sha,
+                            })
+                            .collect(),
+                        proposer_spiffe_id: rec.proposer_spiffe_id,
+                        proposed_at: rec.proposed_at,
+                    }),
+                    Err(e) => {
+                        tracing::error!(error = %e, %host_uuid, "stored proposal failed to decode");
+                        None
+                    }
+                }
+            })
+            .collect();
+        Ok(Response::new(ListProposalsResponse { items }))
+    }
+
+    async fn delete_proposal(
+        &self,
+        request: Request<DeleteProposalRequest>,
+    ) -> Result<Response<DeleteProposalResponse>, Status> {
+        let host_uuid = request.into_inner().host_uuid;
+        if host_uuid.trim().is_empty() {
+            return Err(Status::invalid_argument("empty host_uuid"));
+        }
+        let existed = self.state.delete_proposal(&host_uuid).await;
+        if existed {
+            let now = unix_now();
+            audit_record(
+                &self.state,
+                AuditEvent::AllowlistProposalRejected {
+                    host_uuid: host_uuid.clone(),
+                },
+                now,
+            );
+            tracing::info!(%host_uuid, "allowlist proposal rejected");
+        }
+        Ok(Response::new(DeleteProposalResponse { existed }))
     }
 
     async fn revoke_svid(

@@ -35,6 +35,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::helper::allowlist::Allowlist;
 use crate::helper::auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
 use crate::helper::crl::{CrlCache, CrlGate};
+use crate::helper::ledger::CallerLedger;
 use crate::helper::proto::{self, ChildToken, ErrorCode, HelperReq, HelperResp};
 use crate::helper::token::ChildTokenMinter;
 
@@ -117,6 +118,8 @@ struct Shared<A: CallerAuth> {
     crl: Arc<CrlCache>,
     audit_tx: mpsc::Sender<AuditEvent>,
     clock: Clock,
+    /// Distinct callers observed this run, fed to the allowlist-propose task.
+    ledger: CallerLedger,
 }
 
 impl<A: CallerAuth> Shared<A> {
@@ -198,6 +201,11 @@ async fn process_request<A: CallerAuth>(
             return err(ErrorCode::PermissionDenied, None);
         }
     };
+
+    // Record this kernel-attested caller for the allowlist-propose task. Done
+    // for every authenticated caller — granted or denied below — since a
+    // deny-all host's denials are exactly the bootstrap proposal candidates.
+    shared.ledger.observe(id.uid, id.bin_sha);
 
     // 2. Reject obviously malformed requests (identity is known now, so the
     //    refusal is still attributable).

@@ -55,6 +55,13 @@
 # cmis.endpoint + cmis.spki_pin and a successful attestation; a fetch failure is
 # non-fatal and falls back to whatever is already at `path`. Default: false.
 #fetch = false
+# Propose the local callers this host observes (granted and denied) to CMIS
+# periodically. CMIS auto-adopts the first proposal on a host with no allowlist
+# (bootstrap/TOFU) or queues it for operator review, per its policy. Needs
+# cmis.endpoint + cmis.spki_pin and a host SVID. Default: false.
+#propose = false
+# How often (seconds) to propose when `propose` is set. Default: 300.
+#propose_interval_secs = 300
 
 # --- Attestation ------------------------------------------------------------
 [attestation]

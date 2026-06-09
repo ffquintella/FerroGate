@@ -88,11 +88,24 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(audit_kid = signer.kid(), "audit signer ready");
     let audit = AuditLog::new(store, Arc::new(signer));
 
+    // Host-driven allowlist proposal policy (see docs/mia.md). Default is
+    // bootstrap-only TOFU: auto-adopt a host's first proposal when it has no
+    // allowlist yet, queue every later change for operator review.
+    let mut cmis_config = CmisConfig::default();
+    if let Ok(v) = std::env::var("CMIS_ALLOWLIST_PROPOSALS") {
+        cmis_config.allowlist_proposal_policy =
+            cmis::state::ProposalPolicy::from_env_value(&v);
+    }
+    tracing::info!(
+        proposal_policy = ?cmis_config.allowlist_proposal_policy,
+        "allowlist proposal policy"
+    );
+
     let state = Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(UnconfiguredCredentialMaker),
-        CmisConfig::default(),
+        cmis_config,
         audit,
     ));
 

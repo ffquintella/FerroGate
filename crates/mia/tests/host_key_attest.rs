@@ -75,6 +75,7 @@ fn build_state() -> Arc<CmisState> {
             trust_domain: "ferrogate.test".to_string(),
             svid_ttl_secs: 3600,
             policy_epoch: 1,
+            allowlist_proposal_policy: cmis::state::ProposalPolicy::default(),
         },
         audit,
     ))

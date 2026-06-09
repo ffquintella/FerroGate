@@ -13,6 +13,14 @@
 //! - `list`   → `ListAllowlists`  (every provisioned host)
 //! - `delete` → `DeleteAllowlist`
 //!
+//! Host-driven proposals (mia sends the callers it observes; CMIS auto-adopts
+//! the first one on a host with no allowlist, else queues it):
+//!
+//! - `proposals` → `ListProposals`  (every pending proposal)
+//! - `review`    → `ListProposals`+`GetAllowlist` (diff a host's proposal vs live)
+//! - `approve`   → `SetAllowlist`+`DeleteProposal` (sign the proposed entries)
+//! - `reject`    → `DeleteProposal`
+//!
 //! A host is named by its EK-derived UUID. Supply it directly with `--host`, or
 //! let the CLI derive it from the EK certificate (`--ek-cert <pem>`) or the EK
 //! certificate's SHA-384 (`--ek-sha384 <hex>`).
@@ -21,8 +29,8 @@ use std::collections::HashMap;
 
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
 use ferro_proto::v1::{
-    AllowEntryMsg, DeleteAllowlistRequest, GetAllowlistRequest, ListAllowlistsRequest,
-    SetAllowlistRequest,
+    AllowEntryMsg, DeleteAllowlistRequest, DeleteProposalRequest, GetAllowlistRequest,
+    ListAllowlistsRequest, ListProposalsRequest, PendingProposal, SetAllowlistRequest,
 };
 use ferro_svid::allowlist::{self, AllowEntry, AllowlistDoc};
 use ferro_svid::host_uuid_from_ek_digest;
@@ -51,6 +59,10 @@ pub(crate) fn usage() -> &'static str {
      \x20 show    <host>                fetch and print the entries + validity\n\
      \x20 list                          every host that has a stored allowlist\n\
      \x20 delete  <host>                remove the host's stored allowlist\n\
+     \x20 proposals                     every pending host-driven proposal\n\
+     \x20 review  <host>                diff a host's pending proposal vs its live allowlist\n\
+     \x20 approve <host> [--ttl secs]   sign+store the proposed entries, then clear the proposal\n\
+     \x20 reject  <host>                drop the host's pending proposal\n\
      \n\
      host selector (one of):\n\
      \x20 --host <uuid>       the EK-derived host UUID directly\n\
@@ -77,6 +89,10 @@ pub(crate) async fn run(
         "show" => show(client, &flags).await,
         "list" => list(client).await,
         "delete" => delete(client, &flags).await,
+        "proposals" => proposals(client).await,
+        "review" => review(client, &flags).await,
+        "approve" => approve(client, &flags).await,
+        "reject" => reject(client, &flags).await,
         "help" | "-h" | "--help" => {
             println!("{}", usage());
             Ok(())
@@ -232,7 +248,153 @@ async fn delete(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
     Ok(())
 }
 
+async fn proposals(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
+    let items = fetch_proposals(client).await?;
+    if items.is_empty() {
+        println!("(no pending proposals)");
+        return Ok(());
+    }
+    println!("{} pending proposal(s):", items.len());
+    for p in &items {
+        println!();
+        println!("  host_uuid:   {}", p.host_uuid);
+        println!("  proposer:    {}", p.proposer_spiffe_id);
+        println!("  proposed_at: {} (unix)", p.proposed_at);
+        println!("  entries:     {}", p.entries.len());
+    }
+    println!("\nReview one with `ferrogate allowlist review <host>`.");
+    Ok(())
+}
+
+async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+    let host_uuid = flags.host_uuid()?;
+    let Some(proposal) = fetch_proposal(client, &host_uuid).await? else {
+        anyhow::bail!("no pending proposal for {host_uuid}");
+    };
+    // Compare proposed entries against whatever is live today, so the operator
+    // sees exactly what approving would change.
+    let live: Vec<AllowEntry> = fetch_doc(client, &host_uuid)
+        .await?
+        .map(|d| d.entries)
+        .unwrap_or_default();
+    let live_set: std::collections::HashSet<(u32, &str)> =
+        live.iter().map(|e| (e.uid, e.bin_sha.as_str())).collect();
+    let proposed: Vec<(u32, String)> = proposal
+        .entries
+        .iter()
+        .map(|e| (e.uid, e.bin_sha.clone()))
+        .collect();
+    let proposed_set: std::collections::HashSet<(u32, &str)> =
+        proposed.iter().map(|(u, s)| (*u, s.as_str())).collect();
+
+    println!("host_uuid:   {host_uuid}");
+    println!("proposer:    {}", proposal.proposer_spiffe_id);
+    println!("proposed_at: {} (unix)", proposal.proposed_at);
+    println!(
+        "live allowlist: {}",
+        if live.is_empty() {
+            "(none — approving bootstraps this host)".to_string()
+        } else {
+            format!("{} entr(y/ies)", live.len())
+        }
+    );
+    println!("\nproposed entries ({}):", proposed.len());
+    for (uid, sha) in &proposed {
+        let mark = if live_set.contains(&(*uid, sha.as_str())) {
+            "    " // unchanged
+        } else {
+            "  + " // new vs live
+        };
+        println!("{mark}uid={uid:<7} bin_sha={sha}");
+    }
+    // Entries live today but absent from the proposal — approving would drop them.
+    let dropped: Vec<_> = live
+        .iter()
+        .filter(|e| !proposed_set.contains(&(e.uid, e.bin_sha.as_str())))
+        .collect();
+    if !dropped.is_empty() {
+        println!("\nwould be removed ({}):", dropped.len());
+        for e in dropped {
+            println!("  - uid={:<7} bin_sha={}", e.uid, e.bin_sha);
+        }
+    }
+    println!("\nApprove with `ferrogate allowlist approve {host_uuid}` or reject with `… reject {host_uuid}`.");
+    Ok(())
+}
+
+async fn approve(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+    let host_uuid = flags.host_uuid()?;
+    let Some(proposal) = fetch_proposal(client, &host_uuid).await? else {
+        anyhow::bail!("no pending proposal for {host_uuid}");
+    };
+    let entries: Vec<AllowEntry> = proposal
+        .entries
+        .into_iter()
+        .map(|e| AllowEntry {
+            uid: e.uid,
+            bin_sha: e.bin_sha,
+        })
+        .collect();
+    if entries.is_empty() {
+        anyhow::bail!("proposal for {host_uuid} has no entries; reject it instead");
+    }
+    let ttl = flags.ttl()?.unwrap_or(DEFAULT_TTL_SECS);
+    let resp = put(client, &host_uuid, entries, ttl).await?;
+    // Clear the now-applied proposal so it does not linger in the review queue.
+    client
+        .delete_proposal(DeleteProposalRequest {
+            host_uuid: host_uuid.clone(),
+        })
+        .await
+        .map_err(rpc_err)?;
+    println!(
+        "approved proposal for {host_uuid}: {} entr(y/ies) signed; not_after={}",
+        resp.2, resp.1
+    );
+    Ok(())
+}
+
+async fn reject(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+    let host_uuid = flags.host_uuid()?;
+    let resp = client
+        .delete_proposal(DeleteProposalRequest {
+            host_uuid: host_uuid.clone(),
+        })
+        .await
+        .map_err(rpc_err)?
+        .into_inner();
+    if resp.existed {
+        println!("rejected pending proposal for {host_uuid}");
+    } else {
+        println!("no pending proposal for {host_uuid} (nothing to reject)");
+    }
+    Ok(())
+}
+
 // ---- RPC helpers -----------------------------------------------------------
+
+/// Fetch every pending proposal.
+async fn fetch_proposals(
+    client: &mut MachineIdentityClient<Channel>,
+) -> anyhow::Result<Vec<PendingProposal>> {
+    let resp = client
+        .list_proposals(ListProposalsRequest {})
+        .await
+        .map_err(rpc_err)?
+        .into_inner();
+    Ok(resp.items)
+}
+
+/// Fetch the pending proposal for one host (`None` when none pending).
+async fn fetch_proposal(
+    client: &mut MachineIdentityClient<Channel>,
+    host_uuid: &str,
+) -> anyhow::Result<Option<PendingProposal>> {
+    Ok(fetch_proposals(client)
+        .await?
+        .into_iter()
+        .find(|p| p.host_uuid == host_uuid))
+}
 
 /// Push entries to CMIS and return `(issued_at, not_after, new_entry_count)`.
 async fn put(

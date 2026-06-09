@@ -96,6 +96,58 @@ pub async fn fetch_allowlist(
     Ok((!resp.signed_allowlist.is_empty()).then_some(resp.signed_allowlist))
 }
 
+/// What CMIS did with a host-driven allowlist proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeOutcome {
+    /// Queued for operator review.
+    Pending,
+    /// Signed and stored immediately (first-use bootstrap). Carries the stamped
+    /// hard expiry, Unix seconds.
+    AutoAdopted {
+        /// Hard expiry CMIS stamped on the adopted allowlist.
+        not_after: i64,
+    },
+    /// The proposed entries already matched the live allowlist.
+    Unchanged,
+}
+
+/// Propose this host's observed caller set to CMIS over the pinned channel.
+///
+/// `signed_proposal` is the canonical CBOR `ferro_svid::ProposalDoc`,
+/// `proposal_sig` the host machine-key signature over its
+/// `proposal_signing_input`, `svid_jws` the host's SVID, and `sep_pub` the DER
+/// SPKI of the machine key — CMIS binds all four together (see
+/// `ProposeAllowlist`). The decision is CMIS's; this returns which it made.
+pub async fn propose_allowlist(
+    endpoint: &str,
+    pins: Vec<SpkiPin>,
+    signed_proposal: Vec<u8>,
+    proposal_sig: Vec<u8>,
+    svid_jws: String,
+    sep_pub: Vec<u8>,
+) -> anyhow::Result<ProposeOutcome> {
+    use ferro_proto::v1::propose_allowlist_response::Outcome;
+    use ferro_proto::v1::ProposeAllowlistRequest;
+
+    let mut client = connect_pinned(endpoint, pins).await?;
+    let resp = client
+        .propose_allowlist(Request::new(ProposeAllowlistRequest {
+            signed_proposal,
+            proposal_sig,
+            svid_jws,
+            sep_pub,
+        }))
+        .await?
+        .into_inner();
+    Ok(match Outcome::try_from(resp.outcome).unwrap_or(Outcome::Pending) {
+        Outcome::AutoAdopted => ProposeOutcome::AutoAdopted {
+            not_after: resp.not_after,
+        },
+        Outcome::Unchanged => ProposeOutcome::Unchanged,
+        Outcome::Pending => ProposeOutcome::Pending,
+    })
+}
+
 /// A produced PCR quote and the raw values backing it.
 pub struct QuoteEvidence {
     /// Marshaled `TPMS_ATTEST`.

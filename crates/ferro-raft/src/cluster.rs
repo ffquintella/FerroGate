@@ -169,6 +169,17 @@ impl Cluster {
             .await?;
         self.client
             .execute(
+                "CREATE TABLE IF NOT EXISTS pending_allowlist_proposals ( \
+                    host_uuid TEXT PRIMARY KEY, \
+                    entries BLOB NOT NULL, \
+                    proposer_spiffe_id TEXT NOT NULL, \
+                    proposed_at INTEGER NOT NULL \
+                )",
+                Vec::<hiqlite::Param>::new(),
+            )
+            .await?;
+        self.client
+            .execute(
                 "CREATE TABLE IF NOT EXISTS rim_state ( \
                     id INTEGER PRIMARY KEY CHECK (id = 1), \
                     version INTEGER NOT NULL DEFAULT 0 \
@@ -378,6 +389,63 @@ impl Cluster {
         Ok(affected > 0)
     }
 
+    /// Insert or replace one host's pending allowlist proposal. `entries` bytes
+    /// are opaque to the cluster — CMIS owns the CBOR `Vec<AllowEntry>` schema. A
+    /// host has at most one pending proposal; a newer one replaces the older.
+    pub async fn upsert_proposal(
+        &self,
+        host_uuid: &str,
+        entries: &[u8],
+        proposer_spiffe_id: &str,
+        proposed_at: i64,
+    ) -> Result<(), ClusterError> {
+        self.client
+            .execute(
+                "INSERT INTO pending_allowlist_proposals (host_uuid, entries, proposer_spiffe_id, proposed_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (host_uuid) DO UPDATE SET entries = excluded.entries, \
+                    proposer_spiffe_id = excluded.proposer_spiffe_id, proposed_at = excluded.proposed_at",
+                vec![
+                    Param::from(host_uuid.to_string()),
+                    Param::from(entries.to_vec()),
+                    Param::from(proposer_spiffe_id.to_string()),
+                    Param::from(proposed_at),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// All pending proposals as `(host_uuid, entries, proposer_spiffe_id,
+    /// proposed_at)` tuples. `entries` is the opaque CBOR CMIS stored.
+    pub async fn list_proposals(
+        &self,
+    ) -> Result<Vec<(String, Vec<u8>, String, i64)>, ClusterError> {
+        let rows: Vec<RawProposalRow> = self
+            .client
+            .query_map(
+                "SELECT host_uuid, entries, proposer_spiffe_id, proposed_at FROM pending_allowlist_proposals",
+                Vec::<hiqlite::Param>::new(),
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.host_uuid, r.entries, r.proposer_spiffe_id, r.proposed_at))
+            .collect())
+    }
+
+    /// Delete one host's pending proposal. Returns whether a row was removed.
+    pub async fn delete_proposal(&self, host_uuid: &str) -> Result<bool, ClusterError> {
+        let affected = self
+            .client
+            .execute(
+                "DELETE FROM pending_allowlist_proposals WHERE host_uuid = $1",
+                vec![Param::from(host_uuid.to_string())],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
     /// Current RIM policy epoch.
     pub async fn current_rim_version(&self) -> Result<u64, ClusterError> {
         let row: RimRow = self
@@ -443,6 +511,25 @@ impl<'r> From<&'r mut hiqlite::Row<'_>> for RawAllowlistRow {
             host_uuid: row.get("host_uuid"),
             payload: row.get("payload"),
             updated_at: row.get("updated_at"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RawProposalRow {
+    host_uuid: String,
+    entries: Vec<u8>,
+    proposer_spiffe_id: String,
+    proposed_at: i64,
+}
+
+impl<'r> From<&'r mut hiqlite::Row<'_>> for RawProposalRow {
+    fn from(row: &'r mut hiqlite::Row<'_>) -> Self {
+        Self {
+            host_uuid: row.get("host_uuid"),
+            entries: row.get("entries"),
+            proposer_spiffe_id: row.get("proposer_spiffe_id"),
+            proposed_at: row.get("proposed_at"),
         }
     }
 }

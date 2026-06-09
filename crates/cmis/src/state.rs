@@ -34,6 +34,34 @@ use crate::cluster_store;
 use crate::credential::CredentialMaker;
 use crate::fleet_manifest::{EnrollmentDecision, FleetStore};
 
+/// How CMIS treats a host-driven allowlist proposal (see `ProposeAllowlist`).
+/// All variants still verify the proposal's SVID + signature first; this only
+/// governs whether an accepted proposal becomes the live allowlist on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProposalPolicy {
+    /// Never auto-adopt: every proposal queues for operator review.
+    Off,
+    /// Auto-adopt only when the host has no allowlist yet (first-use bootstrap,
+    /// TOFU); any change to an existing allowlist queues for review.
+    #[default]
+    BootstrapOnly,
+    /// Auto-adopt every accepted proposal, including changes to an existing
+    /// allowlist. Most convenient, weakest — see docs/mia.md.
+    Always,
+}
+
+impl ProposalPolicy {
+    /// Parse the `CMIS_ALLOWLIST_PROPOSALS` env value; unknown/empty ⇒ default.
+    #[must_use]
+    pub fn from_env_value(v: &str) -> Self {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" => Self::Off,
+            "always" => Self::Always,
+            _ => Self::BootstrapOnly,
+        }
+    }
+}
+
 /// Static issuance policy for a CMIS instance.
 #[derive(Debug, Clone)]
 pub struct CmisConfig {
@@ -43,6 +71,8 @@ pub struct CmisConfig {
     pub svid_ttl_secs: u64,
     /// The live RIM policy epoch. A bump forces re-attestation on `Rotate`.
     pub policy_epoch: u64,
+    /// How host-driven allowlist proposals are handled (`ProposeAllowlist`).
+    pub allowlist_proposal_policy: ProposalPolicy,
 }
 
 impl Default for CmisConfig {
@@ -51,6 +81,7 @@ impl Default for CmisConfig {
             trust_domain: "ferrogate.dev".to_string(),
             svid_ttl_secs: 3600,
             policy_epoch: 1,
+            allowlist_proposal_policy: ProposalPolicy::default(),
         }
     }
 }
@@ -124,7 +155,24 @@ pub struct CmisState {
     /// [`CmisState::put_allowlist`]). The stored value is the opaque CBOR
     /// `SignedAllowlist` the issuer minted.
     allowlists_local: Mutex<HashMap<String, Vec<u8>>>,
+    /// Pending host-driven allowlist proposals awaiting operator review, keyed by
+    /// host UUID (`Backend::Local` only; clusters use the
+    /// `pending_allowlist_proposals` Raft keyspace). The value is the proposed
+    /// entries as CBOR `Vec<AllowEntry>`, the proposer SPIFFE id, and when it
+    /// was recorded.
+    proposals_local: Mutex<HashMap<String, ProposalRecord>>,
     backend: Backend,
+}
+
+/// One pending allowlist proposal as CMIS holds it for review.
+#[derive(Debug, Clone)]
+pub struct ProposalRecord {
+    /// Proposed entries as opaque CBOR `Vec<ferro_svid::AllowEntry>`.
+    pub entries_cbor: Vec<u8>,
+    /// SVID subject (SPIFFE id) that submitted the proposal.
+    pub proposer_spiffe_id: String,
+    /// Unix seconds CMIS recorded the proposal.
+    pub proposed_at: i64,
 }
 
 /// The outcome of binding a host fingerprint to its presented machine key.
@@ -178,6 +226,7 @@ impl CmisState {
             fleet: FleetStore::unenforced(),
             host_key_pins: Mutex::new(HashMap::new()),
             allowlists_local: Mutex::new(HashMap::new()),
+            proposals_local: Mutex::new(HashMap::new()),
             backend: Backend::Local(Mutex::new(HashMap::new())),
         }
     }
@@ -208,6 +257,7 @@ impl CmisState {
             fleet: FleetStore::unenforced(),
             host_key_pins: Mutex::new(HashMap::new()),
             allowlists_local: Mutex::new(HashMap::new()),
+            proposals_local: Mutex::new(HashMap::new()),
             backend: Backend::Cluster(cluster),
         }
     }
@@ -579,6 +629,78 @@ impl CmisState {
                 Err(e) => {
                     tracing::error!(error = %e, "cluster list_allowlists failed");
                     Vec::new()
+                }
+            },
+        }
+    }
+
+    /// Store or replace a host's pending allowlist proposal. `entries_cbor` is
+    /// the opaque CBOR `Vec<AllowEntry>` the host proposed; CMIS stamps the
+    /// proposer SPIFFE id and time so an operator can review it later.
+    pub async fn put_proposal(&self, host_uuid: &str, rec: ProposalRecord) {
+        match &self.backend {
+            Backend::Local(_) => {
+                self.proposals_local
+                    .lock()
+                    .insert(host_uuid.to_string(), rec);
+            }
+            Backend::Cluster(c) => {
+                if let Err(e) = c
+                    .upsert_proposal(
+                        host_uuid,
+                        &rec.entries_cbor,
+                        &rec.proposer_spiffe_id,
+                        rec.proposed_at,
+                    )
+                    .await
+                {
+                    tracing::error!(error = %e, %host_uuid, "cluster proposal upsert failed");
+                }
+            }
+        }
+    }
+
+    /// Enumerate every pending `(host_uuid, ProposalRecord)`, mirroring
+    /// [`CmisState::list_allowlists`].
+    pub async fn list_proposals(&self) -> Vec<(String, ProposalRecord)> {
+        match &self.backend {
+            Backend::Local(_) => self
+                .proposals_local
+                .lock()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Backend::Cluster(c) => match c.list_proposals().await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|(host_uuid, entries_cbor, proposer_spiffe_id, proposed_at)| {
+                        (
+                            host_uuid,
+                            ProposalRecord {
+                                entries_cbor,
+                                proposer_spiffe_id,
+                                proposed_at,
+                            },
+                        )
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::error!(error = %e, "cluster list_proposals failed");
+                    Vec::new()
+                }
+            },
+        }
+    }
+
+    /// Delete a host's pending proposal. Returns whether one existed.
+    pub async fn delete_proposal(&self, host_uuid: &str) -> bool {
+        match &self.backend {
+            Backend::Local(_) => self.proposals_local.lock().remove(host_uuid).is_some(),
+            Backend::Cluster(c) => match c.delete_proposal(host_uuid).await {
+                Ok(existed) => existed,
+                Err(e) => {
+                    tracing::error!(error = %e, %host_uuid, "cluster proposal delete failed");
+                    false
                 }
             },
         }

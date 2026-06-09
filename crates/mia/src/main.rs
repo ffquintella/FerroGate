@@ -302,6 +302,7 @@ async fn bootstrap_host_svid(config: &mia::config::Config) -> Option<HostSession
     );
     Some(HostSession {
         spiffe_id: attested.bundle.spiffe_id.clone(),
+        jws: attested.bundle.jws.clone(),
         minter: ChildTokenMinter::new(attested.svid_secret, cfg),
     })
 }
@@ -313,6 +314,8 @@ async fn bootstrap_host_svid(config: &mia::config::Config) -> Option<HostSession
 struct HostSession {
     minter: mia::helper::ChildTokenMinter,
     spiffe_id: String,
+    /// The host's compact-JWS SVID, presented when proposing an allowlist.
+    jws: String,
 }
 
 /// Extract the host UUID from a host SVID SPIFFE id (`spiffe://<td>/host/<uuid>`)
@@ -403,6 +406,132 @@ fn write_allowlist_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<
     Ok(())
 }
 
+/// Spawn the background allowlist-propose task (host-driven allowlist
+/// bootstrap). It periodically snapshots the callers the helper API has observed
+/// (granted *and* denied) and sends them to CMIS, signed by the host machine key
+/// and accompanied by the host SVID. CMIS auto-adopts the first proposal on a
+/// host with no allowlist (TOFU) or queues it for operator review; see
+/// `ProposeAllowlist`.
+///
+/// Every precondition failure logs and returns without spawning — proposing is
+/// strictly opt-in best-effort. The SVID presented is the one obtained at
+/// startup; once it expires CMIS rejects further proposals until mia restarts
+/// (scheduled re-attestation is a follow-up).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[allow(clippy::too_many_lines)] // precondition checks + the periodic loop.
+fn maybe_spawn_propose_task(
+    config: &mia::config::Config,
+    host_spiffe_id: Option<&str>,
+    host_jws: Option<String>,
+    ledger: mia::helper::CallerLedger,
+) {
+    use ferro_crypto::pin::SpkiPin;
+    use ferro_sep::MachineKey as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Some(spiffe_id) = host_spiffe_id else {
+        tracing::warn!("allowlist.propose is set but no host SVID this start; not proposing");
+        return;
+    };
+    let Some(jws) = host_jws else {
+        tracing::warn!("allowlist.propose is set but host SVID JWS is missing; not proposing");
+        return;
+    };
+    let Some(host_uuid) = host_uuid_from_spiffe_id(spiffe_id).map(str::to_string) else {
+        tracing::warn!(%spiffe_id, "could not derive host UUID; not proposing");
+        return;
+    };
+    let (Some(endpoint), Some(pin_hex)) =
+        (config.cmis.endpoint.clone(), config.cmis.spki_pin.clone())
+    else {
+        tracing::warn!(
+            "allowlist.propose is set but cmis.endpoint/spki_pin are missing; not proposing"
+        );
+        return;
+    };
+    let pin = match SpkiPin::from_hex(pin_hex.trim()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "cmis.spki_pin invalid; not proposing");
+            return;
+        }
+    };
+    let key = match ferro_sep::SoftwareMachineKey::open_or_create(&host_key_path()) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot open machine key; not proposing");
+            return;
+        }
+    };
+    let sep_pub = key.public_spki_der();
+    let interval = std::time::Duration::from_secs(config.allowlist_propose_interval());
+    tracing::info!(%host_uuid, interval_secs = config.allowlist_propose_interval(), "allowlist-propose task started");
+
+    tokio::spawn(async move {
+        let mut last_sent: Option<Vec<(u32, [u8; 48])>> = None;
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately; skip it so we never propose before a
+        // caller has connected.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let mut snapshot = ledger.snapshot();
+            if snapshot.is_empty() {
+                continue;
+            }
+            snapshot.sort_unstable();
+            if last_sent.as_ref() == Some(&snapshot) {
+                continue; // nothing new since the last successful proposal
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            let entries = snapshot
+                .iter()
+                .map(|(uid, bin)| ferro_svid::AllowEntry {
+                    uid: *uid,
+                    bin_sha: hex::encode(bin),
+                })
+                .collect();
+            let doc = ferro_svid::ProposalDoc {
+                host_uuid: host_uuid.clone(),
+                issued_at: now,
+                entries,
+            };
+            let body = match ferro_svid::allowlist::encode_proposal(&doc) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "encode proposal failed");
+                    continue;
+                }
+            };
+            let sig = match key.sign(&ferro_svid::allowlist::proposal_signing_input(&body)) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sign proposal failed");
+                    continue;
+                }
+            };
+            match mia::client::propose_allowlist(
+                &endpoint,
+                vec![pin],
+                body,
+                sig,
+                jws.clone(),
+                sep_pub.clone(),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    tracing::info!(?outcome, entries = snapshot.len(), "proposed observed allowlist to CMIS");
+                    last_sent = Some(snapshot);
+                }
+                Err(e) => tracing::warn!(error = %e, "allowlist proposal failed; will retry"),
+            }
+        }
+    });
+}
+
 /// Bind and serve the helper API with the given caller authenticator. Shared by
 /// every supported platform.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -440,6 +569,7 @@ where
     // session — the helper API still serves but refuses to mint (`no_host_svid`).
     let session = bootstrap_host_svid(config).await;
     let host_spiffe_id = session.as_ref().map(|s| s.spiffe_id.clone());
+    let host_jws = session.as_ref().map(|s| s.jws.clone());
     let minter = session.map(|s| s.minter);
     if minter.is_none() {
         tracing::warn!(
@@ -508,6 +638,12 @@ where
     let crl = Arc::new(CrlCache::new());
     let server = HelperServer::bind(helper_config, auth, minter, allowlist, crl, audit_tx, clock)?;
     tracing::info!(listener = %socket_path.display(), "helper API listening");
+
+    // Optionally propose the callers the helper API observes back to CMIS, so a
+    // host with no allowlist can bootstrap its own (subject to CMIS policy).
+    if config.allowlist.propose {
+        maybe_spawn_propose_task(config, host_spiffe_id.as_deref(), host_jws, server.ledger());
+    }
 
     server.serve_with_shutdown(shutdown_signal()).await;
     tracing::info!("helper API shut down cleanly");

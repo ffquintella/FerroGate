@@ -10,6 +10,23 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **Host-driven allowlist proposals (TOFU bootstrap + review queue).** mia can
+  now propose the local callers it observes back to CMIS so a freshly installed
+  host populates its own allowlist instead of an operator hand-enumerating every
+  caller. The helper API records each authenticated `(uid, binary SHA-384)` it
+  sees (granted *and* denied — a deny-all host's denials are the bootstrap
+  candidates); when `allowlist.propose` is on, a background task periodically
+  sends them via a new `ProposeAllowlist` RPC, signed by the host machine key
+  and carrying the host SVID. CMIS verifies the SVID it issued, checks the
+  signature against the key bound by `cnf.jkt`, and confirms the host UUID, then
+  applies its `CMIS_ALLOWLIST_PROPOSALS` policy: `bootstrap` (default) auto-signs
+  the first proposal on a host with no allowlist (trust-on-first-use) and queues
+  any later change; `off` queues everything; `always` auto-adopts every
+  proposal. Operators review the queue with `ferrogate allowlist proposals` /
+  `review` / `approve` / `reject`. New audit events `AllowlistProposed`,
+  `AllowlistAutoAdopted`, `AllowlistProposalRejected`. The signing context
+  `ferrogate-allowlist-proposal-v1` is distinct from the issuance context so a
+  proposal signature can never be replayed as a signed allowlist.
 - **`GetEnrollmentKey` RPC + `mia setup` key fetch.** CMIS now serves its
   enrollment public key (the composite key that signs caller allowlists, as
   `from_concat_bytes` bytes) via a new `GetEnrollmentKey` gRPC. `mia setup`,

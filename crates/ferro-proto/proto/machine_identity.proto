@@ -57,6 +57,29 @@ service MachineIdentity {
   // action.
   rpc ListAllowlists (ListAllowlistsRequest) returns (ListAllowlistsResponse);
 
+  // ---- Allowlist proposals (host-driven TOFU) ----
+
+  // Host-authenticated RPC: a host agent (mia) proposes the set of local
+  // callers it has observed. The proposal is CBOR `ferro_svid::ProposalDoc`
+  // signed by the host's machine key (context `ferrogate-allowlist-proposal-v1`)
+  // and accompanied by the host's SVID JWS; CMIS verifies the SVID it issued,
+  // checks the signature against the key bound by the SVID's `cnf.jkt`, and
+  // confirms the proposal's host_uuid matches the SVID. With no allowlist yet
+  // for the host and policy permitting, CMIS signs and stores it immediately
+  // (first-use bootstrap, TOFU); otherwise it queues the proposal for operator
+  // review. Unlike the admin RPCs this is authenticated *in band* by the SVID.
+  rpc ProposeAllowlist (ProposeAllowlistRequest) returns (ProposeAllowlistResponse);
+
+  // Admin RPC: enumerate pending allowlist proposals awaiting operator review,
+  // with their full proposed entries. Authenticated out of band as an operator
+  // action.
+  rpc ListProposals (ListProposalsRequest) returns (ListProposalsResponse);
+
+  // Admin RPC: drop a host's pending proposal — used to reject it, and to clean
+  // up after approving it (the operator approves via SetAllowlist). Authenticated
+  // out of band as an operator action.
+  rpc DeleteProposal (DeleteProposalRequest) returns (DeleteProposalResponse);
+
   // ---- Revocation (F11) ----
 
   // Admin RPC: revoke a single SVID by the lowercase-hex SHA-384 of its compact
@@ -281,6 +304,64 @@ message AllowlistSummary {
 
 message ListAllowlistsResponse {
   repeated AllowlistSummary items = 1;
+}
+
+// ---- Allowlist proposals -----------------------------------------------
+
+message ProposeAllowlistRequest {
+  // Canonical CBOR of `ferro_svid::allowlist::ProposalDoc`
+  // (`{host_uuid, issued_at, entries}`). Carried as opaque bytes so the exact
+  // bytes the host signed are what CMIS verifies.
+  bytes signed_proposal = 1;
+  // Host machine-key signature over `proposal_signing_input(signed_proposal)`
+  // (context `ferrogate-allowlist-proposal-v1` followed by the CBOR). X9.62 DER
+  // ECDSA-P256 over SHA-256, by the host's machine (SEP) key.
+  bytes proposal_sig = 2;
+  // The host's compact-JWS SVID, proving which attested host is proposing. CMIS
+  // re-verifies it was issued by this CMIS and reads `sub` + `cnf.jkt` from it.
+  string svid_jws = 3;
+  // DER SubjectPublicKeyInfo of the host machine key that produced
+  // `proposal_sig`. CMIS confirms `base64url(SHA256(sep_pub)) == svid.cnf.jkt`
+  // before trusting the signature, binding the proposal to the SVID's key.
+  bytes sep_pub = 4;
+}
+
+message ProposeAllowlistResponse {
+  enum Outcome {
+    // Queued for operator review (an allowlist already exists, or policy
+    // declines to auto-adopt).
+    PENDING = 0;
+    // Signed and stored immediately (first-use bootstrap under policy).
+    AUTO_ADOPTED = 1;
+    // The proposed entries already match the live allowlist; nothing changed.
+    UNCHANGED = 2;
+  }
+  Outcome outcome = 1;
+  int64 issued_at = 2; // unix seconds CMIS stamped (set when AUTO_ADOPTED)
+  int64 not_after = 3; // unix seconds CMIS stamped (set when AUTO_ADOPTED)
+}
+
+message ListProposalsRequest {}
+
+// One pending proposal awaiting review, with its full proposed entries so an
+// operator can diff it against the live allowlist before approving.
+message PendingProposal {
+  string host_uuid = 1;
+  repeated AllowEntryMsg entries = 2;
+  string proposer_spiffe_id = 3; // SVID `sub` that submitted the proposal
+  int64 proposed_at = 4;         // unix seconds CMIS recorded it
+}
+
+message ListProposalsResponse {
+  repeated PendingProposal items = 1;
+}
+
+message DeleteProposalRequest {
+  string host_uuid = 1;
+}
+
+message DeleteProposalResponse {
+  bool existed = 1; // whether a pending proposal was removed
 }
 
 // ---- Revocation (F11) --------------------------------------------------
