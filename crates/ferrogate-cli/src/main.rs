@@ -57,6 +57,9 @@ fn usage() -> &'static str {
      \x20 bump-epoch [reason]              advance the RIM policy epoch (mass re-attest)\n\
      \x20 allowlist <subcommand> ...       manage per-host signed caller allowlists\n\
      \x20                                  (run `ferrogate allowlist help` for details)\n\
+     \x20 spki-pin [--format hex|env|flag] print the CMIS SPKI pin from its cert\n\
+     \x20                                  (--tls-cert / $FERROGATE_CMIS_TLS_CERT); no\n\
+     \x20                                  connection is made\n\
      \n\
      options:\n\
      \x20 --endpoint <url>   CMIS gRPC endpoint (default http://127.0.0.1:8443,\n\
@@ -106,6 +109,12 @@ async fn run() -> anyhow::Result<()> {
     if command == "allowlist" && matches!(rest.first().map(String::as_str), None | Some("help" | "-h" | "--help")) {
         println!("{}", allowlist::usage());
         return Ok(());
+    }
+
+    // `spki-pin` is a purely local cert→pin computation; it never talks to
+    // CMIS, so resolve it before the dial.
+    if command == "spki-pin" {
+        return spki_pin(&global, rest);
     }
 
     // Reject an unknown command before dialing CMIS, so a typo gives a usage
@@ -252,30 +261,37 @@ fn resolve_pins(global: &GlobalArgs) -> anyhow::Result<Vec<SpkiPin>> {
 
     let explicit_cert = global.tls_cert.is_some();
     let cert_path = global.tls_cert.as_deref().unwrap_or(DEFAULT_TLS_CERT);
-    let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+    let pin = pin_from_cert(cert_path).map_err(|e| {
         // The default path is the in-container mount; if it is absent the
         // caller is likely running outside the container and must supply a pin
         // or point at a cert explicitly.
         if explicit_cert {
-            anyhow::anyhow!("reading TLS cert `{cert_path}`: {e}")
+            e
         } else {
             anyhow::anyhow!(
-                "no SPKI pin available for the https:// endpoint: reading the default \
-                 server cert `{cert_path}` failed ({e}). Supply --spki-pin <hex> \
-                 (or $FERROGATE_CMIS_SPKI_PIN), or --tls-cert <path> \
-                 (or $FERROGATE_CMIS_TLS_CERT) pointing at the CMIS server certificate."
+                "no SPKI pin available for the https:// endpoint: {e}. \
+                 Supply --spki-pin <hex> (or $FERROGATE_CMIS_SPKI_PIN), or \
+                 --tls-cert <path> (or $FERROGATE_CMIS_TLS_CERT) pointing at the \
+                 CMIS server certificate."
             )
         }
     })?;
+    Ok(vec![pin])
+}
 
+/// Read a PEM server certificate and derive its SPKI pin (SHA-384 over the
+/// DER `SubjectPublicKeyInfo`). Uses the first certificate in the file, which
+/// is the leaf for a CMIS server cert.
+fn pin_from_cert(cert_path: &str) -> anyhow::Result<SpkiPin> {
+    let cert_bytes = std::fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("reading TLS cert `{cert_path}`: {e}"))?;
     let mut reader = std::io::BufReader::new(&cert_bytes[..]);
     let cert = rustls_pemfile::certs(&mut reader)
         .next()
         .ok_or_else(|| anyhow::anyhow!("no certificate found in `{cert_path}`"))?
         .map_err(|e| anyhow::anyhow!("parsing TLS cert `{cert_path}`: {e}"))?;
-    let pin = SpkiPin::from_certificate_der(cert.as_ref())
-        .map_err(|e| anyhow::anyhow!("deriving SPKI pin from `{cert_path}`: {e}"))?;
-    Ok(vec![pin])
+    SpkiPin::from_certificate_der(cert.as_ref())
+        .map_err(|e| anyhow::anyhow!("deriving SPKI pin from `{cert_path}`: {e}"))
 }
 
 async fn status(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
@@ -376,5 +392,44 @@ async fn bump_epoch(
         .map_err(rpc_err)?
         .into_inner();
     println!("RIM policy epoch bumped; now in force: {}", resp.new_epoch);
+    Ok(())
+}
+
+/// Print the CMIS server's SPKI pin (lowercase-hex SHA-384), derived locally
+/// from its certificate PEM — no connection to CMIS is made. This is the value
+/// clients put in `--spki-pin` / `$FERROGATE_CMIS_SPKI_PIN` to authenticate the
+/// server over the hybrid-PQC TLS transport, so an operator can read it off a
+/// CMIS node and publish it.
+///
+/// The certificate is taken from `--tls-cert` / `$FERROGATE_CMIS_TLS_CERT`,
+/// defaulting to [`DEFAULT_TLS_CERT`] (the in-container mount). `--format`
+/// selects how the pin is rendered for easy export:
+///
+/// - `hex`  (default) → the bare lowercase-hex pin;
+/// - `env`            → `FERROGATE_CMIS_SPKI_PIN=<hex>`;
+/// - `flag`           → `--spki-pin <hex>`.
+fn spki_pin(global: &GlobalArgs, args: &[String]) -> anyhow::Result<()> {
+    let mut format = "hex";
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--format" | "-f" => {
+                format = it
+                    .next()
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("--format needs a value (hex|env|flag)"))?;
+            }
+            other => anyhow::bail!("unknown spki-pin argument: {other}"),
+        }
+    }
+
+    let cert_path = global.tls_cert.as_deref().unwrap_or(DEFAULT_TLS_CERT);
+    let hex = pin_from_cert(cert_path)?.to_hex();
+    match format {
+        "hex" => println!("{hex}"),
+        "env" => println!("FERROGATE_CMIS_SPKI_PIN={hex}"),
+        "flag" => println!("--spki-pin {hex}"),
+        other => anyhow::bail!("unknown --format `{other}` (expected hex|env|flag)"),
+    }
     Ok(())
 }
