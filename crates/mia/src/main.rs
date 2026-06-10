@@ -619,8 +619,7 @@ where
     A: mia::helper::auth::CallerAuth,
 {
     use anyhow::Context as _;
-    use ferro_crypto::composite::CompositePublicKey;
-    use mia::helper::{system_clock, Allowlist, CrlCache, HelperServer, HelperServerConfig};
+    use mia::helper::{system_clock, CrlCache, HelperServer, HelperServerConfig};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -655,42 +654,17 @@ where
     // the served body stays in sync with what the operator provisioned.
     maybe_fetch_allowlist(config, host_spiffe_id.as_deref()).await;
 
-    // Allowlist: configured ⇒ load and verify (fail loudly); absent ⇒ deny all.
-    // A configured path whose file does not yet exist also denies all (fail
-    // closed) rather than crashing: CMIS may have no allowlist for this host and
-    // none was ever written, so `maybe_fetch_allowlist` left the path empty.
+    // Allowlist: configured ⇒ load and verify, denying all callers (fail
+    // closed) on a missing file or a verification failure rather than crashing
+    // — a crash here would loop under the service supervisor and unbind the
+    // helper socket, hiding the real error behind ECONNREFUSED. Absent
+    // configuration also denies all.
     let allowlist = if let Some(path) = config.allowlist.path.as_deref() {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let key_path = config.allowlist.key.as_deref().context(
-                    "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing",
-                )?;
-                let key_bytes = std::fs::read(key_path).with_context(|| {
-                    format!(
-                        "reading allowlist key (allowlist.key) {}",
-                        key_path.display()
-                    )
-                })?;
-                let trusted = CompositePublicKey::from_concat_bytes(&key_bytes)
-                    .map_err(|e| anyhow::anyhow!("trusted allowlist key: {e}"))?;
-                let al = Allowlist::load(&bytes, &trusted, clock(), max_age)
-                    .map_err(|e| anyhow::anyhow!("allowlist verification failed: {e}"))?;
-                tracing::info!(trust_domain = al.trust_domain(), "loaded signed allowlist");
-                Some(al)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "allowlist.path configured but no file present; helper API denies all callers (fail closed)"
-                );
-                None
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("reading allowlist (allowlist.path) {}", path.display())
-                });
-            }
-        }
+        let key_path = config.allowlist.key.as_deref().context(
+            "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing",
+        )?;
+        mia::helper::allowlist::load_at_startup(path, key_path, clock(), max_age)
+            .with_context(|| format!("reading allowlist (allowlist.path) {}", path.display()))?
     } else {
         tracing::warn!("no allowlist configured; helper API denies all callers (fail closed)");
         None

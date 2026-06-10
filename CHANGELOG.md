@@ -10,14 +10,12 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
-- **Hosts self-report their OS hostname for operator display.** MIA now sends
-  its OS hostname in `AttestInit`, and CMIS stores it on the issued record and
-  surfaces it in `ferrogate list-svids` (and the `SvidSummary` RPC field). It
-  is a display-only convenience — never identity (which stays rooted in the
-  EK/host-key fingerprint) and never verified: CMIS sanitises it to printable
-  ASCII and truncates to 64 chars before storing, a host that cannot report one
-  sends the empty string, and records written before the field existed still
-  decode (it is optional).
+- **Hostname shown in `ferrogate list-svids`.** mia now reports the host's OS
+  hostname in `AttestInit` as a display-only label; CMIS sanitises it
+  (printable ASCII, 64-char cap), stores it on the issued record, and the CLI
+  prints it under the SPIFFE id marked "(self-reported, display only)". It is
+  never identity — the SPIFFE id stays rooted in the EK / hardware-fingerprint
+  UUID — and records written before the field existed still decode.
 - **`mia test` — connectivity and token-issuance self-test.** A new
   non-interactive subcommand that exercises the full path a local application
   depends on: configuration (CMIS endpoint + SPKI pin), the eager pinned
@@ -56,6 +54,20 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **mia no longer crash-loops on an unverifiable allowlist; it serves deny-all
+  instead.** A bad allowlist signature at startup — typically a CMIS redeploy
+  that changed the enrollment key, leaving the locally pinned `allowlist.pub`
+  stale — aborted the daemon, which the service supervisor then restarted
+  every few seconds: the helper socket never bound, callers saw `ECONNREFUSED`
+  against a stale socket file, and `mia test` misread the failure as a socket
+  path/permissions problem. Signature/freshness failures, a missing or
+  unparseable key file, and a missing allowlist body now all log a loud error
+  and serve in deny-all mode (`mia::helper::allowlist::load_at_startup`), so
+  the daemon stays up and the deny is diagnosable from the daemon log and
+  audit events; only unexpected I/O errors remain fatal. `mia test` gained
+  connection-refused hints pointing at supervisor restart loops, and its
+  `permission_denied` hints now mention the deny-all mode and re-fetching the
+  enrollment key with `mia setup`.
 - **mia now starts the CRL puller, so helper tokens can actually be minted.**
   The daemon created the F11 CRL cache empty and never wired
   `mia::helper::crl::spawn_puller`, so the helper API's fail-closed freshness
@@ -85,8 +97,9 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   for the host and none was ever written to disk, the daemon read the missing
   `allowlist.cbor` as a fatal error and exited — launchd/systemd then restarted
   it every few seconds. The loader now treats a `NotFound` allowlist file as
-  deny-all (fail closed) with a warning, matching the documented contract;
-  other read errors and present-but-invalid allowlists still fail loudly.
+  deny-all (fail closed) with a warning, matching the documented contract.
+  (Present-but-invalid allowlists initially kept failing loudly; the
+  deny-all-instead-of-crash entry above extends the same treatment to them.)
 - **`mia setup` no longer double-prompts when editing an existing file.** The
   final "Write this configuration to …?" prompt is now the single point of
   consent; the redundant secondary "… exists — overwrite?" prompt (which always
@@ -95,6 +108,14 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **Hosts self-report their OS hostname for operator display.** MIA now sends
+  its OS hostname in `AttestInit`, and CMIS stores it on the issued record and
+  surfaces it in `ferrogate list-svids` (and the `SvidSummary` RPC field). It
+  is a display-only convenience — never identity (which stays rooted in the
+  EK/host-key fingerprint) and never verified: CMIS sanitises it to printable
+  ASCII and truncates to 64 chars before storing, a host that cannot report one
+  sends the empty string, and records written before the field existed still
+  decode (it is optional).
 - **MIA runs on Linux, macOS, and Windows.** The daemon now wires up and serves
   the helper API on all three platforms instead of only Linux: Linux uses
   `SO_PEERCRED` + IMA, Windows uses the named-pipe transport with PID + image

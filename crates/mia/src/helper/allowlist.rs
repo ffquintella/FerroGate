@@ -89,6 +89,78 @@ impl Allowlist {
     }
 }
 
+/// Load the configured allowlist from disk at daemon startup, failing closed.
+///
+/// `Ok(Some)` is a verified allowlist; `Ok(None)` means the helper API must
+/// serve in deny-all mode. Trust problems — a missing body or key file, an
+/// unparseable key, a signature/freshness failure — all yield `Ok(None)` with
+/// a loud log line rather than an error: crashing here would put the daemon in
+/// a supervisor restart loop that unbinds the helper socket, so callers see
+/// `ECONNREFUSED` instead of a diagnosable deny, and the stale pinned key that
+/// commonly causes this (CMIS enrollment-key change) needs operator
+/// re-provisioning either way. Only an unexpected I/O failure (not
+/// `NotFound`) reading either file is returned as an error.
+pub fn load_at_startup(
+    path: &std::path::Path,
+    key_path: &std::path::Path,
+    now: i64,
+    max_age_secs: i64,
+) -> std::io::Result<Option<Allowlist>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // CMIS may have no allowlist for this host and none was ever
+            // written, so the configured path can legitimately be empty.
+            tracing::warn!(
+                path = %path.display(),
+                "allowlist.path configured but no file present; helper API denies all callers (fail closed)"
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let key_bytes = match std::fs::read(key_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::error!(
+                key = %key_path.display(),
+                "allowlist key file missing; helper API denies all callers (fail closed) — \
+                 fetch the CMIS enrollment key (`mia setup`) and restart"
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let trusted = match CompositePublicKey::from_concat_bytes(&key_bytes) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(
+                key = %key_path.display(),
+                error = %e,
+                "allowlist key file unparseable; helper API denies all callers (fail closed) — \
+                 fetch the CMIS enrollment key (`mia setup`) and restart"
+            );
+            return Ok(None);
+        }
+    };
+    match Allowlist::load(&bytes, &trusted, now, max_age_secs) {
+        Ok(al) => {
+            tracing::info!(trust_domain = al.trust_domain(), "loaded signed allowlist");
+            Ok(Some(al))
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "allowlist verification failed; helper API denies all callers (fail closed) — \
+                 if CMIS was redeployed its signing key may have changed: re-fetch the \
+                 enrollment key (`mia setup`) and the allowlist, then restart"
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +240,83 @@ mod tests {
         let (_sk, pk) = keypair();
         let err = Allowlist::load(&[0xFF, 0x00, 0x42], &pk, 1000, 86_400).unwrap_err();
         assert!(matches!(err, AllowlistError::Cbor(_)));
+    }
+
+    /// A scratch directory with an optional allowlist body and key file, for
+    /// exercising `load_at_startup`.
+    fn startup_dir(tag: &str, body: Option<&[u8]>, key: Option<&[u8]>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mia-allowlist-startup-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(bytes) = body {
+            std::fs::write(dir.join("allowlist.cbor"), bytes).unwrap();
+        }
+        if let Some(bytes) = key {
+            std::fs::write(dir.join("allowlist.pub"), bytes).unwrap();
+        }
+        dir
+    }
+
+    fn load_startup(dir: &std::path::Path) -> std::io::Result<Option<Allowlist>> {
+        load_at_startup(
+            &dir.join("allowlist.cbor"),
+            &dir.join("allowlist.pub"),
+            1000,
+            86_400,
+        )
+    }
+
+    #[test]
+    fn startup_loads_valid_allowlist() {
+        let (sk, pk) = keypair();
+        let dir = startup_dir(
+            "valid",
+            Some(&signed_bytes(&doc(1000), &sk)),
+            Some(&pk.to_concat_bytes()),
+        );
+        let al = load_startup(&dir).unwrap().expect("allowlist loaded");
+        assert!(al.permits(1001, &[0xAA; 48]));
+    }
+
+    #[test]
+    fn startup_missing_body_denies_all_without_crashing() {
+        let (_sk, pk) = keypair();
+        let dir = startup_dir("no-body", None, Some(&pk.to_concat_bytes()));
+        assert!(load_startup(&dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_bad_signature_denies_all_without_crashing() {
+        // A stale pinned key (CMIS re-keyed) must not abort startup: the
+        // daemon serves deny-all so the socket stays diagnosable.
+        let (sk, _pk) = keypair();
+        let (_sk2, pk2) = keypair();
+        let dir = startup_dir(
+            "bad-sig",
+            Some(&signed_bytes(&doc(1000), &sk)),
+            Some(&pk2.to_concat_bytes()),
+        );
+        assert!(load_startup(&dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_missing_key_file_denies_all_without_crashing() {
+        let (sk, _pk) = keypair();
+        let dir = startup_dir("no-key", Some(&signed_bytes(&doc(1000), &sk)), None);
+        assert!(load_startup(&dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_unparseable_key_denies_all_without_crashing() {
+        let (sk, _pk) = keypair();
+        let dir = startup_dir(
+            "bad-key",
+            Some(&signed_bytes(&doc(1000), &sk)),
+            Some(&[0x42; 7]),
+        );
+        assert!(load_startup(&dir).unwrap().is_none());
     }
 }

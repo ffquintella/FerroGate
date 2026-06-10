@@ -481,6 +481,16 @@ fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
              the test as a permitted user."
                 .to_string(),
         ],
+        std::io::ErrorKind::ConnectionRefused => vec![
+            "The socket file exists but nothing is listening — it is likely stale and the \
+             daemon is down or restart-looping. Check the service status and the daemon log \
+             for a startup error repeating at the supervisor's restart interval."
+                .to_string(),
+            "A common cause is a CMIS redeploy that changed the enrollment key, so locally \
+             pinned material no longer verifies (e.g. 'allowlist verification failed'): \
+             re-fetch the enrollment key with `mia setup` and restart the daemon."
+                .to_string(),
+        ],
         _ => vec!["Check the daemon log and the socket path/permissions.".to_string()],
     }
 }
@@ -540,6 +550,11 @@ fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
             "If the reason is 'not-allowlisted', everything upstream (socket, caller auth, host \
              SVID, CRL gate) works — provision this caller with `ferrogate allowlist set`, or \
              enable allowlist.propose and approve the pending proposal on CMIS."
+                .to_string(),
+            "If the daemon log shows 'allowlist verification failed' at startup, the daemon is \
+             serving in deny-all mode because the locally pinned enrollment key no longer \
+             verifies the allowlist (common after a CMIS redeploy changed the signing key) — \
+             re-fetch the key with `mia setup` and restart the daemon."
                 .to_string(),
         ],
         ErrorCode::NoHostSvid => vec![
