@@ -29,8 +29,12 @@
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
+        <!-- /var/run is a boot-cleared tmpfs on macOS; a socket parented there
+             vanishes on reboot and the daemon crash-loops on bind. Use the
+             persistent Application Support tree (where config/allowlist live);
+             the daemon creates the run/ subdir, owned root:<helper gid> 0750. -->
         <key>FERROGATE_HELPER_SOCKET</key>
-        <string>/var/run/ferrogate/mia.sock</string>
+        <string>/Library/Application Support/FerroGate/run/mia.sock</string>
     </dict>
 
     <key>RunAtLoad</key>

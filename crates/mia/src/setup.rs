@@ -435,11 +435,15 @@ fn default_socket() -> String {
 }
 
 /// The platform's default helper listener address (macOS Unix socket). macOS
-/// has no `/run`; daemons use `/var/run`, matching the launchd plist's
-/// `FERROGATE_HELPER_SOCKET` (`crates/mia/dist/com.ferrogate.mia.plist`).
+/// has no `/run`, and `/var/run` is a boot-cleared tmpfs — a socket parented
+/// there vanishes on every reboot and the daemon crash-loops on bind. Use the
+/// persistent system Application Support tree instead (the same place the
+/// config and allowlist live), in a dedicated `run/` subdirectory the daemon
+/// owns. Must match the launchd plist's `FERROGATE_HELPER_SOCKET`
+/// (`crates/mia/dist/com.ferrogate.mia.plist`).
 #[cfg(target_os = "macos")]
 fn default_socket() -> String {
-    "/var/run/ferrogate/mia.sock".to_string()
+    "/Library/Application Support/FerroGate/run/mia.sock".to_string()
 }
 
 /// The platform's default helper listener address (Linux/other Unix socket).

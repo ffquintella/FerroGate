@@ -251,7 +251,7 @@ ifeq ($(MIA_OS),macos)
 	  $$SUDO chmod 0644 $$DEST; \
 	  $$SUDO /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:FERROGATE_HELPER_SOCKET_GID string $$GID" $$DEST 2>/dev/null \
 	    || $$SUDO /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:FERROGATE_HELPER_SOCKET_GID $$GID" $$DEST; \
-	  $$SUDO mkdir -p /var/run/ferrogate /var/log/ferrogate; \
+	  $$SUDO mkdir -p /var/log/ferrogate; \
 	  $$SUDO launchctl bootout system $$DEST 2>/dev/null || true; \
 	  $$SUDO launchctl bootstrap system $$DEST; \
 	  $$SUDO launchctl kickstart -k system/$(MIA_LABEL); \

@@ -36,6 +36,28 @@ impl<A: CallerAuth> HelperServer<A> {
         audit_tx: mpsc::Sender<AuditEvent>,
         clock: Clock,
     ) -> Result<Self, ServerError> {
+        // Ensure the socket's parent directory exists, creating it owned by the
+        // socket's group so peers that can open the socket can also traverse the
+        // dir. On macOS the socket lives under Application Support in a dedicated
+        // `run/` subdir the daemon owns; this is where it gets created. It also
+        // guards against a parent that was wiped out of band (e.g. a path under
+        // the boot-cleared `/var/run` tmpfs): without it `bind` fails with ENOENT
+        // and the daemon crash-loops under the supervisor, hiding the real cause
+        // behind the socket's apparent absence.
+        // Only touch ownership/mode on a directory we create — a pre-existing
+        // parent (a shared system dir like `/tmp`, or a run/ dir from a prior
+        // start) is left as the operator set it.
+        if let Some(parent) = config.socket_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(ServerError::Socket)?;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750))
+                    .map_err(ServerError::Socket)?;
+                if let Some(gid) = config.socket_gid {
+                    std::os::unix::fs::chown(parent, None, Some(gid))
+                        .map_err(ServerError::Socket)?;
+                }
+            }
+        }
         match std::fs::remove_file(&config.socket_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
