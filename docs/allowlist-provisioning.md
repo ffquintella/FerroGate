@@ -187,9 +187,10 @@ any integrity-preserving channel is fine.
 ## Storage & authorization
 
 - **Persistence.** CMIS stores allowlists in the same backend as issued SVIDs:
-  a process-local map on a single replica, or the Raft-replicated
-  `host_allowlists` keyspace on a clustered deployment (strongly-consistent
-  reads, so a follower never serves a stale body after a leader upsert).
+  the Raft-replicated `host_allowlists` keyspace (strongly-consistent reads, so
+  a follower never serves a stale body after a leader upsert). A single replica
+  runs a one-node Raft, so the SQLite store under `CMIS_RAFT_DIR` (default
+  `/var/lib/ferrogate/raft`) survives restarts.
 - **Validity.** `SetAllowlist` stamps `issued_at = now` and
   `not_after = now + ttl` (default one day, capped at 30 days). Re-issue rather
   than mint long-lived lists so the MIA's freshness check stays meaningful.

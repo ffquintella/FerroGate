@@ -301,9 +301,9 @@ fn build_clustered_state(
     };
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&audit_root).unwrap());
     let (signer, _audit_pk) = InProcessSigner::generate(format!("audit-{kid}")).unwrap();
-    let audit = AuditLog::new(store, Arc::new(signer));
+    let audit = AuditLog::new(store, Arc::new(signer)).unwrap();
 
-    Arc::new(CmisState::new_clustered(
+    Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(SoftwareCredentialMaker),

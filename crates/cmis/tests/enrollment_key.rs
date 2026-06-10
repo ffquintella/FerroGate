@@ -3,6 +3,8 @@
 //! (`CompositePublicKey::from_concat_bytes`). This is the key that signs caller
 //! allowlists, fetched by `mia setup` over the pinned CMIS channel.
 
+#![allow(clippy::large_futures)]
+
 use std::sync::Arc;
 
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
@@ -12,6 +14,7 @@ use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore};
 use ferro_crypto::composite::CompositePublicKey;
 use ferro_proto::v1::machine_identity_server::MachineIdentity;
 use ferro_proto::v1::GetEnrollmentKeyRequest;
+use ferro_raft::Cluster;
 use ferro_svid::Issuer;
 
 struct UnusedCredentialMaker;
@@ -26,27 +29,36 @@ impl CredentialMaker for UnusedCredentialMaker {
     }
 }
 
-fn svc() -> (MachineIdentitySvc, Arc<CmisState>) {
+async fn svc() -> (MachineIdentitySvc, Arc<CmisState>) {
     let issuer = Issuer::generate("cmis-test-ek", "ferrogate.test").unwrap();
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), RimStore::new());
     let tmp = std::env::temp_dir().join(format!("ferrogate-cmis-ek-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&tmp).unwrap());
     let (signer, _pk) = InProcessSigner::generate("audit-test-ek").unwrap();
-    let audit = AuditLog::new(store, Arc::new(signer));
+    let audit = AuditLog::new(store, Arc::new(signer)).unwrap();
+    let raft_dir =
+        std::env::temp_dir().join(format!("ferrogate-cmis-ek-raft-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&raft_dir);
+    let cluster = Arc::new(
+        Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap(),
+    );
     let state = Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(UnusedCredentialMaker),
         CmisConfig::default(),
         audit,
+        cluster,
     ));
     (MachineIdentitySvc::new(Arc::clone(&state)), state)
 }
 
 #[tokio::test]
 async fn get_enrollment_key_returns_issuer_public_concat() {
-    let (svc, state) = svc();
+    let (svc, state) = svc().await;
 
     let resp = svc
         .get_enrollment_key(tonic::Request::new(GetEnrollmentKeyRequest {}))
@@ -67,5 +79,8 @@ async fn get_enrollment_key_returns_issuer_public_concat() {
 
     let _ = std::fs::remove_dir_all(
         std::env::temp_dir().join(format!("ferrogate-cmis-ek-{}", std::process::id())),
+    );
+    let _ = std::fs::remove_dir_all(
+        std::env::temp_dir().join(format!("ferrogate-cmis-ek-raft-{}", std::process::id())),
     );
 }

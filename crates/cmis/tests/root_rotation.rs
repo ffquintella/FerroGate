@@ -3,6 +3,8 @@
 //! newest-first so a verifier prefers the newer root, while both — and the
 //! per-host child keys — stay resolvable by `kid`.
 
+#![allow(clippy::large_futures)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -11,6 +13,7 @@ use cmis::{CmisConfig, CmisState};
 use ferro_attest::{RimStore, TpmQuoteVerifier, VendorTrustStore};
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore};
 use ferro_crypto::composite::CompositeSecretKey;
+use ferro_raft::Cluster;
 use ferro_svid::Issuer;
 
 struct UnusedCredentialMaker;
@@ -27,30 +30,41 @@ impl CredentialMaker for UnusedCredentialMaker {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn state() -> CmisState {
+async fn state() -> CmisState {
     let issuer = Issuer::generate("root-2025", "ferrogate.test").unwrap();
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), RimStore::new());
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!(
-        "ferrogate-cmis-rot-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
+        "ferrogate-cmis-rot-{}-{seq}",
+        std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&tmp).unwrap());
     let (signer, _pk) = InProcessSigner::generate("audit-rot-1").unwrap();
-    let audit = AuditLog::new(store, Arc::new(signer));
+    let audit = AuditLog::new(store, Arc::new(signer)).unwrap();
+    let raft_dir = std::env::temp_dir().join(format!(
+        "ferrogate-cmis-rot-raft-{}-{seq}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&raft_dir);
+    let cluster = Arc::new(
+        Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap(),
+    );
     CmisState::new(
         issuer,
         verifier,
         Box::new(UnusedCredentialMaker),
         CmisConfig::default(),
         audit,
+        cluster,
     )
 }
 
-#[test]
-fn incoming_root_is_published_newest_first_and_preferred() {
-    let state = state();
+#[tokio::test]
+async fn incoming_root_is_published_newest_first_and_preferred() {
+    let state = state().await;
 
     // Before the window the issuer root is the only key, and it is preferred.
     let jwks = state.published_jwks();

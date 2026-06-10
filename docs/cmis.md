@@ -118,9 +118,15 @@ provider      = "sev-snp"                       # or "tdx"
 peer_roots    = "/etc/ferrogate/peer-roots.pem"
 
 [raft]
+# The shipped binary reads these from env. All durable state (issued SVIDs,
+# host allowlists, pending allowlist proposals) lives in this store. With no
+# CMIS_CLUSTER_PEERS set, CMIS runs a single-node cluster: it elects itself
+# leader, never looks for peers, and still persists to data_dir across
+# restarts. Multi-node: CMIS_CLUSTER_PEERS="1=h1:9601,h1:9602;2=h2:9601,..."
+# plus CMIS_NODE_ID and shared CMIS_RAFT_SECRET / CMIS_API_SECRET.
 peers         = ["cmis-1:9443", "cmis-2:9443", "cmis-3:9443"]
 node_id       = 1                               # 1.. ; node 1 bootstraps
-data_dir      = "/var/lib/ferrogate/raft"       # hiqlite SQLite state + WAL
+data_dir      = "/var/lib/ferrogate/raft"       # hiqlite SQLite state + WAL (CMIS_RAFT_DIR)
 
 [rim]
 allowlist     = "/var/lib/ferrogate/rim/current.json"

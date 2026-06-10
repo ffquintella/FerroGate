@@ -44,6 +44,11 @@ pub enum AuditLogError {
     /// A requested leaf index or tree size is out of range.
     #[error("range: {0}")]
     Range(String),
+    /// The tree rebuilt from the store's leaves does not match a tree head the
+    /// store itself recorded — the persisted log was tampered with or
+    /// corrupted. Refusing to resume is the only safe answer.
+    #[error("resume: {0}")]
+    Resume(String),
 }
 
 /// Thread-safe audit log. Cloning is cheap (`Arc` clone) and shares state.
@@ -65,19 +70,78 @@ struct TreeState {
 }
 
 impl AuditLog {
-    /// Build a log from a backing store and an STH signer.
-    pub fn new(store: Arc<dyn AuditStore>, signer: Arc<dyn SthSigner>) -> Self {
-        Self {
+    /// Build a log from a backing store and an STH signer, resuming from
+    /// whatever the store already holds.
+    ///
+    /// The in-memory Merkle tree is rebuilt by replaying every persisted leaf
+    /// in index order, so the next append lands at the correct index instead
+    /// of colliding with leaf `0` and wedging against the WORM invariant
+    /// (which is exactly what an empty tree over a non-empty store would do —
+    /// every later append fails `AlreadyExists`, permanently). The newest
+    /// persisted STH is cross-checked against the rebuilt tree and seeds the
+    /// latest-STH cache; a root mismatch means the persisted log was tampered
+    /// with or corrupted, and construction refuses rather than continuing on
+    /// a forked history.
+    pub fn new(
+        store: Arc<dyn AuditStore>,
+        signer: Arc<dyn SthSigner>,
+    ) -> Result<Self, AuditLogError> {
+        let mut tree = MerkleTree::new();
+        loop {
+            match store.read_leaf(tree.len() as u64) {
+                Ok(raw) => {
+                    tree.append(leaf_hash(&raw));
+                }
+                Err(AuditStoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let latest_sth = store.latest_sth()?;
+        if let Some(sth) = &latest_sth {
+            let body = sth.body()?;
+            let covered = usize::try_from(body.tree_size).map_err(|_| {
+                AuditLogError::Resume(format!("persisted STH size {} out of range", body.tree_size))
+            })?;
+            if covered > tree.len() {
+                return Err(AuditLogError::Resume(format!(
+                    "persisted STH covers {} leaves but only {} are on disk",
+                    covered,
+                    tree.len()
+                )));
+            }
+            // Root of the first `covered` leaves must match what was signed.
+            let mut prefix = MerkleTree::new();
+            for i in 0..covered {
+                let Some(hash) = tree.leaf(i) else {
+                    // Unreachable (`covered <= tree.len()` was checked above),
+                    // but a Resume error beats a panic on a corrupt store.
+                    return Err(AuditLogError::Resume(format!("leaf {i} missing")));
+                };
+                prefix.append(*hash);
+            }
+            if prefix.root().unwrap_or([0u8; HASH_LEN]) != body.root_hash.0 {
+                return Err(AuditLogError::Resume(format!(
+                    "rebuilt root for {covered} leaves does not match the persisted STH"
+                )));
+            }
+        }
+        let latest_cosigned_sth = store.latest_cosigned_sth()?;
+
+        if !tree.is_empty() {
+            tracing::info!(leaves = tree.len(), "audit log resumed from backing store");
+        }
+        Ok(Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(TreeState {
-                    tree: MerkleTree::new(),
-                    latest_sth: None,
-                    latest_cosigned_sth: None,
+                    tree,
+                    latest_sth,
+                    latest_cosigned_sth,
                 }),
                 store,
                 signer,
             }),
-        }
+        })
     }
 
     /// Number of leaves currently in the tree.
@@ -278,7 +342,7 @@ mod tests {
         let dir = temp_dir(tag);
         let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&dir).unwrap());
         let (signer, _pk) = InProcessSigner::generate("kid").unwrap();
-        let log = AuditLog::new(store, Arc::new(signer));
+        let log = AuditLog::new(store, Arc::new(signer)).unwrap();
         (log, dir)
     }
 
@@ -287,6 +351,77 @@ mod tests {
             cert_sha: Hash384([i; 48]),
             spiffe_id: format!("spiffe://x/host/{i}"),
         }
+    }
+
+    /// A restart (new `AuditLog` over the same store) must resume at the next
+    /// leaf index — not restart at 0 and wedge against the WORM invariant —
+    /// and must seed the latest-STH cache from disk.
+    #[test]
+    fn reopening_a_populated_store_resumes_appends_and_sth() {
+        let dir = temp_dir("resume");
+        let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&dir).unwrap());
+        let (signer, _pk) = InProcessSigner::generate("kid").unwrap();
+        let log = AuditLog::new(Arc::clone(&store), Arc::new(signer)).unwrap();
+        for i in 0..3u8 {
+            log.append(&event(i)).unwrap();
+        }
+        let sth_before = log.produce_sth(1_770_000_000).unwrap();
+        drop(log);
+
+        // "Restart": fresh log over the same backing store.
+        let (signer, _pk) = InProcessSigner::generate("kid").unwrap();
+        let log = AuditLog::new(store, Arc::new(signer)).unwrap();
+        assert_eq!(log.len(), 3, "tree must be rebuilt from persisted leaves");
+        assert_eq!(
+            log.latest_sth().unwrap().body().unwrap().root_hash,
+            sth_before.body().unwrap().root_hash,
+            "latest STH must be seeded from the store"
+        );
+        assert_eq!(
+            log.append(&event(3)).unwrap(),
+            3,
+            "append must continue at the next index"
+        );
+        let p = log.inclusion_proof(0).unwrap();
+        assert!(verify_inclusion(
+            &p.leaf_hash,
+            0,
+            4,
+            &log.produce_sth(1_770_000_001)
+                .unwrap()
+                .body()
+                .unwrap()
+                .root_hash
+                .0,
+            &p.audit_path
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A persisted leaf that no longer matches the signed tree head must make
+    /// resume refuse — continuing would silently fork the log's history.
+    #[test]
+    fn reopening_refuses_a_tampered_leaf() {
+        let dir = temp_dir("tamper");
+        let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&dir).unwrap());
+        let (signer, _pk) = InProcessSigner::generate("kid").unwrap();
+        let log = AuditLog::new(Arc::clone(&store), Arc::new(signer)).unwrap();
+        for i in 0..3u8 {
+            log.append(&event(i)).unwrap();
+        }
+        log.produce_sth(1_770_000_000).unwrap();
+        drop(log);
+
+        // Tamper with leaf 1 behind the WORM store's back.
+        let raw = event::encode(&event(9)).unwrap();
+        std::fs::write(dir.join(format!("leaves/{:020}.cbor", 1)), raw).unwrap();
+
+        let (signer, _pk) = InProcessSigner::generate("kid").unwrap();
+        let Err(err) = AuditLog::new(store, Arc::new(signer)) else {
+            panic!("resume over a tampered leaf must refuse");
+        };
+        assert!(matches!(err, AuditLogError::Resume(_)), "got: {err}");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

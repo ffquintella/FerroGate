@@ -2,16 +2,13 @@
 //! credential-activation seam, and the store of issued SVIDs used to gate
 //! `Rotate`.
 //!
-//! Two backends are supported behind a single API:
-//!
-//! - **Single-replica** (M2 default): a process-local `HashMap`.
-//! - **Clustered** (F05): a hiqlite-backed Raft cluster shared by all CMIS
-//!   replicas. Writes go through the leader; reads on followers are strongly
-//!   consistent so a freshly-issued SVID is visible on the next hop.
-//!
-//! The backend is chosen at construction time and stays fixed for the lifetime
-//! of the state. Callers never branch on the backend — they call the async
-//! `record` / `lookup` / `update_bundle` methods and the implementation routes.
+//! All durable state (issued SVIDs, host allowlists, pending allowlist
+//! proposals) lives in the hiqlite-backed Raft cluster (F05), so it survives
+//! restarts. A single-replica deployment runs a one-node cluster — same code
+//! path, same SQLite persistence, no peer discovery (see
+//! [`ferro_raft::ClusterConfig::single_node`]). Writes go through the leader;
+//! reads on followers are strongly consistent so a freshly-issued SVID is
+//! visible on the next hop.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -149,19 +146,11 @@ pub struct CmisState {
     /// the pin through the Raft store so every replica enforces the same binding
     /// is a documented deployment seam.
     host_key_pins: Mutex<HashMap<[u8; 48], Vec<u8>>>,
-    /// Per-host signed caller allowlists, keyed by EK-derived host UUID. Used by
-    /// the `Backend::Local` arm only; clustered deployments replicate them
-    /// through the `host_allowlists` Raft keyspace instead (see
-    /// [`CmisState::put_allowlist`]). The stored value is the opaque CBOR
-    /// `SignedAllowlist` the issuer minted.
-    allowlists_local: Mutex<HashMap<String, Vec<u8>>>,
-    /// Pending host-driven allowlist proposals awaiting operator review, keyed by
-    /// host UUID (`Backend::Local` only; clusters use the
-    /// `pending_allowlist_proposals` Raft keyspace). The value is the proposed
-    /// entries as CBOR `Vec<AllowEntry>`, the proposer SPIFFE id, and when it
-    /// was recorded.
-    proposals_local: Mutex<HashMap<String, ProposalRecord>>,
-    backend: Backend,
+    /// The Raft cluster mediating all durable state: issued SVIDs
+    /// (`issued_svids`), per-host signed allowlists (`host_allowlists`), and
+    /// pending allowlist proposals (`pending_allowlist_proposals`). A
+    /// single-replica deployment passes a one-node cluster.
+    cluster: Arc<Cluster>,
 }
 
 /// One pending allowlist proposal as CMIS holds it for review.
@@ -196,45 +185,11 @@ struct Revocations {
     number: u64,
 }
 
-enum Backend {
-    Local(Mutex<HashMap<String, IssuedRecord>>),
-    Cluster(Arc<Cluster>),
-}
-
 impl CmisState {
-    /// Assemble single-replica CMIS state from its parts.
+    /// Assemble CMIS state — all durable stores are mediated by the provided
+    /// `cluster` handle (a one-node cluster on a single-replica deployment).
     #[must_use]
     pub fn new(
-        issuer: Issuer,
-        verifier: TpmQuoteVerifier,
-        credential_maker: Box<dyn CredentialMaker>,
-        config: CmisConfig,
-        audit: AuditLog,
-    ) -> Self {
-        let published_keys = RwLock::new(issuer.jwks().keys);
-        Self {
-            issuer,
-            verifier,
-            credential_maker,
-            policy_epoch: AtomicU64::new(config.policy_epoch),
-            config,
-            audit,
-            published_keys,
-            extra_roots: RwLock::new(Vec::new()),
-            revocations: Mutex::new(Revocations::default()),
-            published_crl: RwLock::new(None),
-            fleet: FleetStore::unenforced(),
-            host_key_pins: Mutex::new(HashMap::new()),
-            allowlists_local: Mutex::new(HashMap::new()),
-            proposals_local: Mutex::new(HashMap::new()),
-            backend: Backend::Local(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// Assemble clustered CMIS state — the issued-SVID store is mediated by
-    /// the provided `cluster` handle. All other fields behave the same.
-    #[must_use]
-    pub fn new_clustered(
         issuer: Issuer,
         verifier: TpmQuoteVerifier,
         credential_maker: Box<dyn CredentialMaker>,
@@ -256,9 +211,7 @@ impl CmisState {
             published_crl: RwLock::new(None),
             fleet: FleetStore::unenforced(),
             host_key_pins: Mutex::new(HashMap::new()),
-            allowlists_local: Mutex::new(HashMap::new()),
-            proposals_local: Mutex::new(HashMap::new()),
-            backend: Backend::Cluster(cluster),
+            cluster,
         }
     }
 
@@ -429,13 +382,10 @@ impl CmisState {
         Ok(number)
     }
 
-    /// Borrow the local Raft cluster handle, if this state is clustered.
+    /// Borrow the local Raft cluster handle.
     #[must_use]
-    pub fn cluster(&self) -> Option<&Arc<Cluster>> {
-        match &self.backend {
-            Backend::Cluster(c) => Some(c),
-            Backend::Local(_) => None,
-        }
+    pub fn cluster(&self) -> &Arc<Cluster> {
+        &self.cluster
     }
 
     /// The live RIM policy epoch (feature F10). Read this — not
@@ -468,169 +418,128 @@ impl CmisState {
 
     /// Record a freshly attested+issued SVID, keyed by subject SPIFFE ID.
     pub async fn record(&self, record: IssuedRecord) {
-        match &self.backend {
-            Backend::Local(map) => {
-                map.lock().insert(record.bundle.spiffe_id.clone(), record);
-            }
-            Backend::Cluster(c) => {
-                let spiffe_id = record.bundle.spiffe_id.clone();
-                match cluster_store::encode(&record) {
-                    Ok(payload) => {
-                        if let Err(e) = c.upsert_svid(&spiffe_id, &payload, record.bundle.iat).await
-                        {
-                            tracing::error!(error = %e, %spiffe_id, "cluster upsert failed");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, %spiffe_id, "cluster encode failed");
-                    }
+        let spiffe_id = record.bundle.spiffe_id.clone();
+        match cluster_store::encode(&record) {
+            Ok(payload) => {
+                if let Err(e) = self
+                    .cluster
+                    .upsert_svid(&spiffe_id, &payload, record.bundle.iat)
+                    .await
+                {
+                    tracing::error!(error = %e, %spiffe_id, "cluster upsert failed");
                 }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, %spiffe_id, "cluster encode failed");
             }
         }
     }
 
-    /// Look up the stored record for a subject. Cluster reads are
-    /// strongly-consistent so a follower never serves a stale record after a
-    /// successful `record` on the leader.
+    /// Look up the stored record for a subject. Reads are strongly-consistent
+    /// so a follower never serves a stale record after a successful `record`
+    /// on the leader.
     pub async fn lookup(&self, spiffe_id: &str) -> Option<IssuedRecord> {
-        match &self.backend {
-            Backend::Local(map) => map.lock().get(spiffe_id).cloned(),
-            Backend::Cluster(c) => match c.fetch_svid_consistent(spiffe_id).await {
-                Ok(Some(bytes)) => match cluster_store::decode(&bytes) {
-                    Ok(rec) => Some(rec),
-                    Err(e) => {
-                        tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
-                        None
-                    }
-                },
-                Ok(None) => None,
+        match self.cluster.fetch_svid_consistent(spiffe_id).await {
+            Ok(Some(bytes)) => match cluster_store::decode(&bytes) {
+                Ok(rec) => Some(rec),
                 Err(e) => {
-                    tracing::error!(error = %e, %spiffe_id, "cluster fetch failed");
+                    tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
                     None
                 }
             },
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(error = %e, %spiffe_id, "cluster fetch failed");
+                None
+            }
         }
     }
 
-    /// Enumerate every issued-SVID record this node knows about.
-    ///
-    /// On a single replica this is the process-local store; on a clustered
-    /// deployment it is the full replicated set (an ordinary, eventually
-    /// consistent read — an operator inventory does not need a leader round
-    /// trip). A record whose clustered payload fails to decode is logged and
-    /// skipped rather than failing the whole listing.
+    /// Enumerate every issued-SVID record in the replicated store (an
+    /// ordinary, eventually consistent read — an operator inventory does not
+    /// need a leader round trip). A record whose payload fails to decode is
+    /// logged and skipped rather than failing the whole listing.
     pub async fn list_svids(&self) -> Vec<IssuedRecord> {
-        match &self.backend {
-            Backend::Local(map) => map.lock().values().cloned().collect(),
-            Backend::Cluster(c) => match c.list_svids().await {
-                Ok(rows) => rows
-                    .into_iter()
-                    .filter_map(
-                        |(spiffe_id, payload)| match cluster_store::decode(&payload) {
-                            Ok(rec) => Some(rec),
-                            Err(e) => {
-                                tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
-                                None
-                            }
-                        },
-                    )
-                    .collect(),
-                Err(e) => {
-                    tracing::error!(error = %e, "cluster list_svids failed");
-                    Vec::new()
-                }
-            },
+        match self.cluster.list_svids().await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(
+                    |(spiffe_id, payload)| match cluster_store::decode(&payload) {
+                        Ok(rec) => Some(rec),
+                        Err(e) => {
+                            tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
+                            None
+                        }
+                    },
+                )
+                .collect(),
+            Err(e) => {
+                tracing::error!(error = %e, "cluster list_svids failed");
+                Vec::new()
+            }
         }
     }
 
     /// Replace the stored bundle for a subject after a renewal (the
     /// `last_attestation` window is intentionally left unchanged).
+    ///
+    /// Read-modify-write through the cluster. Two concurrent rotations for
+    /// the same subject would race; CMIS serialises them per-subject upstream
+    /// (`Rotate` decides off the looked-up record before issuance), so the
+    /// loss window is small and benign — the later writer wins and both
+    /// bundles are valid.
     pub async fn update_bundle(&self, spiffe_id: &str, bundle: IssuedSvid) {
-        match &self.backend {
-            Backend::Local(map) => {
-                if let Some(rec) = map.lock().get_mut(spiffe_id) {
-                    rec.bundle = bundle;
-                }
-            }
-            Backend::Cluster(_) => {
-                // Read-modify-write through the cluster. Two concurrent
-                // rotations for the same subject would race; CMIS serialises
-                // them per-subject upstream (`Rotate` decides off the looked-up
-                // record before issuance), so the loss window is small and
-                // benign — the later writer wins and both bundles are valid.
-                if let Some(mut rec) = self.lookup(spiffe_id).await {
-                    rec.bundle = bundle;
-                    self.record(rec).await;
-                }
-            }
+        if let Some(mut rec) = self.lookup(spiffe_id).await {
+            rec.bundle = bundle;
+            self.record(rec).await;
         }
     }
 
     /// Store or replace a host's signed caller allowlist, keyed by its
     /// EK-derived host UUID. `signed_bytes` is the opaque CBOR `SignedAllowlist`
-    /// the issuer minted; the cluster (or local map) treats it as a blob.
+    /// the issuer minted; the cluster treats it as a blob.
     pub async fn put_allowlist(&self, host_uuid: &str, signed_bytes: Vec<u8>, now: i64) {
-        match &self.backend {
-            Backend::Local(_) => {
-                self.allowlists_local
-                    .lock()
-                    .insert(host_uuid.to_string(), signed_bytes);
-            }
-            Backend::Cluster(c) => {
-                if let Err(e) = c.upsert_allowlist(host_uuid, &signed_bytes, now).await {
-                    tracing::error!(error = %e, %host_uuid, "cluster allowlist upsert failed");
-                }
-            }
+        if let Err(e) = self
+            .cluster
+            .upsert_allowlist(host_uuid, &signed_bytes, now)
+            .await
+        {
+            tracing::error!(error = %e, %host_uuid, "cluster allowlist upsert failed");
         }
     }
 
-    /// Fetch a host's stored signed allowlist bytes, if any. Cluster reads are
+    /// Fetch a host's stored signed allowlist bytes, if any. Reads are
     /// strongly-consistent, mirroring [`CmisState::lookup`].
     pub async fn get_allowlist(&self, host_uuid: &str) -> Option<Vec<u8>> {
-        match &self.backend {
-            Backend::Local(_) => self.allowlists_local.lock().get(host_uuid).cloned(),
-            Backend::Cluster(c) => match c.fetch_allowlist_consistent(host_uuid).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::error!(error = %e, %host_uuid, "cluster allowlist fetch failed");
-                    None
-                }
-            },
+        match self.cluster.fetch_allowlist_consistent(host_uuid).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!(error = %e, %host_uuid, "cluster allowlist fetch failed");
+                None
+            }
         }
     }
 
     /// Delete a host's stored allowlist. Returns whether one existed.
     pub async fn delete_allowlist(&self, host_uuid: &str) -> bool {
-        match &self.backend {
-            Backend::Local(_) => self.allowlists_local.lock().remove(host_uuid).is_some(),
-            Backend::Cluster(c) => match c.delete_allowlist(host_uuid).await {
-                Ok(existed) => existed,
-                Err(e) => {
-                    tracing::error!(error = %e, %host_uuid, "cluster allowlist delete failed");
-                    false
-                }
-            },
+        match self.cluster.delete_allowlist(host_uuid).await {
+            Ok(existed) => existed,
+            Err(e) => {
+                tracing::error!(error = %e, %host_uuid, "cluster allowlist delete failed");
+                false
+            }
         }
     }
 
-    /// Enumerate every stored `(host_uuid, signed_bytes)` allowlist. Mirrors
-    /// [`CmisState::list_svids`]: the local map on a single replica, the full
-    /// replicated set on a cluster.
+    /// Enumerate every stored `(host_uuid, signed_bytes)` allowlist, mirroring
+    /// [`CmisState::list_svids`].
     pub async fn list_allowlists(&self) -> Vec<(String, Vec<u8>)> {
-        match &self.backend {
-            Backend::Local(_) => self
-                .allowlists_local
-                .lock()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            Backend::Cluster(c) => match c.list_allowlists().await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::error!(error = %e, "cluster list_allowlists failed");
-                    Vec::new()
-                }
-            },
+        match self.cluster.list_allowlists().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "cluster list_allowlists failed");
+                Vec::new()
+            }
         }
     }
 
@@ -638,88 +547,63 @@ impl CmisState {
     /// the opaque CBOR `Vec<AllowEntry>` the host proposed; CMIS stamps the
     /// proposer SPIFFE id and time so an operator can review it later.
     pub async fn put_proposal(&self, host_uuid: &str, rec: ProposalRecord) {
-        match &self.backend {
-            Backend::Local(_) => {
-                self.proposals_local
-                    .lock()
-                    .insert(host_uuid.to_string(), rec);
-            }
-            Backend::Cluster(c) => {
-                if let Err(e) = c
-                    .upsert_proposal(
-                        host_uuid,
-                        &rec.entries_cbor,
-                        &rec.proposer_spiffe_id,
-                        rec.proposed_at,
-                    )
-                    .await
-                {
-                    tracing::error!(error = %e, %host_uuid, "cluster proposal upsert failed");
-                }
-            }
+        if let Err(e) = self
+            .cluster
+            .upsert_proposal(
+                host_uuid,
+                &rec.entries_cbor,
+                &rec.proposer_spiffe_id,
+                rec.proposed_at,
+            )
+            .await
+        {
+            tracing::error!(error = %e, %host_uuid, "cluster proposal upsert failed");
         }
     }
 
     /// Enumerate every pending `(host_uuid, ProposalRecord)`, mirroring
     /// [`CmisState::list_allowlists`].
     pub async fn list_proposals(&self) -> Vec<(String, ProposalRecord)> {
-        match &self.backend {
-            Backend::Local(_) => self
-                .proposals_local
-                .lock()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+        match self.cluster.list_proposals().await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(host_uuid, entries_cbor, proposer_spiffe_id, proposed_at)| {
+                    (
+                        host_uuid,
+                        ProposalRecord {
+                            entries_cbor,
+                            proposer_spiffe_id,
+                            proposed_at,
+                        },
+                    )
+                })
                 .collect(),
-            Backend::Cluster(c) => match c.list_proposals().await {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|(host_uuid, entries_cbor, proposer_spiffe_id, proposed_at)| {
-                        (
-                            host_uuid,
-                            ProposalRecord {
-                                entries_cbor,
-                                proposer_spiffe_id,
-                                proposed_at,
-                            },
-                        )
-                    })
-                    .collect(),
-                Err(e) => {
-                    tracing::error!(error = %e, "cluster list_proposals failed");
-                    Vec::new()
-                }
-            },
+            Err(e) => {
+                tracing::error!(error = %e, "cluster list_proposals failed");
+                Vec::new()
+            }
         }
     }
 
     /// Delete a host's pending proposal. Returns whether one existed.
     pub async fn delete_proposal(&self, host_uuid: &str) -> bool {
-        match &self.backend {
-            Backend::Local(_) => self.proposals_local.lock().remove(host_uuid).is_some(),
-            Backend::Cluster(c) => match c.delete_proposal(host_uuid).await {
-                Ok(existed) => existed,
-                Err(e) => {
-                    tracing::error!(error = %e, %host_uuid, "cluster proposal delete failed");
-                    false
-                }
-            },
+        match self.cluster.delete_proposal(host_uuid).await {
+            Ok(existed) => existed,
+            Err(e) => {
+                tracing::error!(error = %e, %host_uuid, "cluster proposal delete failed");
+                false
+            }
         }
     }
 
-    /// Coarse health summary for the `Health` gRPC. Local-only states are
-    /// always healthy and always report `Unknown` for role.
+    /// Coarse health summary for the `Health` gRPC.
     pub async fn health(&self) -> (bool, NodeRole) {
-        match &self.backend {
-            Backend::Local(_) => (true, NodeRole::Unknown),
-            Backend::Cluster(c) => {
-                let healthy = c.is_healthy().await;
-                let role = if healthy {
-                    c.role().await
-                } else {
-                    NodeRole::Unknown
-                };
-                (healthy, role)
-            }
-        }
+        let healthy = self.cluster.is_healthy().await;
+        let role = if healthy {
+            self.cluster.role().await
+        } else {
+            NodeRole::Unknown
+        };
+        (healthy, role)
     }
 }

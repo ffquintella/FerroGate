@@ -231,7 +231,7 @@ impl AttestEvidence for SoftwareEvidence {
 
 // --- server harness ---------------------------------------------------------
 
-fn build_state(evidence: &SoftwareEvidence) -> Arc<CmisState> {
+async fn build_state(evidence: &SoftwareEvidence) -> Arc<CmisState> {
     // Trust the synthetic EK root and approve the synthetic PCR digest.
     let mut trust = VendorTrustStore::new();
     trust
@@ -241,31 +241,43 @@ fn build_state(evidence: &SoftwareEvidence) -> Arc<CmisState> {
     let rim = RimStore::new();
     rim.approve(pcr_digest, PolicyId("test-fleet".into()));
     let verifier = TpmQuoteVerifier::new(trust, rim);
-    state_with_verifier(verifier)
+    state_with_verifier(verifier).await
 }
 
-fn state_with_verifier(verifier: TpmQuoteVerifier) -> Arc<CmisState> {
-    state_with_verifier_capturing_audit(verifier).0
+async fn state_with_verifier(verifier: TpmQuoteVerifier) -> Arc<CmisState> {
+    state_with_verifier_capturing_audit(verifier).await.0
 }
 
 /// Same as [`state_with_verifier`] but also hands back the audit signer's
 /// public key so a verifier in the test can authenticate STHs offline.
-fn state_with_verifier_capturing_audit(
+async fn state_with_verifier_capturing_audit(
     verifier: TpmQuoteVerifier,
 ) -> (Arc<CmisState>, ferro_crypto::composite::CompositePublicKey) {
+    // Parallel tests can land on the same SystemTime nanos; a counter keeps the
+    // per-state temp dirs (and hiqlite's WAL lock) from colliding.
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let issuer = Issuer::generate("kid-e2e", "ferrogate.test").unwrap();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let nanos = format!("{nanos}-{n}");
     let audit_root = {
         let mut p = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
         p.push(format!("ferrogate-e2e-audit-{nanos}"));
         p
     };
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&audit_root).unwrap());
     let (signer, audit_pk) = InProcessSigner::generate("audit-test").unwrap();
-    let audit = AuditLog::new(store, Arc::new(signer));
+    let audit = AuditLog::new(store, Arc::new(signer)).unwrap();
+    let raft_dir = std::env::temp_dir().join(format!("ferrogate-e2e-raft-{nanos}"));
+    let _ = std::fs::remove_dir_all(&raft_dir);
+    let cluster = Arc::new(
+        ferro_raft::Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap(),
+    );
     let state = Arc::new(CmisState::new(
         issuer,
         verifier,
@@ -277,6 +289,7 @@ fn state_with_verifier_capturing_audit(
             allowlist_proposal_policy: cmis::state::ProposalPolicy::default(),
         },
         audit,
+        cluster,
     ));
     (state, audit_pk)
 }
@@ -310,7 +323,7 @@ async fn fetch_jwks(client: &mut MachineIdentityClient<tonic::transport::Channel
 #[tokio::test]
 async fn attest_issues_svid_that_reference_verifier_accepts() {
     let mut evidence = SoftwareEvidence::new();
-    let state = build_state(&evidence);
+    let state = build_state(&evidence).await;
     let mut client = spawn_server(state).await;
 
     let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
@@ -344,7 +357,7 @@ async fn attest_issues_svid_that_reference_verifier_accepts() {
 #[tokio::test]
 async fn rotate_short_path_when_pcrs_unchanged() {
     let mut evidence = SoftwareEvidence::new();
-    let state = build_state(&evidence);
+    let state = build_state(&evidence).await;
     let mut client = spawn_server(state).await;
 
     let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
@@ -376,7 +389,7 @@ async fn rotate_short_path_when_pcrs_unchanged() {
 #[tokio::test]
 async fn rotate_refused_on_pcr_drift() {
     let mut evidence = SoftwareEvidence::new();
-    let state = build_state(&evidence);
+    let state = build_state(&evidence).await;
     let mut client = spawn_server(state).await;
 
     let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
@@ -418,7 +431,7 @@ async fn attest_returns_failed_precondition_when_digest_not_in_rim() {
         .add_root_der(&evidence.ek_root, Vendor::Infineon)
         .unwrap();
     let verifier = TpmQuoteVerifier::new(trust, RimStore::new());
-    let state = state_with_verifier(verifier);
+    let state = state_with_verifier(verifier).await;
     let mut client = spawn_server(state).await;
 
     let Err(err) = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string()).await else {
@@ -478,7 +491,7 @@ async fn rim_loader_hot_swap_admits_a_freshly_published_generation() {
         .add_root_der(&evidence.ek_root, Vendor::Infineon)
         .unwrap();
     let verifier = TpmQuoteVerifier::new(trust, store);
-    let state = state_with_verifier(verifier);
+    let state = state_with_verifier(verifier).await;
     let mut client = spawn_server(state).await;
 
     let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
@@ -524,7 +537,8 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
         let rim = RimStore::new();
         rim.approve(pcr_digest, PolicyId("test-fleet".into()));
         TpmQuoteVerifier::new(trust, rim)
-    });
+    })
+    .await;
     let mut client = spawn_server(state).await;
 
     // Drive a successful attestation. CMIS appends AttestStart + SvidIssued.
@@ -645,7 +659,7 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
 #[tokio::test]
 async fn bump_epoch_forces_full_reattestation_on_next_rotate() {
     let mut evidence = SoftwareEvidence::new();
-    let state = build_state(&evidence);
+    let state = build_state(&evidence).await;
     let mut client = spawn_server(Arc::clone(&state)).await;
 
     // Attest under epoch 1, then confirm a same-epoch rotate takes the short
@@ -720,7 +734,7 @@ fn enroll_eks(state: &CmisState, ek_certs: &[&[u8]]) {
 #[tokio::test]
 async fn enrolled_host_attests_end_to_end() {
     let mut evidence = SoftwareEvidence::new();
-    let state = build_state(&evidence);
+    let state = build_state(&evidence).await;
     // The host's EK is in the manifest — admission passes, attestation runs.
     enroll_eks(&state, &[&evidence.ek_cert]);
     let mut client = spawn_server(state).await;
@@ -741,7 +755,7 @@ async fn unenrolled_host_is_rejected_before_quote_verification() {
     // manifest this exact host attests successfully (see the test above). The
     // *only* change here is enforcing a manifest that omits its EK, so any
     // failure is attributable to the F13 pre-admission gate.
-    let state = build_state(&evidence);
+    let state = build_state(&evidence).await;
     enroll_eks(&state, &[b"a-different-host-ek-cert"]);
     let audit_before = state.audit.len();
     let mut client = spawn_server(Arc::clone(&state)).await;

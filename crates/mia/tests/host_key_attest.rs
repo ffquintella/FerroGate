@@ -52,21 +52,33 @@ fn sample_facts() -> MachineFacts {
 
 /// A CMIS state with an empty TPM verifier (the host-key path never consults
 /// it) and a fresh audit log.
-fn build_state() -> Arc<CmisState> {
+async fn build_state() -> Arc<CmisState> {
+    // Parallel tests can land on the same SystemTime nanos; a counter keeps the
+    // per-state temp dirs (and hiqlite's WAL lock) from colliding.
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::new(), RimStore::new());
     let issuer = Issuer::generate("kid-hostkey", "ferrogate.test").unwrap();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let nanos = format!("{nanos}-{n}");
     let audit_root = {
         let mut p = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
         p.push(format!("ferrogate-hostkey-audit-{nanos}"));
         p
     };
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&audit_root).unwrap());
     let (signer, _audit_pk) = InProcessSigner::generate("audit-test").unwrap();
-    let audit = AuditLog::new(store, Arc::new(signer));
+    let audit = AuditLog::new(store, Arc::new(signer)).unwrap();
+    let raft_dir = std::env::temp_dir().join(format!("ferrogate-hostkey-raft-{nanos}"));
+    let _ = std::fs::remove_dir_all(&raft_dir);
+    let cluster = Arc::new(
+        ferro_raft::Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap(),
+    );
     Arc::new(CmisState::new(
         issuer,
         verifier,
@@ -78,6 +90,7 @@ fn build_state() -> Arc<CmisState> {
             allowlist_proposal_policy: cmis::state::ProposalPolicy::default(),
         },
         audit,
+        cluster,
     ))
 }
 
@@ -121,7 +134,7 @@ fn now_secs() -> i64 {
 
 #[tokio::test]
 async fn enrolled_host_key_attests_end_to_end() {
-    let state = build_state();
+    let state = build_state().await;
     let facts = sample_facts();
     enroll_machines(&state, &[facts.fingerprint().to_hex()]);
     let mut client = spawn_server(state).await;
@@ -150,7 +163,7 @@ async fn enrolled_host_key_attests_end_to_end() {
 
 #[tokio::test]
 async fn unenrolled_host_key_is_rejected() {
-    let state = build_state();
+    let state = build_state().await;
     // Enroll a *different* host's fingerprint, so the manifest is enforcing but
     // our host is not on it.
     let other = MachineFacts {
@@ -176,7 +189,7 @@ async fn forged_facts_are_rejected() {
     // Enroll the genuine fingerprint, but present facts that don't hash to it:
     // the signature is over the claimed H, yet CMIS recomputes H from the facts
     // and the mismatch trips verification.
-    let state = build_state();
+    let state = build_state().await;
     let genuine = sample_facts();
     enroll_machines(&state, &[genuine.fingerprint().to_hex()]);
     let mut client = spawn_server(state).await;
@@ -198,7 +211,7 @@ async fn forged_facts_are_rejected() {
 
 #[tokio::test]
 async fn tofu_pin_rejects_a_rebind_with_a_different_key() {
-    let state = build_state();
+    let state = build_state().await;
     let facts = sample_facts();
     enroll_machines(&state, &[facts.fingerprint().to_hex()]);
     let mut client = spawn_server(state).await;
@@ -243,7 +256,7 @@ fn enroll_prereg(state: &CmisState, fingerprint_hex: &str, sep_pub: &[u8]) {
 
 #[tokio::test]
 async fn preregistered_key_is_required_from_first_attestation() {
-    let state = build_state();
+    let state = build_state().await;
     let facts = sample_facts();
     let expected = SoftwareMachineKey::generate().unwrap();
     enroll_prereg(&state, &facts.fingerprint().to_hex(), &expected.public_spki_der());

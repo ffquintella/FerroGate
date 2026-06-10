@@ -22,6 +22,7 @@ use ferro_attest::{RimLoader, RimStore, TpmQuoteVerifier, TrustedKeys, VendorTru
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
 use ferro_crypto::composite::CompositePublicKey;
 use ferro_crypto::tls::ProviderMode;
+use ferro_raft::{Cluster, ClusterConfig, PeerNode};
 use ferro_svid::Issuer;
 use tracing_subscriber::EnvFilter;
 
@@ -61,6 +62,101 @@ fn load_single_key_trust(kid_var: &str, pub_var: &str) -> anyhow::Result<Trusted
     Ok(trust)
 }
 
+/// Assemble the Raft cluster every durable CMIS store lives in (issued SVIDs,
+/// host allowlists, pending allowlist proposals — all in SQLite under
+/// `CMIS_RAFT_DIR`, so they survive restarts).
+///
+/// With no `CMIS_CLUSTER_PEERS` configured this is a **single-node** cluster:
+/// the node is its own only peer, elects itself leader, and never looks for
+/// other nodes. Multi-node deployments list every peer (including this one) in
+/// `CMIS_CLUSTER_PEERS` as `id=raft_addr,api_addr` entries separated by `;`,
+/// pick which entry is "this node" with `CMIS_NODE_ID`, and must share real
+/// `CMIS_RAFT_SECRET` / `CMIS_API_SECRET` values across the fleet.
+async fn start_cluster() -> anyhow::Result<Arc<Cluster>> {
+    let data_dir =
+        std::env::var("CMIS_RAFT_DIR").unwrap_or_else(|_| "/var/lib/ferrogate/raft".to_string());
+
+    let peers = match std::env::var("CMIS_CLUSTER_PEERS") {
+        Ok(spec) if !spec.trim().is_empty() => parse_peers(&spec)?,
+        _ => Vec::new(),
+    };
+
+    let mut cfg = if peers.is_empty() {
+        let addr_raft =
+            std::env::var("CMIS_RAFT_ADDR").unwrap_or_else(|_| "127.0.0.1:9601".to_string());
+        let addr_api =
+            std::env::var("CMIS_API_ADDR").unwrap_or_else(|_| "127.0.0.1:9602".to_string());
+        tracing::info!(
+            %data_dir, %addr_raft, %addr_api,
+            "no CMIS_CLUSTER_PEERS configured — single-node cluster (no peer discovery)"
+        );
+        ClusterConfig::single_node(data_dir, addr_raft, addr_api)
+    } else {
+        let node_id: u64 = std::env::var("CMIS_NODE_ID")
+            .map_err(|_| anyhow::anyhow!("CMIS_CLUSTER_PEERS is set but CMIS_NODE_ID is missing"))?
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("CMIS_NODE_ID: {e}"))?;
+        if !peers.iter().any(|p| p.id == node_id) {
+            return Err(anyhow::anyhow!(
+                "CMIS_NODE_ID {node_id} is not listed in CMIS_CLUSTER_PEERS"
+            ));
+        }
+        tracing::info!(node_id, peers = peers.len(), %data_dir, "joining CMIS cluster");
+        ClusterConfig::for_node(node_id, peers, data_dir)
+    };
+
+    match (
+        std::env::var("CMIS_RAFT_SECRET"),
+        std::env::var("CMIS_API_SECRET"),
+    ) {
+        (Ok(raft), Ok(api)) => {
+            cfg.secret_raft = raft;
+            cfg.secret_api = api;
+        }
+        _ if cfg.is_single_node() => {
+            // Loopback-only transports on a single node; the built-in dev
+            // secrets are acceptable because nothing remote shares them.
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "multi-node cluster requires CMIS_RAFT_SECRET and CMIS_API_SECRET"
+            ));
+        }
+    }
+
+    let cluster = Cluster::start(cfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("cluster start: {e}"))?;
+    Ok(Arc::new(cluster))
+}
+
+/// Parse `CMIS_CLUSTER_PEERS`: `;`-separated `id=raft_addr,api_addr` entries,
+/// e.g. `1=10.0.0.1:9601,10.0.0.1:9602;2=10.0.0.2:9601,10.0.0.2:9602`.
+fn parse_peers(spec: &str) -> anyhow::Result<Vec<PeerNode>> {
+    let mut peers = Vec::new();
+    for entry in spec.split(';').filter(|s| !s.trim().is_empty()) {
+        let (id, addrs) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("CMIS_CLUSTER_PEERS entry {entry:?}: missing '='"))?;
+        let (addr_raft, addr_api) = addrs.split_once(',').ok_or_else(|| {
+            anyhow::anyhow!("CMIS_CLUSTER_PEERS entry {entry:?}: expected raft_addr,api_addr")
+        })?;
+        peers.push(PeerNode {
+            id: id
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("CMIS_CLUSTER_PEERS entry {entry:?}: id: {e}"))?,
+            addr_raft: addr_raft.trim().to_string(),
+            addr_api: addr_api.trim().to_string(),
+        });
+    }
+    if peers.is_empty() {
+        return Err(anyhow::anyhow!("CMIS_CLUSTER_PEERS is set but empty"));
+    }
+    Ok(peers)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -86,7 +182,10 @@ async fn main() -> anyhow::Result<()> {
     let (signer, _audit_pk) = InProcessSigner::generate("cmis-dev-audit-1")
         .map_err(|e| anyhow::anyhow!("audit signer: {e}"))?;
     tracing::info!(audit_kid = signer.kid(), "audit signer ready");
-    let audit = AuditLog::new(store, Arc::new(signer));
+    // Resumes the Merkle tree from the leaves already in the WORM store, so a
+    // restart keeps appending at the right index instead of wedging on leaf 0.
+    let audit = AuditLog::new(store, Arc::new(signer))
+        .map_err(|e| anyhow::anyhow!("audit log resume: {e}"))?;
 
     // Host-driven allowlist proposal policy (see docs/mia.md). Default is
     // bootstrap-only TOFU: auto-adopt a host's first proposal when it has no
@@ -101,12 +200,18 @@ async fn main() -> anyhow::Result<()> {
         "allowlist proposal policy"
     );
 
+    // All durable CMIS state (issued SVIDs, allowlists, proposals) lives in
+    // the Raft-replicated SQLite store — a one-node Raft when no peers are
+    // configured — so it survives restarts.
+    let cluster = start_cluster().await?;
+
     let state = Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(UnconfiguredCredentialMaker),
         cmis_config,
         audit,
+        cluster,
     ));
 
     // F13 zero-touch enrolment. If a signed fleet manifest is configured, load

@@ -119,11 +119,13 @@ fn unix_now() -> i64 {
 /// noted in `docs/audit.md`.)
 fn audit_record(state: &CmisState, event: AuditEvent, now: i64) {
     if let Err(e) = state.audit.append(&event) {
-        tracing::warn!(error = %e, "audit append failed");
+        // ERROR, not WARN: a failing append usually means every later append
+        // fails too (e.g. a wedged WORM store), and operators must see that.
+        tracing::error!(error = %e, "audit append failed");
         return;
     }
     if let Err(e) = state.audit.produce_sth(now) {
-        tracing::warn!(error = %e, "audit STH produce failed");
+        tracing::error!(error = %e, "audit STH produce failed");
     }
 }
 
@@ -1210,7 +1212,7 @@ impl MachineIdentity for MachineIdentitySvc {
             NodeRole::Learner => ProtoNodeRole::Learner,
             NodeRole::Unknown => ProtoNodeRole::Unknown,
         };
-        let node_id = self.state.cluster().map_or(0, |c| c.node_id());
+        let node_id = self.state.cluster().node_id();
         Ok(Response::new(HealthResponse {
             healthy,
             role: proto_role as i32,

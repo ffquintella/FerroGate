@@ -4,6 +4,8 @@
 //! way a MIA does: decode the CBOR `SignedAllowlist`, check its signature under
 //! the enrollment key (`GetEnrollmentKey`), and confirm the entries/validity.
 
+#![allow(clippy::large_futures)]
+
 use std::sync::Arc;
 
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
@@ -16,6 +18,7 @@ use ferro_proto::v1::{
     AllowEntryMsg, DeleteAllowlistRequest, GetAllowlistRequest, GetEnrollmentKeyRequest,
     ListAllowlistsRequest, SetAllowlistRequest,
 };
+use ferro_raft::Cluster;
 use ferro_svid::Issuer;
 
 struct UnusedCredentialMaker;
@@ -30,16 +33,19 @@ impl CredentialMaker for UnusedCredentialMaker {
     }
 }
 
-/// Removes its audit directory on drop, so each test gets an isolated WORM store
-/// (tests run in parallel in one process — a shared dir would race).
-struct TmpAudit(std::path::PathBuf);
-impl Drop for TmpAudit {
+/// Removes its directories (audit WORM store, raft data dir) on drop, so each
+/// test gets isolated state (tests run in parallel in one process — a shared
+/// dir would race).
+struct TmpDirs(Vec<std::path::PathBuf>);
+impl Drop for TmpDirs {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        for dir in &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
-fn svc() -> (MachineIdentitySvc, TmpAudit) {
+async fn svc() -> (MachineIdentitySvc, TmpDirs) {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -49,15 +55,24 @@ fn svc() -> (MachineIdentitySvc, TmpAudit) {
     let _ = std::fs::remove_dir_all(&tmp);
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&tmp).unwrap());
     let (signer, _pk) = InProcessSigner::generate("audit-test-al").unwrap();
-    let audit = AuditLog::new(store, Arc::new(signer));
+    let audit = AuditLog::new(store, Arc::new(signer)).unwrap();
+    let raft_dir =
+        std::env::temp_dir().join(format!("ferrogate-cmis-al-raft-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&raft_dir);
+    let cluster = Arc::new(
+        Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap(),
+    );
     let state = Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(UnusedCredentialMaker),
         CmisConfig::default(),
         audit,
+        cluster,
     ));
-    (MachineIdentitySvc::new(state), TmpAudit(tmp))
+    (MachineIdentitySvc::new(state), TmpDirs(vec![tmp, raft_dir]))
 }
 
 /// The enrollment public key CMIS publishes, parsed for verification.
@@ -79,7 +94,7 @@ fn entry(uid: u32, byte: u8) -> AllowEntryMsg {
 
 #[tokio::test]
 async fn set_then_get_serves_a_verifiable_signed_allowlist() {
-    let (svc, _g) = svc();
+    let (svc, _g) = svc().await;
     let pk = enrollment_key(&svc).await;
     let host = "host-uuid-1";
 
@@ -117,7 +132,7 @@ async fn set_then_get_serves_a_verifiable_signed_allowlist() {
 
 #[tokio::test]
 async fn get_unknown_host_returns_empty_not_error() {
-    let (svc, _g) = svc();
+    let (svc, _g) = svc().await;
     let got = svc
         .get_allowlist(tonic::Request::new(GetAllowlistRequest {
             host_uuid: "nobody".into(),
@@ -130,7 +145,7 @@ async fn get_unknown_host_returns_empty_not_error() {
 
 #[tokio::test]
 async fn set_rejects_malformed_entry_hash() {
-    let (svc, _g) = svc();
+    let (svc, _g) = svc().await;
     let err = svc
         .set_allowlist(tonic::Request::new(SetAllowlistRequest {
             host_uuid: "host".into(),
@@ -147,7 +162,7 @@ async fn set_rejects_malformed_entry_hash() {
 
 #[tokio::test]
 async fn set_rejects_empty_host_uuid() {
-    let (svc, _g) = svc();
+    let (svc, _g) = svc().await;
     let err = svc
         .set_allowlist(tonic::Request::new(SetAllowlistRequest {
             host_uuid: "  ".into(),
@@ -161,7 +176,7 @@ async fn set_rejects_empty_host_uuid() {
 
 #[tokio::test]
 async fn list_and_delete_reflect_stored_allowlists() {
-    let (svc, _g) = svc();
+    let (svc, _g) = svc().await;
     for (host, n) in [("h1", 0x01u8), ("h2", 0x02u8)] {
         svc.set_allowlist(tonic::Request::new(SetAllowlistRequest {
             host_uuid: host.into(),
@@ -211,7 +226,7 @@ async fn list_and_delete_reflect_stored_allowlists() {
 
 #[tokio::test]
 async fn ttl_zero_falls_back_to_a_default_window() {
-    let (svc, _g) = svc();
+    let (svc, _g) = svc().await;
     let set = svc
         .set_allowlist(tonic::Request::new(SetAllowlistRequest {
             host_uuid: "h".into(),

@@ -14,6 +14,8 @@
 //! 3. a client carrying the wrong SPKI pin is refused by `connect_pinned`
 //!    before any RPC.
 
+#![allow(clippy::large_futures)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -62,25 +64,36 @@ fn make_identity() -> (
     (vec![cert], key, pin)
 }
 
-fn build_state() -> Arc<CmisState> {
+async fn build_state() -> Arc<CmisState> {
+    // Parallel tests can land on the same SystemTime nanos; a counter keeps the
+    // per-state temp dirs (and hiqlite's WAL lock) from colliding.
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let issuer = Issuer::generate("kid-tls-test", "ferrogate.test").unwrap();
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), RimStore::new());
-    let audit_root = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("ferrogate-tls-test-audit-{nanos}"))
-    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let nanos = format!("{nanos}-{n}");
+    let audit_root = std::env::temp_dir().join(format!("ferrogate-tls-test-audit-{nanos}"));
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&audit_root).unwrap());
     let (signer, _pk) = InProcessSigner::generate("audit-tls-test").unwrap();
-    let audit = AuditLog::new(store, Arc::new(signer));
+    let audit = AuditLog::new(store, Arc::new(signer)).unwrap();
+    let raft_dir = std::env::temp_dir().join(format!("ferrogate-tls-test-raft-{nanos}"));
+    let _ = std::fs::remove_dir_all(&raft_dir);
+    let cluster = Arc::new(
+        ferro_raft::Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap(),
+    );
     Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(NoCredentialMaker),
         CmisConfig::default(),
         audit,
+        cluster,
     ))
 }
 
@@ -92,7 +105,7 @@ async fn spawn_tls_cmis() -> (SocketAddr, SpkiPin) {
         ferro_crypto::transport::server_config(ProviderMode::HybridOnly, chain, key).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let state = build_state();
+    let state = build_state().await;
     let incoming = cmis::transport::tls_incoming(listener, server_config);
     tokio::spawn(async move {
         tonic::transport::Server::builder()

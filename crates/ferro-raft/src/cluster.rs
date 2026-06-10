@@ -69,6 +69,30 @@ impl ClusterConfig {
             filename_db: "hiqlite.db".to_string(),
         }
     }
+
+    /// Build a single-node config: node 1 is the only peer, so the Raft
+    /// bootstraps alone (it elects itself leader and never looks for other
+    /// nodes). Both transports bind loopback addresses — nothing external
+    /// talks to them on a single-node deployment.
+    #[must_use]
+    pub fn single_node(
+        data_dir: impl Into<String>,
+        addr_raft: impl Into<String>,
+        addr_api: impl Into<String>,
+    ) -> Self {
+        let peer = PeerNode {
+            id: 1,
+            addr_raft: addr_raft.into(),
+            addr_api: addr_api.into(),
+        };
+        Self::for_node(1, vec![peer], data_dir)
+    }
+
+    /// True iff this config describes a single-node cluster.
+    #[must_use]
+    pub fn is_single_node(&self) -> bool {
+        self.peers.len() == 1
+    }
 }
 
 /// Coarse-grained classification of a node's Raft role at a point in time.
@@ -93,6 +117,9 @@ pub enum ClusterError {
     /// Cluster never became healthy within the supplied timeout.
     #[error("cluster did not become healthy within {0:?}")]
     HealthTimeout(Duration),
+    /// Local socket setup failed (single-node ephemeral port allocation).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// One CMIS Raft node, talking to its peers through hiqlite.
@@ -109,6 +136,12 @@ impl Cluster {
     /// startup waits for peers to come up before the Raft can elect a leader.
     pub async fn start(cfg: ClusterConfig) -> Result<Self, ClusterError> {
         let node_id = cfg.node_id;
+        if cfg.is_single_node() {
+            tracing::info!(
+                data_dir = %cfg.data_dir,
+                "single-node cluster: this node is the only peer and will not look for others"
+            );
+        }
         let nodes: Vec<Node> = cfg
             .peers
             .iter()
@@ -144,6 +177,28 @@ impl Cluster {
         let cluster = Self { client, node_id };
         cluster.init_schema().await?;
         Ok(cluster)
+    }
+
+    /// Start a single-node cluster on kernel-assigned loopback ports.
+    ///
+    /// Convenience for tests and zero-config single-replica deployments: the
+    /// two transports are internal-only on a single node, so the exact ports
+    /// do not matter and ephemeral ones avoid collisions between concurrent
+    /// processes. Deployments that pin ports use [`ClusterConfig::single_node`]
+    /// with [`Self::start`] instead.
+    pub async fn start_single_node(data_dir: impl Into<String>) -> Result<Self, ClusterError> {
+        // Bind both sockets before reading the ports so the kernel cannot hand
+        // the same port out twice; the listeners drop just before hiqlite
+        // rebinds them (a small race window, reliable in practice).
+        let raft = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let api = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let cfg = ClusterConfig::single_node(
+            data_dir,
+            format!("127.0.0.1:{}", raft.local_addr()?.port()),
+            format!("127.0.0.1:{}", api.local_addr()?.port()),
+        );
+        drop((raft, api));
+        Self::start(cfg).await
     }
 
     async fn init_schema(&self) -> Result<(), ClusterError> {

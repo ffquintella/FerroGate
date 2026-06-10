@@ -51,6 +51,14 @@ Once per minute the latest STH is anchored to a public transparency log
 artefact so that mutual divergence between the WORM store and the public
 log is itself detectable.
 
+On startup the in-memory tree is **resumed** from the WORM store: every
+persisted leaf is replayed in index order, the rebuilt root is cross-checked
+against the newest persisted STH, and the next append continues at the next
+free index. (An empty tree over a non-empty store would try to re-write leaf
+`0`, which the WORM invariant refuses — wedging the log permanently after any
+restart.) A root mismatch on resume means the persisted log was tampered with
+or corrupted; CMIS refuses to start rather than continue on a forked history.
+
 ## Inclusion proofs
 
 Any reader can fetch:

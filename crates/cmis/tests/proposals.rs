@@ -8,6 +8,8 @@
 //! issuer key, checks the signature against `sep_pub`, and confirms the host
 //! UUID matches.
 
+#![allow(clippy::large_futures)]
+
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +26,7 @@ use ferro_proto::v1::{
     AllowEntryMsg, DeleteProposalRequest, GetAllowlistRequest, GetEnrollmentKeyRequest,
     ListProposalsRequest, ProposeAllowlistRequest, SetAllowlistRequest,
 };
+use ferro_raft::Cluster;
 use ferro_sep::{MachineKey, SoftwareMachineKey};
 use ferro_svid::allowlist::{self, AllowEntry, ProposalDoc};
 use ferro_svid::{host_uuid_from_ek_digest, IssueParams, Issuer};
@@ -41,10 +44,12 @@ impl CredentialMaker for UnusedCredentialMaker {
     }
 }
 
-struct TmpAudit(std::path::PathBuf);
-impl Drop for TmpAudit {
+struct TmpDirs(Vec<std::path::PathBuf>);
+impl Drop for TmpDirs {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        for dir in &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -56,7 +61,9 @@ fn now_unix() -> i64 {
 
 /// Build an in-process CMIS with `policy`, plus a host machine key and a fresh
 /// SVID bound to it (issued at "now" so the validity check passes).
-fn setup(policy: ProposalPolicy) -> (MachineIdentitySvc, SoftwareMachineKey, String, String, TmpAudit) {
+async fn setup(
+    policy: ProposalPolicy,
+) -> (MachineIdentitySvc, SoftwareMachineKey, String, String, TmpDirs) {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -87,19 +94,34 @@ fn setup(policy: ProposalPolicy) -> (MachineIdentitySvc, SoftwareMachineKey, Str
     let _ = std::fs::remove_dir_all(&tmp);
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&tmp).unwrap());
     let (signer, _pk) = InProcessSigner::generate("audit-test-prop").unwrap();
-    let audit = AuditLog::new(store, Arc::new(signer));
+    let audit = AuditLog::new(store, Arc::new(signer)).unwrap();
     let config = CmisConfig {
         allowlist_proposal_policy: policy,
         ..CmisConfig::default()
     };
+    let raft_dir =
+        std::env::temp_dir().join(format!("ferrogate-cmis-prop-raft-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&raft_dir);
+    let cluster = Arc::new(
+        Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap(),
+    );
     let state = Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(UnusedCredentialMaker),
         config,
         audit,
+        cluster,
     ));
-    (MachineIdentitySvc::new(state), key, host_uuid, jws, TmpAudit(tmp))
+    (
+        MachineIdentitySvc::new(state),
+        key,
+        host_uuid,
+        jws,
+        TmpDirs(vec![tmp, raft_dir]),
+    )
 }
 
 fn entry(uid: u32, byte: u8) -> AllowEntry {
@@ -142,7 +164,7 @@ async fn enrollment_key(svc: &MachineIdentitySvc) -> CompositePublicKey {
 
 #[tokio::test]
 async fn bootstrap_auto_adopts_when_no_allowlist() {
-    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly);
+    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly).await;
     let pk = enrollment_key(&svc).await;
 
     let resp = svc
@@ -186,7 +208,7 @@ async fn bootstrap_auto_adopts_when_no_allowlist() {
 
 #[tokio::test]
 async fn existing_allowlist_queues_proposal_for_review() {
-    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly);
+    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly).await;
 
     // An operator has already provisioned an allowlist.
     svc.set_allowlist(tonic::Request::new(SetAllowlistRequest {
@@ -253,7 +275,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
 
 #[tokio::test]
 async fn off_policy_never_auto_adopts() {
-    let (svc, key, host, jws, _g) = setup(ProposalPolicy::Off);
+    let (svc, key, host, jws, _g) = setup(ProposalPolicy::Off).await;
     let resp = svc
         .propose_allowlist(tonic::Request::new(proposal_req(
             &key,
@@ -278,7 +300,7 @@ async fn off_policy_never_auto_adopts() {
 
 #[tokio::test]
 async fn rejects_tampered_signature() {
-    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly);
+    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly).await;
     let mut req = proposal_req(&key, &host, vec![entry(1000, 0xAA)], &jws);
     req.proposal_sig[0] ^= 0xFF;
     let err = svc
@@ -290,7 +312,7 @@ async fn rejects_tampered_signature() {
 
 #[tokio::test]
 async fn rejects_sep_pub_not_bound_to_svid() {
-    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly);
+    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly).await;
     let mut req = proposal_req(&key, &host, vec![entry(1000, 0xAA)], &jws);
     // A different key's SPKI does not match the SVID's cnf.jkt.
     req.sep_pub = SoftwareMachineKey::generate().unwrap().public_spki_der();
@@ -303,7 +325,7 @@ async fn rejects_sep_pub_not_bound_to_svid() {
 
 #[tokio::test]
 async fn rejects_host_uuid_mismatch() {
-    let (svc, key, _host, jws, _g) = setup(ProposalPolicy::BootstrapOnly);
+    let (svc, key, _host, jws, _g) = setup(ProposalPolicy::BootstrapOnly).await;
     // Propose for a different host than the SVID attests.
     let req = proposal_req(&key, "some-other-host-uuid", vec![entry(1000, 0xAA)], &jws);
     let err = svc
@@ -315,7 +337,7 @@ async fn rejects_host_uuid_mismatch() {
 
 #[tokio::test]
 async fn rejects_unissued_svid() {
-    let (svc, key, host, _jws, _g) = setup(ProposalPolicy::BootstrapOnly);
+    let (svc, key, host, _jws, _g) = setup(ProposalPolicy::BootstrapOnly).await;
     // An SVID signed by a *different* issuer is not one this CMIS issued.
     let other = Issuer::generate("other", "ferrogate.test").unwrap();
     let bogus = other

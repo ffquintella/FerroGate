@@ -40,6 +40,14 @@ Out:
 See [../architecture.md](../architecture.md) §"High availability" and
 [../operations.md](../operations.md) §"Adding a CMIS replica".
 
+The Raft-backed store is the **only** backend: a deployment with no
+`CMIS_CLUSTER_PEERS` configured runs a single-node cluster (the node is its own
+only peer, elects itself leader, and skips peer discovery) so issued SVIDs,
+host allowlists, and pending allowlist proposals persist across restarts in
+the same SQLite state machine a multi-node cluster uses. The earlier
+process-local `HashMap` backend, which lost all of that state on restart, was
+removed.
+
 ## Acceptance criteria
 
 - [x] Three-node Raft cluster forms, elects a leader, and replicates a write

@@ -33,6 +33,7 @@ ferro-crypto = { path = "../ferro-crypto" }
 cmis         = { path = "../cmis" }
 ferro-attest = { path = "../ferro-attest" }
 ferro-audit  = { path = "../ferro-audit" }
+ferro-raft   = { path = "../ferro-raft" }
 ferro-svid   = { path = "../ferro-svid" }
 
 rustls-pki-types = { workspace = true }
