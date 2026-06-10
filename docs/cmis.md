@@ -46,6 +46,22 @@ in mlocked, zeroize-on-drop memory inside an attested enclave.
 
 Annual root rotation is performed offline (see [operations.md](operations.md)).
 
+### Bring-up persistence (pre-TEE)
+
+Until the TEE-sealed path above is wired, the shipped binary keeps the issuer
+key stable across restarts by persisting a **32-byte master seed** and rebuilding
+the composite key deterministically (`Issuer::from_seed`). On first run CMIS
+generates a seed and writes it `0600` to `CMIS_ISSUER_KEY`
+(default `/var/lib/ferrogate/issuer/issuer.seed`); subsequent boots reuse it.
+Only the seed is secret material at rest — the expanded private key never touches
+disk. `CMIS_ISSUER_KID` (default `cmis-dev-1`) and `CMIS_TRUST_DOMAIN` (default
+`ferrogate.dev`) set the published `kid` and trust domain and must stay constant
+for a given seed, since the `kid` is how verifiers resolve the JWKS key.
+
+Losing the seed rotates the signing key, which invalidates every issued SVID,
+the allowlist a MIA has adopted, and the published CRL — MIAs then fail closed
+(`crl-stale` / bad signature). Keep the path on a persistent volume.
+
 ## Crate layout (target)
 
 ```

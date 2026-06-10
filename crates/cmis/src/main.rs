@@ -62,6 +62,81 @@ fn load_single_key_trust(kid_var: &str, pub_var: &str) -> anyhow::Result<Trusted
     Ok(trust)
 }
 
+/// Load the issuer's composite signing key from persistent storage, generating
+/// and persisting a fresh one on first run.
+///
+/// The issuer key signs every SVID, the CRL, and host allowlists. If it were
+/// regenerated on each boot (as the bring-up path did), a restart would rotate
+/// the JWKS key out from under every consumer: previously-minted SVIDs, the
+/// allowlist a MIA already adopted, and the published CRL would all fail
+/// signature verification, and the MIA would deny callers (`crl-stale` /
+/// invalid signature). To keep the issuer's identity stable across restarts we
+/// persist a 32-byte master seed (not the expanded private key) and rebuild the
+/// keypair deterministically with [`Issuer::from_seed`].
+///
+/// Path: `CMIS_ISSUER_KEY` (default `<CMIS_RAFT_DIR-sibling>/issuer/issuer.seed`,
+/// i.e. `/var/lib/ferrogate/issuer/issuer.seed`). The file is created `0600`.
+/// `CMIS_ISSUER_KID` / `CMIS_TRUST_DOMAIN` override the defaults but must stay
+/// constant for a given seed, since the `kid` is how consumers resolve the key.
+fn load_or_create_issuer() -> anyhow::Result<Issuer> {
+    use rand_core::{OsRng, RngCore};
+
+    let kid = std::env::var("CMIS_ISSUER_KID").unwrap_or_else(|_| "cmis-dev-1".to_string());
+    let trust_domain =
+        std::env::var("CMIS_TRUST_DOMAIN").unwrap_or_else(|_| "ferrogate.dev".to_string());
+    let path = PathBuf::from(
+        std::env::var("CMIS_ISSUER_KEY")
+            .unwrap_or_else(|_| "/var/lib/ferrogate/issuer/issuer.seed".to_string()),
+    );
+
+    if path.exists() {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("reading issuer seed {}: {e}", path.display()))?;
+        let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "issuer seed {} is {} bytes, expected 32",
+                path.display(),
+                bytes.len()
+            )
+        })?;
+        tracing::info!(kid = %kid, path = %path.display(), "loaded persisted issuer key");
+        return Ok(Issuer::from_seed(&seed, kid, trust_domain));
+    }
+
+    // First run: mint a fresh seed and persist it before use so a crash between
+    // here and serving doesn't leave us with an in-memory-only key.
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating issuer key dir {}: {e}", parent.display()))?;
+    }
+    write_secret_file(&path, &seed)
+        .map_err(|e| anyhow::anyhow!("writing issuer seed {}: {e}", path.display()))?;
+    tracing::warn!(
+        kid = %kid,
+        path = %path.display(),
+        "no persisted issuer key found — generated a new one and stored it"
+    );
+    Ok(Issuer::from_seed(&seed, kid, trust_domain))
+}
+
+/// Write `data` to `path`, creating it `0600` (owner read/write only) so the
+/// issuer seed is never group/world-readable.
+fn write_secret_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
 /// Assemble the Raft cluster every durable CMIS store lives in (issued SVIDs,
 /// host allowlists, pending allowlist proposals — all in SQLite under
 /// `CMIS_RAFT_DIR`, so they survive restarts).
@@ -166,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:8443".to_string())
         .parse()?;
 
-    let issuer = Issuer::generate("cmis-dev-1", "ferrogate.dev")?;
+    let issuer = load_or_create_issuer()?;
     // The verifier and the RIM loader share one `RimStore` handle so a signed
     // bundle applied by the loader is immediately visible to quote verification.
     let rim_store = RimStore::new();

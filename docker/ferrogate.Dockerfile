@@ -70,7 +70,7 @@ RUN groupadd --system --gid "${FERROGATE_GID}" ferrogate \
 # Application layout. The log dir and the audit WORM root are created up front
 # and owned by the service user so they stay writable when running unprivileged
 # and when bind-mounted from the host.
-RUN mkdir -p /opt/ferrogate/logs /var/lib/ferrogate/audit \
+RUN mkdir -p /opt/ferrogate/logs /var/lib/ferrogate/audit /var/lib/ferrogate/issuer \
     && chown -R ferrogate:ferrogate /opt/ferrogate /var/lib/ferrogate
 
 COPY --from=builder /src/target/release/cmis /usr/local/bin/cmis
@@ -88,6 +88,10 @@ ENV FERROGATE_LOG_DIR=/opt/ferrogate/logs
 # --- CMIS ---
 ENV CMIS_LISTEN=0.0.0.0:8443
 ENV CMIS_AUDIT_ROOT=/var/lib/ferrogate/audit
+# Persistent issuer signing key. CMIS auto-generates a 32-byte master seed here
+# on first run and reuses it afterwards, so the SVID/CRL/allowlist signing key
+# (and its JWKS kid) stays stable across restarts. Keep this on a volume.
+ENV CMIS_ISSUER_KEY=/var/lib/ferrogate/issuer/issuer.seed
 # --- ferrogate operator CLI ---
 # Default target for the bundled CLI: the CMIS in this same container, over the
 # loopback. Override with `-e FERROGATE_CMIS_ENDPOINT=...` to point at another
@@ -99,8 +103,11 @@ USER ferrogate
 
 EXPOSE 8443
 
-# Persist tracing logs and the audit store outside the container.
-VOLUME ["/opt/ferrogate/logs", "/var/lib/ferrogate/audit"]
+# Persist tracing logs, the audit store, and the issuer signing key outside the
+# container. The issuer seed MUST persist across re-creation — losing it rotates
+# the signing key, invalidating every issued SVID, the adopted allowlist, and
+# the published CRL (MIAs then fail closed with `crl-stale` / bad signature).
+VOLUME ["/opt/ferrogate/logs", "/var/lib/ferrogate/audit", "/var/lib/ferrogate/issuer"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ferrogate-entrypoint.sh"]
 CMD ["cmis"]

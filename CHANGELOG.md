@@ -38,6 +38,18 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **CMIS now persists its issuer signing key across restarts.** The bring-up
+  path minted a fresh in-memory composite key on every boot (`Issuer::generate`),
+  so a CMIS restart rotated the JWKS key out from under every consumer: issued
+  SVIDs, the allowlist a MIA had adopted, and the published CRL all failed
+  signature verification, and MIAs fell back to denying callers (`crl-stale`).
+  CMIS now loads a persisted 32-byte master seed from `CMIS_ISSUER_KEY` (default
+  `/var/lib/ferrogate/issuer/issuer.seed`, `0600`), generating and storing one
+  on first run, and rebuilds the issuer deterministically via `Issuer::from_seed`.
+  `CMIS_ISSUER_KID` / `CMIS_TRUST_DOMAIN` override the key id / trust domain.
+  The container image pre-creates and persists `/var/lib/ferrogate/issuer` as a
+  volume. Only the seed is secret material at rest; the expanded private key
+  never touches disk.
 - **mia no longer crash-loops when the allowlist file is absent.** With
   `allowlist.path` configured and `allowlist.fetch` on, if CMIS has no allowlist
   for the host and none was ever written to disk, the daemon read the missing

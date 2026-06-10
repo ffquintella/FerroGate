@@ -97,6 +97,23 @@ impl Issuer {
         Ok(Self::new(secret, public, kid, trust_domain))
     }
 
+    /// Rebuild an issuer **deterministically** from a 32-byte master seed.
+    ///
+    /// The same seed always yields the same composite key (and therefore the
+    /// same JWKS public key under `kid`), so persisting the 32-byte seed across
+    /// restarts keeps the issuer's identity — and the CRL / allowlist / SVID
+    /// signatures that consumers have already pinned — stable. Only the seed is
+    /// secret material at rest; the expanded private key never touches disk.
+    #[must_use]
+    pub fn from_seed(
+        seed: &[u8; 32],
+        kid: impl Into<String>,
+        trust_domain: impl Into<String>,
+    ) -> Self {
+        let (secret, public) = CompositeSecretKey::from_seed(seed);
+        Self::new(secret, public, kid, trust_domain)
+    }
+
     /// The signing key id.
     #[must_use]
     pub fn kid(&self) -> &str {
@@ -232,6 +249,34 @@ mod tests {
         p.ttl_secs = 999_999;
         let svid = issuer.issue(&p, 0).unwrap();
         assert_eq!(svid.exp - svid.iat, 3600);
+    }
+
+    #[test]
+    fn from_seed_is_deterministic_across_restarts() {
+        let seed = [0x42u8; 32];
+        // Two issuers built from the same seed (a "restart") must publish the
+        // same JWKS key, so the CRL/allowlist/SVID signatures a consumer pinned
+        // before the restart still verify after it.
+        let a = Issuer::from_seed(&seed, "cmis-dev-1", "ferrogate.dev");
+        let b = Issuer::from_seed(&seed, "cmis-dev-1", "ferrogate.dev");
+        assert_eq!(
+            a.public_key().to_concat_bytes(),
+            b.public_key().to_concat_bytes()
+        );
+
+        // A signature minted by the "old" process verifies under the "new" one.
+        let svid = a.issue(&params(), 1_000_000).unwrap();
+        let decoded = envelope::decode(&svid.jws).unwrap();
+        let sig =
+            ferro_crypto::composite::CompositeSignature::from_concat_bytes(&decoded.signature)
+                .unwrap();
+        b.public_key()
+            .verify(
+                crate::SVID_SIGNING_CONTEXT,
+                decoded.signing_input.as_bytes(),
+                &sig,
+            )
+            .expect("signature from the same seed verifies after restart");
     }
 
     #[test]
