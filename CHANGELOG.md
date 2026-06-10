@@ -10,6 +10,16 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **`mia test` — connectivity and token-issuance self-test.** A new
+  non-interactive subcommand that exercises the full path a local application
+  depends on: configuration (CMIS endpoint + SPKI pin), the eager pinned
+  hybrid-PQC TLS dial to CMIS, CMIS CRL publishing (`JWKS` RPC, signature
+  verification, freshness), and a live child-token mint through the local
+  helper socket. Every failing step prints targeted remediation hints
+  mirroring the operations runbooks — a `crl_stale` refusal is
+  cross-referenced with the server-side CRL check to say which side is at
+  fault — and the command exits non-zero so provisioning scripts can gate on
+  it.
 - **Host-driven allowlist proposals (TOFU bootstrap + review queue).** mia can
   now propose the local callers it observes back to CMIS so a freshly installed
   host populates its own allowlist instead of an operator hand-enumerating every
@@ -38,6 +48,18 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **mia now starts the CRL puller, so helper tokens can actually be minted.**
+  The daemon created the F11 CRL cache empty and never wired
+  `mia::helper::crl::spawn_puller`, so the helper API's fail-closed freshness
+  gate refused every mint with `crl_stale` forever — even against a healthy
+  CMIS publishing a fresh CRL every 60 s. Startup now spawns the puller against
+  the pinned CMIS channel (`maybe_spawn_crl_puller`), pulling at the 60 s
+  publish cadence and retrying the initial dial forever so CMIS being down at
+  boot cannot permanently disable minting; a missing/invalid CMIS configuration
+  is loudly logged as leaving minting disabled. Covered by a new integration
+  test (`crates/mia/tests/crl_pull.rs`) running a real in-process CMIS:
+  fail-closed when empty or unpublished, gate opens after the first verified
+  pull, and `spawn_puller` pulls immediately rather than after the first tick.
 - **CMIS now persists its issuer signing key across restarts.** The bring-up
   path minted a fresh in-memory composite key on every boot (`Issuer::generate`),
   so a CMIS restart rotated the JWKS key out from under every consumer: issued

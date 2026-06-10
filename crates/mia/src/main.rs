@@ -55,6 +55,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("setup") => return mia::setup::run(&args[1..]),
+        Some("test") => return mia::selftest::run(&args[1..]),
         Some("-h" | "--help") => {
             print_usage();
             return Ok(());
@@ -140,6 +141,7 @@ fn print_usage() {
          commands:\n\
          \x20 (none)   run the agent daemon\n\
          \x20 setup    interactive wizard that writes the agent's config file\n\
+         \x20 test     check CMIS connectivity and helper-token issuance\n\
          \n\
          options:\n\
          \x20 -c, --config <path>   TOML config file (default {}, then\n\
@@ -147,7 +149,8 @@ fn print_usage() {
          \x20 -h, --help            show this help\n\
          \x20 -V, --version         print the version\n\
          \n\
-         Run `mia setup --help` for the wizard's options.",
+         Run `mia setup --help` for the wizard's options and `mia test --help`\n\
+         for the self-test's.",
         env!("CARGO_PKG_VERSION"),
         mia::config::system_config_path().display(),
     );
@@ -211,12 +214,10 @@ async fn start_helper_api(config: &mia::config::Config) -> anyhow::Result<()> {
 /// Resolve where the persistent machine signing key lives — beside the system
 /// config (e.g. `/Library/Application Support/FerroGate/host-key.bin` on macOS).
 fn host_key_path() -> std::path::PathBuf {
-    mia::config::system_config_path()
-        .parent()
-        .map_or_else(
-            || std::path::PathBuf::from("mia-host-key.bin"),
-            |d| d.join("host-key.bin"),
-        )
+    mia::config::system_config_path().parent().map_or_else(
+        || std::path::PathBuf::from("mia-host-key.bin"),
+        |d| d.join("host-key.bin"),
+    )
 }
 
 /// Bootstrap the host SVID via the TPM-less **host-key** attestation profile
@@ -526,11 +527,81 @@ fn maybe_spawn_propose_task(
             .await
             {
                 Ok(outcome) => {
-                    tracing::info!(?outcome, entries = snapshot.len(), "proposed observed allowlist to CMIS");
+                    tracing::info!(
+                        ?outcome,
+                        entries = snapshot.len(),
+                        "proposed observed allowlist to CMIS"
+                    );
                     last_sent = Some(snapshot);
                 }
                 Err(e) => tracing::warn!(error = %e, "allowlist proposal failed; will retry"),
             }
+        }
+    });
+}
+
+/// Interval between CRL pulls. CMIS republishes every 60 s and the helper-API
+/// mint gate tolerates 300 s + 60 s leeway, so pulling at the publish cadence
+/// keeps the cache fresh with margin for several consecutive failed pulls.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const CRL_PULL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Start the background CRL puller (feature F11) feeding `cache` from the CMIS
+/// `JWKS` RPC over a pinned channel.
+///
+/// Without a usable CMIS configuration nothing can be pulled, so the cache
+/// stays empty and every mint is refused (`crl_stale`, fail closed) — that is
+/// loudly logged rather than silently accepted. The initial dial is retried
+/// forever: CMIS being down at boot must not permanently disable minting.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn maybe_spawn_crl_puller(
+    config: &mia::config::Config,
+    cache: std::sync::Arc<mia::helper::CrlCache>,
+) {
+    use ferro_crypto::pin::SpkiPin;
+
+    let (Some(endpoint), Some(pin_hex)) =
+        (config.cmis.endpoint.clone(), config.cmis.spki_pin.clone())
+    else {
+        tracing::warn!(
+            "cmis.endpoint/spki_pin not configured; no CRL can be pulled, so token minting \
+             stays disabled (crl_stale, fail closed)"
+        );
+        return;
+    };
+    let pin = match SpkiPin::from_hex(pin_hex.trim()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cmis.spki_pin invalid; no CRL can be pulled, so token minting stays disabled \
+                 (crl_stale, fail closed)"
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        loop {
+            match mia::client::connect_pinned(&endpoint, vec![pin]).await {
+                Ok(client) => {
+                    // The channel redials on demand after transient drops, so
+                    // one successful connect is enough to hand the pull loop;
+                    // it only resolves if the puller task itself dies.
+                    let puller =
+                        mia::helper::crl::spawn_puller(client, cache.clone(), CRL_PULL_INTERVAL);
+                    let _ = puller.await;
+                    tracing::warn!("CRL puller stopped unexpectedly; restarting");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e, %endpoint,
+                        "cannot connect to CMIS for CRL pulls; retrying (minting stays \
+                         fail-closed until the first verified pull)"
+                    );
+                }
+            }
+            tokio::time::sleep(CRL_PULL_INTERVAL).await;
         }
     });
 }
@@ -636,9 +707,10 @@ where
         read_timeout: Duration::from_secs(5),
     };
 
-    // The CRL cache (feature F11) starts empty; wiring the puller
-    // (`mia::helper::crl::spawn_puller`) against the CMIS endpoint is a follow-up.
+    // The CRL cache (feature F11) starts empty and the mint gate fails closed;
+    // the puller's first verified pull (within seconds of startup) opens it.
     let crl = Arc::new(CrlCache::new());
+    maybe_spawn_crl_puller(config, Arc::clone(&crl));
     let server = HelperServer::bind(helper_config, auth, minter, allowlist, crl, audit_tx, clock)?;
     tracing::info!(listener = %socket_path.display(), "helper API listening");
 
@@ -702,8 +774,14 @@ mod tests {
 
     #[test]
     fn rejects_ids_without_a_host_segment() {
-        assert_eq!(host_uuid_from_spiffe_id("spiffe://ferrogate.test/cmis"), None);
-        assert_eq!(host_uuid_from_spiffe_id("spiffe://ferrogate.test/host/"), None);
+        assert_eq!(
+            host_uuid_from_spiffe_id("spiffe://ferrogate.test/cmis"),
+            None
+        );
+        assert_eq!(
+            host_uuid_from_spiffe_id("spiffe://ferrogate.test/host/"),
+            None
+        );
         assert_eq!(host_uuid_from_spiffe_id(""), None);
     }
 }

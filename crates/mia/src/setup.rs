@@ -761,17 +761,18 @@ fn clean_config(path: &Path, force: bool) -> anyhow::Result<()> {
                 path.display()
             );
         }
-        let proceed = match Confirm::new(&format!("Delete the configuration at {}?", path.display()))
-            .with_default(false)
-            .prompt()
-        {
-            Ok(v) => v,
-            Err(
-                inquire::InquireError::OperationCanceled
-                | inquire::InquireError::OperationInterrupted,
-            ) => false,
-            Err(e) => return Err(e.into()),
-        };
+        let proceed =
+            match Confirm::new(&format!("Delete the configuration at {}?", path.display()))
+                .with_default(false)
+                .prompt()
+            {
+                Ok(v) => v,
+                Err(
+                    inquire::InquireError::OperationCanceled
+                    | inquire::InquireError::OperationInterrupted,
+                ) => false,
+                Err(e) => return Err(e.into()),
+            };
         if !proceed {
             println!("Aborted — nothing deleted.");
             return Ok(());

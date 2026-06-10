@@ -253,6 +253,37 @@ until mia restarts.
 It requires a TTY; for unattended provisioning (configuration management),
 write the TOML file directly from the template in `crates/mia/dist/mia.toml`.
 
+### `mia test` — connectivity and token-issuance self-test
+
+```console
+$ mia test
+```
+
+A non-interactive diagnostic that exercises the full path a local application
+depends on and exits non-zero if any step fails, so it can gate provisioning
+scripts. It runs four checks in order:
+
+1. **configuration** — a CMIS endpoint and a valid SPKI pin resolve from the
+   usual config-file/environment precedence;
+2. **CMIS connection** — an eager dial over pinned hybrid-PQC TLS, validating
+   DNS, TCP, the X25519MLKEM768 handshake, and the SPKI pin;
+3. **CMIS CRL publishing** — the `JWKS` RPC returns a signature-valid, fresh
+   CRL (the freshness the helper API fail-closed gates minting on, F11);
+4. **helper token mint** — a real `HelperReq` over the local helper socket,
+   reporting the minted token or interpreting the refusal.
+
+Each failing step prints targeted remediation hints (mirroring the
+[operations runbooks](operations/runbooks/README.md)); a `crl_stale` refusal in
+step 4 is cross-referenced with step 3's result to say whether the server or
+the agent is at fault. Note that step 4 authenticates *this command's binary
+and uid* like any other caller, so on a host with a restrictive allowlist a
+`PermissionDenied` ("not-allowlisted") refusal still proves everything up to
+the allowlist check works. Options:
+
+- `-c, --config <path>` — TOML config file (same resolution as the daemon).
+- `-a, --audience <aud>` — audience for the test token (default
+  `https://selftest.ferrogate.invalid`).
+
 ## Configuration sketch (aspirational)
 
 > Forward-looking superset showing where the schema is headed (hardening

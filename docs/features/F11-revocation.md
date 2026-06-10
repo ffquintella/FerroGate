@@ -72,14 +72,17 @@ See [../operations.md](../operations.md) §"Revocation".
 **Done.** Per-SVID and per-host revocation, the composite-signed CRL delta in
 the `x-ferrogate-crl` JWKS extension (60 s publisher heartbeat plus inline
 publish on revoke), MIA freshness/revocation enforcement, fail-closed CRL
-signature verification, and reference-verifier rejection all landed. Two seams
-are intentionally deferred, matching the precedent set by the F09 JWKS
-registry: the revocation working set is **process-local** (replicating it
-through the Raft store so every replica's CRL agrees is deployment wiring on
-the existing `CmisState::revoke` seam), and the MIA CRL puller
-(`crl::spawn_puller`) is wired by the attestation loop that supplies the host
-SVID — until that lands the daemon runs with an empty cache and therefore
-refuses to mint (fail closed). The admin RPCs are authenticated as operator
+signature verification, and reference-verifier rejection all landed. The MIA
+CRL puller (`crl::spawn_puller`) is wired at daemon startup
+(`maybe_spawn_crl_puller` in `crates/mia/src/main.rs`): it dials CMIS over the
+pinned channel (retrying forever if CMIS is down at boot) and pulls at the
+60 s publish cadence, so the fail-closed gate opens within seconds of the
+first verified pull. Without a usable CMIS configuration nothing can be
+pulled and the daemon loudly logs that minting stays disabled. One seam is
+intentionally deferred, matching the precedent set by the F09 JWKS registry:
+the revocation working set is **process-local** (replicating it through the
+Raft store so every replica's CRL agrees is deployment wiring on the existing
+`CmisState::revoke` seam). The admin RPCs are authenticated as operator
 actions out of band (mTLS/role gating at the transport), not in the message.
 
 ## Risks

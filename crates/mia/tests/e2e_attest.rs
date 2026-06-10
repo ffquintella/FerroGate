@@ -124,7 +124,7 @@ fn marshal_signature(hash_alg: u16, r: &[u8], s: &[u8]) -> Vec<u8> {
 }
 
 fn build_ek_chain() -> (Vec<u8>, Vec<u8>) {
-    use rcgen::{date_time_ymd, BasicConstraints, CertificateParams, Issuer, IsCa, KeyPair};
+    use rcgen::{date_time_ymd, BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
     let ca_key = KeyPair::generate().unwrap();
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);

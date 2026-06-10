@@ -259,7 +259,11 @@ async fn preregistered_key_is_required_from_first_attestation() {
     let state = build_state().await;
     let facts = sample_facts();
     let expected = SoftwareMachineKey::generate().unwrap();
-    enroll_prereg(&state, &facts.fingerprint().to_hex(), &expected.public_spki_der());
+    enroll_prereg(
+        &state,
+        &facts.fingerprint().to_hex(),
+        &expected.public_spki_der(),
+    );
     let mut client = spawn_server(state).await;
 
     // A different key is rejected even though the fingerprint is enrolled —

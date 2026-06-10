@@ -139,13 +139,15 @@ pub async fn propose_allowlist(
         }))
         .await?
         .into_inner();
-    Ok(match Outcome::try_from(resp.outcome).unwrap_or(Outcome::Pending) {
-        Outcome::AutoAdopted => ProposeOutcome::AutoAdopted {
-            not_after: resp.not_after,
+    Ok(
+        match Outcome::try_from(resp.outcome).unwrap_or(Outcome::Pending) {
+            Outcome::AutoAdopted => ProposeOutcome::AutoAdopted {
+                not_after: resp.not_after,
+            },
+            Outcome::Unchanged => ProposeOutcome::Unchanged,
+            Outcome::Pending => ProposeOutcome::Pending,
         },
-        Outcome::Unchanged => ProposeOutcome::Unchanged,
-        Outcome::Pending => ProposeOutcome::Pending,
-    })
+    )
 }
 
 /// A produced PCR quote and the raw values backing it.

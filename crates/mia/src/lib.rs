@@ -30,6 +30,9 @@ pub mod hardening;
 pub mod helper;
 pub mod scheduler;
 
+/// `mia test` connectivity and token-issuance self-test.
+pub mod selftest;
+
 /// Interactive `mia setup` configuration wizard (rich-terminal prompts).
 pub mod setup;
 
