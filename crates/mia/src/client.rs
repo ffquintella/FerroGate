@@ -207,6 +207,15 @@ pub enum AttestClientError {
     KeyGen(String),
 }
 
+/// This machine's OS hostname, sent in `AttestInit` purely as an operator
+/// display label (`list-svids`). Identity stays rooted in the EK/fingerprint;
+/// a host that cannot report a hostname simply sends the empty string.
+fn os_hostname() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Run the full handshake. `dpop_jkt` is the thumbprint of the MIA's DPoP key
 /// (minted elsewhere; see F09) that the SVID will be bound to.
 pub async fn run_attest<T: AttestEvidence>(
@@ -243,6 +252,7 @@ pub async fn run_attest<T: AttestEvidence>(
             })
             .collect(),
         host_key: None,
+        hostname: os_hostname(),
     };
     send(&tx, ReqPhase::Init(init)).await?;
 
@@ -330,6 +340,7 @@ pub async fn run_attest_host_key(
             sep_pub: key.public_spki_der(),
             signature: sig,
         }),
+        hostname: os_hostname(),
         ..Default::default()
     };
     send(&tx, ReqPhase::Init(init)).await?;

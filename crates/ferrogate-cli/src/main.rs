@@ -326,6 +326,9 @@ async fn list_svids(client: &mut MachineIdentityClient<Channel>) -> anyhow::Resu
     for s in &resp.svids {
         println!();
         println!("  spiffe_id:    {}", s.spiffe_id);
+        if !s.hostname.is_empty() {
+            println!("  hostname:     {} (self-reported, display only)", s.hostname);
+        }
         println!("  cert_sha:     {}", s.cert_sha);
         println!("  issued_at:    {} (unix)", s.issued_at);
         println!("  expires_at:   {} (unix)", s.expires_at);

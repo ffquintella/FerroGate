@@ -157,6 +157,11 @@ message AttestInit {
   // TPM-less host-key profile (F15). When set, fields 1–6 are ignored and the
   // handshake skips phase-3 credential activation.
   HostKeyEvidence host_key = 7;
+
+  // The host's self-reported OS hostname, for operator display only (e.g. in
+  // `list-svids` output). It is NOT identity — identity is the EK/fingerprint
+  // — and is never verified; CMIS sanitises and truncates it before storing.
+  string hostname = 8;
 }
 
 message PcrValue {
@@ -403,6 +408,7 @@ message SvidSummary {
   int64 expires_at = 4;    // unix seconds (exp) of the current bundle
   string policy_id = 5;    // RIM policy generation at the last full attestation
   uint64 policy_epoch = 6; // RIM policy epoch at the last full attestation
+  string hostname = 7;     // host's self-reported hostname — display only, not identity
 }
 
 message ListSvidsResponse {

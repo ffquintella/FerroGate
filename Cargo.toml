@@ -65,6 +65,9 @@ serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium   = "0.2"
 
+# host facts (display-only hostname sent at attestation)
+hostname = "0.4"
+
 # crypto (placeholders pinned now, used in later milestones)
 sha3          = "0.11"
 zeroize       = { version = "1.8", features = ["zeroize_derive"] }

@@ -10,6 +10,14 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **Hosts self-report their OS hostname for operator display.** MIA now sends
+  its OS hostname in `AttestInit`, and CMIS stores it on the issued record and
+  surfaces it in `ferrogate list-svids` (and the `SvidSummary` RPC field). It
+  is a display-only convenience — never identity (which stays rooted in the
+  EK/host-key fingerprint) and never verified: CMIS sanitises it to printable
+  ASCII and truncates to 64 chars before storing, a host that cannot report one
+  sends the empty string, and records written before the field existed still
+  decode (it is optional).
 - **`mia test` — connectivity and token-issuance self-test.** A new
   non-interactive subcommand that exercises the full path a local application
   depends on: configuration (CMIS endpoint + SPKI pin), the eager pinned

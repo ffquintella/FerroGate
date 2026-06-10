@@ -238,6 +238,21 @@ async fn next_request(inbound: &mut Streaming<AttestRequest>) -> Result<ReqPhase
     }
 }
 
+/// Sanitise the host's self-reported hostname before it is stored or shown to
+/// an operator. The value is host-controlled free text and display-only —
+/// never identity — so keep only printable ASCII, cap the length, and return
+/// `None` when nothing usable remains.
+fn display_hostname(raw: &str) -> Option<String> {
+    const MAX_HOSTNAME_CHARS: usize = 64;
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(char::is_ascii_graphic)
+        .take(MAX_HOSTNAME_CHARS)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 async fn send(
     tx: &mpsc::Sender<Result<AttestResponse, Status>>,
     phase: RespPhase,
@@ -276,11 +291,14 @@ async fn run_attest(
         return Err(Status::invalid_argument("expected attest init"));
     };
 
+    // Display-only operator label, sanitised once here for both profiles.
+    let hostname = display_hostname(&init.hostname);
+
     // Profile split (F15): a TPM-less host sets `host_key` and runs a 3-phase
     // handshake with no credential-activation round. Branch before any
     // TPM-specific work.
     if let Some(host_key) = init.host_key {
-        return run_attest_host_key(state, inbound, tx, &nonce, host_key, now).await;
+        return run_attest_host_key(state, inbound, tx, &nonce, host_key, hostname, now).await;
     }
 
     // F13 pre-admission: gate the host on the offline-signed fleet manifest
@@ -428,6 +446,7 @@ async fn run_attest(
                 policy_epoch: state.current_epoch(),
             },
             bundle: issued.clone(),
+            hostname,
         })
         .await;
 
@@ -453,6 +472,7 @@ async fn run_attest_host_key(
     tx: &mpsc::Sender<Result<AttestResponse, Status>>,
     nonce: &[u8],
     evidence: ferro_proto::v1::HostKeyEvidence,
+    hostname: Option<String>,
     now: i64,
 ) -> Result<(), Status> {
     let facts = evidence.facts.unwrap_or_default();
@@ -579,6 +599,7 @@ async fn run_attest_host_key(
                 policy_epoch: state.current_epoch(),
             },
             bundle: issued.clone(),
+            hostname,
         })
         .await;
 
@@ -1139,6 +1160,7 @@ impl MachineIdentity for MachineIdentitySvc {
                 expires_at: rec.bundle.exp,
                 policy_id: rec.params.policy_id.clone(),
                 policy_epoch: rec.last_attestation.policy_epoch,
+                hostname: rec.hostname.clone().unwrap_or_default(),
             })
             .collect();
         Ok(Response::new(ListSvidsResponse { svids }))
@@ -1251,4 +1273,38 @@ fn to_proto_sth(sth: &ferro_audit::SignedTreeHead) -> Result<SignedTreeHead, Sta
         signer_kid: sth.signer_kid.clone(),
         signature: sig_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_hostname;
+
+    #[test]
+    fn hostname_passes_through_clean_values() {
+        assert_eq!(
+            display_hostname("segdc1vds0005"),
+            Some("segdc1vds0005".to_string())
+        );
+        assert_eq!(
+            display_hostname("  web-01.prod  "),
+            Some("web-01.prod".to_string())
+        );
+    }
+
+    #[test]
+    fn hostname_strips_control_and_non_ascii() {
+        assert_eq!(
+            display_hostname("evil\x1b[2Jhost\nname"),
+            Some("evil[2Jhostname".to_string())
+        );
+        assert_eq!(display_hostname("máquina"), Some("mquina".to_string()));
+    }
+
+    #[test]
+    fn hostname_caps_length_and_drops_empty() {
+        let long = "a".repeat(200);
+        assert_eq!(display_hostname(&long).unwrap().len(), 64);
+        assert_eq!(display_hostname(""), None);
+        assert_eq!(display_hostname("  \t\x07 "), None);
+    }
 }

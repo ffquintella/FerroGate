@@ -70,6 +70,12 @@ pub struct WireIssuedRecord {
     pub iat: i64,
     /// `exp` (Unix seconds).
     pub exp: i64,
+
+    /// Self-reported hostname captured at the last full attestation (display
+    /// only). Optional with a default so records written before the field
+    /// existed still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 fn hex_48(field: &'static str, s: &str) -> Result<[u8; 48], WireError> {
@@ -106,6 +112,7 @@ impl WireIssuedRecord {
             spiffe_id: r.bundle.spiffe_id.clone(),
             iat: r.bundle.iat,
             exp: r.bundle.exp,
+            hostname: r.hostname.clone(),
         }
     }
 
@@ -134,6 +141,7 @@ impl WireIssuedRecord {
             params,
             last_attestation,
             bundle,
+            hostname: self.hostname,
         })
     }
 }
@@ -175,6 +183,7 @@ mod tests {
                 iat: 1_700_000_000,
                 exp: 1_700_003_600,
             },
+            hostname: Some("segdc1vds0005".into()),
         }
     }
 
@@ -194,6 +203,16 @@ mod tests {
         );
         assert_eq!(back.bundle.jws, r.bundle.jws);
         assert_eq!(back.bundle.spiffe_id, r.bundle.spiffe_id);
+        assert_eq!(back.hostname, r.hostname);
+    }
+
+    #[test]
+    fn decodes_record_written_before_hostname_existed() {
+        let mut wire = serde_json::to_value(WireIssuedRecord::from_record(&sample_record())).unwrap();
+        wire.as_object_mut().unwrap().remove("hostname");
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.hostname, None);
     }
 
     #[test]

@@ -92,6 +92,9 @@ pub struct IssuedRecord {
     pub last_attestation: LastAttestation,
     /// The most recently issued bundle.
     pub bundle: IssuedSvid,
+    /// The host's self-reported hostname at the last full attestation.
+    /// Display-only operator convenience — never identity, never verified.
+    pub hostname: Option<String>,
 }
 
 /// Process-wide CMIS state behind an `Arc`.

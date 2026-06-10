@@ -43,6 +43,7 @@ thiserror          = { workspace = true }
 rand_core          = { workspace = true }
 sha2               = { workspace = true }
 hex                = { workspace = true }
+hostname           = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 ciborium           = { workspace = true }

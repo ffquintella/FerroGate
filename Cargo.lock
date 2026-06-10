@@ -2846,6 +2846,7 @@ dependencies = [
  "ferro-winauth",
  "futures",
  "hex",
+ "hostname",
  "hyper-util",
  "inquire",
  "libproc",
