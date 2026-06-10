@@ -497,25 +497,25 @@ fn fetch_enrollment_key_to(endpoint: &str, pin_hex: &str, key_path: &Path) -> an
 
 /// The platform-appropriate service-restart hint shown after writing (Linux).
 #[cfg(target_os = "linux")]
-fn restart_hint() -> &'static str {
+pub(crate) fn restart_hint() -> &'static str {
     "sudo systemctl restart mia"
 }
 
 /// The service-restart hint (macOS launchd).
 #[cfg(target_os = "macos")]
-fn restart_hint() -> &'static str {
+pub(crate) fn restart_hint() -> &'static str {
     "sudo launchctl kickstart -k system/com.ferrogate.mia"
 }
 
 /// The service-restart hint (Windows service control).
 #[cfg(windows)]
-fn restart_hint() -> &'static str {
+pub(crate) fn restart_hint() -> &'static str {
     "Restart-Service mia  (or: sc stop mia && sc start mia)"
 }
 
 /// The service-restart hint (other platforms).
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn restart_hint() -> &'static str {
+pub(crate) fn restart_hint() -> &'static str {
     "restart the mia service"
 }
 

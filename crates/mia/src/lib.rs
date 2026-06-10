@@ -30,6 +30,9 @@ pub mod hardening;
 pub mod helper;
 pub mod scheduler;
 
+/// `mia resync-allowlist` on-demand allowlist re-fetch.
+pub mod resync;
+
 /// `mia test` connectivity and token-issuance self-test.
 pub mod selftest;
 

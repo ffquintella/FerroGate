@@ -55,6 +55,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("setup") => return mia::setup::run(&args[1..]),
+        Some("resync-allowlist") => return mia::resync::run(&args[1..]),
         Some("test") => return mia::selftest::run(&args[1..]),
         Some("-h" | "--help") => {
             print_usage();
@@ -139,9 +140,10 @@ fn print_usage() {
          \x20      mia <command>\n\
          \n\
          commands:\n\
-         \x20 (none)   run the agent daemon\n\
-         \x20 setup    interactive wizard that writes the agent's config file\n\
-         \x20 test     check CMIS connectivity and helper-token issuance\n\
+         \x20 (none)            run the agent daemon\n\
+         \x20 setup             interactive wizard that writes the agent's config file\n\
+         \x20 resync-allowlist  re-fetch this host's signed allowlist from CMIS\n\
+         \x20 test              check CMIS connectivity and helper-token issuance\n\
          \n\
          options:\n\
          \x20 -c, --config <path>   TOML config file (default {}, then\n\
@@ -149,8 +151,7 @@ fn print_usage() {
          \x20 -h, --help            show this help\n\
          \x20 -V, --version         print the version\n\
          \n\
-         Run `mia setup --help` for the wizard's options and `mia test --help`\n\
-         for the self-test's.",
+         Run `mia <command> --help` for a command's own options.",
         env!("CARGO_PKG_VERSION"),
         mia::config::system_config_path().display(),
     );
