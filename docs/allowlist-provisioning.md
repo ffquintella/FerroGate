@@ -182,17 +182,21 @@ problems, so the helper socket remains bound and the deny is diagnosable.
 
 ### Unattended / configuration management
 
-`mia setup` requires a TTY. For automated provisioning, deliver `allowlist.key`
-(and the allowlist body) to the host through your configuration-management
-channel and point the TOML/`FERROGATE_*` config at them — the key is public, so
-any integrity-preserving channel is fine.
+`mia setup` requires a TTY. For automated provisioning, either deliver
+`allowlist.key` (and the allowlist body) to the host through your
+configuration-management channel and point the TOML/`FERROGATE_*` config at them
+— the key is public, so any integrity-preserving channel is fine — or, once the
+`[cmis]` endpoint and pin are configured, run the non-interactive **`mia
+refresh-key`** to fetch `allowlist.key` and **`mia resync-allowlist`** to fetch
+the signed body, then restart. Both are TTY-free and exit non-zero on failure,
+so they gate cleanly in provisioning scripts.
 
 ## Troubleshooting
 
 | Symptom | Cause | Remedy |
 |---------|-------|--------|
-| `allowlist key file missing` / `unparseable` (daemon serves deny-all) | `allowlist.path`/`key` set but the key file is missing or corrupt | Re-run `mia setup` to fetch it, deliver it out of band, or remove the `[allowlist]` keys to start fail-closed |
-| `allowlist verification failed: bad signature` (daemon serves deny-all) | wrong `allowlist.key`, or an allowlist signed by a different/rotated issuer (e.g. a CMIS redeploy changed the enrollment key) | Re-fetch the key; re-issue the allowlist from the current CMIS; restart the daemon |
+| `allowlist key file missing` / `unparseable` (daemon serves deny-all) | `allowlist.path`/`key` set but the key file is missing or corrupt | Fetch it with `mia refresh-key` (or `mia setup`), deliver it out of band, or remove the `[allowlist]` keys to start fail-closed |
+| `allowlist verification failed: bad signature` (daemon serves deny-all) | wrong `allowlist.key`, or an allowlist signed by a different/rotated issuer (e.g. a CMIS redeploy changed the enrollment key) | `mia refresh-key` to re-fetch the key, then `mia resync-allowlist` to pull a body signed by it; restart the daemon |
 | `allowlist verification failed: expired` / `too old` (daemon serves deny-all) | `not_after` passed, or older than `max_age_secs` | Re-issue a fresh allowlist; check clock skew; restart the daemon |
 | fetch fails with a TLS/pin error | wrong or missing SPKI pin, unreachable endpoint | Re-verify the pin out of band; confirm the endpoint |
 

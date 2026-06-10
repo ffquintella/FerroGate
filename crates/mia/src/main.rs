@@ -56,6 +56,7 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("setup") => return mia::setup::run(&args[1..]),
         Some("resync-allowlist") => return mia::resync::run(&args[1..]),
+        Some("refresh-key") => return mia::resync::run_refresh_key(&args[1..]),
         Some("test") => return mia::selftest::run(&args[1..]),
         Some("-h" | "--help") => {
             print_usage();
@@ -142,6 +143,7 @@ fn print_usage() {
          commands:\n\
          \x20 (none)            run the agent daemon\n\
          \x20 setup             interactive wizard that writes the agent's config file\n\
+         \x20 refresh-key       re-fetch the CMIS enrollment key into allowlist.key\n\
          \x20 resync-allowlist  re-fetch this host's signed allowlist from CMIS\n\
          \x20 test              check CMIS connectivity and helper-token issuance\n\
          \n\

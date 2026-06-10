@@ -469,8 +469,13 @@ fn path_default(existing: Option<&Path>, fallback: String) -> String {
 
 /// Fetch the CMIS enrollment public key over pinned TLS and write it to
 /// `key_path` (composite concat bytes). Spins a short-lived current-thread
-/// runtime since the wizard is otherwise synchronous.
-fn fetch_enrollment_key_to(endpoint: &str, pin_hex: &str, key_path: &Path) -> anyhow::Result<()> {
+/// runtime since the wizard is otherwise synchronous. Shared with the
+/// non-interactive `mia refresh-key` command ([`crate::resync`]).
+pub(crate) fn fetch_enrollment_key_to(
+    endpoint: &str,
+    pin_hex: &str,
+    key_path: &Path,
+) -> anyhow::Result<()> {
     let pin =
         SpkiPin::from_hex(pin_hex.trim()).map_err(|e| anyhow::anyhow!("invalid SPKI pin: {e}"))?;
     let rt = tokio::runtime::Builder::new_current_thread()

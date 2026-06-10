@@ -1,21 +1,24 @@
-//! `mia resync-allowlist` — re-fetch this host's signed caller allowlist from
-//! CMIS on demand.
+//! On-demand re-sync of a host's CMIS trust material — the two client commands
+//! `mia resync-allowlist` and `mia refresh-key`.
 //!
-//! The daemon fetches the allowlist once at startup (when `allowlist.fetch` is
-//! set). This command performs the **identical** fetch at any time — keyed by
-//! the same fingerprint-derived host UUID — writes the signed body to
-//! `allowlist.path`, and verifies it against the locally pinned enrollment key
-//! so the operator gets immediate, authoritative feedback (the common failure,
-//! a CMIS enrollment-key rotation, shows up here as a verification error rather
-//! than as a silent deny-all once the daemon restarts).
+//! - **`resync-allowlist`** re-fetches this host's signed caller allowlist. The
+//!   daemon fetches it once at startup (when `allowlist.fetch` is set); this
+//!   performs the **identical** fetch at any time — keyed by the same
+//!   fingerprint-derived host UUID — writes the signed body to `allowlist.path`,
+//!   and verifies it against the locally pinned enrollment key so the operator
+//!   gets immediate, authoritative feedback.
+//! - **`refresh-key`** re-fetches the CMIS **enrollment key** (the public key
+//!   that signs allowlists) and writes it to `allowlist.key`. This is the
+//!   non-interactive equivalent of the `mia setup` key fetch — the fix when CMIS
+//!   was redeployed with a new issuer key and the pinned key no longer verifies.
 //!
-//! The running daemon reads the allowlist only at startup, so a restart is
-//! still required for the refreshed body to take effect; the command prints the
-//! platform restart hint.
+//! The two compose: after a CMIS redeploy, `refresh-key` then `resync-allowlist`
+//! re-establishes both halves of the allowlist trust chain. The running daemon
+//! reads both files only at startup, so a restart is required for either to take
+//! effect; the commands print the platform restart hint.
 //!
-//! Like `mia setup`/`mia test`, this is a client command: it runs without the
-//! daemon's hardening profile, never touches the TPM, and writes plain terminal
-//! output (no tracing).
+//! Like `mia setup`/`mia test`, these are client commands: no hardening profile,
+//! no TPM, plain terminal output (no tracing).
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,58 +29,62 @@ use ferro_crypto::pin::SpkiPin;
 
 use crate::config::Config;
 
-const USAGE: &str = "usage: mia resync-allowlist [--config <path>]";
+const USAGE_RESYNC: &str = "usage: mia resync-allowlist [--config <path>]";
+const USAGE_REFRESH: &str = "usage: mia refresh-key [--config <path>]";
 
 /// Run the `mia resync-allowlist` subcommand. `args` is everything after
 /// `resync-allowlist` on the command line.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
-    let Some(opts) = Opts::parse(args)? else {
+    let Some(config) = load(args, USAGE_RESYNC, print_help_resync, "allowlist resync")? else {
         return Ok(()); // --help printed
     };
-
-    let (config, source) = Config::load(opts.config.as_deref())?;
-    println!(
-        "FerroGate allowlist resync (mia {})",
-        env!("CARGO_PKG_VERSION")
-    );
-    match &source {
-        Some(path) => println!("config: {}", path.display()),
-        None => println!("config: none found — using environment and defaults"),
-    }
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(resync(&config))
 }
 
-/// Parsed `mia resync-allowlist` options.
-struct Opts {
-    /// `--config <path>` override (same as the daemon's flag).
-    config: Option<PathBuf>,
+/// Run the `mia refresh-key` subcommand. `args` is everything after
+/// `refresh-key` on the command line.
+pub fn run_refresh_key(args: &[String]) -> anyhow::Result<()> {
+    let Some(config) = load(args, USAGE_REFRESH, print_help_refresh, "enrollment-key refresh")?
+    else {
+        return Ok(()); // --help printed
+    };
+    refresh_key(&config)
 }
 
-impl Opts {
-    /// Parse `args`; `Ok(None)` means help was printed and the caller should
-    /// exit successfully.
-    fn parse(args: &[String]) -> anyhow::Result<Option<Self>> {
-        let mut config = None;
-        let mut it = args.iter();
-        while let Some(arg) = it.next() {
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    print_help();
-                    return Ok(None);
-                }
-                "-c" | "--config" => {
-                    let path = it.next().context("--config requires a path argument")?;
-                    config = Some(PathBuf::from(path));
-                }
-                other => anyhow::bail!("unknown argument: {other}\n\n{USAGE}"),
+/// Parse the shared `[--config <path>]` / `--help` options and load the config,
+/// printing a one-line banner. `Ok(None)` means `--help` was printed and the
+/// caller should exit successfully.
+fn load(
+    args: &[String],
+    usage: &str,
+    help: fn(),
+    banner: &str,
+) -> anyhow::Result<Option<Config>> {
+    let mut config_path = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                help();
+                return Ok(None);
             }
+            "-c" | "--config" => {
+                let path = it.next().context("--config requires a path argument")?;
+                config_path = Some(PathBuf::from(path));
+            }
+            other => anyhow::bail!("unknown argument: {other}\n\n{usage}"),
         }
-        Ok(Some(Self { config }))
     }
+    let (config, source) = Config::load(config_path.as_deref())?;
+    println!("FerroGate {banner} (mia {})", env!("CARGO_PKG_VERSION"));
+    match &source {
+        Some(path) => println!("config: {}", path.display()),
+        None => println!("config: none found — using environment and defaults"),
+    }
+    Ok(Some(config))
 }
 
 /// Fetch the signed allowlist from CMIS, write it, and verify it.
@@ -137,6 +144,57 @@ async fn resync(config: &Config) -> anyhow::Result<()> {
     }
 
     println!("\nRestart the agent to load it:  {}", crate::setup::restart_hint());
+    Ok(())
+}
+
+/// Fetch the CMIS enrollment key and write it to `allowlist.key`, then report
+/// whether the allowlist already on disk verifies under it.
+fn refresh_key(config: &Config) -> anyhow::Result<()> {
+    let endpoint = config
+        .cmis
+        .endpoint
+        .as_deref()
+        .context("cmis.endpoint is not configured; cannot reach CMIS (run `mia setup`)")?;
+    let pin_hex = config
+        .cmis
+        .spki_pin
+        .as_deref()
+        .context("cmis.spki_pin is not configured; cannot pin CMIS (run `mia setup`)")?;
+    let key_path = config
+        .allowlist
+        .key
+        .as_deref()
+        .context("allowlist.key is not configured; nowhere to write the key (run `mia setup`)")?;
+    // Validate the pin here for a clear message before the fetch re-parses it.
+    SpkiPin::from_hex(pin_hex.trim())
+        .map_err(|e| anyhow::anyhow!("cmis.spki_pin is not a valid SHA-384 SPKI pin: {e}"))?;
+    println!();
+
+    // Reuse the wizard's fetch+write (pinned TLS, writes the composite concat
+    // bytes 0644). It dials over its own short-lived runtime.
+    crate::setup::fetch_enrollment_key_to(endpoint, pin_hex, key_path)
+        .context("fetching the enrollment key from CMIS")?;
+    println!("✓ fetched and wrote {}", key_path.display());
+
+    // If an allowlist is already present, report whether it verifies under the
+    // *new* key. After a CMIS key rotation it typically will NOT (the on-disk
+    // body was signed by the old key) — the operator then runs resync-allowlist
+    // to pull a body signed by the new key.
+    match config.allowlist.path.as_deref() {
+        Some(path) => match std::fs::read(path) {
+            Ok(bytes) => verify_after_write(&bytes, key_path, config.allowlist_max_age()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("note: no allowlist at {} yet.", path.display());
+            }
+            Err(e) => println!("note: could not read {} ({e}).", path.display()),
+        },
+        None => println!("note: allowlist.path is not configured."),
+    }
+
+    println!(
+        "\nNext: `mia resync-allowlist` to pull a freshly-signed allowlist, then restart:  {}",
+        crate::setup::restart_hint()
+    );
     Ok(())
 }
 
@@ -206,16 +264,35 @@ fn write_allowlist_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_help() {
+fn print_help_resync() {
     println!(
         "mia resync-allowlist — re-fetch this host's signed caller allowlist from CMIS\n\
          \n\
-         {USAGE}\n\
+         {USAGE_RESYNC}\n\
          \n\
          Fetches the allowlist CMIS holds for this host (keyed by its hardware\n\
          fingerprint), writes it to allowlist.path, and verifies it against the\n\
          pinned enrollment key (allowlist.key). The daemon reads the allowlist only\n\
          at startup, so restart it afterwards to load the refreshed body.\n\
+         \n\
+         options:\n\
+         \x20 -c, --config <path>   TOML config file (default: the system config;\n\
+         \x20                       environment variables override it)\n\
+         \x20 -h, --help            show this help"
+    );
+}
+
+fn print_help_refresh() {
+    println!(
+        "mia refresh-key — re-fetch the CMIS enrollment key into allowlist.key\n\
+         \n\
+         {USAGE_REFRESH}\n\
+         \n\
+         Dials CMIS over the pinned channel, fetches the enrollment public key (the\n\
+         key that signs allowlists), and writes it to allowlist.key — the\n\
+         non-interactive equivalent of the `mia setup` key fetch. Use it after a\n\
+         CMIS redeploy changed the issuer key; then run `mia resync-allowlist` to\n\
+         pull an allowlist signed by the new key, and restart the daemon.\n\
          \n\
          options:\n\
          \x20 -c, --config <path>   TOML config file (default: the system config;\n\
