@@ -27,11 +27,22 @@ pub const ALLOWLIST_SIGNING_CONTEXT: &[u8] = b"ferrogate-allowlist-v1";
 /// enrollment key (and vice versa).
 pub const PROPOSAL_SIGNING_CONTEXT: &[u8] = b"ferrogate-allowlist-proposal-v1";
 
-/// One permitted caller: a uid plus the IMA hash of its binary (hex).
+/// One permitted caller: the IMA hash of its binary (hex), optionally pinned to
+/// a uid.
+///
+/// `uid = None` permits the binary run by **any** user — the restart-stable mode
+/// for callers with an ephemeral uid (systemd `DynamicUser`, sandboxes). `uid =
+/// Some(n)` additionally pins the entry to uid `n`. See ADR-0002.
+///
+/// On the wire (`ciborium`), `Some(n)` encodes as the bare integer `n` — exactly
+/// as the historical `u32` field did — so pinned entries stay byte-identical and
+/// their signatures unchanged; `None` encodes as CBOR `null`. `#[serde(default)]`
+/// lets a body that predates this field (every entry had a uid) decode cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllowEntry {
-    /// Permitted user id.
-    pub uid: u32,
+    /// Permitted user id, or `None` to permit the binary run by any user.
+    #[serde(default)]
+    pub uid: Option<u32>,
     /// Lowercase hex `SHA-384` of the permitted binary.
     pub bin_sha: String,
 }
@@ -195,7 +206,7 @@ mod tests {
             issued_at: now,
             not_after: now + 3600,
             entries: vec![AllowEntry {
-                uid: 1001,
+                uid: Some(1001),
                 bin_sha: hex::encode([0xAA; 48]),
             }],
         }
@@ -209,7 +220,61 @@ mod tests {
         let body = verify(&signed, &pk).unwrap();
         assert_eq!(body.trust_domain, "ferrogate.test");
         assert_eq!(body.entries.len(), 1);
-        assert_eq!(body.entries[0].uid, 1001);
+        assert_eq!(body.entries[0].uid, Some(1001));
+    }
+
+    /// ADR-0002 compat guard: a pinned (`Some`) uid must encode byte-identically
+    /// to the historical bare-`u32` field, so existing signed allowlists keep
+    /// verifying. We assert the entry's CBOR is exactly that of a struct whose
+    /// `uid` is a plain `u32` — i.e. the integer, not a wrapped/tagged form.
+    #[test]
+    fn pinned_uid_encodes_as_bare_integer() {
+        #[derive(serde::Serialize)]
+        struct LegacyEntry {
+            uid: u32,
+            bin_sha: String,
+        }
+        let sha = hex::encode([0xAA; 48]);
+        let mut new = Vec::new();
+        ciborium::into_writer(
+            &AllowEntry {
+                uid: Some(1001),
+                bin_sha: sha.clone(),
+            },
+            &mut new,
+        )
+        .unwrap();
+        let mut legacy = Vec::new();
+        ciborium::into_writer(&LegacyEntry { uid: 1001, bin_sha: sha }, &mut legacy).unwrap();
+        assert_eq!(new, legacy, "Some(uid) must match the legacy u32 encoding");
+    }
+
+    /// A wildcard (`None`) entry round-trips, and a body that omits the `uid`
+    /// field entirely (a pre-field encoding shape) decodes to `None`.
+    #[test]
+    fn wildcard_uid_roundtrips_and_missing_field_defaults_to_none() {
+        let sha = hex::encode([0xCC; 48]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &AllowEntry {
+                uid: None,
+                bin_sha: sha.clone(),
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let back: AllowEntry = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(back.uid, None);
+
+        // A map carrying only `bin_sha` (no `uid` key) must default to None.
+        #[derive(serde::Serialize)]
+        struct OnlySha {
+            bin_sha: String,
+        }
+        let mut buf = Vec::new();
+        ciborium::into_writer(&OnlySha { bin_sha: sha }, &mut buf).unwrap();
+        let back: AllowEntry = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(back.uid, None);
     }
 
     #[test]
@@ -248,7 +313,7 @@ mod tests {
             host_uuid: "5376139b-0117-8e2d-8049-1ab7b32e7d9a".into(),
             issued_at: 1000,
             entries: vec![AllowEntry {
-                uid: 501,
+                uid: Some(501),
                 bin_sha: hex::encode([0xAB; 48]),
             }],
         };

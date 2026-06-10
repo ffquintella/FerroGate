@@ -49,12 +49,12 @@ pub(crate) fn usage() -> &'static str {
      usage: ferrogate allowlist <subcommand> [args]\n\
      \n\
      subcommands:\n\
-     \x20 set     <host> (--entry uid:sha | --bin uid:path)... [--ttl secs]\n\
+     \x20 set     <host> (--entry [uid:]sha | --bin [uid:]path)... [--ttl secs]\n\
      \x20                  replace the host's allowlist with exactly these callers\n\
-     \x20 add     <host> (--entry uid:sha | --bin uid:path)... [--ttl secs]\n\
+     \x20 add     <host> (--entry [uid:]sha | --bin [uid:]path)... [--ttl secs]\n\
      \x20                  add callers to the host's existing allowlist\n\
-     \x20 remove  <host> --uid N [--bin-sha hex] [--ttl secs]\n\
-     \x20                  drop a caller (or every entry for a uid) and re-sign\n\
+     \x20 remove  <host> (--uid N | --bin-sha hex | --uid N --bin-sha hex) [--ttl secs]\n\
+     \x20                  drop matching callers (a uid, a binary, or one pinned pair) and re-sign\n\
      \x20 get     <host> [--out path]   fetch the raw signed CBOR (stdout if no --out)\n\
      \x20 show    <host>                fetch and print the entries + validity\n\
      \x20 list                          every host that has a stored allowlist\n\
@@ -69,9 +69,11 @@ pub(crate) fn usage() -> &'static str {
      \x20 --ek-cert <pem>     derive the UUID from an EK certificate PEM\n\
      \x20 --ek-sha384 <hex>   derive the UUID from the EK certificate's SHA-384\n\
      \n\
-     entries:\n\
-     \x20 --entry <uid>:<sha>   uid + lowercase-hex SHA-384 of the permitted binary\n\
-     \x20 --bin   <uid>:<path>  uid + a binary whose SHA-384 the CLI computes"
+     entries (omit the `uid:` prefix to permit the binary run by ANY user):\n\
+     \x20 --entry <uid>:<sha>   pin to uid; lowercase-hex SHA-384 of the permitted binary\n\
+     \x20 --entry <sha>         wildcard: any user running this binary\n\
+     \x20 --bin   <uid>:<path>  pin to uid; a binary whose SHA-384 the CLI computes\n\
+     \x20 --bin   <path>        wildcard: any user running this binary"
 }
 
 /// Dispatch an `allowlist` subcommand.
@@ -142,13 +144,20 @@ async fn add(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyh
 
 async fn remove(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
-    let Some(uid) = flags.one("--uid") else {
-        anyhow::bail!("remove needs --uid <N>");
-    };
-    let uid: u32 = uid
-        .parse()
-        .map_err(|_| anyhow::anyhow!("--uid must be a u32, got `{uid}`"))?;
+    // Either filter may be given. `--uid N` drops entries pinned to N; `--bin-sha
+    // X` drops every entry for that binary (any scope, including a wildcard);
+    // together they drop the N-pinned entry for X. At least one is required.
+    let uid: Option<u32> = flags
+        .one("--uid")
+        .map(|u| {
+            u.parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("--uid must be a u32, got `{u}`"))
+        })
+        .transpose()?;
     let bin_sha = flags.one("--bin-sha").map(normalize_sha).transpose()?;
+    if uid.is_none() && bin_sha.is_none() {
+        anyhow::bail!("remove needs --uid <N> and/or --bin-sha <hex>");
+    }
 
     let Some(doc) = fetch_doc(client, &host_uuid).await? else {
         anyhow::bail!("no allowlist stored for {host_uuid}");
@@ -158,8 +167,12 @@ async fn remove(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
         .entries
         .into_iter()
         .filter(|e| {
-            // Drop the matching uid (+ bin_sha if given); keep everything else.
-            !(e.uid == uid && bin_sha.as_ref().is_none_or(|b| *b == e.bin_sha))
+            // An entry is dropped only if it matches every filter given. `--uid N`
+            // matches the pinned entry for N (never a wildcard); omitting --uid
+            // matches any scope.
+            let uid_match = uid.is_none_or(|u| e.uid == Some(u));
+            let sha_match = bin_sha.as_ref().is_none_or(|b| *b == e.bin_sha);
+            !(uid_match && sha_match)
         })
         .collect();
     if entries.len() == before {
@@ -205,7 +218,7 @@ async fn show(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> any
     println!("not_after:    {} (unix)", doc.not_after);
     println!("entries:      {}", doc.entries.len());
     for e in &doc.entries {
-        println!("  uid={:<7} bin_sha={}", e.uid, e.bin_sha);
+        println!("  uid={:<7} bin_sha={}", fmt_uid(e.uid), e.bin_sha);
     }
     Ok(())
 }
@@ -277,14 +290,14 @@ async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
         .await?
         .map(|d| d.entries)
         .unwrap_or_default();
-    let live_set: std::collections::HashSet<(u32, &str)> =
+    let live_set: std::collections::HashSet<(Option<u32>, &str)> =
         live.iter().map(|e| (e.uid, e.bin_sha.as_str())).collect();
-    let proposed: Vec<(u32, String)> = proposal
+    let proposed: Vec<(Option<u32>, String)> = proposal
         .entries
         .iter()
         .map(|e| (e.uid, e.bin_sha.clone()))
         .collect();
-    let proposed_set: std::collections::HashSet<(u32, &str)> =
+    let proposed_set: std::collections::HashSet<(Option<u32>, &str)> =
         proposed.iter().map(|(u, s)| (*u, s.as_str())).collect();
 
     println!("host_uuid:   {host_uuid}");
@@ -305,7 +318,7 @@ async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
         } else {
             "  + " // new vs live
         };
-        println!("{mark}uid={uid:<7} bin_sha={sha}");
+        println!("{mark}uid={:<7} bin_sha={sha}", fmt_uid(*uid));
     }
     // Entries live today but absent from the proposal — approving would drop them.
     let dropped: Vec<_> = live
@@ -315,7 +328,7 @@ async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
     if !dropped.is_empty() {
         println!("\nwould be removed ({}):", dropped.len());
         for e in dropped {
-            println!("  - uid={:<7} bin_sha={}", e.uid, e.bin_sha);
+            println!("  - uid={:<7} bin_sha={}", fmt_uid(e.uid), e.bin_sha);
         }
     }
     println!("\nApprove with `ferrogate allowlist approve {host_uuid}` or reject with `… reject {host_uuid}`.");
@@ -579,16 +592,25 @@ impl Flags {
     }
 }
 
-/// Split a `uid:rest` flag value into its parts.
-fn split_uid<'a>(raw: &'a str, flag: &str) -> anyhow::Result<(u32, &'a str)> {
-    let (uid, rest) = raw
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("{flag} must be `uid:value`, got `{raw}`"))?;
-    let uid: u32 = uid
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("{flag} uid must be a u32, got `{uid}`"))?;
-    Ok((uid, rest.trim()))
+/// Split a flag value into an optional uid and the rest. A `uid:value` prefix
+/// pins the entry to that uid; a bare `value` (no colon) is a wildcard entry
+/// (`uid = None`) that matches the binary run by any user (ADR-0002).
+fn split_uid<'a>(raw: &'a str, flag: &str) -> anyhow::Result<(Option<u32>, &'a str)> {
+    match raw.split_once(':') {
+        Some((uid, rest)) => {
+            let uid: u32 = uid
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{flag} uid must be a u32, got `{uid}`"))?;
+            Ok((Some(uid), rest.trim()))
+        }
+        None => Ok((None, raw.trim())),
+    }
+}
+
+/// Render an entry's uid for display: a wildcard prints as `*`.
+fn fmt_uid(uid: Option<u32>) -> String {
+    uid.map_or_else(|| "*".to_string(), |u| u.to_string())
 }
 
 /// Validate and normalize a lowercase-hex SHA-384 (96 hex chars ⇒ 48 bytes).

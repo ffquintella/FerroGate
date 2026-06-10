@@ -96,7 +96,7 @@ fn allowlist_with_app(now: i64) -> Allowlist {
         &pk,
         now,
         vec![AllowEntry {
-            uid: APP_UID,
+            uid: Some(APP_UID),
             bin_sha: hex::encode(APP_BIN),
         }],
     )

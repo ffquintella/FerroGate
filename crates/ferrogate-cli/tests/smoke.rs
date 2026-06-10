@@ -353,8 +353,49 @@ async fn allowlist_set_show_list_get_delete_roundtrip() {
     let signed = ferro_svid::allowlist::decode(&bytes).expect("decode served allowlist");
     let doc = ferro_svid::allowlist::decode_body(&signed.body).expect("decode body");
     assert_eq!(doc.entries.len(), 1);
-    assert_eq!(doc.entries[0].uid, 1000);
+    assert_eq!(doc.entries[0].uid, Some(1000));
     let _ = std::fs::remove_file(&cbor_path);
+
+    // wildcard (ADR-0002): `--entry <sha>` with no uid prefix permits any user.
+    let out = run(vec![
+        "set".into(),
+        "--host".into(),
+        host.into(),
+        "--entry".into(),
+        bin_sha.clone(), // no `uid:` prefix ⇒ wildcard
+        "--ttl".into(),
+        "3600".into(),
+    ])
+    .await;
+    assert!(
+        out.status.success(),
+        "wildcard set must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(vec!["show".into(), "--host".into(), host.into()]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("uid=*"),
+        "show must render the wildcard entry as uid=*: {stdout}"
+    );
+    let wnanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let wpath = std::env::temp_dir().join(format!("ferrogate-cli-al-wild-{wnanos}.cbor"));
+    let out = run(vec![
+        "get".into(),
+        "--host".into(),
+        host.into(),
+        "--out".into(),
+        wpath.to_string_lossy().into_owned(),
+    ])
+    .await;
+    assert!(out.status.success(), "wildcard get --out must succeed");
+    let signed = ferro_svid::allowlist::decode(&std::fs::read(&wpath).unwrap()).unwrap();
+    let doc = ferro_svid::allowlist::decode_body(&signed.body).unwrap();
+    assert_eq!(doc.entries[0].uid, None, "wildcard entry serialises uid=None");
+    let _ = std::fs::remove_file(&wpath);
 
     // delete
     let out = run(vec!["delete".into(), "--host".into(), host.into()]).await;

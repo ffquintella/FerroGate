@@ -87,7 +87,7 @@ async fn enrollment_key(svc: &MachineIdentitySvc) -> CompositePublicKey {
 
 fn entry(uid: u32, byte: u8) -> AllowEntryMsg {
     AllowEntryMsg {
-        uid,
+        uid: Some(uid),
         bin_sha: hex::encode([byte; 48]),
     }
 }
@@ -126,7 +126,7 @@ async fn set_then_get_serves_a_verifiable_signed_allowlist() {
     assert_eq!(doc.entries.len(), 2);
     assert_eq!(doc.issued_at, set.issued_at);
     assert_eq!(doc.not_after, set.not_after);
-    assert!(doc.entries.iter().any(|e| e.uid == 1000));
+    assert!(doc.entries.iter().any(|e| e.uid == Some(1000)));
 
 }
 
@@ -150,7 +150,7 @@ async fn set_rejects_malformed_entry_hash() {
         .set_allowlist(tonic::Request::new(SetAllowlistRequest {
             host_uuid: "host".into(),
             entries: vec![AllowEntryMsg {
-                uid: 1,
+                uid: Some(1),
                 bin_sha: "not-hex".into(),
             }],
             ttl_secs: 60,

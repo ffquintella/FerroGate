@@ -493,8 +493,10 @@ fn maybe_spawn_propose_task(
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
             let entries = snapshot
                 .iter()
+                // Proposals carry the concrete observed uid; relaxing an entry
+                // to a wildcard (uid = None) is an operator decision (ADR-0002).
                 .map(|(uid, bin)| ferro_svid::AllowEntry {
-                    uid: *uid,
+                    uid: Some(*uid),
                     bin_sha: hex::encode(bin),
                 })
                 .collect();

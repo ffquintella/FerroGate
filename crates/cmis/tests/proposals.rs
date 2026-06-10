@@ -126,7 +126,7 @@ async fn setup(
 
 fn entry(uid: u32, byte: u8) -> AllowEntry {
     AllowEntry {
-        uid,
+        uid: Some(uid),
         bin_sha: hex::encode([byte; 48]),
     }
 }
@@ -214,7 +214,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
     svc.set_allowlist(tonic::Request::new(SetAllowlistRequest {
         host_uuid: host.clone(),
         entries: vec![AllowEntryMsg {
-            uid: 1,
+            uid: Some(1),
             bin_sha: hex::encode([0x01u8; 48]),
         }],
         ttl_secs: 3600,
@@ -243,7 +243,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
     assert_eq!(pending.items.len(), 1);
     assert_eq!(pending.items[0].host_uuid, host);
     assert_eq!(pending.items[0].entries.len(), 1);
-    assert_eq!(pending.items[0].entries[0].uid, 1000);
+    assert_eq!(pending.items[0].entries[0].uid, Some(1000));
 
     // The live allowlist is untouched while the proposal waits.
     let got = svc
@@ -254,7 +254,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
         .unwrap()
         .into_inner();
     let doc = allowlist::decode_body(&allowlist::decode(&got.signed_allowlist).unwrap().body).unwrap();
-    assert_eq!(doc.entries[0].uid, 1);
+    assert_eq!(doc.entries[0].uid, Some(1));
 
     // Rejecting drops it.
     let del = svc

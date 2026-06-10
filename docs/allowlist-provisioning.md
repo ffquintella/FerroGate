@@ -8,10 +8,15 @@ for, its security properties, and how to operate it.
 ## What it serves
 
 The MIA [helper API](helper-api.md) mints DPoP-bound child tokens only for
-callers on a **signed allowlist** — a list of `(uid, binary-SHA-384)` pairs that
-are permitted on this host. The allowlist is a CBOR document signed by CMIS;
-the MIA re-verifies the signature before trusting it and **fails closed** (denies
-every caller) on any error.
+callers on a **signed allowlist** — a list of entries keyed on the **binary's
+SHA-384**, each optionally pinned to a uid: an entry with a uid permits that
+binary run by that user, an entry without one (a *wildcard*) permits it run by
+*any* user. Wildcard entries are the restart-stable choice for callers with an
+ephemeral uid — systemd `DynamicUser=yes`, sandboxes — whose binary is constant
+but whose uid changes on every launch (see [ADR-0002](adr/0002-allowlist-optional-uid.md)).
+The allowlist is a CBOR document signed by CMIS; the MIA re-verifies the
+signature before trusting it and **fails closed** (denies every caller) on any
+error.
 
 Verification needs two files on the host:
 
@@ -23,7 +28,8 @@ Verification needs two files on the host:
 This workflow provisions the first one. The MIA verifies the allowlist with
 `allowlist.key` under the domain-separation context `ferrogate-allowlist-v1`,
 checks freshness (`issued_at`/`not_after` and the `max_age_secs` bound), then
-loads the `(uid, bin_sha)` members for O(1) caller checks.
+loads the members — keyed by binary hash, each carrying its uid rule (a specific
+uid, a set of uids, or "any") — for O(1) caller checks.
 
 ### The pieces
 
@@ -138,12 +144,16 @@ cert's SHA-384 (`--ek-sha384 <hex>`).
 
 ```console
 # Replace a host's allowlist with exactly these callers. `--bin` hashes the
-# binary for you; `--entry` takes a precomputed uid:SHA-384 pair.
+# binary for you; `--entry` takes a precomputed SHA-384. Prefix `uid:` to pin to
+# a user, or omit it for a wildcard (any user running that binary).
 $ ferrogate allowlist set --host <uuid> --bin 1000:/usr/bin/foo --ttl 86400
+$ ferrogate allowlist set --host <uuid> --bin /usr/bin/foo       # wildcard (any uid)
 
 # Add/remove callers in place (read-modify-write, re-signed by CMIS):
-$ ferrogate allowlist add    --host <uuid> --entry 1001:<sha384hex>
-$ ferrogate allowlist remove --host <uuid> --uid 1001
+$ ferrogate allowlist add    --host <uuid> --entry 1001:<sha384hex>  # pin to uid 1001
+$ ferrogate allowlist add    --host <uuid> --entry <sha384hex>       # wildcard
+$ ferrogate allowlist remove --host <uuid> --uid 1001               # drop uid-1001 pins
+$ ferrogate allowlist remove --host <uuid> --bin-sha <sha384hex>    # drop a binary (any scope)
 
 # Inspect:
 $ ferrogate allowlist show <…> --host <uuid>   # decoded entries + validity

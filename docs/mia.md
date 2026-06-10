@@ -230,7 +230,9 @@ workflow.
 **`allowlist.propose`** closes the bootstrap gap from the other direction. With
 it enabled the daemon periodically sends CMIS the local callers it has actually
 observed — every `(uid, binary SHA-384)` it authenticates, *granted or denied* —
-via the `ProposeAllowlist` RPC. The proposal is signed by the host machine key
+via the `ProposeAllowlist` RPC. Proposals carry the concrete observed uid; an
+operator may relax an approved entry to a wildcard (any user) where the uid is
+ephemeral — see [ADR-0002](adr/0002-allowlist-optional-uid.md). The proposal is signed by the host machine key
 and accompanied by the host SVID, so CMIS can prove which attested host sent it
 (there is no mTLS; the SVID is the in-band proof). What CMIS does with it is set
 by its `CMIS_ALLOWLIST_PROPOSALS` policy:
