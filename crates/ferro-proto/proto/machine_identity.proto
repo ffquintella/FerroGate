@@ -263,11 +263,12 @@ message GetEnrollmentKeyResponse {
 
 // One permitted caller: the lowercase-hex SHA-384 of its binary, optionally
 // pinned to a uid. An absent `uid` permits the binary run by any user (the
-// restart-stable mode for ephemeral-uid callers); see ADR-0002. Mirrors
+// restart-stable mode for ephemeral-uid callers); a `bin_sha` of "*" permits
+// any binary (the symmetric binary-side wildcard). See ADR-0002. Mirrors
 // `ferro_svid::allowlist::AllowEntry`.
 message AllowEntryMsg {
   optional uint32 uid = 1; // absent ⇒ any user (wildcard)
-  string bin_sha = 2; // lowercase hex SHA-384 (96 chars)
+  string bin_sha = 2; // lowercase hex SHA-384 (96 chars), or "*" ⇒ any binary (wildcard)
 }
 
 message GetAllowlistRequest {

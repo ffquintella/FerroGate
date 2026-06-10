@@ -53,7 +53,7 @@ pub(crate) fn usage() -> &'static str {
      \x20                  replace the host's allowlist with exactly these callers\n\
      \x20 add     <host> (--entry [uid:]sha | --bin [uid:]path)... [--ttl secs]\n\
      \x20                  add callers to the host's existing allowlist\n\
-     \x20 remove  <host> (--uid N | --bin-sha hex | --uid N --bin-sha hex) [--ttl secs]\n\
+     \x20 remove  <host> (--uid N | --bin-sha hex|* | --uid N --bin-sha hex|*) [--ttl secs]\n\
      \x20                  drop matching callers (a uid, a binary, or one pinned pair) and re-sign\n\
      \x20 get     <host> [--out path]   fetch the raw signed CBOR (stdout if no --out)\n\
      \x20 show    <host>                fetch and print the entries + validity\n\
@@ -69,11 +69,14 @@ pub(crate) fn usage() -> &'static str {
      \x20 --ek-cert <pem>     derive the UUID from an EK certificate PEM\n\
      \x20 --ek-sha384 <hex>   derive the UUID from the EK certificate's SHA-384\n\
      \n\
-     entries (omit the `uid:` prefix to permit the binary run by ANY user):\n\
+     entries (omit the `uid:` prefix to permit the binary run by ANY user; use\n\
+     a `<sha>` of `*` to permit ANY binary):\n\
      \x20 --entry <uid>:<sha>   pin to uid; lowercase-hex SHA-384 of the permitted binary\n\
-     \x20 --entry <sha>         wildcard: any user running this binary\n\
+     \x20 --entry <sha>         wildcard uid: any user running this binary\n\
+     \x20 --entry <uid>:*       wildcard binary: this uid running any binary\n\
+     \x20 --entry *             wildcard both: any user running any binary\n\
      \x20 --bin   <uid>:<path>  pin to uid; a binary whose SHA-384 the CLI computes\n\
-     \x20 --bin   <path>        wildcard: any user running this binary"
+     \x20 --bin   <path>        wildcard uid: any user running this binary"
 }
 
 /// Dispatch an `allowlist` subcommand.
@@ -613,9 +616,13 @@ fn fmt_uid(uid: Option<u32>) -> String {
     uid.map_or_else(|| "*".to_string(), |u| u.to_string())
 }
 
-/// Validate and normalize a lowercase-hex SHA-384 (96 hex chars ⇒ 48 bytes).
+/// Validate and normalize a `bin_sha`: the `"*"` any-binary wildcard, or a
+/// lowercase-hex SHA-384 (96 hex chars ⇒ 48 bytes).
 fn normalize_sha(s: impl AsRef<str>) -> anyhow::Result<String> {
     let s = s.as_ref().trim();
+    if s == allowlist::BIN_SHA_WILDCARD {
+        return Ok(allowlist::BIN_SHA_WILDCARD.to_string());
+    }
     let raw = hex::decode(s).map_err(|_| anyhow::anyhow!("bin_sha is not hex: `{s}`"))?;
     if raw.len() != 48 {
         anyhow::bail!("bin_sha must be 48 bytes (SHA-384), got {} bytes", raw.len());

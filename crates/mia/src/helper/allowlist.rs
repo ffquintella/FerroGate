@@ -19,7 +19,7 @@ use ferro_crypto::composite::CompositePublicKey;
 // (and tests) keep working unchanged.
 pub use ferro_svid::allowlist::{
     decode, encode, sign, AllowEntry, AllowlistDoc, AllowlistError, SignedAllowlist,
-    ALLOWLIST_SIGNING_CONTEXT,
+    ALLOWLIST_SIGNING_CONTEXT, BIN_SHA_WILDCARD,
 };
 
 /// How an allowlisted binary is gated on the caller's uid (ADR-0002).
@@ -37,11 +37,50 @@ enum UidScope {
 /// Keyed by binary hash: a caller is permitted when its hash is present and the
 /// hash's [`UidScope`] admits the caller's uid. `Any` wins if a hash appears as
 /// both a wildcard and a pinned entry.
+///
+/// `any_bin` captures the binary-side wildcard (`bin_sha = "*"`): when set, its
+/// [`UidScope`] admits a caller regardless of its binary hash. It is folded the
+/// same way as a per-hash scope, so `(uid = None, bin_sha = "*")` becomes
+/// `Any` (admit everyone) while `(uid = Some(n), bin_sha = "*")` admits uid `n`
+/// running any binary.
 #[derive(Debug, Clone)]
 pub struct Allowlist {
     trust_domain: String,
     not_after: i64,
     members: HashMap<[u8; 48], UidScope>,
+    any_bin: Option<UidScope>,
+}
+
+/// Widen `scope` to also admit `uid` (`None` is the wildcard, subsuming every
+/// uid). Shared by the per-hash and any-binary folds so both treat a later
+/// wildcard as subsuming earlier pins and accumulate distinct pinned uids.
+fn admit(scope: &mut UidScope, uid: Option<u32>) {
+    match (scope, uid) {
+        // A wildcard entry subsumes any uid pins for the same key.
+        (slot, None) => *slot = UidScope::Any,
+        // Once a key is wildcard, a later uid pin can't narrow it.
+        (UidScope::Any, Some(_)) => {}
+        (UidScope::Only(uids), Some(uid)) => {
+            uids.insert(uid);
+        }
+    }
+}
+
+/// Seed a fresh [`UidScope`] for the first entry seen for a key.
+fn seed(uid: Option<u32>) -> UidScope {
+    match uid {
+        None => UidScope::Any,
+        Some(uid) => UidScope::Only(HashSet::from([uid])),
+    }
+}
+
+/// Does `scope` admit `uid`?
+fn scope_admits(scope: Option<&UidScope>, uid: u32) -> bool {
+    match scope {
+        Some(UidScope::Any) => true,
+        Some(UidScope::Only(uids)) => uids.contains(&uid),
+        None => false,
+    }
 }
 
 impl Allowlist {
@@ -71,21 +110,23 @@ impl Allowlist {
         }
 
         let mut members: HashMap<[u8; 48], UidScope> = HashMap::with_capacity(doc.entries.len());
+        let mut any_bin: Option<UidScope> = None;
         for e in &doc.entries {
+            // A `bin_sha = "*"` entry permits any binary; fold it into the
+            // any-binary scope rather than a per-hash one.
+            if e.bin_is_wildcard() {
+                match &mut any_bin {
+                    Some(scope) => admit(scope, e.uid),
+                    None => any_bin = Some(seed(e.uid)),
+                }
+                continue;
+            }
             let raw = hex::decode(&e.bin_sha).map_err(|_| AllowlistError::MalformedEntry)?;
             let arr: [u8; 48] = raw.try_into().map_err(|_| AllowlistError::MalformedEntry)?;
-            match (members.get_mut(&arr), e.uid) {
-                // A wildcard entry subsumes any uid pins for the same hash.
-                (_, None) => {
-                    members.insert(arr, UidScope::Any);
-                }
-                // Once a hash is wildcard, a later uid pin can't narrow it.
-                (Some(UidScope::Any), Some(_)) => {}
-                (Some(UidScope::Only(uids)), Some(uid)) => {
-                    uids.insert(uid);
-                }
-                (None, Some(uid)) => {
-                    members.insert(arr, UidScope::Only(HashSet::from([uid])));
+            match members.get_mut(&arr) {
+                Some(scope) => admit(scope, e.uid),
+                None => {
+                    members.insert(arr, seed(e.uid));
                 }
             }
         }
@@ -94,18 +135,16 @@ impl Allowlist {
             trust_domain: doc.trust_domain,
             not_after: doc.not_after,
             members,
+            any_bin,
         })
     }
 
-    /// Is the caller `(uid, bin_sha)` permitted? The binary hash must be listed,
-    /// and the entry must either be a wildcard (any user) or pin this `uid`.
+    /// Is the caller `(uid, bin_sha)` permitted? A binary-side wildcard
+    /// (`any_bin`) admits the caller regardless of its hash; otherwise the
+    /// binary hash must be listed and its [`UidScope`] must admit this `uid`.
     #[must_use]
     pub fn permits(&self, uid: u32, bin_sha: &[u8; 48]) -> bool {
-        match self.members.get(bin_sha) {
-            Some(UidScope::Any) => true,
-            Some(UidScope::Only(uids)) => uids.contains(&uid),
-            None => false,
-        }
+        scope_admits(self.any_bin.as_ref(), uid) || scope_admits(self.members.get(bin_sha), uid)
     }
 
     /// The trust domain the allowlist was issued for.
@@ -275,6 +314,62 @@ mod tests {
         assert!(al.permits(7, &[0xBB; 48]));
         assert!(al.permits(8, &[0xBB; 48]));
         assert!(!al.permits(9, &[0xBB; 48])); // not a pinned uid for BB
+    }
+
+    /// A `bin_sha = "*"` entry pinned to a uid permits that uid running ANY
+    /// binary, but no other uid.
+    #[test]
+    fn bin_wildcard_pinned_to_uid_permits_any_binary_for_that_uid() {
+        let (sk, pk) = keypair();
+        let mut d = doc(1000);
+        d.entries = vec![AllowEntry {
+            uid: Some(1001),
+            bin_sha: BIN_SHA_WILDCARD.to_string(),
+        }];
+        let al = Allowlist::load(&signed_bytes(&d, &sk), &pk, 1000, 86_400).unwrap();
+        assert!(al.permits(1001, &[0xAA; 48]));
+        assert!(al.permits(1001, &[0xBB; 48])); // any binary for uid 1001
+        assert!(!al.permits(2002, &[0xAA; 48])); // but not another uid
+    }
+
+    /// A fully-open entry (`uid = None, bin_sha = "*"`) permits any binary under
+    /// any uid.
+    #[test]
+    fn full_wildcard_permits_everyone() {
+        let (sk, pk) = keypair();
+        let mut d = doc(1000);
+        d.entries = vec![AllowEntry {
+            uid: None,
+            bin_sha: BIN_SHA_WILDCARD.to_string(),
+        }];
+        let al = Allowlist::load(&signed_bytes(&d, &sk), &pk, 1000, 86_400).unwrap();
+        assert!(al.permits(0, &[0x00; 48]));
+        assert!(al.permits(4242, &[0xFF; 48]));
+    }
+
+    /// A binary-side wildcard coexists with hash-pinned entries: the wildcard's
+    /// uids plus any hash-specific uids both match.
+    #[test]
+    fn bin_wildcard_coexists_with_pinned_hashes() {
+        let (sk, pk) = keypair();
+        let mut d = doc(1000);
+        d.entries = vec![
+            // uid 7 may run anything.
+            AllowEntry {
+                uid: Some(7),
+                bin_sha: BIN_SHA_WILDCARD.to_string(),
+            },
+            // uid 9 may run only binary AA.
+            AllowEntry {
+                uid: Some(9),
+                bin_sha: hex::encode([0xAA; 48]),
+            },
+        ];
+        let al = Allowlist::load(&signed_bytes(&d, &sk), &pk, 1000, 86_400).unwrap();
+        assert!(al.permits(7, &[0xCC; 48])); // wildcard uid, any binary
+        assert!(al.permits(9, &[0xAA; 48])); // pinned uid+hash
+        assert!(!al.permits(9, &[0xBB; 48])); // uid 9 not wildcard
+        assert!(!al.permits(8, &[0xAA; 48])); // uid 8 listed nowhere
     }
 
     #[test]

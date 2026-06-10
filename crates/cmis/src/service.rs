@@ -96,6 +96,20 @@ fn parse_cert_sha(s: &str) -> Result<[u8; 48], Status> {
     Ok(arr)
 }
 
+/// Validate an allowlist entry's `bin_sha`: either the [`BIN_SHA_WILDCARD`]
+/// (`"*"`, any binary) or a lowercase-hex `SHA-384`. Rejected here so a
+/// malformed list never reaches the signer (and the MIA later rejects nothing
+/// it could have caught here).
+#[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
+fn validate_bin_sha(s: &str) -> Result<(), Status> {
+    if s.trim() == ferro_svid::allowlist::BIN_SHA_WILDCARD {
+        return Ok(());
+    }
+    parse_cert_sha(s)
+        .map(|_| ())
+        .map_err(|_| Status::invalid_argument("entry bin_sha must be hex SHA-384 or \"*\""))
+}
+
 /// Normalise the operator-supplied revocation reason to a bounded opcode so the
 /// CRL and audit log never carry unbounded free-text. An empty reason becomes
 /// the catch-all `"unspecified"`.
@@ -746,10 +760,9 @@ impl MachineIdentity for MachineIdentitySvc {
         // signer (and the MIA later rejects nothing it could have caught here).
         let mut entries = Vec::with_capacity(req.entries.len());
         for e in &req.entries {
-            // Reuse the 96-hex-char SHA-384 check; the MIA decodes `bin_sha`
-            // exactly the same way.
-            parse_cert_sha(&e.bin_sha)
-                .map_err(|_| Status::invalid_argument("entry bin_sha must be hex SHA-384"))?;
+            // The MIA decodes `bin_sha` exactly the same way (hex SHA-384, or
+            // the `"*"` any-binary wildcard).
+            validate_bin_sha(&e.bin_sha)?;
             entries.push(ferro_svid::AllowEntry {
                 uid: e.uid,
                 bin_sha: e.bin_sha.trim().to_string(),
@@ -894,8 +907,7 @@ impl MachineIdentity for MachineIdentitySvc {
         // Validate entries exactly as `set_allowlist` does.
         let mut entries = Vec::with_capacity(proposal.entries.len());
         for e in &proposal.entries {
-            parse_cert_sha(&e.bin_sha)
-                .map_err(|_| Status::invalid_argument("entry bin_sha must be hex SHA-384"))?;
+            validate_bin_sha(&e.bin_sha)?;
             entries.push(ferro_svid::AllowEntry {
                 uid: e.uid,
                 bin_sha: e.bin_sha.trim().to_string(),
@@ -1277,7 +1289,21 @@ fn to_proto_sth(sth: &ferro_audit::SignedTreeHead) -> Result<SignedTreeHead, Sta
 
 #[cfg(test)]
 mod tests {
-    use super::display_hostname;
+    use super::{display_hostname, validate_bin_sha};
+
+    #[test]
+    fn validate_bin_sha_accepts_hex_and_wildcard_rejects_garbage() {
+        // A real lowercase-hex SHA-384.
+        assert!(validate_bin_sha(&"a".repeat(96)).is_ok());
+        // The any-binary wildcard, with surrounding whitespace tolerated.
+        assert!(validate_bin_sha("*").is_ok());
+        assert!(validate_bin_sha("  *  ").is_ok());
+        // Neither hex nor the wildcard.
+        assert!(validate_bin_sha("not-hex").is_err());
+        assert!(validate_bin_sha("**").is_err());
+        // Right alphabet, wrong length.
+        assert!(validate_bin_sha("abcd").is_err());
+    }
 
     #[test]
     fn hostname_passes_through_clean_values() {

@@ -24,7 +24,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.18.5"
+version      = "0.18.7"
 edition      = "2021"
 rust-version = "1.88"
 license      = "Apache-2.0"
@@ -52,7 +52,7 @@ tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "io-
 
 # tracing
 tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 tracing-appender   = "0.2"
 file-rotate        = "0.7"
 

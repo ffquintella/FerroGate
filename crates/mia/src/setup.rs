@@ -524,6 +524,34 @@ pub(crate) fn restart_hint() -> &'static str {
     "restart the mia service"
 }
 
+/// The argv that signals the running agent to reload its allowlist (SIGHUP)
+/// without restarting it, so the helper socket never goes down. `None` on
+/// platforms with no signal-reload path (Windows: no SIGHUP). The daemon must
+/// be a build that handles SIGHUP — older builds treat it as terminate and the
+/// supervisor simply restarts them (a degraded but safe fallback).
+#[cfg(target_os = "linux")]
+pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
+    Some(&["systemctl", "kill", "-s", "HUP", "mia"])
+}
+
+/// The reload command (macOS launchd).
+#[cfg(target_os = "macos")]
+pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
+    Some(&["launchctl", "kill", "HUP", "system/com.ferrogate.mia"])
+}
+
+/// The reload command (Windows — no SIGHUP, so none).
+#[cfg(windows)]
+pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
+    None
+}
+
+/// The reload command (other platforms).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
+    None
+}
+
 /// An octal-mode validator (e.g. `660`, `0o640`).
 fn octal_validator(input: &str) -> Result<Validation, inquire::CustomUserError> {
     let t = input.trim().trim_start_matches("0o");

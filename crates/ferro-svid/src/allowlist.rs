@@ -27,12 +27,23 @@ pub const ALLOWLIST_SIGNING_CONTEXT: &[u8] = b"ferrogate-allowlist-v1";
 /// enrollment key (and vice versa).
 pub const PROPOSAL_SIGNING_CONTEXT: &[u8] = b"ferrogate-allowlist-proposal-v1";
 
-/// One permitted caller: the IMA hash of its binary (hex), optionally pinned to
-/// a uid.
+/// The `bin_sha` sentinel that matches **any** binary (the binary-side wildcard,
+/// mirroring `uid = None` on the user side). A single `"*"` can never collide
+/// with a real entry — a valid `bin_sha` is 96 lowercase-hex chars — so it is an
+/// unambiguous marker and the signed wire shape stays a plain string.
+pub const BIN_SHA_WILDCARD: &str = "*";
+
+/// One permitted caller: the IMA hash of its binary (hex), optionally relaxed to
+/// any binary, and optionally pinned to a uid.
 ///
 /// `uid = None` permits the binary run by **any** user — the restart-stable mode
 /// for callers with an ephemeral uid (systemd `DynamicUser`, sandboxes). `uid =
 /// Some(n)` additionally pins the entry to uid `n`. See ADR-0002.
+///
+/// `bin_sha = "*"` ([`BIN_SHA_WILDCARD`]) is the symmetric binary-side wildcard:
+/// it permits **any** binary, so `(uid = Some(n), bin_sha = "*")` admits any
+/// program run by uid `n`, and `(uid = None, bin_sha = "*")` admits any program
+/// run by any user. Any other `bin_sha` pins the exact 48-byte hash.
 ///
 /// On the wire (`ciborium`), `Some(n)` encodes as the bare integer `n` — exactly
 /// as the historical `u32` field did — so pinned entries stay byte-identical and
@@ -43,8 +54,17 @@ pub struct AllowEntry {
     /// Permitted user id, or `None` to permit the binary run by any user.
     #[serde(default)]
     pub uid: Option<u32>,
-    /// Lowercase hex `SHA-384` of the permitted binary.
+    /// Lowercase hex `SHA-384` of the permitted binary, or [`BIN_SHA_WILDCARD`]
+    /// (`"*"`) to permit any binary.
     pub bin_sha: String,
+}
+
+impl AllowEntry {
+    /// Does this entry permit **any** binary (`bin_sha == "*"`)?
+    #[must_use]
+    pub fn bin_is_wildcard(&self) -> bool {
+        self.bin_sha == BIN_SHA_WILDCARD
+    }
 }
 
 /// The signed body: who may call, under which trust domain, and how long the
@@ -275,6 +295,28 @@ mod tests {
         ciborium::into_writer(&OnlySha { bin_sha: sha }, &mut buf).unwrap();
         let back: AllowEntry = ciborium::from_reader(&buf[..]).unwrap();
         assert_eq!(back.uid, None);
+    }
+
+    /// A binary-side wildcard (`bin_sha = "*"`) round-trips and is recognised by
+    /// [`AllowEntry::bin_is_wildcard`], while a real hash is not.
+    #[test]
+    fn bin_wildcard_roundtrips_and_is_recognised() {
+        let wild = AllowEntry {
+            uid: Some(1001),
+            bin_sha: BIN_SHA_WILDCARD.to_string(),
+        };
+        assert!(wild.bin_is_wildcard());
+        let mut buf = Vec::new();
+        ciborium::into_writer(&wild, &mut buf).unwrap();
+        let back: AllowEntry = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(back, wild);
+        assert!(back.bin_is_wildcard());
+
+        let pinned = AllowEntry {
+            uid: None,
+            bin_sha: hex::encode([0xAA; 48]),
+        };
+        assert!(!pinned.bin_is_wildcard());
     }
 
     #[test]

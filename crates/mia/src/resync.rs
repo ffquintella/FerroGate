@@ -13,9 +13,11 @@
 //!   was redeployed with a new issuer key and the pinned key no longer verifies.
 //!
 //! The two compose: after a CMIS redeploy, `refresh-key` then `resync-allowlist`
-//! re-establishes both halves of the allowlist trust chain. The running daemon
-//! reads both files only at startup, so a restart is required for either to take
-//! effect; the commands print the platform restart hint.
+//! re-establishes both halves of the allowlist trust chain. The daemon reads the
+//! enrollment key only at startup (so `refresh-key` needs a restart), but
+//! `resync-allowlist --reload` signals the running daemon (SIGHUP) to swap in
+//! the new allowlist live — no restart, no helper-socket downtime. Without
+//! `--reload`, the command prints the platform restart hint.
 //!
 //! Like `mia setup`/`mia test`, these are client commands: no hardening profile,
 //! no TPM, plain terminal output (no tracing).
@@ -29,19 +31,82 @@ use ferro_crypto::pin::SpkiPin;
 
 use crate::config::Config;
 
-const USAGE_RESYNC: &str = "usage: mia resync-allowlist [--config <path>]";
+const USAGE_RESYNC: &str = "usage: mia resync-allowlist [--config <path>] [--reload]";
 const USAGE_REFRESH: &str = "usage: mia refresh-key [--config <path>]";
+const USAGE_RELOAD: &str = "usage: mia --reload";
+
+/// Run the top-level `mia --reload` command: signal the running agent (SIGHUP)
+/// to re-read its configuration and signed allowlist live, without a restart, so
+/// the helper socket never goes down. Unlike `resync-allowlist --reload`, this
+/// fetches nothing — it only signals — so it is the right tool after editing the
+/// local config file or dropping a new allowlist body in place by other means.
+pub fn run_reload(args: &[String]) -> anyhow::Result<()> {
+    if let Some(arg) = args.first() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help_reload();
+                return Ok(());
+            }
+            other => anyhow::bail!("unknown argument: {other}\n\n{USAGE_RELOAD}"),
+        }
+    }
+    let Some(cmd) = crate::setup::reload_command() else {
+        anyhow::bail!(
+            "--reload is not supported on this platform (no SIGHUP); restart the agent instead:  {}",
+            crate::setup::restart_hint()
+        );
+    };
+    println!(
+        "Signaling the running agent to reload its configuration and allowlist (SIGHUP via {}) …",
+        cmd[0]
+    );
+    let status = std::process::Command::new(cmd[0])
+        .args(&cmd[1..])
+        .status()
+        .with_context(|| format!("running `{}`", cmd[0]))?;
+    if status.success() {
+        println!(
+            "✓ done — the agent re-read its configuration and signed allowlist live; the helper \
+             socket stayed up."
+        );
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "reload command exited with {}; is mia running as a managed service? Otherwise restart \
+             it to load changes:  {}",
+            status
+                .code()
+                .map_or_else(|| "a signal".to_string(), |c| c.to_string()),
+            crate::setup::restart_hint()
+        )
+    }
+}
 
 /// Run the `mia resync-allowlist` subcommand. `args` is everything after
 /// `resync-allowlist` on the command line.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
-    let Some(config) = load(args, USAGE_RESYNC, print_help_resync, "allowlist resync")? else {
+    // `--reload` is resync-only, so strip it before the shared option parser
+    // (which rejects unknown flags) sees the rest.
+    let mut reload = false;
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|a| {
+            if a.as_str() == "--reload" {
+                reload = true;
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+    let Some(config) = load(&rest, USAGE_RESYNC, print_help_resync, "allowlist resync")? else {
         return Ok(()); // --help printed
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(resync(&config))
+    runtime.block_on(resync(&config, reload))
 }
 
 /// Run the `mia refresh-key` subcommand. `args` is everything after
@@ -87,8 +152,9 @@ fn load(
     Ok(Some(config))
 }
 
-/// Fetch the signed allowlist from CMIS, write it, and verify it.
-async fn resync(config: &Config) -> anyhow::Result<()> {
+/// Fetch the signed allowlist from CMIS, write it, and verify it. When `reload`
+/// is set, signal the running agent to swap in the new body live (no restart).
+async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
     let path = config
         .allowlist
         .path
@@ -143,8 +209,44 @@ async fn resync(config: &Config) -> anyhow::Result<()> {
         ),
     }
 
-    println!("\nRestart the agent to load it:  {}", crate::setup::restart_hint());
+    if reload {
+        signal_reload();
+    } else {
+        println!(
+            "\nLoad it live (no restart, keeps the helper socket up):  mia resync-allowlist --reload"
+        );
+        println!("  or restart the agent:  {}", crate::setup::restart_hint());
+    }
     Ok(())
+}
+
+/// Signal the running agent to reload the freshly written allowlist via SIGHUP,
+/// printing the outcome. Falls back to the manual restart hint when the signal
+/// can't be sent (no signal-reload path on this platform, or the service
+/// manager command fails — e.g. the agent isn't running as a managed service).
+fn signal_reload() {
+    let Some(cmd) = crate::setup::reload_command() else {
+        println!(
+            "\n--reload is not supported on this platform; restart the agent to load it:  {}",
+            crate::setup::restart_hint()
+        );
+        return;
+    };
+    print!("\nSignaling the running agent to reload (SIGHUP via {}) … ", cmd[0]);
+    match std::process::Command::new(cmd[0]).args(&cmd[1..]).status() {
+        Ok(status) if status.success() => {
+            println!("done.");
+            println!("  The new allowlist is now live — no restart, the helper socket stayed up.");
+        }
+        Ok(status) => {
+            println!("failed (exit {}).", status.code().map_or_else(|| "signal".to_string(), |c| c.to_string()));
+            println!("  Load it with a restart instead:  {}", crate::setup::restart_hint());
+        }
+        Err(e) => {
+            println!("could not run `{}` ({e}).", cmd[0]);
+            println!("  Load it with a restart instead:  {}", crate::setup::restart_hint());
+        }
+    }
 }
 
 /// Fetch the CMIS enrollment key and write it to `allowlist.key`, then report
@@ -272,13 +374,41 @@ fn print_help_resync() {
          \n\
          Fetches the allowlist CMIS holds for this host (keyed by its hardware\n\
          fingerprint), writes it to allowlist.path, and verifies it against the\n\
-         pinned enrollment key (allowlist.key). The daemon reads the allowlist only\n\
-         at startup, so restart it afterwards to load the refreshed body.\n\
+         pinned enrollment key (allowlist.key).\n\
+         \n\
+         With --reload, the running agent is signalled (SIGHUP) to swap in the\n\
+         new body immediately — no restart, so the helper socket never drops.\n\
+         Without it, restart the agent to load the refreshed body.\n\
          \n\
          options:\n\
          \x20 -c, --config <path>   TOML config file (default: the system config;\n\
          \x20                       environment variables override it)\n\
+         \x20     --reload          signal the running agent to reload the allowlist\n\
+         \x20                       live (SIGHUP) instead of requiring a restart\n\
          \x20 -h, --help            show this help"
+    );
+}
+
+fn print_help_reload() {
+    println!(
+        "mia --reload — signal the running agent to reload its config and allowlist\n\
+         \n\
+         {USAGE_RELOAD}\n\
+         \n\
+         Sends SIGHUP to the running agent (via the service manager) so it re-reads\n\
+         its configuration file and signed caller allowlist and swaps them in live —\n\
+         no restart, so the helper socket never drops. Use it after editing the local\n\
+         config or replacing the allowlist body on disk. To also re-fetch the body\n\
+         from CMIS first, use `mia resync-allowlist --reload` instead.\n\
+         \n\
+         The live reload covers the log verbosity (`log`) and the allowlist\n\
+         (`allowlist.path`/`key`/`max_age_secs`). Other settings — the helper socket,\n\
+         the CMIS endpoint, attestation inputs — take effect only on a restart.\n\
+         \n\
+         Not supported on Windows (no SIGHUP); restart the service there.\n\
+         \n\
+         options:\n\
+         \x20 -h, --help   show this help"
     );
 }
 

@@ -10,6 +10,44 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **Any-binary allowlist wildcard (`bin_sha = "*"`).** Allowlist entries now
+  support a binary-side wildcard symmetric to the existing uid wildcard: a
+  `bin_sha` of `"*"` permits **any** binary, so `(uid 1000, "*")` admits any
+  program run by uid 1000 and `(any uid, "*")` admits any program run by any
+  user. CMIS validates and signs `"*"` entries (`SetAllowlist` and host
+  proposals), the MIA folds them into an any-binary scope it checks alongside
+  the per-hash entries (a wildcard subsumes uid pins exactly as before), and
+  the CLI accepts `--entry <uid>:*`, `--entry *`, and `--bin-sha *` (for
+  `remove`). Existing hash-pinned entries and their signatures are unchanged —
+  `"*"` can never collide with a 96-hex-char hash, so the signed wire shape
+  stays a plain string. See [docs/allowlist-provisioning.md](docs/allowlist-provisioning.md)
+  and [ADR-0002](docs/adr/0002-allowlist-optional-uid.md).
+
+- **`mia --reload` — signal a live config + allowlist reload.** A top-level
+  management flag that sends `SIGHUP` to the running agent (via the service
+  manager) so it re-reads its configuration file and signed allowlist and swaps
+  them in without a restart — the helper socket never drops. The daemon's
+  `SIGHUP` handler now reloads the configuration (not just the allowlist): it
+  re-applies the `log` verbosity directive live and re-loads the allowlist from
+  the possibly-changed `allowlist.path`/`key`/`max_age_secs`. Settings that pin
+  process-wide state at startup — the helper socket, the CMIS endpoint,
+  attestation inputs, the hardening profile — still require a restart. Unlike
+  `mia resync-allowlist --reload`, `mia --reload` fetches nothing; it only
+  signals, so it is the right tool after editing the local config or replacing
+  the allowlist body on disk. Not supported on Windows (no `SIGHUP`).
+
+- **Live allowlist reload on `SIGHUP` (`mia resync-allowlist --reload`).** The
+  agent now re-reads and swaps in its signed caller allowlist on `SIGHUP`
+  without restarting, so a re-sync no longer tears down the helper socket (the
+  restart window that surfaced as a transient `ECONNREFUSED` in `mia test`).
+  `resync-allowlist` gains an opt-in `--reload` flag that signals the running
+  service (`launchctl kill HUP …` on macOS, `systemctl kill -s HUP mia` on
+  Linux) after writing and verifying the new body; without it the command
+  still prints the restart hint. Reload mirrors startup's fail-closed
+  semantics — a missing or non-verifying body swaps in deny-all, an
+  unexpected I/O error keeps the current allowlist — and Windows (no SIGHUP)
+  continues to require a restart.
+
 - **Hostname shown in `ferrogate list-svids`.** mia now reports the host's OS
   hostname in `AttestInit` as a display-only label; CMIS sanitises it
   (printable ASCII, 64-char cap), stores it on the issued record, and the CLI

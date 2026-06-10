@@ -10,10 +10,17 @@ for, its security properties, and how to operate it.
 The MIA [helper API](helper-api.md) mints DPoP-bound child tokens only for
 callers on a **signed allowlist** — a list of entries keyed on the **binary's
 SHA-384**, each optionally pinned to a uid: an entry with a uid permits that
-binary run by that user, an entry without one (a *wildcard*) permits it run by
-*any* user. Wildcard entries are the restart-stable choice for callers with an
-ephemeral uid — systemd `DynamicUser=yes`, sandboxes — whose binary is constant
-but whose uid changes on every launch (see [ADR-0002](adr/0002-allowlist-optional-uid.md)).
+binary run by that user, an entry without one (a *uid wildcard*) permits it run
+by *any* user. Wildcard entries are the restart-stable choice for callers with
+an ephemeral uid — systemd `DynamicUser=yes`, sandboxes — whose binary is
+constant but whose uid changes on every launch (see [ADR-0002](adr/0002-allowlist-optional-uid.md)).
+
+The binary hash supports a symmetric **wildcard** too: a `bin_sha` of `"*"`
+permits **any** binary. The two wildcards combine — `(uid 1000, bin_sha "*")`
+admits any program run by uid 1000, and `(any uid, bin_sha "*")` admits any
+program run by any user. The any-binary wildcard is a coarse, high-trust grant
+(it removes the per-binary measurement check); prefer hash-pinned entries and
+reach for `"*"` only for a tightly-scoped uid, or a host you fully trust.
 The allowlist is a CBOR document signed by CMIS; the MIA re-verifies the
 signature before trusting it and **fails closed** (denies every caller) on any
 error.
@@ -144,16 +151,19 @@ cert's SHA-384 (`--ek-sha384 <hex>`).
 
 ```console
 # Replace a host's allowlist with exactly these callers. `--bin` hashes the
-# binary for you; `--entry` takes a precomputed SHA-384. Prefix `uid:` to pin to
-# a user, or omit it for a wildcard (any user running that binary).
+# binary for you; `--entry` takes a precomputed SHA-384 (or `*` for any binary).
+# Prefix `uid:` to pin to a user, or omit it for a wildcard (any user).
 $ ferrogate allowlist set --host <uuid> --bin 1000:/usr/bin/foo --ttl 86400
-$ ferrogate allowlist set --host <uuid> --bin /usr/bin/foo       # wildcard (any uid)
+$ ferrogate allowlist set --host <uuid> --bin /usr/bin/foo       # uid wildcard (any uid)
+$ ferrogate allowlist set --host <uuid> --entry 1000:'*'         # any binary run by uid 1000
+$ ferrogate allowlist set --host <uuid> --entry '*'              # any binary, any uid
 
 # Add/remove callers in place (read-modify-write, re-signed by CMIS):
 $ ferrogate allowlist add    --host <uuid> --entry 1001:<sha384hex>  # pin to uid 1001
-$ ferrogate allowlist add    --host <uuid> --entry <sha384hex>       # wildcard
+$ ferrogate allowlist add    --host <uuid> --entry <sha384hex>       # uid wildcard
 $ ferrogate allowlist remove --host <uuid> --uid 1001               # drop uid-1001 pins
 $ ferrogate allowlist remove --host <uuid> --bin-sha <sha384hex>    # drop a binary (any scope)
+$ ferrogate allowlist remove --host <uuid> --bin-sha '*'            # drop any-binary wildcards
 
 # Inspect:
 $ ferrogate allowlist show <…> --host <uuid>   # decoded entries + validity
@@ -190,6 +200,13 @@ configuration-management channel and point the TOML/`FERROGATE_*` config at them
 refresh-key`** to fetch `allowlist.key` and **`mia resync-allowlist`** to fetch
 the signed body, then restart. Both are TTY-free and exit non-zero on failure,
 so they gate cleanly in provisioning scripts.
+
+When only the allowlist body changed (not the enrollment key), pass **`mia
+resync-allowlist --reload`**: after writing and verifying the new body it
+signals the running agent (`SIGHUP`) to swap it in live, so the helper socket
+never goes down — no restart needed. (Windows has no `SIGHUP`; restart there.
+`refresh-key` still needs a restart, since the daemon reads the key only at
+startup.)
 
 ## Troubleshooting
 

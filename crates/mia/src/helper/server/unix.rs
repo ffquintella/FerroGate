@@ -7,7 +7,7 @@ use ferro_audit::AuditEvent;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Semaphore};
 
-use super::{serve_connection, Clock, HelperServerConfig, ServerError, Shared};
+use super::{serve_connection, AllowlistReloader, Clock, HelperServerConfig, ServerError, Shared};
 use crate::helper::allowlist::Allowlist;
 use crate::helper::auth::{AuthError, CallerAuth, PeerCred};
 use crate::helper::crl::CrlCache;
@@ -89,6 +89,15 @@ impl<A: CallerAuth> HelperServer<A> {
     /// Replace the live allowlist (e.g. after a signed refresh from CMIS).
     pub async fn set_allowlist(&self, allowlist: Option<Allowlist>) {
         self.shared.set_allowlist(allowlist).await;
+    }
+
+    /// A clonable handle to swap the live allowlist after serving has started
+    /// (used by the SIGHUP reload task).
+    #[must_use]
+    pub fn allowlist_reloader(&self) -> AllowlistReloader<A> {
+        AllowlistReloader {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// A handle to the observed-caller ledger, for the allowlist-propose task.

@@ -128,6 +128,33 @@ impl<A: CallerAuth> Shared<A> {
     }
 }
 
+/// A cheap, clonable handle that swaps the live allowlist while the server is
+/// already serving — held by the daemon's SIGHUP reload task so a signed
+/// re-sync takes effect without tearing down the helper socket. Obtained via
+/// `HelperServer::allowlist_reloader` before `serve_with_shutdown` consumes the
+/// server.
+pub struct AllowlistReloader<A: CallerAuth> {
+    shared: Arc<Shared<A>>,
+}
+
+// Derived `Clone` would demand `A: Clone`, which the handle does not need —
+// it only ever clones the `Arc`.
+impl<A: CallerAuth> Clone for AllowlistReloader<A> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<A: CallerAuth> AllowlistReloader<A> {
+    /// Swap the live allowlist. `None` puts the server in deny-all mode (fail
+    /// closed), matching startup semantics.
+    pub async fn set(&self, allowlist: Option<Allowlist>) {
+        self.shared.set_allowlist(allowlist).await;
+    }
+}
+
 /// Drive one already-accepted connection through the request/response exchange.
 ///
 /// `cred` is the caller's `SO_PEERCRED` / named-pipe credentials, read cheaply

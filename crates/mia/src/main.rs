@@ -44,7 +44,15 @@
 
 #![forbid(unsafe_code)]
 
-use tracing_subscriber::EnvFilter;
+use std::sync::Arc;
+
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, reload, EnvFilter};
+
+/// A type-erased handle that swaps the live tracing filter, so a SIGHUP reload
+/// can apply a changed `log` directive without a restart. Hides the concrete
+/// `reload::Handle` type so it threads cleanly through the serve path.
+type LogReload = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn main() -> anyhow::Result<()> {
     // Subcommand dispatch. `mia` with no subcommand is the daemon (the systemd
@@ -57,6 +65,9 @@ fn main() -> anyhow::Result<()> {
         Some("setup") => return mia::setup::run(&args[1..]),
         Some("resync-allowlist") => return mia::resync::run(&args[1..]),
         Some("refresh-key") => return mia::resync::run_refresh_key(&args[1..]),
+        // `--reload` is a management flag, not a daemon option: it signals the
+        // running agent (SIGHUP) to re-read its config + allowlist, then exits.
+        Some("--reload") => return mia::resync::run_reload(&args[1..]),
         Some("test") => return mia::selftest::run(&args[1..]),
         Some("-h" | "--help") => {
             print_usage();
@@ -79,9 +90,25 @@ fn main() -> anyhow::Result<()> {
     let config_path = parse_config_flag(&args)?;
     let (config, source) = mia::config::Config::load(config_path.as_deref())?;
 
+    // A reloadable filter layer: SIGHUP re-reads the config and applies a
+    // changed `log` directive live (see `spawn_reload_task`).
     let filter =
         EnvFilter::try_new(config.log_directive()).unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let (filter_layer, filter_handle) = reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt::layer())
+        .init();
+    let log_reload: LogReload = Arc::new(move |directive: &str| {
+        match EnvFilter::try_new(directive) {
+            Ok(f) => {
+                let _ = filter_handle.reload(f);
+            }
+            Err(e) => {
+                tracing::warn!(directive, error = %e, "ignoring invalid log directive on reload");
+            }
+        }
+    });
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -110,7 +137,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run(config))
+    runtime.block_on(run(config, config_path, log_reload))
 }
 
 /// Parse the daemon's `--config`/`-c <path>` flag from `args`. Returns the
@@ -150,6 +177,8 @@ fn print_usage() {
          options:\n\
          \x20 -c, --config <path>   TOML config file (default {}, then\n\
          \x20                       $FERROGATE_CONFIG; environment variables override it)\n\
+         \x20     --reload          signal the running agent to reload its config and\n\
+         \x20                       allowlist live (SIGHUP), then exit\n\
          \x20 -h, --help            show this help\n\
          \x20 -V, --version         print the version\n\
          \n\
@@ -164,7 +193,11 @@ fn print_usage() {
 // The serve path holds a composite key (~4 KB ML-DSA) across awaits during
 // attestation; the large future is inherent, not a bug.
 #[allow(clippy::large_futures)]
-async fn run(config: mia::config::Config) -> anyhow::Result<()> {
+async fn run(
+    config: mia::config::Config,
+    config_path: Option<std::path::PathBuf>,
+    log_reload: LogReload,
+) -> anyhow::Result<()> {
     if config.helper_socket().is_none() {
         println!(
             "mia v{} — daemon idle; set a helper socket (helper.socket / \
@@ -173,7 +206,7 @@ async fn run(config: mia::config::Config) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    start_helper_api(&config).await
+    start_helper_api(&config, config_path, log_reload).await
 }
 
 /// Build the platform's caller authenticator (Linux: SO_PEERCRED + IMA).
@@ -205,13 +238,17 @@ fn build_auth(_config: &mia::config::Config) -> mia::helper::auth::WindowsCaller
 /// on Windows).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[allow(clippy::large_futures)] // attestation future holds a composite key
-async fn start_helper_api(config: &mia::config::Config) -> anyhow::Result<()> {
+async fn start_helper_api(
+    config: &mia::config::Config,
+    config_path: Option<std::path::PathBuf>,
+    log_reload: LogReload,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let socket_path = config
         .helper_socket()
         .context("internal: start_helper_api called without a helper socket")?
         .to_path_buf();
-    serve(config, socket_path, build_auth(config)).await
+    serve(config, socket_path, build_auth(config), config_path, log_reload).await
 }
 
 /// Resolve where the persistent machine signing key lives — beside the system
@@ -619,6 +656,8 @@ async fn serve<A>(
     config: &mia::config::Config,
     socket_path: std::path::PathBuf,
     auth: A,
+    config_path: Option<std::path::PathBuf>,
+    log_reload: LogReload,
 ) -> anyhow::Result<()>
 where
     A: mia::helper::auth::CallerAuth,
@@ -690,8 +729,27 @@ where
     // the puller's first verified pull (within seconds of startup) opens it.
     let crl = Arc::new(CrlCache::new());
     maybe_spawn_crl_puller(config, Arc::clone(&crl));
-    let server = HelperServer::bind(helper_config, auth, minter, allowlist, crl, audit_tx, clock)?;
+    let server = HelperServer::bind(
+        helper_config,
+        auth,
+        minter,
+        allowlist,
+        crl,
+        audit_tx,
+        Arc::clone(&clock),
+    )?;
     tracing::info!(listener = %socket_path.display(), "helper API listening");
+
+    // Live config + allowlist reload on SIGHUP: `mia --reload` /
+    // `mia resync-allowlist --reload` (or a manual `kill -HUP`) re-reads the
+    // configuration file and signed allowlist and swaps them in without a
+    // restart, so the helper socket never goes down. Spawned unconditionally so
+    // a reload can pick up a newly-added allowlist or a changed log directive;
+    // reload mirrors startup's fail-closed semantics.
+    #[cfg(unix)]
+    spawn_reload_task(server.allowlist_reloader(), config_path, log_reload, clock);
+    #[cfg(not(unix))]
+    let _ = (&config_path, &log_reload, &clock);
 
     // Optionally propose the callers the helper API observes back to CMIS, so a
     // host with no allowlist can bootstrap its own (subject to CMIS policy).
@@ -707,8 +765,95 @@ where
 /// Fallback for platforms with no helper transport (neither Unix nor Windows).
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[allow(clippy::unused_async)] // async to match the cross-platform signature
-async fn start_helper_api(_config: &mia::config::Config) -> anyhow::Result<()> {
+async fn start_helper_api(
+    _config: &mia::config::Config,
+    _config_path: Option<std::path::PathBuf>,
+    _log_reload: LogReload,
+) -> anyhow::Result<()> {
     anyhow::bail!("unsupported platform: mia's helper API runs on Linux, macOS, and Windows")
+}
+
+/// Install a `SIGHUP` handler that re-reads the configuration file and the
+/// signed allowlist and live-swaps them into the running server, so a
+/// `mia --reload` (or a re-synced allowlist) takes effect without a restart
+/// (which would briefly unbind the helper socket).
+///
+/// The reload covers the parts that are safe to change live: the `log`
+/// verbosity directive and the allowlist (`allowlist.path`/`key`/
+/// `max_age_secs`). Settings that pin process-wide state at startup — the helper
+/// socket, the CMIS endpoint, attestation inputs, the hardening profile — are
+/// intentionally *not* re-applied here; they require a restart.
+///
+/// Reload mirrors `load_at_startup`: a missing or non-verifying body (or an
+/// allowlist that has been removed from the config) swaps in deny-all (fail
+/// closed); an unexpected I/O error keeps the current allowlist. A config file
+/// that no longer parses is logged and the previous configuration is kept.
+#[cfg(unix)]
+fn spawn_reload_task<A>(
+    reloader: mia::helper::AllowlistReloader<A>,
+    config_path: Option<std::path::PathBuf>,
+    log_reload: LogReload,
+    clock: mia::helper::Clock,
+) where
+    A: mia::helper::auth::CallerAuth,
+{
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install SIGHUP handler; live config/allowlist reload disabled");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        while hup.recv().await.is_some() {
+            tracing::info!("SIGHUP received; reloading configuration and signed allowlist");
+            // Re-read the file the daemon was started with, re-overlaying the
+            // environment, exactly as at startup.
+            let config = match mia::config::Config::load(config_path.as_deref()) {
+                Ok((config, _source)) => config,
+                Err(e) => {
+                    tracing::warn!(error = %e, "config reload failed to parse; keeping the current configuration and allowlist");
+                    continue;
+                }
+            };
+
+            // Log verbosity can change live.
+            log_reload(config.log_directive());
+
+            // Allowlist: re-load from the (possibly changed) path/key/max-age.
+            // Both must be configured to verify a body; otherwise fail closed.
+            if let (Some(path), Some(key_path)) =
+                (config.allowlist.path.as_deref(), config.allowlist.key.as_deref())
+            {
+                match mia::helper::allowlist::load_at_startup(
+                    path,
+                    key_path,
+                    clock(),
+                    config.allowlist_max_age(),
+                ) {
+                    // `load_at_startup` already logs loudly on a missing or
+                    // non-verifying body; here we only note the swap outcome.
+                    Ok(al) => {
+                        let loaded = al.is_some();
+                        reloader.set(al).await;
+                        if loaded {
+                            tracing::info!("configuration and signed allowlist reloaded and swapped in live");
+                        } else {
+                            tracing::warn!("reloaded allowlist absent or unverified; serving deny-all (fail closed)");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "allowlist reload failed (I/O); keeping the current allowlist");
+                    }
+                }
+            } else {
+                tracing::warn!("no allowlist configured after reload; serving deny-all (fail closed)");
+                reloader.set(None).await;
+            }
+        }
+    });
 }
 
 /// Resolve when the process is asked to stop: `SIGINT`/`SIGTERM` on Unix,

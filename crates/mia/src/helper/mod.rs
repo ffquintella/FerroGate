@@ -34,4 +34,6 @@ pub use proto::{ChildToken, ErrorCode, HelperReq, HelperResp};
 pub use token::{ChildTokenMinter, MintedToken, MinterConfig, MAX_CHILD_TTL_SECS};
 
 #[cfg(any(unix, windows))]
-pub use server::{system_clock, Clock, HelperServer, HelperServerConfig, ServerError};
+pub use server::{
+    system_clock, AllowlistReloader, Clock, HelperServer, HelperServerConfig, ServerError,
+};
