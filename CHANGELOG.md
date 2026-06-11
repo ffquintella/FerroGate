@@ -10,6 +10,19 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **`mia` self-trust — the binary never loses access to its own daemon.** `mia`
+  ships as one executable serving as the daemon, the CLI, and the `mia test`
+  self-test. The daemon now computes the `SHA-384` of its own executable once at
+  startup and **always permits a caller whose `bin_sha` matches it**, regardless
+  of the signed allowlist or the caller's `uid`. This fixes `mia test`'s helper
+  token mint step (`[4/4]`) failing with `PermissionDenied` on a host whose
+  allowlist has not yet been provisioned — `mia` talking to itself is always
+  allowed. Self-trust substitutes only for the allowlist membership check; the
+  host-SVID requirement and the CRL freshness/revocation gate (F11) still apply,
+  so a revoked host cannot mint even for `mia`'s own binary, and a modified
+  binary (different hash, or an IMA mismatch on Linux) does not inherit the
+  trust. See [docs/helper-api.md](docs/helper-api.md).
+
 - **Any-binary allowlist wildcard (`bin_sha = "*"`).** Allowlist entries now
   support a binary-side wildcard symmetric to the existing uid wildcard: a
   `bin_sha` of `"*"` permits **any** binary, so `(uid 1000, "*")` admits any

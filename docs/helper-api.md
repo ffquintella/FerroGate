@@ -59,6 +59,25 @@ primitives into the same `CallerIdentity` the Unix path produces.
 Any step failing terminates the request with `permission_denied` and
 appends a `LocalDenied` audit event.
 
+### `mia` self-trust
+
+`mia` ships as a single binary that is simultaneously the daemon, the CLI, and
+the `mia test` self-test. The daemon computes the `SHA-384` of its own
+executable once at startup (before any hardening sandbox closes off access to
+it) and **always permits a caller whose `bin_sha` equals that hash**, regardless
+of the signed allowlist or the caller's `uid`. This guarantees `mia` never loses
+the ability to reach its own daemon — `mia test` and any helper-token needs of
+the binary itself keep working even on a host whose allowlist has not yet been
+provisioned.
+
+Self-trust substitutes **only** for the allowlist membership check (step 4); the
+host-SVID requirement and the CRL freshness/revocation gate (F11) still apply, so
+a revoked host cannot mint even for `mia`'s own binary. Because the trusted hash
+is the on-disk digest of the running daemon, a modified or swapped `mia` binary
+does not inherit the trust: on Linux its IMA-attested hash would no longer match
+(and would be caught at the cross-check step anyway), and on any platform the
+hash simply differs.
+
 ## Request / response
 
 ```rust

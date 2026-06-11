@@ -206,6 +206,16 @@ async fn connect(path: &PathBuf) -> UnixStream {
     panic!("could not connect to {}", path.display());
 }
 
+/// `SHA-384` of the running test binary. Because these integration tests *are*
+/// the process hosting the [`HelperServer`], this equals the server's own
+/// `self_sha`, so a caller presenting this hash is "mia talking to itself".
+fn own_exe_sha() -> [u8; 48] {
+    use sha2::{Digest, Sha384};
+    let path = std::env::current_exe().unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    Sha384::digest(&bytes).into()
+}
+
 fn good_req() -> HelperReq {
     HelperReq {
         audience: "https://api.example.com".into(),
@@ -289,6 +299,69 @@ async fn caller_absent_from_allowlist_is_denied() {
         rx.try_recv().is_err(),
         "exactly one audit event per request"
     );
+}
+
+#[tokio::test]
+async fn mia_own_binary_is_always_permitted_even_without_allowlist() {
+    // `mia` ships as one binary serving as the daemon, the CLI, and `mia test`.
+    // A caller whose hash is the daemon's own (mia talking to itself) must mint
+    // even with NO allowlist loaded and an arbitrary uid that is listed nowhere
+    // — self-trust substitutes for allowlist membership so the binary never
+    // loses the ability to reach its own daemon.
+    let (path, mut rx, _stop) = spawn_server(
+        FixedAuth(Ok(id(4242, own_exe_sha()))),
+        Some(minter()),
+        None, // no allowlist at all
+        1000,
+    );
+
+    let resp = round_trip(&path, &good_req()).await;
+    match resp {
+        HelperResp::Token(_) => {}
+        other => panic!("mia's own binary must always mint, got {other:?}"),
+    }
+    match rx.recv().await.unwrap() {
+        AuditEvent::LocalGrant { uid, .. } => assert_eq!(uid, 4242),
+        other => panic!("expected LocalGrant, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mia_own_binary_still_subject_to_crl_gate() {
+    // Self-trust substitutes only for the allowlist membership check; the host
+    // SVID and CRL gates still apply. A revoked host must not mint even for
+    // mia's own binary.
+    let crl = Arc::new(CrlCache::seeded(ferro_svid::CrlBody {
+        issued_at: 1000,
+        number: 2,
+        entries: vec![ferro_svid::CrlEntry::new(
+            ferro_svid::RevocationTarget::Host {
+                spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
+            },
+            "decommissioned",
+            1000,
+        )],
+    }));
+    let (path, mut rx, _stop) = spawn_server_with_crl(
+        FixedAuth(Ok(id(4242, own_exe_sha()))),
+        Some(minter()),
+        None,
+        crl,
+        1000,
+    );
+
+    let resp = round_trip(&path, &good_req()).await;
+    assert!(matches!(
+        resp,
+        HelperResp::Error {
+            code: ErrorCode::PermissionDenied,
+            ..
+        }
+    ));
+    match rx.recv().await.unwrap() {
+        AuditEvent::LocalDenied { reason, .. } => assert_eq!(reason, "svid-revoked"),
+        other => panic!("expected LocalDenied svid-revoked, got {other:?}"),
+    }
 }
 
 #[tokio::test]

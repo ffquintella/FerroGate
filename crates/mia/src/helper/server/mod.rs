@@ -120,12 +120,57 @@ struct Shared<A: CallerAuth> {
     clock: Clock,
     /// Distinct callers observed this run, fed to the allowlist-propose task.
     ledger: CallerLedger,
+    /// `SHA-384` of the daemon's own executable, computed once at startup. `mia`
+    /// ships as a single binary serving as the daemon, the CLI, and the
+    /// self-test, so a caller whose hash equals this is `mia` talking to itself;
+    /// such a caller is always permitted to mint, regardless of the signed
+    /// allowlist. This keeps `mia test` and `mia`'s own helper-token needs
+    /// working even on a host whose allowlist has not yet been provisioned (the
+    /// reported failure mode). `None` if the path/bytes could not be read at
+    /// startup, in which case the shortcut is inert and `mia` is gated like any
+    /// other caller. The host SVID and CRL gates still apply — self-trust only
+    /// substitutes for the allowlist membership check.
+    self_sha: Option<[u8; 48]>,
 }
 
 impl<A: CallerAuth> Shared<A> {
+    fn new(
+        auth: A,
+        minter: Option<ChildTokenMinter>,
+        allowlist: Option<Allowlist>,
+        crl: Arc<CrlCache>,
+        audit_tx: mpsc::Sender<AuditEvent>,
+        clock: Clock,
+    ) -> Self {
+        Self {
+            auth,
+            minter,
+            allowlist: RwLock::new(allowlist),
+            crl,
+            audit_tx,
+            clock,
+            ledger: CallerLedger::new(),
+            self_sha: running_exe_sha(),
+        }
+    }
+
     async fn set_allowlist(&self, allowlist: Option<Allowlist>) {
         *self.allowlist.write().await = allowlist;
     }
+}
+
+/// `SHA-384` of the running daemon's own executable, the same digest the
+/// authenticator derives for a caller's binary (file-content `SHA-384`, which on
+/// Linux is also the IMA-measured value), so the two are directly comparable.
+///
+/// Computed at startup, before any hardening sandbox can cut off access to the
+/// executable. Returns `None` on any failure to resolve or read the path; the
+/// self-trust shortcut is then simply inert.
+fn running_exe_sha() -> Option<[u8; 48]> {
+    use sha2::{Digest, Sha384};
+    let path = std::env::current_exe().ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    Some(Sha384::digest(&bytes).into())
 }
 
 /// A cheap, clonable handle that swaps the live allowlist while the server is
@@ -268,12 +313,16 @@ async fn process_request<A: CallerAuth>(
         }
     }
 
-    // 4. The caller must be on the (signed, fresh) allowlist. A missing
-    //    allowlist fails closed.
-    let permitted = match &*shared.allowlist.read().await {
-        Some(al) => al.permits(id.uid, &id.bin_sha),
-        None => false,
-    };
+    // 4. The caller must be `mia` itself (the daemon's own binary, always
+    //    trusted — see `Shared::self_sha`) or on the (signed, fresh) allowlist.
+    //    A missing allowlist fails closed; the self-trust path does not consult
+    //    it. The host SVID and CRL gates above still applied either way.
+    let is_self = shared.self_sha == Some(id.bin_sha);
+    let permitted = is_self
+        || match &*shared.allowlist.read().await {
+            Some(al) => al.permits(id.uid, &id.bin_sha),
+            None => false,
+        };
     if !permitted {
         deny(shared, id.pid, id.uid, id.bin_sha, "not-allowlisted").await;
         return err(ErrorCode::PermissionDenied, None);

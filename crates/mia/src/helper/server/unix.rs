@@ -74,15 +74,7 @@ impl<A: CallerAuth> HelperServer<A> {
         Ok(Self {
             listener,
             config,
-            shared: Arc::new(Shared {
-                auth,
-                minter,
-                allowlist: tokio::sync::RwLock::new(allowlist),
-                crl,
-                audit_tx,
-                clock,
-                ledger: crate::helper::ledger::CallerLedger::new(),
-            }),
+            shared: Arc::new(Shared::new(auth, minter, allowlist, crl, audit_tx, clock)),
         })
     }
 

@@ -547,9 +547,18 @@ fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
              this binary/uid pair is not on the host's signed allowlist, or the host SVID is \
              revoked. The daemon log's LocalDenied event names the exact reason."
                 .to_string(),
-            "If the reason is 'not-allowlisted', everything upstream (socket, caller auth, host \
-             SVID, CRL gate) works — provision this caller with `ferrogate allowlist set`, or \
-             enable allowlist.propose and approve the pending proposal on CMIS."
+            "`mia`'s own binary is self-trusted by the daemon (it always mints for the daemon's \
+             own executable), so a refusal of *this* self-test usually means something other \
+             than allowlisting: the running daemon predates the self-trust change (version skew \
+             between this binary and the daemon — align them), caller authentication failed \
+             (the daemon log shows e.g. 'ima-mismatch' — the on-disk `mia` binary was modified \
+             after the daemon started, so its hash no longer matches), or the host SVID was \
+             revoked ('svid-revoked')."
+                .to_string(),
+            "If the reason is 'not-allowlisted' for some *other* caller, everything upstream \
+             (socket, caller auth, host SVID, CRL gate) works — provision that caller with \
+             `ferrogate allowlist set`, or enable allowlist.propose and approve the pending \
+             proposal on CMIS."
                 .to_string(),
             "If the daemon log shows 'allowlist verification failed' at startup, the daemon is \
              serving in deny-all mode because the locally pinned enrollment key no longer \
