@@ -530,7 +530,7 @@ fn maybe_spawn_propose_task(
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-            let entries = snapshot
+            let mut entries: Vec<ferro_svid::AllowEntry> = snapshot
                 .iter()
                 // Proposals carry the concrete observed uid; relaxing an entry
                 // to a wildcard (uid = None) is an operator decision (ADR-0002).
@@ -539,6 +539,46 @@ fn maybe_spawn_propose_task(
                     bin_sha: hex::encode(bin),
                 })
                 .collect();
+            // A proposal is a *full set* that, on approval, replaces the live
+            // allowlist (ADR-0003). The observed snapshot knows nothing about
+            // entries an operator added by hand — a `bin_sha=*` wildcard, a
+            // manual pin — so fold the live allowlist in and propose
+            // `live ∪ observed`. Without this, approving a proposal silently
+            // drops those operator entries.
+            match mia::client::fetch_allowlist(&endpoint, vec![pin], &host_uuid).await {
+                Ok(Some(bytes)) => {
+                    match ferro_svid::allowlist::decode(&bytes)
+                        .and_then(|s| ferro_svid::allowlist::decode_body(&s.body))
+                    {
+                        Ok(live) => {
+                            for e in live.entries {
+                                if !entries
+                                    .iter()
+                                    .any(|x| x.uid == e.uid && x.bin_sha == e.bin_sha)
+                                {
+                                    entries.push(e);
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "live allowlist did not decode; proposing observed set only"
+                        ),
+                    }
+                }
+                // No live allowlist yet (first-use bootstrap): the observed set
+                // is the whole proposal.
+                Ok(None) => {}
+                Err(e) => {
+                    // Don't propose a replacement we couldn't make additive — we
+                    // might drop operator entries. Retry on the next tick.
+                    tracing::warn!(
+                        error = %e,
+                        "could not fetch live allowlist; skipping proposal this round"
+                    );
+                    continue;
+                }
+            }
             let doc = ferro_svid::ProposalDoc {
                 host_uuid: host_uuid.clone(),
                 issued_at: now,

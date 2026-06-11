@@ -314,6 +314,12 @@ async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
             format!("{} entr(y/ies)", live.len())
         }
     );
+    if !live.is_empty() {
+        // A proposal is a full set: approving signs exactly the entries below and
+        // replaces the live allowlist with them (it is not merged in). Say so up
+        // front so the diff that follows reads correctly.
+        println!("\napproving replaces the live allowlist with exactly the proposed set:");
+    }
     println!("\nproposed entries ({}):", proposed.len());
     for (uid, sha) in &proposed {
         let mark = if live_set.contains(&(*uid, sha.as_str())) {
@@ -329,10 +335,17 @@ async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
         .filter(|e| !proposed_set.contains(&(e.uid, e.bin_sha.as_str())))
         .collect();
     if !dropped.is_empty() {
-        println!("\nwould be removed ({}):", dropped.len());
+        println!("\nwould be removed ({}) — live today, absent from the proposal:", dropped.len());
         for e in dropped {
             println!("  - uid={:<7} bin_sha={}", fmt_uid(e.uid), e.bin_sha);
         }
+        // The proposer should compose additively (live ∪ new); a stale or
+        // non-additive proposal that omits operator-added entries shows up here.
+        // Pruning is only correct when the proposer meant to drop these.
+        println!(
+            "  these drop on approval. Reject unless the pruning is intended — \
+             an additive proposal would keep them."
+        );
     }
     println!("\nApprove with `ferrogate allowlist approve {host_uuid}` or reject with `… reject {host_uuid}`.");
     Ok(())
