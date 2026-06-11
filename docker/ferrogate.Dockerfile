@@ -13,7 +13,7 @@
 # container's stdout. The CMIS audit WORM store lives under
 # /var/lib/ferrogate/audit, also a volume.
 #
-# Build (via the Makefile):  make docker-image
+# Build (via the Makefile):  make container-image
 # Build (directly):
 #   docker buildx build --platform linux/amd64 \
 #       -f docker/ferrogate.Dockerfile -t ferrogate:latest --load .

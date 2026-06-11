@@ -1,5 +1,5 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
-        formal formal-tamarin formal-cryptoverif docs docker-image docker-image-push \
+        formal formal-tamarin formal-cryptoverif docs container-image container-image-push \
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
         pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools pkg-sdk release deploy-release
 
@@ -74,7 +74,7 @@ HOST_ARCH := $(shell uname -m)
 MIA_DIST  := crates/mia/dist
 MIA_LABEL := com.ferrogate.mia
 
-docker-image: ## Build the linux/amd64 ferrogate runtime image (IMAGE=tag to override)
+container-image: ## Build the linux/amd64 ferrogate runtime image (IMAGE=tag to override)
 	docker buildx build --platform linux/amd64 \
 		-f docker/ferrogate.Dockerfile \
 		-t $(IMAGE) \
@@ -85,7 +85,7 @@ docker-image: ## Build the linux/amd64 ferrogate runtime image (IMAGE=tag to ove
 
 # ── Container image push ──────────────────────────────────────────────
 #
-# `make docker-image-push` is a one-command flow: on first use it asks which
+# `make container-image-push` is a one-command flow: on first use it asks which
 # registry to push to and which credentials to use, saves the choice OUTSIDE
 # the git repo (in $(PUSH_CONFIG)), then builds and pushes. Later runs reuse
 # the saved config silently. Re-run the questions any time with
@@ -129,7 +129,7 @@ docker-repo-show: ## Print the saved push registry config ($(PUSH_CONFIG))
 	@if [ ! -f $(PUSH_CONFIG) ]; then echo "Not configured yet — run 'make docker-repo-setup'."; exit 1; fi
 	@echo "==> $(PUSH_CONFIG)"; sed 's/^/    /' $(PUSH_CONFIG)
 
-docker-image-push: ## Push the image to the saved registry (asks on first use, then reuses)
+container-image-push: ## Push the image to the saved registry (asks on first use, then reuses)
 	@if [ ! -f $(PUSH_CONFIG) ]; then \
 		echo "No push registry configured yet — let's set one up."; echo ""; \
 		$(MAKE) --no-print-directory docker-repo-setup; \
@@ -147,7 +147,7 @@ docker-image-push: ## Push the image to the saved registry (asks on first use, t
 	     || { echo "ERROR: login to $$REGISTRY failed"; exit 1; }; \
 	 fi; \
 	 echo "==> building image $(IMAGE)"; \
-	 $(MAKE) --no-print-directory docker-image; \
+	 $(MAKE) --no-print-directory container-image; \
 	 echo "==> tagging $(IMAGE) as $$REMOTE:$$VTAG and :latest"; \
 	 docker tag $(IMAGE) "$$REMOTE:$$VTAG"; \
 	 docker tag $(IMAGE) "$$REMOTE:latest"; \
