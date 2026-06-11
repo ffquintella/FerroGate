@@ -48,23 +48,23 @@ pub(crate) fn usage() -> &'static str {
      \n\
      usage: ferrogate allowlist <subcommand> [args]\n\
      \n\
-     subcommands:\n\
-     \x20 set     <host> (--entry [uid:]sha | --bin [uid:]path)... [--ttl secs]\n\
+     subcommands (<selector> is one of the host-selector flags listed below):\n\
+     \x20 set     <selector> (--entry [uid:]sha | --bin [uid:]path)... [--ttl secs]\n\
      \x20                  replace the host's allowlist with exactly these callers\n\
-     \x20 add     <host> (--entry [uid:]sha | --bin [uid:]path)... [--ttl secs]\n\
+     \x20 add     <selector> (--entry [uid:]sha | --bin [uid:]path)... [--ttl secs]\n\
      \x20                  add callers to the host's existing allowlist\n\
-     \x20 remove  <host> (--uid N | --bin-sha hex|* | --uid N --bin-sha hex|*) [--ttl secs]\n\
+     \x20 remove  <selector> (--uid N | --bin-sha hex|* | --uid N --bin-sha hex|*) [--ttl secs]\n\
      \x20                  drop matching callers (a uid, a binary, or one pinned pair) and re-sign\n\
-     \x20 get     <host> [--out path]   fetch the raw signed CBOR (stdout if no --out)\n\
-     \x20 show    <host>                fetch and print the entries + validity\n\
-     \x20 list                          every host that has a stored allowlist\n\
-     \x20 delete  <host>                remove the host's stored allowlist\n\
-     \x20 proposals                     every pending host-driven proposal\n\
-     \x20 review  <host>                diff a host's pending proposal vs its live allowlist\n\
-     \x20 approve <host> [--ttl secs]   sign+store the proposed entries, then clear the proposal\n\
-     \x20 reject  <host>                drop the host's pending proposal\n\
+     \x20 get     <selector> [--out path]   fetch the raw signed CBOR (stdout if no --out)\n\
+     \x20 show    <selector>                fetch and print the entries + validity\n\
+     \x20 list                              every host that has a stored allowlist\n\
+     \x20 delete  <selector>                remove the host's stored allowlist\n\
+     \x20 proposals                         every pending host-driven proposal\n\
+     \x20 review  <selector>                diff a host's pending proposal vs its live allowlist\n\
+     \x20 approve <selector> [--ttl secs]   sign+store the proposed entries, then clear the proposal\n\
+     \x20 reject  <selector>                drop the host's pending proposal\n\
      \n\
-     host selector (one of):\n\
+     host selector <selector> (exactly one of):\n\
      \x20 --host <uuid>       the EK-derived host UUID directly\n\
      \x20 --ek-cert <pem>     derive the UUID from an EK certificate PEM\n\
      \x20 --ek-sha384 <hex>   derive the UUID from the EK certificate's SHA-384\n\
