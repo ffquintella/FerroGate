@@ -21,6 +21,11 @@
 //! (absent ⇒ env/defaults only). A deployment that sets everything through the
 //! systemd `EnvironmentFile` keeps working with no file present.
 //!
+//! `--environment <env>` (mutually exclusive with `--config`) selects
+//! `mia-<env>.toml` from the standard config locations instead of `mia.toml`,
+//! so one host can carry side-by-side configs for different deployments
+//! (`mia --environment staging`, `mia --environment prod`, …).
+//!
 //! The environment variables (each also a TOML key — see `dist/mia.toml`):
 //!
 //! - `FERROGATE_HELPER_SOCKET` (`helper.socket`) — socket path; its presence
@@ -87,8 +92,8 @@ fn main() -> anyhow::Result<()> {
 
     // Resolve the configuration before logging/hardening: the file gives us the
     // log directive, and a malformed file must fail loudly and early.
-    let config_path = parse_config_flag(&args)?;
-    let (config, source) = mia::config::Config::load(config_path.as_deref())?;
+    let config_source = parse_daemon_flags(&args)?;
+    let (config, source) = config_source.load()?;
 
     // A reloadable filter layer: SIGHUP re-reads the config and applies a
     // changed `log` directive live (see `spawn_reload_task`).
@@ -137,13 +142,15 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run(config, config_path, log_reload))
+    runtime.block_on(run(config, config_source, log_reload))
 }
 
-/// Parse the daemon's `--config`/`-c <path>` flag from `args`. Returns the
-/// requested path, if any. Errors on a missing argument or an unknown flag.
-fn parse_config_flag(args: &[String]) -> anyhow::Result<Option<std::path::PathBuf>> {
-    let mut config = None;
+/// Parse the daemon's config-source flags from `args`: `--config`/`-c <path>`
+/// and `--environment`/`-e <env>`. Returns the resolved [`ConfigSource`]. Errors
+/// on a missing argument or an unknown flag (mutual exclusivity of the two is
+/// enforced later, by [`mia::config::Config::load`]).
+fn parse_daemon_flags(args: &[String]) -> anyhow::Result<mia::config::ConfigSource> {
+    let mut source = mia::config::ConfigSource::default();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -151,12 +158,18 @@ fn parse_config_flag(args: &[String]) -> anyhow::Result<Option<std::path::PathBu
                 let path = it
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--config requires a path argument"))?;
-                config = Some(std::path::PathBuf::from(path));
+                source.path = Some(std::path::PathBuf::from(path));
+            }
+            "-e" | "--environment" => {
+                let env = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--environment requires a name argument"))?;
+                source.environment = Some(env.clone());
             }
             other => anyhow::bail!("unknown option: {other}\n\nrun `mia --help` for usage"),
         }
     }
-    Ok(config)
+    Ok(source)
 }
 
 /// Top-level CLI usage banner.
@@ -164,7 +177,7 @@ fn print_usage() {
     println!(
         "mia {} — FerroGate Machine Identity Agent\n\
          \n\
-         usage: mia [--config <path>]\n\
+         usage: mia [--config <path> | --environment <env>]\n\
          \x20      mia <command>\n\
          \n\
          commands:\n\
@@ -177,6 +190,9 @@ fn print_usage() {
          options:\n\
          \x20 -c, --config <path>   TOML config file (default {}, then\n\
          \x20                       $FERROGATE_CONFIG; environment variables override it)\n\
+         \x20 -e, --environment <env>  select mia-<env>.toml from the standard config\n\
+         \x20                       locations instead of mia.toml (for side-by-side\n\
+         \x20                       deployments); mutually exclusive with --config\n\
          \x20     --reload          signal the running agent to reload its config and\n\
          \x20                       allowlist live (SIGHUP), then exit\n\
          \x20 -h, --help            show this help\n\
@@ -195,7 +211,7 @@ fn print_usage() {
 #[allow(clippy::large_futures)]
 async fn run(
     config: mia::config::Config,
-    config_path: Option<std::path::PathBuf>,
+    config_source: mia::config::ConfigSource,
     log_reload: LogReload,
 ) -> anyhow::Result<()> {
     if config.helper_socket().is_none() {
@@ -206,7 +222,7 @@ async fn run(
         );
         return Ok(());
     }
-    start_helper_api(&config, config_path, log_reload).await
+    start_helper_api(&config, config_source, log_reload).await
 }
 
 /// Build the platform's caller authenticator (Linux: SO_PEERCRED + IMA).
@@ -240,7 +256,7 @@ fn build_auth(_config: &mia::config::Config) -> mia::helper::auth::WindowsCaller
 #[allow(clippy::large_futures)] // attestation future holds a composite key
 async fn start_helper_api(
     config: &mia::config::Config,
-    config_path: Option<std::path::PathBuf>,
+    config_source: mia::config::ConfigSource,
     log_reload: LogReload,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
@@ -248,7 +264,7 @@ async fn start_helper_api(
         .helper_socket()
         .context("internal: start_helper_api called without a helper socket")?
         .to_path_buf();
-    serve(config, socket_path, build_auth(config), config_path, log_reload).await
+    serve(config, socket_path, build_auth(config), config_source, log_reload).await
 }
 
 /// Resolve where the persistent machine signing key lives — beside the system
@@ -696,7 +712,7 @@ async fn serve<A>(
     config: &mia::config::Config,
     socket_path: std::path::PathBuf,
     auth: A,
-    config_path: Option<std::path::PathBuf>,
+    config_source: mia::config::ConfigSource,
     log_reload: LogReload,
 ) -> anyhow::Result<()>
 where
@@ -787,9 +803,9 @@ where
     // a reload can pick up a newly-added allowlist or a changed log directive;
     // reload mirrors startup's fail-closed semantics.
     #[cfg(unix)]
-    spawn_reload_task(server.allowlist_reloader(), config_path, log_reload, clock);
+    spawn_reload_task(server.allowlist_reloader(), config_source, log_reload, clock);
     #[cfg(not(unix))]
-    let _ = (&config_path, &log_reload, &clock);
+    let _ = (&config_source, &log_reload, &clock);
 
     // Optionally propose the callers the helper API observes back to CMIS, so a
     // host with no allowlist can bootstrap its own (subject to CMIS policy).
@@ -807,7 +823,7 @@ where
 #[allow(clippy::unused_async)] // async to match the cross-platform signature
 async fn start_helper_api(
     _config: &mia::config::Config,
-    _config_path: Option<std::path::PathBuf>,
+    _config_source: mia::config::ConfigSource,
     _log_reload: LogReload,
 ) -> anyhow::Result<()> {
     anyhow::bail!("unsupported platform: mia's helper API runs on Linux, macOS, and Windows")
@@ -831,7 +847,7 @@ async fn start_helper_api(
 #[cfg(unix)]
 fn spawn_reload_task<A>(
     reloader: mia::helper::AllowlistReloader<A>,
-    config_path: Option<std::path::PathBuf>,
+    config_source: mia::config::ConfigSource,
     log_reload: LogReload,
     clock: mia::helper::Clock,
 ) where
@@ -850,8 +866,8 @@ fn spawn_reload_task<A>(
         while hup.recv().await.is_some() {
             tracing::info!("SIGHUP received; reloading configuration and signed allowlist");
             // Re-read the file the daemon was started with, re-overlaying the
-            // environment, exactly as at startup.
-            let config = match mia::config::Config::load(config_path.as_deref()) {
+            // environment, exactly as at startup (same --config/--environment).
+            let config = match config_source.load() {
                 Ok((config, _source)) => config,
                 Err(e) => {
                     tracing::warn!(error = %e, "config reload failed to parse; keeping the current configuration and allowlist");

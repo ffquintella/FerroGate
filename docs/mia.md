@@ -143,6 +143,28 @@ Per-OS locations:
 | macOS | `/Library/Application Support/FerroGate/mia.toml` | `~/Library/Application Support/FerroGate/mia.toml` |
 | Windows | `%ProgramData%\FerroGate\mia.toml` | `%APPDATA%\FerroGate\mia.toml` |
 
+#### Selecting an environment
+
+`--environment <env>` (short `-e`) selects `mia-<env>.toml` instead of `mia.toml`
+at the **system path** and **per-user path** above — so one host can carry
+side-by-side configs for different deployments and switch between them per
+invocation:
+
+```
+mia --environment staging              # daemon reads mia-staging.toml
+mia test --environment staging         # self-test against the staging deployment
+mia resync-allowlist -e prod --reload  # resync against prod
+mia setup --environment staging        # write mia-staging.toml (composes with --user)
+```
+
+The selector accepts every command that reads or writes the config (`mia`,
+`setup`, `test`, `resync-allowlist`, `refresh-key`). The name must be a safe
+filename component (letters, digits, `.`, `-`, `_`). It is **mutually exclusive
+with `--config`/`--output`**, which name one exact file; it only changes which
+file the standard discovery (step 3) looks for, leaving `$FERROGATE_CONFIG` and
+the `FERROGATE_*` env overlays unchanged. The daemon's SIGHUP live-reload
+re-reads the same `mia-<env>.toml` it started from.
+
 A malformed file — including an unknown key — fails the daemon loudly at
 startup rather than being silently ignored. The packaged template (source:
 `crates/mia/dist/mia.toml`) is installed at the system path; every value is
@@ -208,6 +230,8 @@ Options:
 
 - `-u, --user` — target the per-user config path instead of the system path
   (no elevation needed).
+- `-e, --environment <env>` — write `mia-<env>.toml` instead of `mia.toml` (for
+  side-by-side deployments); composes with `--user`, excludes `--output`.
 - `-o, --output <path>` — target a specific path.
 - `-c, --clean` — delete the stored configuration instead of writing one
   (honours `--user`/`--output` to choose which file; prompts unless `--force`).
@@ -283,6 +307,8 @@ and uid* like any other caller, so on a host with a restrictive allowlist a
 the allowlist check works. Options:
 
 - `-c, --config <path>` — TOML config file (same resolution as the daemon).
+- `-e, --environment <env>` — select `mia-<env>.toml` from the standard config
+  locations instead of `mia.toml`; mutually exclusive with `--config`.
 - `-a, --audience <aud>` — audience for the test token (default
   `https://selftest.ferrogate.invalid`).
 

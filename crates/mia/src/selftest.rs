@@ -42,7 +42,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         return Ok(()); // --help printed
     };
 
-    let (config, source) = Config::load(opts.config.as_deref())?;
+    let (config, source) = Config::load(opts.config.as_deref(), opts.environment.as_deref())?;
     println!(
         "FerroGate MIA self-test (mia {})",
         env!("CARGO_PKG_VERSION")
@@ -63,6 +63,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
 struct Opts {
     /// `--config <path>` override (same as the daemon's flag).
     config: Option<PathBuf>,
+    /// `--environment <env>` selector (same as the daemon's flag); selects
+    /// `mia-<env>.toml`. Mutually exclusive with `config`.
+    environment: Option<String>,
     /// `--audience <aud>` for the test mint.
     audience: String,
 }
@@ -72,6 +75,7 @@ impl Opts {
     /// exit successfully.
     fn parse(args: &[String]) -> anyhow::Result<Option<Self>> {
         let mut config = None;
+        let mut environment = None;
         let mut audience = DEFAULT_AUDIENCE.to_string();
         let mut it = args.iter();
         while let Some(arg) = it.next() {
@@ -84,6 +88,10 @@ impl Opts {
                     let path = it.next().context("--config requires a path argument")?;
                     config = Some(PathBuf::from(path));
                 }
+                "-e" | "--environment" => {
+                    let env = it.next().context("--environment requires a name argument")?;
+                    environment = Some(env.clone());
+                }
                 "-a" | "--audience" => {
                     let aud = it.next().context("--audience requires a value")?;
                     audience.clone_from(aud);
@@ -91,11 +99,16 @@ impl Opts {
                 other => anyhow::bail!("unknown argument: {other}\n\n{USAGE}"),
             }
         }
-        Ok(Some(Self { config, audience }))
+        Ok(Some(Self {
+            config,
+            environment,
+            audience,
+        }))
     }
 }
 
-const USAGE: &str = "usage: mia test [--config <path>] [--audience <aud>]";
+const USAGE: &str =
+    "usage: mia test [--config <path> | --environment <env>] [--audience <aud>]";
 
 fn print_help() {
     println!(
@@ -110,6 +123,8 @@ fn print_help() {
          \n\
          options:\n\
          \x20 -c, --config <path>     TOML config file (same resolution as the daemon)\n\
+         \x20 -e, --environment <env> select mia-<env>.toml from the standard config\n\
+         \x20                         locations instead of mia.toml; excludes --config\n\
          \x20 -a, --audience <aud>    audience for the test token (default {DEFAULT_AUDIENCE})\n\
          \x20 -h, --help              show this help"
     );
@@ -628,6 +643,7 @@ mod tests {
         let opts = Opts::parse(&[]).unwrap().unwrap();
         assert_eq!(opts.audience, DEFAULT_AUDIENCE);
         assert!(opts.config.is_none());
+        assert!(opts.environment.is_none());
 
         let args: Vec<String> = ["--config", "/tmp/x.toml", "--audience", "https://a.example"]
             .iter()
@@ -639,6 +655,15 @@ mod tests {
             Some(std::path::Path::new("/tmp/x.toml"))
         );
         assert_eq!(opts.audience, "https://a.example");
+
+        // `--environment` is parsed into its own slot.
+        let args: Vec<String> = ["--environment", "staging"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let opts = Opts::parse(&args).unwrap().unwrap();
+        assert_eq!(opts.environment.as_deref(), Some("staging"));
+        assert!(opts.config.is_none());
     }
 
     #[test]

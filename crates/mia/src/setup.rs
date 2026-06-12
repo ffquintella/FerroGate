@@ -26,12 +26,15 @@ use ferro_crypto::pin::SpkiPin;
 use inquire::validator::Validation;
 use inquire::{Confirm, Text};
 
-use crate::config::{system_config_path, user_config_path, Config};
+use crate::config::{
+    system_config_path, system_config_path_for, user_config_path_for, validate_environment, Config,
+};
 
 /// Run the `mia setup` subcommand. `args` is everything after `setup` on the
 /// command line.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let mut explicit_output: Option<PathBuf> = None;
+    let mut environment: Option<String> = None;
     let mut user_scope = false;
     let mut force = false;
     let mut clean = false;
@@ -47,6 +50,11 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
                 let path = it.next().context("--output requires a path argument")?;
                 explicit_output = Some(PathBuf::from(path));
             }
+            "-e" | "--environment" => {
+                let env = it.next().context("--environment requires a name argument")?;
+                validate_environment(env)?;
+                environment = Some(env.clone());
+            }
             "-u" | "--user" => user_scope = true,
             "-f" | "--force" => force = true,
             "-c" | "--clean" => clean = true,
@@ -54,12 +62,24 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
+    // `--environment` selects which standard file (`mia-<env>.toml`) to write,
+    // so it composes with `--user` but not with `--output`, which already names
+    // an exact path.
+    if environment.is_some() && explicit_output.is_some() {
+        anyhow::bail!(
+            "--output and --environment are mutually exclusive: --output names an exact file, \
+             --environment selects mia-<env>.toml in the standard config location\n\n{USAGE}"
+        );
+    }
+    let env = environment.as_deref();
+
     let output = if let Some(path) = explicit_output {
         path
     } else if user_scope {
-        user_config_path().context("no per-user config path available (HOME/APPDATA is unset)")?
+        user_config_path_for(env)
+            .context("no per-user config path available (HOME/APPDATA is unset)")?
     } else {
-        system_config_path()
+        system_config_path_for(env)
     };
 
     // `--clean` removes the stored config instead of writing one. It shares the
@@ -95,7 +115,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     println!();
 
     let existing = load_existing(&output);
-    let settings = match prompt_all(&existing) {
+    let settings = match prompt_all(&existing, env) {
         Ok(s) => s,
         // Esc / Ctrl-C: abort cleanly without writing.
         Err(WizardError::Aborted) => {
@@ -105,7 +125,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         Err(WizardError::Inquire(e)) => return Err(e.into()),
     };
 
-    let rendered = render(&settings);
+    let rendered = render(&settings, env);
 
     println!("\n──────── {} ────────", output.display());
     print!("{rendered}");
@@ -184,8 +204,12 @@ impl From<inquire::InquireError> for WizardError {
 }
 
 /// Drive every prompt section, seeding defaults from the existing config.
+/// `environment` is the `--environment` selector, if any: it suffixes the
+/// suggested default paths (helper socket, allowlist body, verification key) so
+/// a side-by-side deployment configured on the same host does not collide with
+/// the default one.
 #[allow(clippy::too_many_lines)] // a linear wizard; splitting it hurts readability
-fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
+fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, WizardError> {
     let mut s = Settings::default();
 
     // ── Logging ───────────────────────────────────────────────────────────
@@ -255,7 +279,7 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
         let socket = Text::new("Helper listener (Unix socket path / Windows pipe name):")
             .with_default(&path_default(
                 existing.helper.socket.as_deref(),
-                default_socket(),
+                default_socket(environment),
             ))
             .prompt()?;
         s.helper_socket = non_empty(socket);
@@ -318,7 +342,7 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
         let path = Text::new("Allowlist path (signed CBOR):")
             .with_default(&path_default(
                 existing.allowlist.path.as_deref(),
-                dist_sibling("allowlist.cbor"),
+                dist_sibling(&env_filename("allowlist.cbor", environment)),
             ))
             .with_help_message("the signed list CMIS issued for this host (place it here)")
             .prompt()?;
@@ -327,7 +351,7 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
         let key = Text::new("Allowlist verification key (CMIS enrollment pubkey):")
             .with_default(&path_default(
                 existing.allowlist.key.as_deref(),
-                dist_sibling("allowlist.pub"),
+                dist_sibling(&env_filename("allowlist.pub", environment)),
             ))
             .with_help_message("public key that verifies the allowlist signature")
             .prompt()?;
@@ -428,10 +452,29 @@ fn prompt_all(existing: &Config) -> Result<Settings, WizardError> {
 /// Standard Linux IMA runtime-measurement log path (default override target).
 const DEFAULT_IMA_LOG: &str = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements";
 
-/// The platform's default helper listener address (Windows named pipe).
+/// Suffix a default filename with the `--environment` selector so side-by-side
+/// deployments don't collide: `allowlist.cbor` + `Some("staging")` →
+/// `allowlist-staging.cbor`; the suffix is inserted before the extension. With
+/// no environment the name is returned unchanged.
+fn env_filename(name: &str, environment: Option<&str>) -> String {
+    match environment {
+        None => name.to_string(),
+        Some(env) => match name.rsplit_once('.') {
+            Some((stem, ext)) => format!("{stem}-{env}.{ext}"),
+            None => format!("{name}-{env}"),
+        },
+    }
+}
+
+/// The platform's default helper listener address (Windows named pipe). With an
+/// `--environment` selector the pipe name is suffixed so two deployments'
+/// daemons don't try to bind the same pipe.
 #[cfg(windows)]
-fn default_socket() -> String {
-    r"\\.\pipe\ferrogate-mia".to_string()
+fn default_socket(environment: Option<&str>) -> String {
+    match environment {
+        Some(env) => format!(r"\\.\pipe\ferrogate-mia-{env}"),
+        None => r"\\.\pipe\ferrogate-mia".to_string(),
+    }
 }
 
 /// The platform's default helper listener address (macOS Unix socket). macOS
@@ -439,17 +482,20 @@ fn default_socket() -> String {
 /// there vanishes on every reboot and the daemon crash-loops on bind. Use the
 /// persistent system Application Support tree instead (the same place the
 /// config and allowlist live), in a dedicated `run/` subdirectory the daemon
-/// owns. Must match the launchd plist's `FERROGATE_HELPER_SOCKET`
-/// (`crates/mia/dist/com.ferrogate.mia.plist`).
+/// owns. For the default environment this must match the launchd plist's
+/// `FERROGATE_HELPER_SOCKET` (`crates/mia/dist/com.ferrogate.mia.plist`); an
+/// `--environment` deployment runs its own service and gets a suffixed socket.
 #[cfg(target_os = "macos")]
-fn default_socket() -> String {
-    "/Library/Application Support/FerroGate/run/mia.sock".to_string()
+fn default_socket(environment: Option<&str>) -> String {
+    let name = env_filename("mia.sock", environment);
+    format!("/Library/Application Support/FerroGate/run/{name}")
 }
 
-/// The platform's default helper listener address (Linux/other Unix socket).
+/// The platform's default helper listener address (Linux/other Unix socket),
+/// suffixed by the `--environment` selector when one is given.
 #[cfg(not(any(target_os = "macos", windows)))]
-fn default_socket() -> String {
-    "/run/ferrogate/mia.sock".to_string()
+fn default_socket(environment: Option<&str>) -> String {
+    format!("/run/ferrogate/{}", env_filename("mia.sock", environment))
 }
 
 /// A file alongside the system config directory (e.g. the allowlist), as a
@@ -599,7 +645,7 @@ fn load_existing(path: &Path) -> Config {
 /// set are active assignments; everything else stays as a commented template
 /// line so the file remains a reference.
 #[allow(clippy::too_many_lines)] // a flat sequence of TOML-emitting blocks.
-fn render(s: &Settings) -> String {
+fn render(s: &Settings, environment: Option<&str>) -> String {
     // A quoted (TOML literal-string) value line, or a commented placeholder.
     fn str_line(set: Option<&str>, key: &str, placeholder: &str) -> String {
         match set {
@@ -649,7 +695,7 @@ fn render(s: &Settings) -> String {
     out.push_str(&str_line(
         s.helper_socket.as_deref(),
         "socket",
-        &default_socket(),
+        &default_socket(environment),
     ));
     out.push_str("# Unix only. Octal socket mode. Default: 660.\n");
     out.push_str(&str_line(
@@ -827,7 +873,8 @@ fn clean_config(path: &Path, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-const USAGE: &str = "usage: mia setup [--user] [--output <path>] [--force] [--clean]";
+const USAGE: &str =
+    "usage: mia setup [--user] [--environment <env>] [--output <path>] [--force] [--clean]";
 
 fn print_help() {
     println!(
@@ -847,6 +894,9 @@ fn print_help() {
          \n\
          options:\n\
          \x20 -u, --user            target the per-user config path instead\n\
+         \x20 -e, --environment <env>  write mia-<env>.toml instead of mia.toml (for\n\
+         \x20                       side-by-side deployments); composes with --user,\n\
+         \x20                       excludes --output\n\
          \x20 -o, --output <path>   target a specific path\n\
          \x20 -c, --clean           delete the stored configuration\n\
          \x20 -f, --force           skip the confirmation prompt (write or clean)\n\
@@ -881,7 +931,7 @@ mod tests {
             allowlist_max_age: Some("3600".into()),
             ..Settings::default()
         };
-        let out = render(&s);
+        let out = render(&s, None);
         assert!(out.contains("\nlog = 'info'\n"));
         assert!(out.contains("\nsocket = '/run/ferrogate/mia.sock'\n"));
         // Integer key is unquoted.
@@ -917,6 +967,38 @@ mod tests {
         clean_config(&path, true).unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_filename_suffixes_before_extension() {
+        // No environment ⇒ unchanged.
+        assert_eq!(env_filename("allowlist.cbor", None), "allowlist.cbor");
+        // With an environment ⇒ inserted before the extension.
+        assert_eq!(
+            env_filename("allowlist.cbor", Some("staging")),
+            "allowlist-staging.cbor"
+        );
+        assert_eq!(env_filename("mia.sock", Some("prod")), "mia-prod.sock");
+        // No extension ⇒ appended.
+        assert_eq!(env_filename("ferrogate-mia", Some("qa")), "ferrogate-mia-qa");
+    }
+
+    #[test]
+    fn default_socket_is_environment_scoped() {
+        // The default-environment socket is unsuffixed; a selector suffixes it
+        // so two daemons don't bind the same path.
+        let default = default_socket(None);
+        let staging = default_socket(Some("staging"));
+        assert_ne!(default, staging);
+        assert!(staging.contains("staging"));
+    }
+
+    #[test]
+    fn render_environment_scopes_the_socket_placeholder() {
+        // With a selector and no explicit socket, the commented placeholder
+        // carries the env-suffixed default.
+        let out = render(&Settings::default(), Some("staging"));
+        assert!(out.contains("staging"), "{out}");
     }
 
     #[test]

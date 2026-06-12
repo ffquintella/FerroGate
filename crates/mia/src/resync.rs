@@ -31,8 +31,9 @@ use ferro_crypto::pin::SpkiPin;
 
 use crate::config::Config;
 
-const USAGE_RESYNC: &str = "usage: mia resync-allowlist [--config <path>] [--reload]";
-const USAGE_REFRESH: &str = "usage: mia refresh-key [--config <path>]";
+const USAGE_RESYNC: &str =
+    "usage: mia resync-allowlist [--config <path> | --environment <env>] [--reload]";
+const USAGE_REFRESH: &str = "usage: mia refresh-key [--config <path> | --environment <env>]";
 const USAGE_RELOAD: &str = "usage: mia --reload";
 
 /// Run the top-level `mia --reload` command: signal the running agent (SIGHUP)
@@ -129,6 +130,7 @@ fn load(
     banner: &str,
 ) -> anyhow::Result<Option<Config>> {
     let mut config_path = None;
+    let mut environment = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -140,10 +142,14 @@ fn load(
                 let path = it.next().context("--config requires a path argument")?;
                 config_path = Some(PathBuf::from(path));
             }
+            "-e" | "--environment" => {
+                let env = it.next().context("--environment requires a name argument")?;
+                environment = Some(env.clone());
+            }
             other => anyhow::bail!("unknown argument: {other}\n\n{usage}"),
         }
     }
-    let (config, source) = Config::load(config_path.as_deref())?;
+    let (config, source) = Config::load(config_path.as_deref(), environment.as_deref())?;
     println!("FerroGate {banner} (mia {})", env!("CARGO_PKG_VERSION"));
     match &source {
         Some(path) => println!("config: {}", path.display()),
@@ -383,6 +389,8 @@ fn print_help_resync() {
          options:\n\
          \x20 -c, --config <path>   TOML config file (default: the system config;\n\
          \x20                       environment variables override it)\n\
+         \x20 -e, --environment <env>  select mia-<env>.toml from the standard config\n\
+         \x20                       locations instead of mia.toml; excludes --config\n\
          \x20     --reload          signal the running agent to reload the allowlist\n\
          \x20                       live (SIGHUP) instead of requiring a restart\n\
          \x20 -h, --help            show this help"
@@ -427,6 +435,8 @@ fn print_help_refresh() {
          options:\n\
          \x20 -c, --config <path>   TOML config file (default: the system config;\n\
          \x20                       environment variables override it)\n\
+         \x20 -e, --environment <env>  select mia-<env>.toml from the standard config\n\
+         \x20                       locations instead of mia.toml; excludes --config\n\
          \x20 -h, --help            show this help"
     );
 }

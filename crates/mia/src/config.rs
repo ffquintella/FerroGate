@@ -46,66 +46,118 @@ use serde::Deserialize;
 /// Environment variable naming an explicit configuration file.
 pub const ENV_CONFIG: &str = "FERROGATE_CONFIG";
 
-/// The OS-idiomatic *system* configuration path (writable by root/admin),
-/// where a system service / daemon / launchd job looks: macOS
-/// `/Library/Application Support/FerroGate/mia.toml`.
-#[cfg(target_os = "macos")]
+/// The base name of the configuration file for an `--environment` selector.
+/// `None` ⇒ the default `mia.toml`; `Some("staging")` ⇒ `mia-staging.toml`. The
+/// selector lets one host carry side-by-side configs for different deployments
+/// (`mia --environment staging test`, `mia --environment prod`, …) without
+/// juggling explicit `--config` paths. The name must already have passed
+/// [`validate_environment`].
 #[must_use]
-pub fn system_config_path() -> PathBuf {
-    PathBuf::from("/Library/Application Support/FerroGate/mia.toml")
+pub fn config_filename(environment: Option<&str>) -> String {
+    match environment {
+        Some(env) => format!("mia-{env}.toml"),
+        None => "mia.toml".to_string(),
+    }
 }
 
-/// The OS-idiomatic *system* configuration path: Windows
-/// `%ProgramData%\FerroGate\mia.toml`.
+/// The OS-idiomatic *system* configuration directory (writable by root/admin),
+/// where a system service / daemon / launchd job looks: macOS
+/// `/Library/Application Support/FerroGate`.
+#[cfg(target_os = "macos")]
+fn system_config_dir() -> PathBuf {
+    PathBuf::from("/Library/Application Support/FerroGate")
+}
+
+/// The OS-idiomatic *system* configuration directory: Windows
+/// `%ProgramData%\FerroGate`.
 #[cfg(windows)]
-#[must_use]
-pub fn system_config_path() -> PathBuf {
+fn system_config_dir() -> PathBuf {
     std::env::var_os("ProgramData")
         .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
         .join("FerroGate")
-        .join("mia.toml")
 }
 
-/// The OS-idiomatic *system* configuration path: Linux/other Unix
-/// `/etc/ferrogate/mia.toml`.
+/// The OS-idiomatic *system* configuration directory: Linux/other Unix
+/// `/etc/ferrogate`.
 #[cfg(not(any(target_os = "macos", windows)))]
+fn system_config_dir() -> PathBuf {
+    PathBuf::from("/etc/ferrogate")
+}
+
+/// The OS-idiomatic *per-user* configuration directory (no elevation needed), or
+/// `None` if the relevant home/config environment variable is unset: macOS
+/// `~/Library/Application Support/FerroGate`.
+#[cfg(target_os = "macos")]
+fn user_config_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/FerroGate"))
+}
+
+/// The OS-idiomatic *per-user* configuration directory: Windows
+/// `%APPDATA%\FerroGate`.
+#[cfg(windows)]
+fn user_config_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("FerroGate"))
+}
+
+/// The OS-idiomatic *per-user* configuration directory: Linux/other Unix
+/// `$XDG_CONFIG_HOME/ferrogate` (or `~/.config/ferrogate`).
+#[cfg(not(any(target_os = "macos", windows)))]
+fn user_config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("ferrogate"));
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("ferrogate"))
+}
+
+/// The OS-idiomatic *system* configuration path for the default environment
+/// (`mia.toml`). Equivalent to `system_config_path_for(None)`.
 #[must_use]
 pub fn system_config_path() -> PathBuf {
-    PathBuf::from("/etc/ferrogate/mia.toml")
+    system_config_path_for(None)
 }
 
-/// The OS-idiomatic *per-user* configuration path (no elevation needed), or
-/// `None` if the relevant home/config environment variable is unset: macOS
-/// `~/Library/Application Support/FerroGate/mia.toml`.
-#[cfg(target_os = "macos")]
+/// The OS-idiomatic *system* configuration path for an `--environment` selector:
+/// the system config directory joined with [`config_filename`].
 #[must_use]
-pub fn user_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join("Library/Application Support/FerroGate/mia.toml"))
+pub fn system_config_path_for(environment: Option<&str>) -> PathBuf {
+    system_config_dir().join(config_filename(environment))
 }
 
-/// The OS-idiomatic *per-user* configuration path: Windows
-/// `%APPDATA%\FerroGate\mia.toml`.
-#[cfg(windows)]
+/// The OS-idiomatic *per-user* configuration path for the default environment
+/// (`mia.toml`), or `None` if no home/config directory is resolvable.
 #[must_use]
 pub fn user_config_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("FerroGate").join("mia.toml"))
+    user_config_path_for(None)
 }
 
-/// The OS-idiomatic *per-user* configuration path: Linux/other Unix
-/// `$XDG_CONFIG_HOME/ferrogate/mia.toml` (or `~/.config/ferrogate/mia.toml`).
-#[cfg(not(any(target_os = "macos", windows)))]
+/// The OS-idiomatic *per-user* configuration path for an `--environment`
+/// selector, or `None` if no home/config directory is resolvable.
 #[must_use]
-pub fn user_config_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("ferrogate").join("mia.toml"));
+pub fn user_config_path_for(environment: Option<&str>) -> Option<PathBuf> {
+    user_config_dir().map(|d| d.join(config_filename(environment)))
+}
+
+/// Validate an `--environment` selector. The name becomes part of a config
+/// filename (`mia-<env>.toml`), so it must be a safe single path component:
+/// non-empty, neither `.` nor `..`, and limited to ASCII letters, digits, `.`,
+/// `-`, and `_` — so it can neither inject a path separator nor traverse out of
+/// the config directory.
+pub fn validate_environment(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("--environment name must not be empty");
     }
-    std::env::var_os("HOME").map(|h| {
-        PathBuf::from(h)
-            .join(".config")
-            .join("ferrogate")
-            .join("mia.toml")
-    })
+    if name == "." || name == ".." {
+        anyhow::bail!("--environment name `{name}` is not a valid environment");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        anyhow::bail!(
+            "--environment name `{name}` is invalid: use only letters, digits, '.', '-', '_'"
+        );
+    }
+    Ok(())
 }
 
 /// Default helper-socket mode when unset (`0o660`).
@@ -210,34 +262,59 @@ pub struct AttestationConfig {
 impl Config {
     /// Discover, parse, and env-overlay the configuration.
     ///
-    /// `explicit` is the `--config <path>` value, if any. Returns the merged
-    /// configuration and the path actually loaded (`None` ⇒ no file, env/defaults
-    /// only).
-    pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Self, Option<PathBuf>)> {
-        let (mut config, source) = Self::load_file(explicit)?;
+    /// `explicit` is the `--config <path>` value, if any. `environment` is the
+    /// `--environment <env>` selector, if any: it picks `mia-<env>.toml` in the
+    /// standard system/user locations instead of the default `mia.toml`, and is
+    /// mutually exclusive with `explicit`. Returns the merged configuration and
+    /// the path actually loaded (`None` ⇒ no file, env/defaults only).
+    pub fn load(
+        explicit: Option<&Path>,
+        environment: Option<&str>,
+    ) -> anyhow::Result<(Self, Option<PathBuf>)> {
+        let (mut config, source) = Self::load_file(explicit, environment)?;
         config.apply_env()?;
         Ok((config, source))
     }
 
     /// Resolve and parse the file portion only (no env overlay). Exposed for
     /// testing; [`Config::load`] is the real entry point.
-    fn load_file(explicit: Option<&Path>) -> anyhow::Result<(Self, Option<PathBuf>)> {
-        // 1) explicit --config: must exist.
-        if let Some(path) = explicit {
-            let cfg = Self::from_path(path)
-                .with_context(|| format!("loading config file {}", path.display()))?;
-            return Ok((cfg, Some(path.to_path_buf())));
+    fn load_file(
+        explicit: Option<&Path>,
+        environment: Option<&str>,
+    ) -> anyhow::Result<(Self, Option<PathBuf>)> {
+        if let Some(env) = environment {
+            validate_environment(env)?;
+            anyhow::ensure!(
+                explicit.is_none(),
+                "--config and --environment are mutually exclusive: --config names one exact \
+                 file, --environment selects mia-{env}.toml from the standard config locations"
+            );
         }
-        // 2) $FERROGATE_CONFIG: if set, must exist.
-        if let Some(env_path) = std::env::var_os(ENV_CONFIG) {
-            let path = PathBuf::from(env_path);
-            let cfg = Self::from_path(&path)
-                .with_context(|| format!("loading {ENV_CONFIG}={}", path.display()))?;
-            return Ok((cfg, Some(path)));
+        // The exact-path sources name a single fixed file, so they apply only
+        // without an `--environment` selector; with one, go straight to the
+        // standard `mia-<env>.toml` discovery so the selector is not shadowed.
+        if environment.is_none() {
+            // 1) explicit --config: must exist.
+            if let Some(path) = explicit {
+                let cfg = Self::from_path(path)
+                    .with_context(|| format!("loading config file {}", path.display()))?;
+                return Ok((cfg, Some(path.to_path_buf())));
+            }
+            // 2) $FERROGATE_CONFIG: if set, must exist.
+            if let Some(env_path) = std::env::var_os(ENV_CONFIG) {
+                let path = PathBuf::from(env_path);
+                let cfg = Self::from_path(&path)
+                    .with_context(|| format!("loading {ENV_CONFIG}={}", path.display()))?;
+                return Ok((cfg, Some(path)));
+            }
         }
-        // 3) OS system path, then per-user path: load the first that exists,
-        //    else fall back to env/defaults.
-        let candidates = [Some(system_config_path()), user_config_path()];
+        // 3) OS system path, then per-user path (the `mia-<env>.toml` filename
+        //    when an environment is selected): load the first that exists, else
+        //    fall back to env/defaults.
+        let candidates = [
+            Some(system_config_path_for(environment)),
+            user_config_path_for(environment),
+        ];
         for path in candidates.into_iter().flatten() {
             if path.exists() {
                 let cfg = Self::from_path(&path)
@@ -376,6 +453,27 @@ impl Config {
     }
 }
 
+/// Where the daemon found — and will re-read, on SIGHUP — its configuration:
+/// the explicit `--config` path (if any) and the `--environment` selector (if
+/// any). Carrying both through the serve path lets the live reload re-resolve
+/// the *same* source it started from. The two are mutually exclusive (enforced
+/// by [`Config::load`]); a default `ConfigSource` means "standard discovery,
+/// default environment".
+#[derive(Debug, Clone, Default)]
+pub struct ConfigSource {
+    /// The explicit `--config <path>`, if one was given.
+    pub path: Option<PathBuf>,
+    /// The `--environment <env>` selector, if one was given.
+    pub environment: Option<String>,
+}
+
+impl ConfigSource {
+    /// Resolve and load the configuration this source describes.
+    pub fn load(&self) -> anyhow::Result<(Config, Option<PathBuf>)> {
+        Config::load(self.path.as_deref(), self.environment.as_deref())
+    }
+}
+
 /// Parse a boolean environment value, accepting the usual truthy/falsy spellings
 /// so an operator can write `1`, `true`, `yes`, or `on` (and their opposites).
 fn parse_bool_env(name: &str, raw: &str) -> anyhow::Result<bool> {
@@ -405,6 +503,42 @@ mod tests {
         if let Some(user) = user_config_path() {
             assert!(user.ends_with("mia.toml"));
         }
+    }
+
+    #[test]
+    fn environment_selects_named_config_filename() {
+        // Default ⇒ mia.toml; a selector ⇒ mia-<env>.toml, in the same dir.
+        assert!(config_filename(None) == "mia.toml");
+        assert_eq!(config_filename(Some("staging")), "mia-staging.toml");
+        let default = system_config_path_for(None);
+        let staging = system_config_path_for(Some("staging"));
+        assert_eq!(default.parent(), staging.parent());
+        assert!(default.ends_with("mia.toml"));
+        assert!(staging.ends_with("mia-staging.toml"));
+        // The plain accessor is the default-environment path.
+        assert_eq!(system_config_path(), default);
+    }
+
+    #[test]
+    fn environment_names_are_validated() {
+        for ok in ["staging", "prod", "qa-1", "us.east", "blue_green"] {
+            assert!(validate_environment(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["", ".", "..", "a/b", "../etc", "a b", "a\\b"] {
+            assert!(validate_environment(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn config_and_environment_are_mutually_exclusive() {
+        let err = Config::load(Some(Path::new("/tmp/x.toml")), Some("staging")).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn invalid_environment_is_rejected_by_load() {
+        let err = Config::load(None, Some("../etc/passwd")).unwrap_err();
+        assert!(err.to_string().contains("--environment"));
     }
 
     #[test]
