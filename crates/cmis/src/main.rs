@@ -62,25 +62,37 @@ fn load_single_key_trust(kid_var: &str, pub_var: &str) -> anyhow::Result<Trusted
     Ok(trust)
 }
 
-/// Load the issuer's composite signing key from persistent storage, generating
-/// and persisting a fresh one on first run.
+/// Load the issuer's composite signing key, sourcing its 32-byte master seed
+/// from the **Raft-replicated cluster** so every node behind the deployment's
+/// SRV name signs under one identity.
 ///
-/// The issuer key signs every SVID, the CRL, and host allowlists. If it were
-/// regenerated on each boot (as the bring-up path did), a restart would rotate
-/// the JWKS key out from under every consumer: previously-minted SVIDs, the
-/// allowlist a MIA already adopted, and the published CRL would all fail
-/// signature verification, and the MIA would deny callers (`crl-stale` /
-/// invalid signature). To keep the issuer's identity stable across restarts we
-/// persist a 32-byte master seed (not the expanded private key) and rebuild the
-/// keypair deterministically with [`Issuer::from_seed`].
+/// The issuer key signs every SVID, the CRL, and host allowlists. Two hazards
+/// shape this:
 ///
-/// Path: `CMIS_ISSUER_KEY` (default `<CMIS_RAFT_DIR-sibling>/issuer/issuer.seed`,
-/// i.e. `/var/lib/ferrogate/issuer/issuer.seed`). The file is created `0600`.
+/// 1. *Restart stability.* If the key were regenerated on each boot, a restart
+///    would rotate the JWKS key out from under every consumer: previously-minted
+///    SVIDs, the allowlist a MIA already adopted, and the published CRL would
+///    all fail signature verification and the MIA would deny callers
+///    (`crl-stale` / invalid signature). So the seed is persisted, not minted
+///    per boot, and the keypair is rebuilt deterministically with
+///    [`Issuer::from_seed`].
+/// 2. *Cluster identity.* The seed previously lived in a per-node local file.
+///    On an HA cluster that file is **not** replicated, so each node minted its
+///    own seed and a client load-balanced across the SRV name would fetch an
+///    allowlist signed by one node yet verify it against another node's
+///    enrollment key — a spurious `bad signature`. Storing the seed in the
+///    replicated store fixes this at the root: there is one seed, cluster-wide.
+///
+/// First-boot establishment is **leader-wins** (see [`resolve_cluster_seed`]):
+/// the leader promotes its on-disk seed (preserving a pre-replication identity)
+/// or a fresh one, and followers adopt it.
+///
+/// `CMIS_ISSUER_KEY` (default `/var/lib/ferrogate/issuer/issuer.seed`) is now
+/// only a migration source and a `0600` disaster-recovery mirror of the
+/// canonical seed — never the source of truth on an established cluster.
 /// `CMIS_ISSUER_KID` / `CMIS_TRUST_DOMAIN` override the defaults but must stay
 /// constant for a given seed, since the `kid` is how consumers resolve the key.
-fn load_or_create_issuer() -> anyhow::Result<Issuer> {
-    use rand_core::{OsRng, RngCore};
-
+async fn load_or_create_issuer(cluster: &Cluster) -> anyhow::Result<Issuer> {
     let kid = std::env::var("CMIS_ISSUER_KID").unwrap_or_else(|_| "cmis-dev-1".to_string());
     let trust_domain =
         std::env::var("CMIS_TRUST_DOMAIN").unwrap_or_else(|_| "ferrogate.dev".to_string());
@@ -89,52 +101,139 @@ fn load_or_create_issuer() -> anyhow::Result<Issuer> {
             .unwrap_or_else(|_| "/var/lib/ferrogate/issuer/issuer.seed".to_string()),
     );
 
-    if path.exists() {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("reading issuer seed {}: {e}", path.display()))?;
-        let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "issuer seed {} is {} bytes, expected 32",
-                path.display(),
-                bytes.len()
-            )
-        })?;
-        tracing::info!(kid = %kid, path = %path.display(), "loaded persisted issuer key");
-        return Ok(Issuer::from_seed(&seed, kid, trust_domain));
-    }
+    let seed = resolve_cluster_seed(cluster, &path).await?;
 
-    // First run: mint a fresh seed and persist it before use so a crash between
-    // here and serving doesn't leave us with an in-memory-only key.
-    let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("creating issuer key dir {}: {e}", parent.display()))?;
+    // Mirror the canonical seed to disk for disaster recovery and as the
+    // migration source on a future bootstrap. It is identical on every node (it
+    // is the one cluster seed), so the mirror can never reintroduce divergence;
+    // it also *heals* a node whose stale on-disk seed differed. Best-effort: a
+    // read-only or full filesystem must not take the issuer down.
+    if let Err(e) = mirror_seed_file(&path, &seed) {
+        tracing::warn!(
+            path = %path.display(), error = %e,
+            "could not mirror issuer seed to disk (continuing — the cluster copy is authoritative)"
+        );
     }
-    write_secret_file(&path, &seed)
-        .map_err(|e| anyhow::anyhow!("writing issuer seed {}: {e}", path.display()))?;
-    tracing::warn!(
-        kid = %kid,
-        path = %path.display(),
-        "no persisted issuer key found — generated a new one and stored it"
-    );
+    tracing::info!(kid = %kid, "issuer key ready (seed sourced from the cluster)");
     Ok(Issuer::from_seed(&seed, kid, trust_domain))
 }
 
-/// Write `data` to `path`, creating it `0600` (owner read/write only) so the
-/// issuer seed is never group/world-readable.
-fn write_secret_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+/// Resolve the cluster's canonical 32-byte issuer seed, establishing it on the
+/// first boot of a fresh cluster.
+///
+/// **Leader-wins.** Only the Raft leader promotes a seed into the replicated
+/// store — its existing on-disk seed if present (so an existing single-node /
+/// leader identity is preserved and already-enrolled hosts keep working), else
+/// a freshly minted one. Followers wait for the leader's seed to appear and
+/// adopt it. A bounded fallback ([`FOLLOWER_SEED_WAIT`]) keeps a follower from
+/// wedging forever if no leader ever publishes (e.g. a botched rolling
+/// upgrade): past the deadline it offers its own candidate through the same
+/// compare-and-set, so the cluster still converges on exactly one seed.
+async fn resolve_cluster_seed(
+    cluster: &Cluster,
+    path: &std::path::Path,
+) -> anyhow::Result<[u8; 32]> {
+    use rand_core::{OsRng, RngCore};
+
+    let started = tokio::time::Instant::now();
+    loop {
+        if let Some(bytes) = cluster.fetch_issuer_seed().await? {
+            return parse_seed(&bytes, "cluster issuer_seed");
+        }
+
+        let past_deadline = started.elapsed() >= FOLLOWER_SEED_WAIT;
+        if cluster.is_leader().await || past_deadline {
+            let candidate = if let Some(seed) = read_seed_file(path)? {
+                tracing::info!(
+                    path = %path.display(),
+                    "promoting on-disk issuer seed into the replicated cluster store"
+                );
+                seed
+            } else {
+                let mut seed = [0u8; 32];
+                OsRng.fill_bytes(&mut seed);
+                tracing::warn!("no issuer seed on disk or in the cluster — minting a fresh one");
+                seed
+            };
+            if cluster.try_store_issuer_seed(&candidate, now_unix()).await? {
+                if past_deadline && !cluster.is_leader().await {
+                    tracing::warn!(
+                        wait = ?FOLLOWER_SEED_WAIT,
+                        "no leader published an issuer seed in time — this follower established it"
+                    );
+                }
+                return Ok(candidate);
+            }
+            // Lost the compare-and-set: another node established the seed first.
+            // Loop to read and adopt the winning value.
+            tracing::info!("another node established the issuer seed first — adopting it");
+            continue;
+        }
+
+        // Follower still within the wait window: give the leader time to publish.
+        tokio::time::sleep(SEED_POLL_INTERVAL).await;
+    }
+}
+
+/// How long a non-leader waits for the leader to publish the issuer seed before
+/// it falls back to establishing one itself (liveness backstop only — the
+/// leader normally wins this comfortably).
+const FOLLOWER_SEED_WAIT: Duration = Duration::from_secs(20);
+/// Poll cadence while a follower waits for the seed to appear.
+const SEED_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Read a 32-byte seed from `path` if present. A missing file is `Ok(None)`;
+/// a present-but-malformed file (wrong length / unreadable) is an error so a
+/// corrupt mirror is surfaced rather than silently regenerating an identity.
+fn read_seed_file(path: &std::path::Path) -> anyhow::Result<Option<[u8; 32]>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("reading issuer seed {}: {e}", path.display()))?;
+    Ok(Some(parse_seed(&bytes, &path.display().to_string())?))
+}
+
+/// Interpret raw bytes as a 32-byte Ed25519/composite master seed.
+fn parse_seed(bytes: &[u8], src: &str) -> anyhow::Result<[u8; 32]> {
+    <[u8; 32]>::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("issuer seed from {src} is {} bytes, expected 32", bytes.len()))
+}
+
+/// Write the canonical seed to `path` as `0600`, creating parent dirs. Writes
+/// to a temp sibling and renames so a concurrent reader never sees a short
+/// file, and overwrites an existing file so a node whose mirror had diverged is
+/// healed. A no-op when the on-disk bytes already match.
+fn mirror_seed_file(path: &std::path::Path, seed: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(data)?;
-    f.sync_all()
+    if std::fs::read(path).is_ok_and(|existing| existing == seed) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("seed.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(seed)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Current Unix time in whole seconds (saturating at 0 before the epoch).
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Assemble the Raft cluster every durable CMIS store lives in (issued SVIDs,
@@ -301,7 +400,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:8443".to_string())
         .parse()?;
 
-    let issuer = load_or_create_issuer()?;
+    // All durable CMIS state (issued SVIDs, allowlists, proposals, and the
+    // issuer's master signing seed) lives in the Raft-replicated SQLite store —
+    // a one-node Raft when no peers are configured — so it survives restarts and
+    // is identical on every node. Start it before loading the issuer: the seed
+    // is sourced from (and, on first boot, promoted into) the cluster, so the
+    // whole HA cluster signs under one identity behind its SRV name.
+    let cluster = start_cluster().await?;
+    let issuer = load_or_create_issuer(&cluster).await?;
     // The verifier and the RIM loader share one `RimStore` handle so a signed
     // bundle applied by the loader is immediately visible to quote verification.
     let rim_store = RimStore::new();
@@ -334,11 +440,6 @@ async fn main() -> anyhow::Result<()> {
         proposal_policy = ?cmis_config.allowlist_proposal_policy,
         "allowlist proposal policy"
     );
-
-    // All durable CMIS state (issued SVIDs, allowlists, proposals) lives in
-    // the Raft-replicated SQLite store — a one-node Raft when no peers are
-    // configured — so it survives restarts.
-    let cluster = start_cluster().await?;
 
     let state = Arc::new(CmisState::new(
         issuer,
@@ -463,4 +564,105 @@ async fn serve_grpc(addr: std::net::SocketAddr, state: Arc<CmisState>) -> anyhow
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_seed_requires_exactly_32_bytes() {
+        assert!(parse_seed(&[0u8; 32], "x").is_ok());
+        assert!(parse_seed(&[0u8; 31], "x").is_err());
+        assert!(parse_seed(&[0u8; 33], "x").is_err());
+        assert!(parse_seed(&[], "x").is_err());
+    }
+
+    #[test]
+    fn read_seed_file_is_none_when_absent_and_round_trips_when_present() {
+        let dir = std::env::temp_dir().join(format!("ferrogate-seedfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("issuer/issuer.seed");
+
+        assert!(read_seed_file(&path).unwrap().is_none());
+
+        let seed = [0x7eu8; 32];
+        mirror_seed_file(&path, &seed).unwrap();
+        assert_eq!(read_seed_file(&path).unwrap(), Some(seed));
+
+        // Mode is 0600 — the seed is never group/world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "mirror must be 0600, got {mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_heals_a_diverged_on_disk_seed() {
+        let dir = std::env::temp_dir().join(format!("ferrogate-seedheal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("issuer.seed");
+
+        mirror_seed_file(&path, &[0x01u8; 32]).unwrap();
+        // A later canonical seed overwrites the stale one in place.
+        mirror_seed_file(&path, &[0x02u8; 32]).unwrap();
+        assert_eq!(read_seed_file(&path).unwrap(), Some([0x02u8; 32]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a fresh single-node cluster (always leader) with an existing on-disk
+    /// seed, `resolve_cluster_seed` adopts that seed — preserving a
+    /// pre-replication identity so already-enrolled hosts keep working — and
+    /// promotes it into the cluster so subsequent reads return it.
+    #[tokio::test]
+    async fn resolve_adopts_existing_on_disk_seed() {
+        let dir = std::env::temp_dir().join(format!("ferrogate-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("issuer/issuer.seed");
+        let existing = [0x42u8; 32];
+        mirror_seed_file(&path, &existing).unwrap();
+
+        let raft_dir = dir.join("raft");
+        let cluster = Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let resolved = resolve_cluster_seed(&cluster, &path).await.unwrap();
+        assert_eq!(resolved, existing, "must adopt the on-disk seed");
+        // It is now the cluster's canonical seed.
+        assert_eq!(
+            cluster.fetch_issuer_seed().await.unwrap().as_deref(),
+            Some(&existing[..]),
+        );
+
+        cluster.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no seed on disk and none in the cluster, the leader mints a fresh
+    /// one and stores it; a second resolve returns the same established seed
+    /// (never a second identity).
+    #[tokio::test]
+    async fn resolve_mints_and_then_reuses_a_fresh_seed() {
+        let dir = std::env::temp_dir().join(format!("ferrogate-mint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("issuer/issuer.seed");
+        let raft_dir = dir.join("raft");
+
+        let cluster = Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let first = resolve_cluster_seed(&cluster, &path).await.unwrap();
+        let second = resolve_cluster_seed(&cluster, &path).await.unwrap();
+        assert_eq!(first, second, "an established seed is stable across resolves");
+
+        cluster.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

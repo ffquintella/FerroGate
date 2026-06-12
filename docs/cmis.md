@@ -50,17 +50,34 @@ Annual root rotation is performed offline (see [operations.md](operations.md)).
 
 Until the TEE-sealed path above is wired, the shipped binary keeps the issuer
 key stable across restarts by persisting a **32-byte master seed** and rebuilding
-the composite key deterministically (`Issuer::from_seed`). On first run CMIS
-generates a seed and writes it `0600` to `CMIS_ISSUER_KEY`
-(default `/var/lib/ferrogate/issuer/issuer.seed`); subsequent boots reuse it.
-Only the seed is secret material at rest — the expanded private key never touches
-disk. `CMIS_ISSUER_KID` (default `cmis-dev-1`) and `CMIS_TRUST_DOMAIN` (default
+the composite key deterministically (`Issuer::from_seed`). Only the seed is
+secret material at rest — the expanded private key never touches disk.
+`CMIS_ISSUER_KID` (default `cmis-dev-1`) and `CMIS_TRUST_DOMAIN` (default
 `ferrogate.dev`) set the published `kid` and trust domain and must stay constant
 for a given seed, since the `kid` is how verifiers resolve the JWKS key.
 
-Losing the seed rotates the signing key, which invalidates every issued SVID,
-the allowlist a MIA has adopted, and the published CRL — MIAs then fail closed
-(`crl-stale` / bad signature). Keep the path on a persistent volume.
+**The seed lives in the Raft-replicated store, not a per-node file.** It is the
+cluster's single signing identity: on the first boot of a fresh cluster the
+*leader* establishes the seed once (adopting an existing on-disk seed if there
+is one, else minting a fresh one) and every other node adopts it from the
+replicated store. This is what lets an HA cluster sit behind one SRV name — a
+client that load-balances across nodes always fetches an allowlist signed by,
+and verified against, the same key. (Before this, each node generated its own
+seed in a non-replicated local file, so a client could fetch an allowlist signed
+by one node yet verify it against another's enrollment key → spurious
+`bad signature`.)
+
+`CMIS_ISSUER_KEY` (default `/var/lib/ferrogate/issuer/issuer.seed`) is no longer
+the source of truth on an established cluster — it is only (a) the migration
+source the leader promotes on first boot and (b) a `0600` disaster-recovery
+mirror CMIS keeps in lock-step with the canonical seed. Because every node
+mirrors the *same* cluster seed, the file can no longer diverge between nodes,
+and a node whose mirror is stale is healed to the canonical seed on next boot.
+
+Losing the seed everywhere (replicated store *and* every mirror) rotates the
+signing key, which invalidates every issued SVID, the allowlist a MIA has
+adopted, and the published CRL — MIAs then fail closed (`crl-stale` / bad
+signature). Keep the Raft volume durable and back up the mirror.
 
 ## Crate layout (target)
 

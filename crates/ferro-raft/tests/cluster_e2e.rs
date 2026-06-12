@@ -624,3 +624,64 @@ async fn ten_minute_chaos_run() {
     shutdown_all(nodes).await;
     std::fs::remove_dir_all(root).ok();
 }
+
+// --- issuer seed: one signing identity across the cluster ------------------
+
+/// The fix for the HML split-brain: the issuer master seed lives in the
+/// replicated store, established exactly once (compare-and-set on the `id = 1`
+/// singleton), so every node behind the cluster's SRV name signs allowlists
+/// and SVIDs under one key. Without this each node minted its own seed and a
+/// client load-balanced across nodes saw `bad signature`.
+#[tokio::test]
+async fn issuer_seed_is_one_identity_across_the_cluster() {
+    let (root, nodes, _leader) = start_3_node("issuer-seed-ha").await;
+
+    // Nobody has established a seed yet.
+    assert!(nodes[0].fetch_issuer_seed().await.unwrap().is_none());
+
+    // One node establishes the seed (writes forward to the leader).
+    let seed = [0x5au8; 32];
+    assert!(nodes[0].try_store_issuer_seed(&seed, 1).await.unwrap());
+
+    // A different node's attempt to establish a *different* seed is ignored:
+    // the singleton already holds one, so the call returns false and the stored
+    // value is untouched. This is precisely what stops a second identity.
+    assert!(!nodes[1]
+        .try_store_issuer_seed(&[0x99u8; 32], 2)
+        .await
+        .unwrap());
+
+    // Every node resolves the same seed — no per-node divergence.
+    for n in &nodes {
+        assert_eq!(
+            n.fetch_issuer_seed().await.unwrap().as_deref(),
+            Some(&seed[..]),
+        );
+    }
+
+    shutdown_all(nodes).await;
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// `try_store_issuer_seed` is idempotent on a single node too: the first call
+/// wins, later calls are no-ops, and the seed reads back unchanged.
+#[tokio::test]
+async fn issuer_seed_store_is_idempotent() {
+    let root = temp_root("issuer-seed-single");
+    let node = Cluster::start_single_node(root.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+
+    assert!(node.fetch_issuer_seed().await.unwrap().is_none());
+
+    let seed_a = [0x11u8; 32];
+    assert!(node.try_store_issuer_seed(&seed_a, 1).await.unwrap());
+    assert!(!node.try_store_issuer_seed(&[0x22u8; 32], 2).await.unwrap());
+    assert_eq!(
+        node.fetch_issuer_seed().await.unwrap().as_deref(),
+        Some(&seed_a[..]),
+    );
+
+    node.shutdown().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}

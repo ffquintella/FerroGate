@@ -428,6 +428,20 @@ impl Cluster {
                 Vec::<hiqlite::Param>::new(),
             )
             .await?;
+        // The issuer's 32-byte master signing seed, replicated so every node
+        // signs SVIDs / CRLs / allowlists under one identity. A single row
+        // (`id = 1`); CMIS seeds it once at bootstrap (see `try_store_issuer_seed`)
+        // rather than here, because the seed value is CMIS's to choose.
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS issuer_seed ( \
+                    id INTEGER PRIMARY KEY CHECK (id = 1), \
+                    seed BLOB NOT NULL, \
+                    created_at INTEGER NOT NULL \
+                )",
+                Vec::<hiqlite::Param>::new(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -705,6 +719,47 @@ impl Cluster {
         self.current_rim_version().await
     }
 
+    /// Fetch the cluster's issuer master seed, if one has been established.
+    ///
+    /// Strongly-consistent (read through the leader) so a node never bootstraps
+    /// its issuer from a stale local view and mints a second signing identity:
+    /// the whole point of replicating the seed is that every node signs under
+    /// one key behind the cluster's SRV name.
+    pub async fn fetch_issuer_seed(&self) -> Result<Option<Vec<u8>>, ClusterError> {
+        let rows: Vec<RawSeedRow> = self
+            .client
+            .query_consistent_map(
+                "SELECT id, seed, created_at FROM issuer_seed WHERE id = 1",
+                Vec::<hiqlite::Param>::new(),
+            )
+            .await?;
+        Ok(rows.into_iter().next().map(|r| r.seed))
+    }
+
+    /// Store the issuer master seed, but only if none is set yet. Returns `true`
+    /// if this call established the seed, `false` if another node had already
+    /// done so (the existing seed is left untouched).
+    ///
+    /// `INSERT OR IGNORE` on the `id = 1` singleton makes this a cluster-wide
+    /// compare-and-set: concurrent bootstrappers race through the Raft log and
+    /// exactly one wins, so the cluster converges on a single seed. Callers that
+    /// lose (`false`) must re-read [`Self::fetch_issuer_seed`] to learn the
+    /// winning value.
+    pub async fn try_store_issuer_seed(
+        &self,
+        seed: &[u8],
+        now_unix: i64,
+    ) -> Result<bool, ClusterError> {
+        let affected = self
+            .client
+            .execute(
+                "INSERT OR IGNORE INTO issuer_seed (id, seed, created_at) VALUES (1, $1, $2)",
+                vec![Param::from(seed.to_vec()), Param::from(now_unix)],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
     /// Gracefully shut down the local Raft node.
     pub async fn shutdown(self) -> Result<(), ClusterError> {
         self.client.shutdown().await?;
@@ -765,6 +820,25 @@ impl<'r> From<&'r mut hiqlite::Row<'_>> for RawProposalRow {
             entries: row.get("entries"),
             proposer_spiffe_id: row.get("proposer_spiffe_id"),
             proposed_at: row.get("proposed_at"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RawSeedRow {
+    #[allow(dead_code)]
+    id: i64,
+    seed: Vec<u8>,
+    #[allow(dead_code)]
+    created_at: i64,
+}
+
+impl<'r> From<&'r mut hiqlite::Row<'_>> for RawSeedRow {
+    fn from(row: &'r mut hiqlite::Row<'_>) -> Self {
+        Self {
+            id: row.get("id"),
+            seed: row.get("seed"),
+            created_at: row.get("created_at"),
         }
     }
 }

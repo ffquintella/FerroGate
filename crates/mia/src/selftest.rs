@@ -6,9 +6,15 @@
 //! 2. **CMIS connection** — a pinned hybrid-PQC TLS connection is established
 //!    (the dial is eager, so DNS, TCP, the X25519MLKEM768 handshake, and the
 //!    SPKI pin are all validated here);
-//! 3. **CMIS CRL publishing** — the `JWKS` RPC returns a signature-valid,
+//! 3. **cluster identity** — when CMIS is an HA cluster (an SRV record with
+//!    more than one node), every reachable node is dialed and confirmed to
+//!    serve the *same* issuer enrollment key. Nodes that disagree silently
+//!    break machine login: a client load-balanced across the SRV name fetches
+//!    an allowlist signed by one node but verifies it against another's key
+//!    (`bad signature`). A single static endpoint has nothing to cross-check;
+//! 4. **CMIS CRL publishing** — the `JWKS` RPC returns a signature-valid,
 //!    fresh CRL (the helper API fail-closed gates minting on this, F11);
-//! 4. **helper token mint** — a real `HelperReq` is sent over the local helper
+//! 5. **helper token mint** — a real `HelperReq` is sent over the local helper
 //!    socket and the reply is interpreted.
 //!
 //! Every failing step prints targeted remediation hints (mirroring the
@@ -159,10 +165,15 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
         match connect_best(resolver).await {
             Ok((endpoint, mut client)) => {
                 report(
-                    "[2/4] CMIS connection",
+                    "[2/5] CMIS connection",
                     "ok",
                     &format!("{endpoint} — hybrid-PQC TLS established, SPKI pin verified"),
                 );
+                // 3. cluster identity ----------------------------------------
+                if !check_cluster_identity(resolver).await {
+                    failures.push("cluster identity");
+                }
+                // 4. CRL publishing ------------------------------------------
                 server_crl = check_server_crl(&mut client).await;
                 if server_crl != ServerCrl::Fresh {
                     failures.push("CMIS CRL publishing");
@@ -170,7 +181,7 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
             }
             Err(e) => {
                 failures.push("CMIS connection");
-                report("[2/4] CMIS connection", "FAIL", &format!("{e:#}"));
+                report("[2/5] CMIS connection", "FAIL", &format!("{e:#}"));
                 hints(&[
                     format!("Check basic reachability: DNS and TCP to {}.", resolver.describe()),
                     "A TLS handshake error usually means the SPKI pin no longer matches the served \
@@ -182,7 +193,12 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
                      (`dig SRV <name>`) and that they share the pinned identity.".to_string(),
                 ]);
                 report(
-                    "[3/4] CMIS CRL publishing",
+                    "[3/5] cluster identity",
+                    "skip",
+                    "no connection — fix step 2 first",
+                );
+                report(
+                    "[4/5] CMIS CRL publishing",
                     "skip",
                     "no connection — fix step 2 first",
                 );
@@ -190,18 +206,23 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
         }
     } else {
         report(
-            "[2/4] CMIS connection",
+            "[2/5] CMIS connection",
             "skip",
             "no usable CMIS configuration",
         );
         report(
-            "[3/4] CMIS CRL publishing",
+            "[3/5] cluster identity",
+            "skip",
+            "no usable CMIS configuration",
+        );
+        report(
+            "[4/5] CMIS CRL publishing",
             "skip",
             "no usable CMIS configuration",
         );
     }
 
-    // 4. helper token mint -------------------------------------------------
+    // 5. helper token mint -------------------------------------------------
     if !check_mint(config, audience, server_crl).await {
         failures.push("helper token mint");
     }
@@ -218,7 +239,7 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
 /// Step 1: build the CMIS resolver from `config` — a single static endpoint, or
 /// an SRV record for HA. Reports the configured source and validates the pin.
 fn check_config(config: &Config) -> Option<CmisResolver> {
-    let label = "[1/4] configuration";
+    let label = "[1/5] configuration";
     match CmisResolver::from_config(&config.cmis) {
         Ok(Some(r)) => {
             let detail = if r.is_srv() {
@@ -306,13 +327,154 @@ async fn connect_best(
     )
 }
 
-/// Step 3: fetch the JWKS and check the embedded CRL verifies and is fresh.
+/// Step 3: when CMIS is an HA cluster, confirm every reachable node serves the
+/// same issuer enrollment key — the key host allowlists are signed under. Nodes
+/// that disagree are a split-brain signing identity: behind one SRV name a
+/// client fetches an allowlist signed by one node yet verifies it against
+/// another's key, so machine login fails with `bad signature` even though each
+/// node's *own* self-test passes (each node is internally self-consistent). A
+/// single static endpoint — or an SRV that resolves to one node — has no peers
+/// to cross-check and passes trivially.
+///
+/// Returns `true` when the cluster presents one identity (or there is nothing
+/// to cross-check), `false` on divergence.
+async fn check_cluster_identity(resolver: &CmisResolver) -> bool {
+    let label = "[3/5] cluster identity";
+    if !resolver.is_srv() {
+        report(label, "ok", "single endpoint — no cluster to cross-check");
+        return true;
+    }
+    let candidates = match resolver.candidates().await {
+        Ok(c) => c,
+        Err(e) => {
+            // SRV resolution / reachability is step 2's concern — don't double-fail.
+            report(label, "skip", &format!("could not resolve SRV candidates: {e:#}"));
+            return true;
+        }
+    };
+    if candidates.len() < 2 {
+        report(label, "ok", "SRV resolved to a single node — no peers to cross-check");
+        return true;
+    }
+
+    // Probe every node for the enrollment key it serves, then group by that key:
+    // one group means a single signing identity, more than one means split brain.
+    let pins = resolver.pins().to_vec();
+    let mut probes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut unreachable = 0usize;
+    for ep in &candidates {
+        match probe_enrollment_key(ep, &pins).await {
+            Ok(key) => probes.push((ep.clone(), key)),
+            Err(e) => {
+                unreachable += 1;
+                println!("          ✗ {ep}: {e:#}");
+            }
+        }
+    }
+
+    let groups = group_by_identity(probes);
+    let compared: usize = groups.iter().map(|(_, eps)| eps.len()).sum();
+    if compared == 0 {
+        report(label, "skip", "no nodes answered the enrollment-key RPC (see step 2)");
+        return true;
+    }
+
+    if groups.len() == 1 {
+        report(
+            label,
+            "ok",
+            &format!(
+                "{compared} node(s) share one signing identity (key {})",
+                key_fp(&groups[0].0)
+            ),
+        );
+        if unreachable > 0 {
+            hints(&[format!(
+                "{unreachable} node(s) could not be checked; re-run when every SRV target is up."
+            )]);
+        }
+        true
+    } else {
+        report(
+            label,
+            "FAIL",
+            &format!(
+                "CMIS nodes serve {} different enrollment keys — split-brain signing identity",
+                groups.len()
+            ),
+        );
+        for (key, eps) in &groups {
+            println!("          key {} ⇐ {}", key_fp(key), eps.join(", "));
+        }
+        hints(&[
+            "Behind one SRV name a client fetches an allowlist signed by one node but verifies it \
+             against another's key, so machine login fails with `bad signature` even though each \
+             node's own `mia test` passes."
+                .to_string(),
+            "The cluster's issuer master seed must be identical on every node. Current CMIS \
+             replicates the seed automatically; if nodes still diverge, one is running an older \
+             build that kept a per-node local seed — unify it (install the leader's \
+             /var/lib/ferrogate/issuer/issuer.seed on the others and restart) or upgrade."
+                .to_string(),
+            "After unifying, re-pin and re-fetch on every enrolled host: `mia refresh-key` then \
+             `mia resync-allowlist` (add `-e <env>` for a named environment)."
+                .to_string(),
+        ]);
+        false
+    }
+}
+
+/// Dial one CMIS node over pinned hybrid-PQC TLS and fetch its issuer
+/// enrollment key, bounding both the connect and the RPC by [`STEP_TIMEOUT`].
+async fn probe_enrollment_key(
+    endpoint: &str,
+    pins: &[ferro_crypto::pin::SpkiPin],
+) -> anyhow::Result<Vec<u8>> {
+    let mut client = tokio::time::timeout(
+        STEP_TIMEOUT,
+        crate::client::connect_pinned(endpoint, pins.to_vec()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect timed out after {}s", STEP_TIMEOUT.as_secs()))??;
+    tokio::time::timeout(STEP_TIMEOUT, crate::client::fetch_enrollment_key(&mut client))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("enrollment-key RPC timed out after {}s", STEP_TIMEOUT.as_secs())
+        })?
+}
+
+/// Group `(endpoint, enrollment_key)` probes by the key served. One entry in
+/// the result means a single signing identity across the cluster; more than one
+/// means split brain. Endpoints keep their probe order within each group.
+fn group_by_identity(probes: Vec<(String, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<String>)> {
+    let mut groups: Vec<(Vec<u8>, Vec<String>)> = Vec::new();
+    for (ep, key) in probes {
+        if let Some(g) = groups.iter_mut().find(|(k, _)| *k == key) {
+            g.1.push(ep);
+        } else {
+            groups.push((key, vec![ep]));
+        }
+    }
+    groups
+}
+
+/// Short, stable fingerprint of an enrollment key for display — the first 12
+/// hex chars of its SHA-384. Equality is always checked on the full bytes; this
+/// is only so an operator can eyeball which nodes agree.
+fn key_fp(key: &[u8]) -> String {
+    use sha2::{Digest, Sha384};
+    let mut s = hex::encode(Sha384::digest(key));
+    s.truncate(12);
+    s
+}
+
+/// Step 4: fetch the JWKS and check the embedded CRL verifies and is fresh.
 async fn check_server_crl(
     client: &mut ferro_proto::v1::machine_identity_client::MachineIdentityClient<
         tonic::transport::Channel,
     >,
 ) -> ServerCrl {
-    let label = "[3/4] CMIS CRL publishing";
+    let label = "[4/5] CMIS CRL publishing";
     let jwks = match tokio::time::timeout(
         STEP_TIMEOUT,
         client.jwks(tonic::Request::new(ferro_proto::v1::JwksRequest {})),
@@ -420,7 +582,7 @@ async fn check_server_crl(
 async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
     use crate::helper::proto::{read_frame, write_frame, HelperReq, HelperResp};
 
-    let label = "[4/4] helper token mint";
+    let label = "[5/5] helper token mint";
     let Some(socket) = config.helper_socket() else {
         report(label, "FAIL", "helper.socket is not configured");
         hints(&[
@@ -549,7 +711,7 @@ fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
 #[cfg(not(unix))]
 async fn check_mint(_config: &Config, _audience: &str, _server_crl: ServerCrl) -> bool {
     report(
-        "[4/4] helper token mint",
+        "[5/5] helper token mint",
         "FAIL",
         "the named-pipe self-test is not supported on this platform yet",
     );
@@ -729,5 +891,40 @@ mod tests {
         let advice = mint_failure_advice(ErrorCode::PermissionDenied, ServerCrl::Fresh).join("\n");
         assert!(advice.contains("allowlist"));
         assert!(advice.contains("LocalDenied"));
+    }
+
+    #[test]
+    fn agreeing_nodes_collapse_to_one_identity() {
+        let key = vec![0xAAu8; 32];
+        let groups = group_by_identity(vec![
+            ("https://a:8443".into(), key.clone()),
+            ("https://b:8443".into(), key.clone()),
+            ("https://c:8443".into(), key),
+        ]);
+        assert_eq!(groups.len(), 1, "all nodes share one key => one group");
+        assert_eq!(groups[0].1.len(), 3);
+    }
+
+    #[test]
+    fn divergent_nodes_are_detected_as_split_brain() {
+        // The HML failure: two nodes signing under different seeds.
+        let groups = group_by_identity(vec![
+            ("https://n3:8443".into(), vec![0x08u8; 32]),
+            ("https://n4:8443".into(), vec![0xa0u8; 32]),
+        ]);
+        assert_eq!(groups.len(), 2, "distinct keys => split brain");
+        // Each distinct identity lists exactly the node(s) that served it.
+        assert_eq!(groups[0].1, vec!["https://n3:8443".to_string()]);
+        assert_eq!(groups[1].1, vec!["https://n4:8443".to_string()]);
+    }
+
+    #[test]
+    fn key_fingerprint_is_stable_short_and_distinguishing() {
+        let a = key_fp(&[0x01u8; 32]);
+        let b = key_fp(&[0x02u8; 32]);
+        assert_eq!(a.len(), 12);
+        assert_eq!(a, key_fp(&[0x01u8; 32]), "deterministic");
+        assert_ne!(a, b, "different keys => different fingerprints");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
