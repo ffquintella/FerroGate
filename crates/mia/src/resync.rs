@@ -27,7 +27,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use ferro_crypto::composite::CompositePublicKey;
-use ferro_crypto::pin::SpkiPin;
 
 use crate::config::Config;
 
@@ -166,18 +165,8 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
         .path
         .as_deref()
         .context("allowlist.path is not configured; nothing to write (run `mia setup`)")?;
-    let endpoint = config
-        .cmis
-        .endpoint
-        .as_deref()
-        .context("cmis.endpoint is not configured; cannot reach CMIS (run `mia setup`)")?;
-    let pin_hex = config
-        .cmis
-        .spki_pin
-        .as_deref()
-        .context("cmis.spki_pin is not configured; cannot pin CMIS (run `mia setup`)")?;
-    let pin = SpkiPin::from_hex(pin_hex.trim())
-        .map_err(|e| anyhow::anyhow!("cmis.spki_pin is not a valid SHA-384 SPKI pin: {e}"))?;
+    let resolver = crate::endpoint::CmisResolver::from_config(&config.cmis)?
+        .context("cmis is not configured (set cmis.endpoint or cmis.srv); run `mia setup`")?;
 
     // Derive this host's UUID locally from its hardware fingerprint — the same
     // identity the daemon's host-key attestation resolves to: CMIS keys a host's
@@ -189,7 +178,14 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
     let uuid = ferro_svid::host_uuid_from_ek_digest(facts.fingerprint().as_bytes()).to_string();
     println!("host: {uuid}\n");
 
-    let Some(bytes) = crate::client::fetch_allowlist(endpoint, vec![pin], &uuid)
+    // Resolve + dial CMIS with fail-over (static endpoint or SRV-discovered HA
+    // cluster); the chosen node is reported so the operator sees which served.
+    let (endpoint, mut client) = resolver.connect().await.context("connecting to CMIS")?;
+    if resolver.is_srv() {
+        println!("cmis: {endpoint} (selected via SRV {})\n", resolver.describe());
+    }
+
+    let Some(bytes) = crate::client::fetch_allowlist(&mut client, &uuid)
         .await
         .context("fetching the signed allowlist from CMIS")?
     else {
@@ -258,29 +254,19 @@ fn signal_reload() {
 /// Fetch the CMIS enrollment key and write it to `allowlist.key`, then report
 /// whether the allowlist already on disk verifies under it.
 fn refresh_key(config: &Config) -> anyhow::Result<()> {
-    let endpoint = config
-        .cmis
-        .endpoint
-        .as_deref()
-        .context("cmis.endpoint is not configured; cannot reach CMIS (run `mia setup`)")?;
-    let pin_hex = config
-        .cmis
-        .spki_pin
-        .as_deref()
-        .context("cmis.spki_pin is not configured; cannot pin CMIS (run `mia setup`)")?;
+    let resolver = crate::endpoint::CmisResolver::from_config(&config.cmis)?
+        .context("cmis is not configured (set cmis.endpoint or cmis.srv); run `mia setup`")?;
     let key_path = config
         .allowlist
         .key
         .as_deref()
         .context("allowlist.key is not configured; nowhere to write the key (run `mia setup`)")?;
-    // Validate the pin here for a clear message before the fetch re-parses it.
-    SpkiPin::from_hex(pin_hex.trim())
-        .map_err(|e| anyhow::anyhow!("cmis.spki_pin is not a valid SHA-384 SPKI pin: {e}"))?;
     println!();
 
     // Reuse the wizard's fetch+write (pinned TLS, writes the composite concat
-    // bytes 0644). It dials over its own short-lived runtime.
-    crate::setup::fetch_enrollment_key_to(endpoint, pin_hex, key_path)
+    // bytes 0644). It dials over its own short-lived runtime, with fail-over
+    // across the resolver's candidates.
+    crate::setup::fetch_enrollment_key_to(&resolver, key_path)
         .context("fetching the enrollment key from CMIS")?;
     println!("✓ fetched and wrote {}", key_path.display());
 

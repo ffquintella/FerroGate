@@ -198,6 +198,7 @@ Each key has an environment-variable equivalent that overrides it:
 |----------|----------------------|
 | `log` | `RUST_LOG` |
 | `cmis.endpoint` | `FERROGATE_CMIS_ENDPOINT` |
+| `cmis.srv` | `FERROGATE_CMIS_SRV` |
 | `cmis.spki_pin` | `FERROGATE_CMIS_SPKI_PIN` |
 | `helper.socket` | `FERROGATE_HELPER_SOCKET` |
 | `helper.socket_mode` | `FERROGATE_HELPER_SOCKET_MODE` |
@@ -210,6 +211,51 @@ Each key has an environment-variable equivalent that overrides it:
 | `allowlist.propose_interval_secs` | `FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS` |
 | `attestation.ima_log` | `FERROGATE_IMA_LOG` |
 
+### High availability via DNS SRV discovery
+
+Instead of a single static `cmis.endpoint`, point the agent at a DNS **SRV
+record** that advertises the CMIS nodes:
+
+```toml
+[cmis]
+srv      = "_cmis._tcp.example.com"   # mutually exclusive with `endpoint`
+spki_pin = "<hex-sha384>"             # authenticates every node (shared identity)
+```
+
+`cmis.srv` and `cmis.endpoint` are mutually exclusive — set exactly one. When
+`srv` is set the agent:
+
+1. **resolves** the SRV record (via the platform's DNS resolver) to its
+   `(priority, weight, port, target)` entries;
+2. **orders** them by RFC 2782 — ascending priority, then descending weight — so
+   the most-preferred node is tried first;
+3. **selects the best live node**: it dials candidates best-first and uses the
+   first that completes the pinned hybrid-PQC TLS handshake. That handshake *is*
+   the health check — an unreachable, non-hybrid, or wrong-identity node is
+   skipped (a per-node 10 s timeout keeps a black-holed node from stalling the
+   sweep); and
+4. **fails over** automatically: every CMIS interaction (startup attestation,
+   the allowlist fetch, the background CRL puller, and the allowlist-propose
+   loop) re-resolves and re-selects on each (re)connect, so a node that goes down
+   — or a cluster that is rescaled in DNS — is followed without a restart.
+
+Because CMIS authenticates by **SPKI pin** rather than a CA chain, the cluster
+shares one pinned identity, so a single `cmis.spki_pin` covers every node. All
+SRV targets are dialed over `https` hybrid-PQC TLS regardless of the record's
+port. Run `mia test` to see the discovered candidates and which node was
+selected (it probes each and prints per-node reachability).
+
+To publish such a record, add SRV entries pointing at your CMIS nodes, e.g.:
+
+```dns
+_cmis._tcp.example.com. 300 IN SRV 10 50 8443 cmis-a.example.com.
+_cmis._tcp.example.com. 300 IN SRV 10 50 8443 cmis-b.example.com.
+_cmis._tcp.example.com. 300 IN SRV 20 0  8443 cmis-dr.example.com.
+```
+
+Here `cmis-a`/`cmis-b` (priority 10) are preferred and load-shared, and
+`cmis-dr` (priority 20) is a fallback used only when both primaries are down.
+
 ### `mia setup` — interactive wizard
 
 Rather than hand-editing the env file, run the bundled wizard:
@@ -220,8 +266,9 @@ $ sudo mia setup
 
 `mia setup` is a rich-terminal, guided wizard (arrow keys / typed answers, with
 validation and per-field help) that walks through the agent's configuration —
-the CMIS server to connect to, the local helper API, the caller allowlist,
-attestation, and log verbosity — and writes the **TOML configuration file** in
+how to reach CMIS (a single endpoint, or an **SRV record for HA**), the local
+helper API, the caller allowlist, attestation, and log verbosity — and writes
+the **TOML configuration file** in
 the documented, self-commenting form. It writes the OS **system path** by
 default (see the per-OS table above) and prompts platform-appropriately (socket
 mode on Unix, the pipe group on Windows). Run against an existing file it
@@ -289,10 +336,14 @@ A non-interactive diagnostic that exercises the full path a local application
 depends on and exits non-zero if any step fails, so it can gate provisioning
 scripts. It runs four checks in order:
 
-1. **configuration** — a CMIS endpoint and a valid SPKI pin resolve from the
-   usual config-file/environment precedence;
+1. **configuration** — a CMIS source (a static `endpoint`, or an `srv` record)
+   and a valid SPKI pin resolve from the usual config-file/environment
+   precedence;
 2. **CMIS connection** — an eager dial over pinned hybrid-PQC TLS, validating
-   DNS, TCP, the X25519MLKEM768 handshake, and the SPKI pin;
+   DNS, TCP, the X25519MLKEM768 handshake, and the SPKI pin. For an SRV source it
+   resolves the record, probes each node best-first (printing per-node
+   reachability), and selects the first live one — so the check doubles as an HA
+   readout;
 3. **CMIS CRL publishing** — the `JWKS` RPC returns a signature-valid, fresh
    CRL (the freshness the helper API fail-closed gates minting on, F11);
 4. **helper token mint** — a real `HelperReq` over the local helper socket,

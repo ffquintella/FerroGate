@@ -190,9 +190,19 @@ pub struct Config {
 #[derive(Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CmisConfig {
-    /// `https://host:port` endpoint (`https` ⇒ hybrid-PQC TLS, SPKI-pinned).
+    /// A single `https://host:port` endpoint (`https` ⇒ hybrid-PQC TLS,
+    /// SPKI-pinned). Mutually exclusive with [`srv`](Self::srv).
     pub endpoint: Option<String>,
-    /// Accepted CMIS SPKI pin (lowercase-hex SHA-384).
+    /// A DNS **SRV** record owner name (e.g. `_cmis._tcp.example.com`) advertising
+    /// one or more CMIS nodes for high availability. When set, the agent resolves
+    /// it, prefers the records by RFC 2782 priority/weight, dials them best-first,
+    /// and fails over to the next live node automatically. Mutually exclusive with
+    /// [`endpoint`](Self::endpoint); the SPKI pin still authenticates every node
+    /// (a CMIS cluster shares one pinned identity). Resolved candidates are always
+    /// dialed over `https` hybrid-PQC TLS.
+    pub srv: Option<String>,
+    /// Accepted CMIS SPKI pin (lowercase-hex SHA-384). Required whenever
+    /// `endpoint` or `srv` is set.
     pub spki_pin: Option<String>,
 }
 
@@ -351,6 +361,9 @@ impl Config {
         }
         if let Some(v) = get("FERROGATE_CMIS_ENDPOINT") {
             self.cmis.endpoint = Some(v);
+        }
+        if let Some(v) = get("FERROGATE_CMIS_SRV") {
+            self.cmis.srv = Some(v);
         }
         if let Some(v) = get("FERROGATE_CMIS_SPKI_PIN") {
             self.cmis.spki_pin = Some(v);

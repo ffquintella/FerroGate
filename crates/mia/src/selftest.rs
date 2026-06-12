@@ -21,9 +21,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use ferro_crypto::pin::SpkiPin;
 
 use crate::config::Config;
+use crate::endpoint::CmisResolver;
 use crate::helper::crl::{CrlIngestError, CRL_FRESHNESS_LEEWAY_SECS};
 use crate::helper::proto::ErrorCode;
 
@@ -148,16 +148,16 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
     let mut failures: Vec<&str> = Vec::new();
 
     // 1. configuration ----------------------------------------------------
-    let cmis = check_config(config);
-    if cmis.is_none() {
+    let resolver = check_config(config);
+    if resolver.is_none() {
         failures.push("configuration");
     }
 
     // 2. CMIS connection / 3. CRL publishing ------------------------------
     let mut server_crl = ServerCrl::Unknown;
-    if let Some((endpoint, pin)) = &cmis {
-        match dial_cmis(endpoint, *pin).await {
-            Ok(mut client) => {
+    if let Some(resolver) = &resolver {
+        match connect_best(resolver).await {
+            Ok((endpoint, mut client)) => {
                 report(
                     "[2/4] CMIS connection",
                     "ok",
@@ -172,13 +172,14 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
                 failures.push("CMIS connection");
                 report("[2/4] CMIS connection", "FAIL", &format!("{e:#}"));
                 hints(&[
-                    format!("Check basic reachability: DNS for the host and TCP to the port in {endpoint}."),
+                    format!("Check basic reachability: DNS and TCP to {}.", resolver.describe()),
                     "A TLS handshake error usually means the SPKI pin no longer matches the served \
                      certificate (a cert rotation without a config update), or the server does not \
                      offer hybrid X25519MLKEM768 — non-hybrid servers are rejected by design."
                         .to_string(),
-                    "Compare cmis.spki_pin against the pin of the live certificate, and confirm the \
-                     CMIS service is up on the target host.".to_string(),
+                    "Compare cmis.spki_pin against the pin of the live certificate(s), and confirm \
+                     the CMIS service is up. For an SRV record, check it resolves to the live nodes \
+                     (`dig SRV <name>`) and that they share the pinned identity.".to_string(),
                 ]);
                 report(
                     "[3/4] CMIS CRL publishing",
@@ -214,41 +215,35 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Step 1: resolve and validate the CMIS endpoint and pin from `config`.
-fn check_config(config: &Config) -> Option<(String, SpkiPin)> {
+/// Step 1: build the CMIS resolver from `config` — a single static endpoint, or
+/// an SRV record for HA. Reports the configured source and validates the pin.
+fn check_config(config: &Config) -> Option<CmisResolver> {
     let label = "[1/4] configuration";
-    let Some(endpoint) = config.cmis.endpoint.as_deref() else {
-        report(label, "FAIL", "cmis.endpoint is not set");
-        hints(&[
-            "Run `mia setup` (or set FERROGATE_CMIS_ENDPOINT) to point the agent at a CMIS \
-                 server, e.g. https://cmis.example.com:8443."
-                .to_string(),
-        ]);
-        return None;
-    };
-    let Some(pin_hex) = config.cmis.spki_pin.as_deref() else {
-        report(
-            label,
-            "FAIL",
-            "cmis.endpoint is set but cmis.spki_pin is missing",
-        );
-        hints(&[
-            "The CMIS server is authenticated by SPKI pin, not a CA chain; without a pin the \
-                 agent cannot dial it. `mia setup` can fetch and confirm the pin interactively."
-                .to_string(),
-        ]);
-        return None;
-    };
-    match SpkiPin::from_hex(pin_hex.trim()) {
-        Ok(pin) => {
-            report(label, "ok", &format!("endpoint {endpoint}"));
-            Some((endpoint.to_string(), pin))
+    match CmisResolver::from_config(&config.cmis) {
+        Ok(Some(r)) => {
+            let detail = if r.is_srv() {
+                format!("SRV {} (high-availability discovery)", r.describe())
+            } else {
+                format!("endpoint {}", r.describe())
+            };
+            report(label, "ok", &detail);
+            Some(r)
+        }
+        Ok(None) => {
+            report(label, "FAIL", "neither cmis.endpoint nor cmis.srv is set");
+            hints(&[
+                "Run `mia setup` (or set FERROGATE_CMIS_ENDPOINT / FERROGATE_CMIS_SRV) to point \
+                 the agent at CMIS: a single https://host:port, or an SRV record like \
+                 _cmis._tcp.example.com for a high-availability cluster."
+                    .to_string(),
+            ]);
+            None
         }
         Err(e) => {
-            report(label, "FAIL", &format!("cmis.spki_pin is invalid: {e}"));
+            report(label, "FAIL", &format!("{e:#}"));
             hints(&[
-                "The pin must be the lowercase-hex SHA-384 of the server certificate's SPKI \
-                     (96 hex chars). Re-run `mia setup` to re-fetch it."
+                "Set exactly one of cmis.endpoint / cmis.srv, plus a valid cmis.spki_pin \
+                 (lowercase-hex SHA-384, 96 chars). `mia setup` can fetch and confirm the pin."
                     .to_string(),
             ]);
             None
@@ -256,20 +251,59 @@ fn check_config(config: &Config) -> Option<(String, SpkiPin)> {
     }
 }
 
-/// Step 2: dial CMIS over pinned hybrid-PQC TLS (eager — validates the
-/// handshake), bounded by [`STEP_TIMEOUT`].
-async fn dial_cmis(
-    endpoint: &str,
-    pin: SpkiPin,
-) -> anyhow::Result<
+/// Step 2: select a live CMIS node. For an SRV source, resolve the candidates,
+/// probe each best-first (printing per-node reachability so the operator sees
+/// the HA picture), and return the first that completes the pinned hybrid-PQC
+/// handshake; a static source dials its single endpoint. Each dial is bounded by
+/// [`STEP_TIMEOUT`].
+async fn connect_best(
+    resolver: &CmisResolver,
+) -> anyhow::Result<(
+    String,
     ferro_proto::v1::machine_identity_client::MachineIdentityClient<tonic::transport::Channel>,
-> {
-    tokio::time::timeout(
-        STEP_TIMEOUT,
-        crate::client::connect_pinned(endpoint, vec![pin]),
+)> {
+    let candidates = resolver
+        .candidates()
+        .await
+        .context("resolving CMIS candidates")?;
+    if resolver.is_srv() {
+        println!(
+            "        SRV {} resolved to {} candidate(s):",
+            resolver.describe(),
+            candidates.len()
+        );
+    }
+    let pins = resolver.pins().to_vec();
+    let mut last_err: Option<String> = None;
+    for ep in &candidates {
+        match tokio::time::timeout(STEP_TIMEOUT, crate::client::connect_pinned(ep, pins.clone()))
+            .await
+        {
+            Ok(Ok(client)) => {
+                if resolver.is_srv() {
+                    println!("          ✓ {ep}");
+                }
+                return Ok((ep.clone(), client));
+            }
+            Ok(Err(e)) => {
+                if resolver.is_srv() {
+                    println!("          ✗ {ep}: {e}");
+                }
+                last_err = Some(format!("{ep}: {e}"));
+            }
+            Err(_) => {
+                if resolver.is_srv() {
+                    println!("          ✗ {ep}: timed out after {}s", STEP_TIMEOUT.as_secs());
+                }
+                last_err = Some(format!("{ep}: timed out"));
+            }
+        }
+    }
+    anyhow::bail!(
+        "no reachable CMIS node among {} candidate(s){}",
+        candidates.len(),
+        last_err.map_or(String::new(), |e| format!(" (last: {e})"))
     )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out after {}s", STEP_TIMEOUT.as_secs()))?
 }
 
 /// Step 3: fetch the JWKS and check the embedded CRL verifies and is fresh.

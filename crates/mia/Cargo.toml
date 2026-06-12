@@ -36,6 +36,7 @@ rustls-pki-types   = { workspace = true }
 hyper-util         = { workspace = true }
 tower              = { workspace = true }
 tonic              = { workspace = true }
+hickory-resolver   = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }

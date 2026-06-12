@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use ferro_crypto::pin::SpkiPin;
 use inquire::validator::Validation;
-use inquire::{Confirm, Text};
+use inquire::{Confirm, Select, Text};
 
 use crate::config::{
     system_config_path, system_config_path_for, user_config_path_for, validate_environment, Config,
@@ -169,6 +169,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
 struct Settings {
     log: Option<String>,
     cmis_endpoint: Option<String>,
+    cmis_srv: Option<String>,
     cmis_spki_pin: Option<String>,
     helper_socket: Option<String>,
     helper_socket_mode: Option<String>,
@@ -221,26 +222,64 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
 
     // ── CMIS connection (the server to attest to) ───────────────────────────
     println!("\n— CMIS server (the Central Machine Identity Service to connect to) —");
-    let endpoint = Text::new("CMIS endpoint URL:")
-        .with_default(existing.cmis.endpoint.as_deref().unwrap_or_default())
-        .with_help_message("https://cmis.example.com:8443  (https ⇒ hybrid-PQC TLS, pinned)")
-        .with_validator(|input: &str| {
-            let t = input.trim();
-            if t.is_empty() || t.starts_with("https://") || t.starts_with("http://") {
-                Ok(Validation::Valid)
-            } else {
-                Ok(Validation::Invalid(
-                    "must start with https:// or http:// (or be left blank)".into(),
-                ))
-            }
-        })
+    // Discovery mode: one fixed endpoint, or a DNS SRV record advertising an HA
+    // cluster the agent discovers and fails over across.
+    let modes = vec![
+        "Single endpoint (one CMIS server)",
+        "SRV record (high availability — discover & fail over across nodes)",
+    ];
+    let start_cursor = usize::from(existing.cmis.srv.is_some());
+    let mode = Select::new("How should this host reach CMIS?", modes)
+        .with_starting_cursor(start_cursor)
+        .with_help_message(
+            "SRV lets one DNS record advertise several CMIS nodes; mia dials the best live one",
+        )
         .prompt()?;
-    s.cmis_endpoint = non_empty(endpoint);
+    let use_srv = mode.starts_with("SRV");
 
-    if s.cmis_endpoint
-        .as_deref()
-        .is_some_and(|e| e.starts_with("https://"))
-    {
+    if use_srv {
+        let srv = Text::new("CMIS SRV record name:")
+            .with_default(existing.cmis.srv.as_deref().unwrap_or_default())
+            .with_help_message(
+                "e.g. _cmis._tcp.example.com  (records dialed best-first over hybrid-PQC TLS)",
+            )
+            .with_validator(|input: &str| {
+                let t = input.trim();
+                if t.is_empty() || t.contains('.') {
+                    Ok(Validation::Valid)
+                } else {
+                    Ok(Validation::Invalid(
+                        "an SRV owner name, e.g. _cmis._tcp.example.com".into(),
+                    ))
+                }
+            })
+            .prompt()?;
+        s.cmis_srv = non_empty(srv);
+    } else {
+        let endpoint = Text::new("CMIS endpoint URL:")
+            .with_default(existing.cmis.endpoint.as_deref().unwrap_or_default())
+            .with_help_message("https://cmis.example.com:8443  (https ⇒ hybrid-PQC TLS, pinned)")
+            .with_validator(|input: &str| {
+                let t = input.trim();
+                if t.is_empty() || t.starts_with("https://") || t.starts_with("http://") {
+                    Ok(Validation::Valid)
+                } else {
+                    Ok(Validation::Invalid(
+                        "must start with https:// or http:// (or be left blank)".into(),
+                    ))
+                }
+            })
+            .prompt()?;
+        s.cmis_endpoint = non_empty(endpoint);
+    }
+
+    // The SPKI pin authenticates CMIS over TLS — required for any SRV record or
+    // an https endpoint (a bare http:// endpoint, plaintext bring-up, needs none).
+    let needs_pin = s.cmis_srv.is_some()
+        || s.cmis_endpoint
+            .as_deref()
+            .is_some_and(|e| e.starts_with("https://"));
+    if needs_pin {
         println!(
             "  The SPKI pin authenticates the CMIS server by its public key — the\n\
              \x20 SHA-384 of the certificate's SubjectPublicKeyInfo, pinned directly\n\
@@ -357,24 +396,29 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
             .prompt()?;
         s.allowlist_key = non_empty(key);
 
-        // Offer to fetch the enrollment key from CMIS now (needs endpoint + pin).
-        if let (Some(key_path), Some(endpoint), Some(pin)) = (
-            s.allowlist_key.as_deref(),
-            s.cmis_endpoint.as_deref(),
-            s.cmis_spki_pin.as_deref(),
-        ) {
-            let fetch = Confirm::new(&format!("Fetch this key from {endpoint} now?"))
-                .with_default(true)
-                .with_help_message("downloads the CMIS enrollment public key over pinned TLS")
-                .prompt()?;
-            if fetch {
-                match fetch_enrollment_key_to(endpoint, pin, Path::new(key_path)) {
-                    Ok(()) => println!("  ✓ wrote {key_path}"),
-                    Err(e) => {
-                        // Non-fatal: keep configuring; the operator can retry or
-                        // place the key out of band.
-                        println!("  ! could not fetch the key: {e:#}");
-                        println!("    (continuing — provide {key_path} another way)");
+        // Offer to fetch the enrollment key from CMIS now. Build a resolver from
+        // the values just entered (static endpoint or SRV record); it needs a
+        // CMIS source + SPKI pin, and for SRV it discovers and fails over.
+        if let Some(key_path) = s.allowlist_key.as_deref() {
+            let cfg = crate::config::CmisConfig {
+                endpoint: s.cmis_endpoint.clone(),
+                srv: s.cmis_srv.clone(),
+                spki_pin: s.cmis_spki_pin.clone(),
+            };
+            if let Ok(Some(resolver)) = crate::endpoint::CmisResolver::from_config(&cfg) {
+                let fetch = Confirm::new(&format!("Fetch this key from {} now?", resolver.describe()))
+                    .with_default(true)
+                    .with_help_message("downloads the CMIS enrollment public key over pinned TLS")
+                    .prompt()?;
+                if fetch {
+                    match fetch_enrollment_key_to(&resolver, Path::new(key_path)) {
+                        Ok(()) => println!("  ✓ wrote {key_path}"),
+                        Err(e) => {
+                            // Non-fatal: keep configuring; the operator can retry
+                            // or place the key out of band.
+                            println!("  ! could not fetch the key: {e:#}");
+                            println!("    (continuing — provide {key_path} another way)");
+                        }
                     }
                 }
             }
@@ -518,17 +562,18 @@ fn path_default(existing: Option<&Path>, fallback: String) -> String {
 /// runtime since the wizard is otherwise synchronous. Shared with the
 /// non-interactive `mia refresh-key` command ([`crate::resync`]).
 pub(crate) fn fetch_enrollment_key_to(
-    endpoint: &str,
-    pin_hex: &str,
+    resolver: &crate::endpoint::CmisResolver,
     key_path: &Path,
 ) -> anyhow::Result<()> {
-    let pin =
-        SpkiPin::from_hex(pin_hex.trim()).map_err(|e| anyhow::anyhow!("invalid SPKI pin: {e}"))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("building runtime")?;
-    let key = rt.block_on(crate::client::fetch_enrollment_key(endpoint, vec![pin]))?;
+    let key = rt.block_on(async {
+        // Resolve + dial with fail-over, then fetch over the chosen channel.
+        let (_, mut client) = resolver.connect().await?;
+        crate::client::fetch_enrollment_key(&mut client).await
+    })?;
 
     if let Some(parent) = key_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -675,12 +720,18 @@ fn render(s: &Settings, environment: Option<&str>) -> String {
 
     out.push_str("[cmis]\n");
     out.push_str("# CMIS endpoint. An https:// URL is dialed over hybrid-PQC TLS, pinned by\n");
-    out.push_str("# SPKI; http:// is plaintext bring-up only.\n");
+    out.push_str("# SPKI; http:// is plaintext bring-up only. Mutually exclusive with `srv`.\n");
     out.push_str(&str_line(
         s.cmis_endpoint.as_deref(),
         "endpoint",
         "https://cmis.example.com:8443",
     ));
+    out.push_str(
+        "# DNS SRV record advertising a CMIS HA cluster (alternative to `endpoint`).\n\
+         # The agent resolves it, prefers records by priority/weight, dials the best\n\
+         # live node, and fails over automatically. The pin below authenticates them all.\n",
+    );
+    out.push_str(&str_line(s.cmis_srv.as_deref(), "srv", "_cmis._tcp.example.com"));
     out.push_str("# Accepted CMIS SPKI pin (lowercase-hex SHA-384).\n");
     out.push_str(&str_line(
         s.cmis_spki_pin.as_deref(),

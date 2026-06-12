@@ -51,16 +51,18 @@ pub async fn connect_pinned(
 }
 
 /// Fetch the CMIS enrollment public key (the composite key that signs caller
-/// allowlists) from a pinned CMIS endpoint.
+/// allowlists) over an already-connected, pinned channel.
 ///
 /// Returns the key as composite concat bytes — exactly what
 /// [`ferro_crypto::composite::CompositePublicKey::from_concat_bytes`] and the
-/// `allowlist.key` file expect. `endpoint` is an `https://host:port` authority
-/// and `pins` are the accepted SHA-384 SPKI pins of the CMIS certificate.
-pub async fn fetch_enrollment_key(endpoint: &str, pins: Vec<SpkiPin>) -> anyhow::Result<Vec<u8>> {
+/// `allowlist.key` file expect. The caller obtains `client` from
+/// [`crate::endpoint::CmisResolver::connect`] (which selects a live node and
+/// fails over), so this only issues the RPC.
+pub async fn fetch_enrollment_key(
+    client: &mut MachineIdentityClient<Channel>,
+) -> anyhow::Result<Vec<u8>> {
     use ferro_proto::v1::GetEnrollmentKeyRequest;
 
-    let mut client = connect_pinned(endpoint, pins).await?;
     let resp = client
         .get_enrollment_key(Request::new(GetEnrollmentKeyRequest {}))
         .await?
@@ -71,22 +73,21 @@ pub async fn fetch_enrollment_key(endpoint: &str, pins: Vec<SpkiPin>) -> anyhow:
     Ok(resp.public_key)
 }
 
-/// Fetch this host's signed caller allowlist body from a pinned CMIS endpoint,
-/// keyed by its EK-derived `host_uuid`.
+/// Fetch this host's signed caller allowlist body over an already-connected,
+/// pinned channel, keyed by its EK-derived `host_uuid`.
 ///
 /// Returns the CBOR `SignedAllowlist` bytes ready to write to `allowlist.path`,
 /// or `None` when CMIS has no allowlist stored for this host (an empty response
 /// is not an error — the daemon then falls back to whatever is already on disk,
 /// or fails closed). The bytes are integrity-protected by their signature, so
-/// fetching them over the pinned channel needs no further authentication.
+/// fetching them over the pinned channel needs no further authentication. The
+/// caller obtains `client` from [`crate::endpoint::CmisResolver::connect`].
 pub async fn fetch_allowlist(
-    endpoint: &str,
-    pins: Vec<SpkiPin>,
+    client: &mut MachineIdentityClient<Channel>,
     host_uuid: &str,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     use ferro_proto::v1::GetAllowlistRequest;
 
-    let mut client = connect_pinned(endpoint, pins).await?;
     let resp = client
         .get_allowlist(Request::new(GetAllowlistRequest {
             host_uuid: host_uuid.to_string(),
@@ -111,16 +112,17 @@ pub enum ProposeOutcome {
     Unchanged,
 }
 
-/// Propose this host's observed caller set to CMIS over the pinned channel.
+/// Propose this host's observed caller set to CMIS over an already-connected,
+/// pinned channel.
 ///
 /// `signed_proposal` is the canonical CBOR `ferro_svid::ProposalDoc`,
 /// `proposal_sig` the host machine-key signature over its
 /// `proposal_signing_input`, `svid_jws` the host's SVID, and `sep_pub` the DER
 /// SPKI of the machine key — CMIS binds all four together (see
-/// `ProposeAllowlist`). The decision is CMIS's; this returns which it made.
+/// `ProposeAllowlist`). The decision is CMIS's; this returns which it made. The
+/// caller obtains `client` from [`crate::endpoint::CmisResolver::connect`].
 pub async fn propose_allowlist(
-    endpoint: &str,
-    pins: Vec<SpkiPin>,
+    client: &mut MachineIdentityClient<Channel>,
     signed_proposal: Vec<u8>,
     proposal_sig: Vec<u8>,
     svid_jws: String,
@@ -129,7 +131,6 @@ pub async fn propose_allowlist(
     use ferro_proto::v1::propose_allowlist_response::Outcome;
     use ferro_proto::v1::ProposeAllowlistRequest;
 
-    let mut client = connect_pinned(endpoint, pins).await?;
     let resp = client
         .propose_allowlist(Request::new(ProposeAllowlistRequest {
             signed_proposal,

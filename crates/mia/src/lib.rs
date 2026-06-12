@@ -26,6 +26,9 @@ pub mod client;
 /// The TOML configuration file and its merge with the environment.
 pub mod config;
 
+/// CMIS endpoint discovery (static or SRV), best-first selection, and fail-over.
+pub mod endpoint;
+
 pub mod hardening;
 pub mod helper;
 pub mod scheduler;

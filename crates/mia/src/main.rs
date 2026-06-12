@@ -290,26 +290,12 @@ fn host_key_path() -> std::path::PathBuf {
 /// cryptographic core is already proven by `ferro-sep`'s live test.
 #[allow(clippy::too_many_lines)] // linear bootstrap: dial → attest → build minter
 #[allow(clippy::large_futures)] // holds a composite key (~4 KB ML-DSA) across awaits
-async fn bootstrap_host_svid(config: &mia::config::Config) -> Option<HostSession> {
+async fn bootstrap_host_svid(resolver: &mia::endpoint::CmisResolver) -> Option<HostSession> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
-    use ferro_crypto::pin::SpkiPin;
     use ferro_sep::MachineKey as _;
     use mia::helper::{ChildTokenMinter, MinterConfig};
     use sha2::{Digest, Sha256, Sha384};
-
-    let endpoint = config.cmis.endpoint.as_deref()?;
-    let Some(pin_hex) = config.cmis.spki_pin.as_deref() else {
-        tracing::error!("cmis.endpoint is set but cmis.spki_pin is missing; cannot attest");
-        return None;
-    };
-    let pin = match SpkiPin::from_hex(pin_hex.trim()) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "cmis.spki_pin is not a valid SHA-384 SPKI pin");
-            return None;
-        }
-    };
 
     let facts = match ferro_machineid::collect_facts() {
         Ok(f) => f,
@@ -332,10 +318,12 @@ async fn bootstrap_host_svid(config: &mia::config::Config) -> Option<HostSession
     // the SVID's `cnf.jkt`.
     let dpop_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(key.public_spki_der()));
 
-    let mut client = match mia::client::connect_pinned(endpoint, vec![pin]).await {
+    // Resolve + dial CMIS with fail-over (static endpoint or SRV-discovered HA
+    // cluster); a successful pinned handshake selects a live node.
+    let (endpoint, mut client) = match resolver.connect().await {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, %endpoint, "could not connect to CMIS for attestation");
+            tracing::error!(error = %e, cmis = %resolver.describe(), "could not connect to CMIS for attestation");
             return None;
         }
     };
@@ -358,6 +346,7 @@ async fn bootstrap_host_svid(config: &mia::config::Config) -> Option<HostSession
     tracing::info!(
         spiffe_id = %attested.bundle.spiffe_id,
         fingerprint = %facts.fingerprint().to_hex(),
+        cmis = %endpoint,
         "host SVID obtained via host-key attestation; token minting enabled"
     );
     Some(HostSession {
@@ -394,9 +383,11 @@ fn host_uuid_from_spiffe_id(spiffe_id: &str) -> Option<&str> {
 /// then falls back to whatever is already on disk (or fails closed if nothing
 /// is), exactly as if auto-fetch were off.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-async fn maybe_fetch_allowlist(config: &mia::config::Config, host_spiffe_id: Option<&str>) {
-    use ferro_crypto::pin::SpkiPin;
-
+async fn maybe_fetch_allowlist(
+    config: &mia::config::Config,
+    resolver: Option<&mia::endpoint::CmisResolver>,
+    host_spiffe_id: Option<&str>,
+) {
     if !config.allowlist.fetch {
         return;
     }
@@ -414,22 +405,19 @@ async fn maybe_fetch_allowlist(config: &mia::config::Config, host_spiffe_id: Opt
         tracing::warn!(%spiffe_id, "could not derive host UUID from SVID; skipping allowlist fetch");
         return;
     };
-    let (Some(endpoint), Some(pin_hex)) = (
-        config.cmis.endpoint.as_deref(),
-        config.cmis.spki_pin.as_deref(),
-    ) else {
-        tracing::warn!("allowlist.fetch is set but cmis.endpoint/spki_pin are missing; skipping");
+    let Some(resolver) = resolver else {
+        tracing::warn!("allowlist.fetch is set but CMIS is not configured; skipping");
         return;
     };
-    let pin = match SpkiPin::from_hex(pin_hex.trim()) {
-        Ok(p) => p,
+    let mut client = match resolver.connect().await {
+        Ok((_, client)) => client,
         Err(e) => {
-            tracing::warn!(error = %e, "cmis.spki_pin invalid; skipping allowlist fetch");
+            tracing::warn!(error = %e, "could not reach CMIS; skipping allowlist fetch");
             return;
         }
     };
 
-    match mia::client::fetch_allowlist(endpoint, vec![pin], host_uuid).await {
+    match mia::client::fetch_allowlist(&mut client, host_uuid).await {
         Ok(Some(bytes)) => {
             if let Err(e) = write_allowlist_file(path, &bytes) {
                 tracing::warn!(error = %e, path = %path.display(), "could not write fetched allowlist; keeping existing file");
@@ -480,12 +468,12 @@ fn write_allowlist_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[allow(clippy::too_many_lines)] // precondition checks + the periodic loop.
 fn maybe_spawn_propose_task(
-    config: &mia::config::Config,
+    resolver: Option<&mia::endpoint::CmisResolver>,
     host_spiffe_id: Option<&str>,
     host_jws: Option<String>,
     ledger: mia::helper::CallerLedger,
+    propose_interval_secs: u64,
 ) {
-    use ferro_crypto::pin::SpkiPin;
     use ferro_sep::MachineKey as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -501,20 +489,9 @@ fn maybe_spawn_propose_task(
         tracing::warn!(%spiffe_id, "could not derive host UUID; not proposing");
         return;
     };
-    let (Some(endpoint), Some(pin_hex)) =
-        (config.cmis.endpoint.clone(), config.cmis.spki_pin.clone())
-    else {
-        tracing::warn!(
-            "allowlist.propose is set but cmis.endpoint/spki_pin are missing; not proposing"
-        );
+    let Some(resolver) = resolver.cloned() else {
+        tracing::warn!("allowlist.propose is set but CMIS is not configured; not proposing");
         return;
-    };
-    let pin = match SpkiPin::from_hex(pin_hex.trim()) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "cmis.spki_pin invalid; not proposing");
-            return;
-        }
     };
     let key = match ferro_sep::SoftwareMachineKey::open_or_create(&host_key_path()) {
         Ok(k) => k,
@@ -524,8 +501,8 @@ fn maybe_spawn_propose_task(
         }
     };
     let sep_pub = key.public_spki_der();
-    let interval = std::time::Duration::from_secs(config.allowlist_propose_interval());
-    tracing::info!(%host_uuid, interval_secs = config.allowlist_propose_interval(), "allowlist-propose task started");
+    let interval = std::time::Duration::from_secs(propose_interval_secs);
+    tracing::info!(%host_uuid, interval_secs = propose_interval_secs, cmis = %resolver.describe(), "allowlist-propose task started");
 
     tokio::spawn(async move {
         let mut last_sent: Option<Vec<(u32, [u8; 48])>> = None;
@@ -555,13 +532,23 @@ fn maybe_spawn_propose_task(
                     bin_sha: hex::encode(bin),
                 })
                 .collect();
+            // Resolve + dial CMIS with fail-over for this round (re-resolving SRV
+            // so a failed-over or rescaled cluster is followed); the one
+            // connection serves both the live-allowlist fetch and the proposal.
+            let mut client = match resolver.connect().await {
+                Ok((_, client)) => client,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not reach CMIS; skipping proposal this round");
+                    continue;
+                }
+            };
             // A proposal is a *full set* that, on approval, replaces the live
             // allowlist (ADR-0003). The observed snapshot knows nothing about
             // entries an operator added by hand — a `bin_sha=*` wildcard, a
             // manual pin — so fold the live allowlist in and propose
             // `live ∪ observed`. Without this, approving a proposal silently
             // drops those operator entries.
-            match mia::client::fetch_allowlist(&endpoint, vec![pin], &host_uuid).await {
+            match mia::client::fetch_allowlist(&mut client, &host_uuid).await {
                 Ok(Some(bytes)) => {
                     match ferro_svid::allowlist::decode(&bytes)
                         .and_then(|s| ferro_svid::allowlist::decode_body(&s.body))
@@ -615,8 +602,7 @@ fn maybe_spawn_propose_task(
                 }
             };
             match mia::client::propose_allowlist(
-                &endpoint,
-                vec![pin],
+                &mut client,
                 body,
                 sig,
                 jws.clone(),
@@ -653,36 +639,23 @@ const CRL_PULL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60
 /// forever: CMIS being down at boot must not permanently disable minting.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn maybe_spawn_crl_puller(
-    config: &mia::config::Config,
+    resolver: Option<mia::endpoint::CmisResolver>,
     cache: std::sync::Arc<mia::helper::CrlCache>,
 ) {
-    use ferro_crypto::pin::SpkiPin;
-
-    let (Some(endpoint), Some(pin_hex)) =
-        (config.cmis.endpoint.clone(), config.cmis.spki_pin.clone())
-    else {
+    let Some(resolver) = resolver else {
         tracing::warn!(
-            "cmis.endpoint/spki_pin not configured; no CRL can be pulled, so token minting \
-             stays disabled (crl_stale, fail closed)"
+            "CMIS not configured; no CRL can be pulled, so token minting stays disabled \
+             (crl_stale, fail closed)"
         );
         return;
-    };
-    let pin = match SpkiPin::from_hex(pin_hex.trim()) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "cmis.spki_pin invalid; no CRL can be pulled, so token minting stays disabled \
-                 (crl_stale, fail closed)"
-            );
-            return;
-        }
     };
 
     tokio::spawn(async move {
         loop {
-            match mia::client::connect_pinned(&endpoint, vec![pin]).await {
-                Ok(client) => {
+            // Resolve + dial with fail-over each cycle, so a CRL puller whose node
+            // went down re-selects a live one (re-resolving SRV on the way).
+            match resolver.connect().await {
+                Ok((_, client)) => {
                     // The channel redials on demand after transient drops, so
                     // one successful connect is enough to hand the pull loop;
                     // it only resolves if the puller task itself dies.
@@ -693,7 +666,7 @@ fn maybe_spawn_crl_puller(
                 }
                 Err(e) => {
                     tracing::warn!(
-                        error = %e, %endpoint,
+                        error = %e, cmis = %resolver.describe(),
                         "cannot connect to CMIS for CRL pulls; retrying (minting stays \
                          fail-closed until the first verified pull)"
                     );
@@ -736,11 +709,35 @@ where
         }
     });
 
+    // Build the CMIS resolver once (static endpoint or SRV-discovered HA
+    // cluster), shared by attestation, the allowlist fetch/propose, and the CRL
+    // puller. `None` ⇒ CMIS not configured; `Err` ⇒ configured but unusable
+    // (both sources set, or a bad pin) — both leave the helper API serving but
+    // unable to reach CMIS (it refuses to mint, fail closed), loudly logged
+    // rather than crashing.
+    let resolver = match mia::endpoint::CmisResolver::from_config(&config.cmis) {
+        Ok(Some(r)) => {
+            tracing::info!(cmis = %r.describe(), srv = r.is_srv(), "CMIS endpoint configured");
+            Some(r)
+        }
+        Ok(None) => {
+            tracing::warn!("CMIS not configured (no cmis.endpoint or cmis.srv); cannot attest");
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "CMIS is misconfigured; cannot attest");
+            None
+        }
+    };
+
     // Attest to CMIS first: a successful attestation yields the host SVID (and
     // thus the EK-derived identity that keys this host's allowlist) and the
     // token minter. When CMIS isn't configured or attestation fails, there is no
     // session — the helper API still serves but refuses to mint (`no_host_svid`).
-    let session = bootstrap_host_svid(config).await;
+    let session = match &resolver {
+        Some(r) => bootstrap_host_svid(r).await,
+        None => None,
+    };
     let host_spiffe_id = session.as_ref().map(|s| s.spiffe_id.clone());
     let host_jws = session.as_ref().map(|s| s.jws.clone());
     let minter = session.map(|s| s.minter);
@@ -752,7 +749,7 @@ where
 
     // Optionally refresh the on-disk allowlist from CMIS before loading it, so
     // the served body stays in sync with what the operator provisioned.
-    maybe_fetch_allowlist(config, host_spiffe_id.as_deref()).await;
+    maybe_fetch_allowlist(config, resolver.as_ref(), host_spiffe_id.as_deref()).await;
 
     // Allowlist: configured ⇒ load and verify, denying all callers (fail
     // closed) on a missing file or a verification failure rather than crashing
@@ -784,7 +781,7 @@ where
     // The CRL cache (feature F11) starts empty and the mint gate fails closed;
     // the puller's first verified pull (within seconds of startup) opens it.
     let crl = Arc::new(CrlCache::new());
-    maybe_spawn_crl_puller(config, Arc::clone(&crl));
+    maybe_spawn_crl_puller(resolver.clone(), Arc::clone(&crl));
     let server = HelperServer::bind(
         helper_config,
         auth,
@@ -810,7 +807,13 @@ where
     // Optionally propose the callers the helper API observes back to CMIS, so a
     // host with no allowlist can bootstrap its own (subject to CMIS policy).
     if config.allowlist.propose {
-        maybe_spawn_propose_task(config, host_spiffe_id.as_deref(), host_jws, server.ledger());
+        maybe_spawn_propose_task(
+            resolver.as_ref(),
+            host_spiffe_id.as_deref(),
+            host_jws,
+            server.ledger(),
+            config.allowlist_propose_interval(),
+        );
     }
 
     server.serve_with_shutdown(shutdown_signal()).await;
