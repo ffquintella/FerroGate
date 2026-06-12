@@ -34,5 +34,6 @@
 #![forbid(unsafe_code)]
 
 pub mod cluster;
+mod peer_cert;
 
 pub use cluster::{Cluster, ClusterConfig, ClusterError, NodeRole, PeerNode, PeerTls};

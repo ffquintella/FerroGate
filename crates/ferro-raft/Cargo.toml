@@ -19,8 +19,15 @@ serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 anyhow      = { workspace = true }
 tracing     = { workspace = true }
+# Deterministic shared peer-TLS cert derived from the cluster secret (see
+# `peer_cert`): rcgen builds the cert, ring derives the key seed via HMAC, and
+# pki-types wraps the PKCS#8 key for rcgen.
+rcgen            = { workspace = true }
+ring             = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 futures            = { workspace = true }
-rcgen              = "0.14"
+# cert inspection in the peer_cert unit tests
+x509-parser        = { workspace = true }

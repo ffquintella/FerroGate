@@ -84,19 +84,47 @@ removed.
 
 The Raft + management transports between replicas can run over TLS, so a
 cluster no longer has to be pinned to a trusted private network for
-confidentiality. Set `CMIS_PEER_TLS=1` to enable hiqlite's rustls transport
-with auto-generated self-signed certificates, or supply a stable PEM pair with
-`CMIS_PEER_TLS_CERT` + `CMIS_PEER_TLS_KEY`. Either way TLS provides on-the-wire
-encryption; peer *identity* is authenticated by the shared `CMIS_RAFT_SECRET` /
-`CMIS_API_SECRET` three-way handshake (the secret never crosses the wire), so
-certificate chains are not validated. Multi-node nodes must also bind a
-routable interface — `CMIS_RAFT_LISTEN` defaults to `0.0.0.0` so peers in other
-hosts/containers can reach them, rather than the loopback a single node uses.
+confidentiality. Set `CMIS_PEER_TLS=1` for the zero-config self-signed mode, or
+supply a stable PEM pair with `CMIS_PEER_TLS_CERT` + `CMIS_PEER_TLS_KEY`. Either
+way TLS provides on-the-wire encryption; peer *identity* is authenticated by the
+shared `CMIS_RAFT_SECRET` / `CMIS_API_SECRET` three-way handshake (the secret
+never crosses the wire). Multi-node nodes must also bind a routable interface —
+`CMIS_RAFT_LISTEN` defaults to `0.0.0.0` so peers in other hosts/containers can
+reach them, rather than the loopback a single node uses.
+
+### Self-signed peer TLS and the split-brain check
+
+hiqlite's own peer clients do not validate certificate chains (the shared secret
+is what authenticates peers), but it *also* runs a periodic `split_brain_check`
+that fetches `/cluster/metrics/*` from peers with a client that **does** do
+platform/CA certificate verification. A naive per-node ephemeral self-signed
+cert is unverifiable by peers, so that check used to fail every cycle with
+`UnknownIssuer` — Raft replication kept working, but split-brain *detection*
+(a safety check) silently did not.
+
+So in `CMIS_PEER_TLS=1` mode every node derives the **same** CA + leaf
+certificate *deterministically from the shared cluster secret* (HMAC-SHA256 →
+Ed25519 key → rcgen, with the peers' hostnames/IPs as SANs — see
+`ferro_raft::peer_cert`). No certificate distribution is needed: the secret is
+already shared, so each node independently produces byte-identical material. The
+node then advertises that CA to its own TLS clients via `SSL_CERT_FILE`, so the
+verifying split-brain client accepts the peers it connects to. Operator certs
+(`CMIS_PEER_TLS_CERT`/`KEY`) are advertised the same way, so split-brain
+detection works for them too even when the cert is self-signed.
+
+> **Platform note.** This trust step relies on `rustls-platform-verifier`
+> honoring `SSL_CERT_FILE`, which it does on Linux (its native-roots path) — the
+> supported deployment target. macOS uses the Security.framework keychain and
+> ignores `SSL_CERT_FILE`, so multi-node self-signed clusters are a Linux
+> feature; macOS is for single-node/dev use.
 
 A runnable two-node example lives at
-[`docker/cluster-test/docker-compose.yml`](../../docker/cluster-test/docker-compose.yml);
-`crates/ferro-raft/tests/cluster_e2e.rs::tls_cluster_elects_a_leader_and_replicates`
-exercises the TLS transport in-process.
+[`docker/cluster-test/docker-compose.yml`](../../docker/cluster-test/docker-compose.yml).
+`tls_cluster_elects_a_leader_and_replicates` in
+`crates/ferro-raft/tests/cluster_e2e.rs` exercises the TLS transport in-process,
+and (on Linux) `self_signed_tls_split_brain_check_does_not_fail_verification`
+runs a self-signed cluster through a split-brain cycle and asserts no
+verification errors.
 
 ## Deferred design points
 

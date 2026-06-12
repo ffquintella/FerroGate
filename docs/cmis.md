@@ -142,7 +142,9 @@ peer_roots    = "/etc/ferrogate/peer-roots.pem"
 # plus CMIS_NODE_ID and shared CMIS_RAFT_SECRET / CMIS_API_SECRET. Multi-node
 # nodes bind CMIS_RAFT_LISTEN (default 0.0.0.0) so peers can reach them, and
 # CMIS_PEER_TLS=1 encrypts the inter-node transport (secret-authenticated) so
-# the cluster need not be pinned to a private network — see F05.
+# the cluster need not be pinned to a private network. Self-signed mode derives
+# a shared peer cert from the secret on every node, so split-brain detection
+# works with no cert distribution (Linux). See F05.
 peers         = ["cmis-1:9443", "cmis-2:9443", "cmis-3:9443"]
 node_id       = 1                               # 1.. ; node 1 bootstraps
 data_dir      = "/var/lib/ferrogate/raft"       # hiqlite SQLite state + WAL (CMIS_RAFT_DIR)

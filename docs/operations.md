@@ -207,9 +207,12 @@ Each replica needs the same view of the cluster and a shared secret pair:
 - `CMIS_RAFT_LISTEN` — the interface the Raft + management transports *bind*
   (default `0.0.0.0` for a multi-node cluster, so peers can reach this node).
 - `CMIS_PEER_TLS=1` — encrypt the inter-node transport with TLS (recommended
-  whenever the peers are not on a trusted private network). Supply
+  whenever the peers are not on a trusted private network). Zero-config: every
+  node derives the same peer certificate from the shared secret, so split-brain
+  detection works out of the box (no `UnknownIssuer` log spam). Supply
   `CMIS_PEER_TLS_CERT` + `CMIS_PEER_TLS_KEY` (PEM) for a stable certificate
-  instead of the auto-generated self-signed one. See
+  instead. Linux is the supported target for multi-node self-signed clusters
+  (the trust step uses `SSL_CERT_FILE`, which macOS ignores). See
   [features/F05-cmis-ha.md](features/F05-cmis-ha.md) §"Inter-node transport
   security".
 

@@ -444,6 +444,141 @@ async fn wait_for_leader_slice(live: &[&Cluster]) -> u64 {
     panic!("cluster did not elect a live leader within 20s");
 }
 
+// --- F05 peer-TLS: split-brain check works on a self-signed cluster ---------
+//
+// Regression guard for the bug where, with self-signed peer TLS
+// (`CMIS_PEER_TLS=1`), hiqlite's periodic `split_brain_check` rejected every
+// peer cert as `UnknownIssuer` — its metrics client does platform/CA cert
+// verification, and a per-node ephemeral self-signed cert is unverifiable. That
+// silently disabled split-brain *detection* on the zero-config cluster mode
+// FerroGate ships.
+//
+// The fix (in `ferro_raft::peer_cert` + `ClusterConfig::materialize_peer_tls`)
+// has every node derive the *same* CA + leaf cert from the shared secret and
+// advertises the CA via `SSL_CERT_FILE`, so the platform verifier accepts it.
+// This test runs a real `PeerTls::SelfSigned` 2-node cluster long enough for a
+// split-brain cycle and asserts the check ran without verification errors.
+//
+// Linux-only: the fix relies on `rustls-platform-verifier` honoring
+// `SSL_CERT_FILE` (its `others`/Linux path loads native certs via
+// `rustls-native-certs`). macOS uses the Security.framework keychain and
+// ignores `SSL_CERT_FILE`, so the assertion would not hold there; real
+// deployments are Linux containers (docker/cluster-test) anyway.
+#[cfg(target_os = "linux")]
+mod self_signed_split_brain {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::Registry;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    /// A `tracing` layer that records every event's `LEVEL target message` into
+    /// a shared buffer, so the test can assert on what hiqlite logged.
+    #[derive(Clone)]
+    struct CaptureLayer {
+        buf: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct MessageVisitor(String);
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let meta = event.metadata();
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            let line = format!("{} {} {}", meta.level(), meta.target(), visitor.0);
+            self.buf.lock().unwrap().push(line);
+        }
+    }
+
+    /// Start a 2-node cluster in the zero-config `SelfSigned` peer-TLS mode
+    /// (deterministic shared cert derived from the secret). Returns the data
+    /// root, the nodes, and the elected leader id.
+    async fn start_2_node_self_signed_tls(tag: &str) -> (std::path::PathBuf, Vec<Cluster>, u64) {
+        let root = temp_root(tag);
+        let ports = free_ports(); // returns 3 pairs; we use the first 2
+        let peers: Vec<PeerNode> = peers_for(&ports[..2]);
+
+        let mut starts = Vec::with_capacity(2);
+        for id in 1..=2u64 {
+            let cfg = node_cfg(id, &peers, &root).with_peer_tls(Some(PeerTls::SelfSigned));
+            starts.push(Cluster::start(cfg));
+        }
+        let nodes = futures::future::try_join_all(starts).await.unwrap();
+        let leader = wait_for_leader(&nodes).await;
+        (root, nodes, leader)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn self_signed_tls_split_brain_check_does_not_fail_verification() {
+        // Capture hiqlite's tracing into a buffer. The split-brain task runs on
+        // a tokio worker thread, so the subscriber must be the process-global
+        // default (a thread-scoped one would miss it). `try_init` is a no-op if
+        // some other test already installed one — the capture buffer is what we
+        // read, and only this test produces the events we assert on.
+        let buf = Arc::new(Mutex::new(Vec::<String>::new()));
+        let _ = Registry::default()
+            .with(CaptureLayer { buf: buf.clone() })
+            .try_init();
+
+        // Run the split-brain check ~once a second instead of the 60s default,
+        // so several cycles land inside the test window. Read by hiqlite when
+        // each node's split-brain task starts, so set it before bringing nodes
+        // up. (edition 2021: `set_var` is safe; the test binary owns its env.)
+        std::env::set_var("HQL_SPLIT_BRAIN_INTERVAL", "1");
+
+        let (root, nodes, leader_id) = start_2_node_self_signed_tls("tls-split-brain").await;
+        assert!(leader_id == 1 || leader_id == 2);
+
+        // Let several split-brain cycles run (it sleeps `interval` *before* the
+        // first check, so this is ~3 cycles at interval=1).
+        sleep(Duration::from_secs(4)).await;
+
+        let lines = buf.lock().unwrap().clone();
+
+        // The check must actually have run — otherwise the test would pass
+        // vacuously even if verification were still broken.
+        let ran = lines
+            .iter()
+            .any(|l| l.contains("split_brain_check") || l.contains("Raft DB Leader"));
+        assert!(
+            ran,
+            "split_brain_check never executed in the test window; captured {} lines",
+            lines.len()
+        );
+
+        // And it must have run cleanly: no platform-verify rejection of the
+        // derived peer cert, and no failed membership comparison.
+        let offending: Vec<&String> = lines
+            .iter()
+            .filter(|l| {
+                l.contains("UnknownIssuer")
+                    || l.contains("check_compare_membership")
+                    || l.contains("invalid peer certificate")
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "split_brain_check hit TLS-verification / membership errors on a \
+             self-signed cluster (the bug this guards against):\n{offending:#?}"
+        );
+
+        shutdown_all(nodes).await;
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
 // --- 10-minute chaos run — ignored by default ------------------------------
 
 #[tokio::test]

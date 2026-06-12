@@ -105,6 +105,26 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **CMIS split-brain detection now works on a self-signed peer-TLS cluster
+  (`CMIS_PEER_TLS=1`).** hiqlite's periodic `split_brain_check` fetches
+  `/cluster/metrics/*` from peers with a client that does platform/CA
+  certificate verification. In the zero-config self-signed mode each node minted
+  its own ephemeral cert, which no peer could verify, so the check failed every
+  cycle with `UnknownIssuer` / `check_compare_membership` errors — Raft
+  replication was unaffected, but split-brain *detection* (a safety check)
+  silently stopped working. Self-signed peer TLS now derives the **same** CA +
+  leaf certificate on every node *deterministically from the shared cluster
+  secret* (no distribution needed) and advertises the CA via `SSL_CERT_FILE`, so
+  the verifying client accepts its peers. Peer *identity* is still authenticated
+  by the shared-secret handshake; the cert exists only to satisfy that one
+  verifying client. The `CMIS_PEER_TLS` env contract is unchanged. Operator
+  certs (`CMIS_PEER_TLS_CERT`/`KEY`) are likewise advertised as a trust anchor,
+  so split-brain detection works there too even when the cert is self-signed.
+  New code lives in `ferro_raft::peer_cert` +
+  `ClusterConfig::materialize_peer_tls`. *Linux note: the trust step relies on
+  `rustls-platform-verifier` honoring `SSL_CERT_FILE`, which holds on Linux (the
+  supported deployment target); macOS uses the system keychain.* See
+  [docs/features/F05-cmis-ha.md](docs/features/F05-cmis-ha.md).
 - **mia no longer crash-loops on an unverifiable allowlist; it serves deny-all
   instead.** A bad allowlist signature at startup — typically a CMIS redeploy
   that changed the enrollment key, leaving the locally pinned `allowlist.pub`

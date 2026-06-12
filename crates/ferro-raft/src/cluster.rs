@@ -31,11 +31,17 @@ use tokio::time::timeout;
 /// classical rustls.
 #[derive(Debug, Clone)]
 pub enum PeerTls {
-    /// Hiqlite generates self-signed certificates on startup. Certificate
-    /// identity is intentionally *not* validated — the shared-secret handshake
-    /// is what authenticates peers — so no cert distribution is needed. This is
-    /// the zero-config option and is sufficient for confidentiality + integrity
-    /// over an untrusted link.
+    /// Zero-config peer TLS: each node derives the *same* CA + leaf certificate
+    /// deterministically from the cluster's shared API secret (see
+    /// [`crate::peer_cert`]) and advertises the CA via `SSL_CERT_FILE`. No cert
+    /// distribution is needed — the secret is already shared.
+    ///
+    /// Peer *identity* is still authenticated by the shared-secret handshake;
+    /// the derived cert exists so that hiqlite's platform-verifying
+    /// `split_brain_check` client can actually verify the peers it connects to
+    /// (a stock self-signed-per-node cert would be rejected as `UnknownIssuer`,
+    /// silently disabling split-brain detection). See
+    /// `docs/features/F05-cmis-ha.md`.
     SelfSigned,
     /// Operator-supplied PEM certificate + private key, the same pair on every
     /// node. Use when you want a stable certificate across restarts (e.g. for
@@ -50,25 +56,114 @@ pub enum PeerTls {
     },
 }
 
-impl PeerTls {
-    fn to_hiqlite(&self) -> ServerTlsConfig {
-        match self {
-            PeerTls::SelfSigned => ServerTlsConfig::TlsAutoCertificates,
+/// Serialize concurrent `SSL_CERT_FILE` mutation. Real deployments run one node
+/// per process, but the in-process e2e tests start several nodes at once, and
+/// `std::env::set_var` is process-global.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Append `anchor_pem` to a trust bundle under `data_dir` and point
+/// `SSL_CERT_FILE` at it, so this process's platform-verifying TLS clients
+/// (notably hiqlite's `split_brain_check`) accept the peer cert. Existing roots
+/// — an operator-set `SSL_CERT_FILE`, else the common system bundle — are
+/// preserved so ordinary outbound TLS in the process still works.
+fn install_trust_anchor(data_dir: &str, anchor_pem: &str) -> Result<(), ClusterError> {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = std::path::Path::new(data_dir).join("peer-tls");
+    std::fs::create_dir_all(&dir)?;
+    let bundle_path = dir.join("trust-bundle.pem");
+
+    let mut bundle = anchor_pem.to_string();
+    if !bundle.ends_with('\n') {
+        bundle.push('\n');
+    }
+    let preserved = std::env::var("SSL_CERT_FILE")
+        .ok()
+        .filter(|p| std::path::Path::new(p) != bundle_path)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .or_else(|| {
+            [
+                "/etc/ssl/certs/ca-certificates.crt",
+                "/etc/pki/tls/certs/ca-bundle.crt",
+                "/etc/ssl/cert.pem",
+            ]
+            .iter()
+            .find_map(|p| std::fs::read_to_string(p).ok())
+        });
+    if let Some(extra) = preserved {
+        bundle.push_str(&extra);
+    }
+
+    std::fs::write(&bundle_path, bundle)?;
+    std::env::set_var("SSL_CERT_FILE", &bundle_path);
+    Ok(())
+}
+
+impl ClusterConfig {
+    /// Materialize this node's inter-node TLS into a hiqlite [`ServerTlsConfig`],
+    /// performing any on-disk/`SSL_CERT_FILE` side effects the mode needs.
+    ///
+    /// `SelfSigned` derives the shared cert from [`Self::secret_api`], writes the
+    /// chain + key under `data_dir`, and installs the CA as a trust anchor.
+    /// `Certs` uses the operator pair as-is and also installs it as a trust
+    /// anchor (so the split-brain client trusts it even when it is self-signed).
+    /// Both keep `danger_tls_no_verify` set: peer identity is the shared
+    /// secret's job, and that flag governs hiqlite's *own* peer clients.
+    fn materialize_peer_tls(&self) -> Result<Option<ServerTlsConfig>, ClusterError> {
+        let Some(peer_tls) = self.peer_tls.as_ref() else {
+            return Ok(None);
+        };
+        let specific = match peer_tls {
             PeerTls::Certs {
                 cert_path,
                 key_path,
-            } => ServerTlsConfig::Specific(ServerTlsConfigCerts {
-                cert: Cow::Owned(cert_path.clone()),
-                key: Cow::Owned(key_path.clone()),
-                // Hiqlite has no API to register a custom CA root, and the
-                // shared-secret three-way handshake is what authenticates the
-                // peers; TLS here is for on-the-wire confidentiality. Skipping
-                // chain validation matches the `SelfSigned` path and hiqlite's
-                // own transport model.
-                danger_tls_no_verify: true,
-            }),
-        }
+            } => {
+                if let Ok(pem) = std::fs::read_to_string(cert_path) {
+                    install_trust_anchor(&self.data_dir, &pem)?;
+                }
+                ServerTlsConfigCerts {
+                    cert: Cow::Owned(cert_path.clone()),
+                    key: Cow::Owned(key_path.clone()),
+                    danger_tls_no_verify: true,
+                }
+            }
+            PeerTls::SelfSigned => {
+                let sans = crate::peer_cert::sans_from_addrs(
+                    self.peers
+                        .iter()
+                        .flat_map(|p| [p.addr_api.as_str(), p.addr_raft.as_str()]),
+                );
+                let derived = crate::peer_cert::derive_shared_peer_cert(&self.secret_api, &sans)
+                    .map_err(|e| ClusterError::PeerCert(e.to_string()))?;
+
+                let dir = std::path::Path::new(&self.data_dir).join("peer-tls");
+                std::fs::create_dir_all(&dir)?;
+                let cert_path = dir.join("peer-chain.pem");
+                let key_path = dir.join("peer-key.pem");
+                std::fs::write(&cert_path, &derived.server_chain_pem)?;
+                write_private_key(&key_path, &derived.key_pem)?;
+                install_trust_anchor(&self.data_dir, &derived.ca_pem)?;
+
+                ServerTlsConfigCerts {
+                    cert: Cow::Owned(cert_path.to_string_lossy().into_owned()),
+                    key: Cow::Owned(key_path.to_string_lossy().into_owned()),
+                    danger_tls_no_verify: true,
+                }
+            }
+        };
+        Ok(Some(ServerTlsConfig::Specific(specific)))
     }
+}
+
+/// Write a PEM private key, best-effort `0600` on unix.
+fn write_private_key(path: &std::path::Path, pem: &str) -> Result<(), ClusterError> {
+    std::fs::write(path, pem)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// One peer in the cluster — its id and the two addresses hiqlite needs.
@@ -196,6 +291,9 @@ pub enum ClusterError {
     /// Local socket setup failed (single-node ephemeral port allocation).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Deriving the deterministic shared peer-TLS certificate failed.
+    #[error("peer-tls cert derivation: {0}")]
+    PeerCert(String),
 }
 
 /// One CMIS Raft node, talking to its peers through hiqlite.
@@ -228,7 +326,7 @@ impl Cluster {
             })
             .collect();
 
-        let peer_tls = cfg.peer_tls.as_ref().map(PeerTls::to_hiqlite);
+        let peer_tls = cfg.materialize_peer_tls()?;
         if peer_tls.is_some() {
             tracing::info!(node_id, "inter-node transport: rustls (secret-authenticated)");
         }

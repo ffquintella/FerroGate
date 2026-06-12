@@ -193,10 +193,13 @@ async fn start_cluster() -> anyhow::Result<Arc<Cluster>> {
 
     // Inter-node TLS. Without it the Raft + management transports are cleartext
     // and the cluster must be pinned to a trusted private network (the historic
-    // F05 limitation). `CMIS_PEER_TLS=1` turns on hiqlite's rustls transport
-    // with auto-generated self-signed certs (the shared secret authenticates
-    // the peers); supplying `CMIS_PEER_TLS_CERT` + `CMIS_PEER_TLS_KEY` uses an
-    // operator-provided PEM pair instead. Single-node loopback stays cleartext.
+    // F05 limitation). `CMIS_PEER_TLS=1` turns on rustls for the peer transport
+    // with a shared certificate each node derives deterministically from the
+    // cluster secret (the shared secret authenticates the peers, and the derived
+    // cert is what lets hiqlite's split-brain check verify them — see
+    // `ferro_raft::peer_cert`); supplying `CMIS_PEER_TLS_CERT` +
+    // `CMIS_PEER_TLS_KEY` uses an operator-provided PEM pair instead. Single-node
+    // loopback stays cleartext.
     if !cfg.is_single_node() {
         cfg.peer_tls = resolve_peer_tls()?;
     }
@@ -252,7 +255,7 @@ fn resolve_peer_tls() -> anyhow::Result<Option<PeerTls>> {
     let enabled = std::env::var("CMIS_PEER_TLS")
         .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
     if enabled {
-        tracing::info!("inter-node TLS: self-signed (secret-authenticated)");
+        tracing::info!("inter-node TLS: shared cert derived from secret (secret-authenticated)");
         Ok(Some(PeerTls::SelfSigned))
     } else {
         tracing::warn!(
