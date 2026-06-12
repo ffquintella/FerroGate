@@ -28,7 +28,7 @@
 
 use std::time::{Duration, Instant};
 
-use ferro_raft::{Cluster, ClusterConfig, NodeRole, PeerNode};
+use ferro_raft::{Cluster, ClusterConfig, NodeRole, PeerNode, PeerTls};
 use tokio::time::sleep;
 
 /// Where ferro-raft tests park their on-disk state. One sub-dir per node.
@@ -94,6 +94,55 @@ async fn start_3_node(tag: &str) -> (std::path::PathBuf, Vec<Cluster>, u64) {
     let mut starts = Vec::with_capacity(3);
     for id in 1..=3u64 {
         starts.push(Cluster::start(node_cfg(id, &peers, &root)));
+    }
+    let nodes = futures::future::try_join_all(starts).await.unwrap();
+
+    let leader = wait_for_leader(&nodes).await;
+    (root, nodes, leader)
+}
+
+/// Write a fresh self-signed cert + key PEM pair into `root` and return their
+/// paths. Used to exercise the [`PeerTls::Certs`] path in-process.
+///
+/// We use `Certs` rather than `SelfSigned` for the multi-node in-process test
+/// because hiqlite's auto-cert mode stashes its keypair in a process-global
+/// `OnceLock` and `.set().unwrap()`s it — three nodes in one process race and
+/// panic. Reading the PEM from disk per node sidesteps that static entirely.
+/// A real deployment runs one node per process, where `SelfSigned` is fine
+/// (and is what the container test in `docs/operations.md` uses).
+fn write_test_certs(root: &std::path::Path) -> (String, String) {
+    std::fs::create_dir_all(root).unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ])
+    .unwrap();
+    let cert_path = root.join("peer.crt");
+    let key_path = root.join("peer.key");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+    (
+        cert_path.to_string_lossy().into_owned(),
+        key_path.to_string_lossy().into_owned(),
+    )
+}
+
+/// Start three nodes whose inter-node transports run over hiqlite's
+/// secret-authenticated rustls (the F05 "peer TLS" path that lets a cluster
+/// span an untrusted network instead of a pinned private one).
+async fn start_3_node_tls(tag: &str) -> (std::path::PathBuf, Vec<Cluster>, u64) {
+    let root = temp_root(tag);
+    let (cert_path, key_path) = write_test_certs(&root);
+    let ports = free_ports();
+    let peers = peers_for(&ports);
+
+    let mut starts = Vec::with_capacity(3);
+    for id in 1..=3u64 {
+        let cfg = node_cfg(id, &peers, &root).with_peer_tls(Some(PeerTls::Certs {
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+        }));
+        starts.push(Cluster::start(cfg));
     }
     let nodes = futures::future::try_join_all(starts).await.unwrap();
 
@@ -168,6 +217,42 @@ async fn three_node_cluster_elects_a_leader_and_replicates() {
         }
         if Instant::now() >= deadline {
             panic!("follower never observed the replicated row");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown_all(nodes).await;
+    std::fs::remove_dir_all(root).ok();
+}
+
+// --- F05 peer-TLS: encrypted inter-node transport elects + replicates -------
+//
+// Proves the cluster forms and replicates when the Raft + management
+// transports run over TLS (hiqlite auto self-signed certs, authenticated by
+// the shared secret). This is what removes the "pin the cluster to a private
+// network" deferral: the bytes between nodes are encrypted on the wire.
+
+#[tokio::test]
+async fn tls_cluster_elects_a_leader_and_replicates() {
+    let (root, nodes, leader_id) = start_3_node_tls("tls-elect").await;
+    assert!(leader_id >= 1 && leader_id <= 3);
+
+    let leader = leader_node(&nodes, leader_id);
+    assert_eq!(leader.role().await, NodeRole::Leader);
+    leader
+        .upsert_svid("spiffe://x/host/tls", b"payload-tls", 1_700_000_000)
+        .await
+        .unwrap();
+
+    let f = follower(&nodes, leader_id);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(Some(p)) = f.fetch_svid("spiffe://x/host/tls").await {
+            assert_eq!(p, b"payload-tls");
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("follower never observed the replicated row over the TLS transport");
         }
         sleep(Duration::from_millis(50)).await;
     }

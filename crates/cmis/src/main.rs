@@ -22,7 +22,7 @@ use ferro_attest::{RimLoader, RimStore, TpmQuoteVerifier, TrustedKeys, VendorTru
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
 use ferro_crypto::composite::CompositePublicKey;
 use ferro_crypto::tls::ProviderMode;
-use ferro_raft::{Cluster, ClusterConfig, PeerNode};
+use ferro_raft::{Cluster, ClusterConfig, PeerNode, PeerTls};
 use ferro_svid::Issuer;
 use tracing_subscriber::EnvFilter;
 
@@ -177,9 +177,29 @@ async fn start_cluster() -> anyhow::Result<Arc<Cluster>> {
                 "CMIS_NODE_ID {node_id} is not listed in CMIS_CLUSTER_PEERS"
             ));
         }
-        tracing::info!(node_id, peers = peers.len(), %data_dir, "joining CMIS cluster");
-        ClusterConfig::for_node(node_id, peers, data_dir)
+        // Multi-node peers live on other hosts/containers, so the inter-node
+        // transports must bind a routable interface — the `127.0.0.1` default
+        // would make this node unreachable to its peers. `CMIS_RAFT_LISTEN`
+        // overrides the bind interface; `0.0.0.0` (all interfaces) is the
+        // container-friendly default. The *advertised* address each peer dials
+        // is still its `CMIS_CLUSTER_PEERS` entry.
+        let listen = std::env::var("CMIS_RAFT_LISTEN").unwrap_or_else(|_| "0.0.0.0".to_string());
+        tracing::info!(
+            node_id, peers = peers.len(), %data_dir, %listen,
+            "joining CMIS cluster"
+        );
+        ClusterConfig::for_node(node_id, peers, data_dir).with_listen_interface(listen)
     };
+
+    // Inter-node TLS. Without it the Raft + management transports are cleartext
+    // and the cluster must be pinned to a trusted private network (the historic
+    // F05 limitation). `CMIS_PEER_TLS=1` turns on hiqlite's rustls transport
+    // with auto-generated self-signed certs (the shared secret authenticates
+    // the peers); supplying `CMIS_PEER_TLS_CERT` + `CMIS_PEER_TLS_KEY` uses an
+    // operator-provided PEM pair instead. Single-node loopback stays cleartext.
+    if !cfg.is_single_node() {
+        cfg.peer_tls = resolve_peer_tls()?;
+    }
 
     match (
         std::env::var("CMIS_RAFT_SECRET"),
@@ -204,6 +224,43 @@ async fn start_cluster() -> anyhow::Result<Arc<Cluster>> {
         .await
         .map_err(|e| anyhow::anyhow!("cluster start: {e}"))?;
     Ok(Arc::new(cluster))
+}
+
+/// Resolve the inter-node TLS mode from the environment.
+///
+/// - `CMIS_PEER_TLS_CERT` + `CMIS_PEER_TLS_KEY` set → operator PEM pair.
+/// - else `CMIS_PEER_TLS` truthy (`1`/`true`/`yes`/`on`) → self-signed.
+/// - else `None` (cleartext; cluster must sit on a trusted private network).
+fn resolve_peer_tls() -> anyhow::Result<Option<PeerTls>> {
+    let cert = std::env::var("CMIS_PEER_TLS_CERT").ok().filter(|s| !s.is_empty());
+    let key = std::env::var("CMIS_PEER_TLS_KEY").ok().filter(|s| !s.is_empty());
+    match (cert, key) {
+        (Some(cert_path), Some(key_path)) => {
+            tracing::info!(%cert_path, "inter-node TLS: operator-supplied certificate");
+            return Ok(Some(PeerTls::Certs {
+                cert_path,
+                key_path,
+            }));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "CMIS_PEER_TLS_CERT and CMIS_PEER_TLS_KEY must be set together"
+            ));
+        }
+        (None, None) => {}
+    }
+    let enabled = std::env::var("CMIS_PEER_TLS")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    if enabled {
+        tracing::info!("inter-node TLS: self-signed (secret-authenticated)");
+        Ok(Some(PeerTls::SelfSigned))
+    } else {
+        tracing::warn!(
+            "inter-node transport is cleartext (CMIS_PEER_TLS unset) — pin the cluster to a \
+             trusted private network or set CMIS_PEER_TLS=1"
+        );
+        Ok(None)
+    }
 }
 
 /// Parse `CMIS_CLUSTER_PEERS`: `;`-separated `id=raft_addr,api_addr` entries,

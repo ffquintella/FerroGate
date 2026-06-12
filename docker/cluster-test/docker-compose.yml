@@ -1,0 +1,60 @@
+# Two-node CMIS HA cluster (feature F05) on a private Docker bridge network.
+#
+# Demonstrates the fix for the historic "pin the cluster to a private network"
+# limitation: the two replicas form a Raft group and replicate over hiqlite's
+# inter-node transport, encrypted with TLS (CMIS_PEER_TLS=1) and authenticated
+# by the shared CMIS_RAFT_SECRET / CMIS_API_SECRET — the secret never crosses
+# the wire. They discover each other by container hostname (cmis1 / cmis2) over
+# the user-defined bridge.
+#
+#   # from the repo root, build the runtime image first:
+#   make container-image            # tags ferrogate:<version>
+#   # then bring the cluster up (override the tag if needed):
+#   IMAGE=ferrogate:$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2) \
+#       docker compose -f docker/cluster-test/docker-compose.yml up
+#
+#   # in another shell, ask each node its Raft role — expect one leader,
+#   # one follower (proves they connected and elected over the peer transport):
+#   docker exec ferrogate-cmis1 ferrogate status
+#   docker exec ferrogate-cmis2 ferrogate status
+
+services:
+  cmis1:
+    image: ${IMAGE:-ferrogate:latest}
+    container_name: ferrogate-cmis1
+    hostname: cmis1
+    networks: [cluster]
+    ports:
+      - "8443:8443"        # public gRPC surface (host:container)
+    environment:
+      RUST_LOG: "info,hiqlite=info"
+      CMIS_LISTEN: "0.0.0.0:8443"
+      CMIS_NODE_ID: "1"
+      CMIS_CLUSTER_PEERS: "1=cmis1:9601,cmis1:9602;2=cmis2:9601,cmis2:9602"
+      CMIS_RAFT_LISTEN: "0.0.0.0"
+      CMIS_PEER_TLS: "1"
+      CMIS_RAFT_SECRET: "ferrogate-cluster-raft-secret-01"
+      CMIS_API_SECRET: "ferrogate-cluster-api-secret-0001"
+      CMIS_RAFT_DIR: "/var/lib/ferrogate/raft"
+
+  cmis2:
+    image: ${IMAGE:-ferrogate:latest}
+    container_name: ferrogate-cmis2
+    hostname: cmis2
+    networks: [cluster]
+    ports:
+      - "8444:8443"
+    environment:
+      RUST_LOG: "info,hiqlite=info"
+      CMIS_LISTEN: "0.0.0.0:8443"
+      CMIS_NODE_ID: "2"
+      CMIS_CLUSTER_PEERS: "1=cmis1:9601,cmis1:9602;2=cmis2:9601,cmis2:9602"
+      CMIS_RAFT_LISTEN: "0.0.0.0"
+      CMIS_PEER_TLS: "1"
+      CMIS_RAFT_SECRET: "ferrogate-cluster-raft-secret-01"
+      CMIS_API_SECRET: "ferrogate-cluster-api-secret-0001"
+      CMIS_RAFT_DIR: "/var/lib/ferrogate/raft"
+
+networks:
+  cluster:
+    driver: bridge

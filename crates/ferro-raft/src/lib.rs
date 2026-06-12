@@ -22,8 +22,10 @@
 //!
 //! - **Transport is hiqlite's.** F05 originally specified a custom QUIC peer
 //!   transport with hybrid-PQC TLS; that is now an upstream-hiqlite concern.
-//!   Operators that need PQC peer TLS today pin the peers to a private
-//!   network; the design point is tracked in the F05 doc.
+//!   The inter-node transport can be encrypted and secret-authenticated with
+//!   rustls via [`ClusterConfig::with_peer_tls`] / [`PeerTls`], so a cluster no
+//!   longer has to be pinned to a private network. PQC peer TLS specifically
+//!   remains upstream; the design point is tracked in the F05 doc.
 //! - **Schema is SQL.** Issued-SVID rows are JSON blobs keyed by SPIFFE id; a
 //!   one-row `rim_state` table tracks the active policy epoch. Migrations
 //!   are inline `CREATE TABLE IF NOT EXISTS` — small enough not to need a
@@ -33,4 +35,4 @@
 
 pub mod cluster;
 
-pub use cluster::{Cluster, ClusterConfig, ClusterError, NodeRole, PeerNode};
+pub use cluster::{Cluster, ClusterConfig, ClusterError, NodeRole, PeerNode, PeerTls};

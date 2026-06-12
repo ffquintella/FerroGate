@@ -139,10 +139,14 @@ peer_roots    = "/etc/ferrogate/peer-roots.pem"
 # CMIS_CLUSTER_PEERS set, CMIS runs a single-node cluster: it elects itself
 # leader, never looks for peers, and still persists to data_dir across
 # restarts. Multi-node: CMIS_CLUSTER_PEERS="1=h1:9601,h1:9602;2=h2:9601,..."
-# plus CMIS_NODE_ID and shared CMIS_RAFT_SECRET / CMIS_API_SECRET.
+# plus CMIS_NODE_ID and shared CMIS_RAFT_SECRET / CMIS_API_SECRET. Multi-node
+# nodes bind CMIS_RAFT_LISTEN (default 0.0.0.0) so peers can reach them, and
+# CMIS_PEER_TLS=1 encrypts the inter-node transport (secret-authenticated) so
+# the cluster need not be pinned to a private network — see F05.
 peers         = ["cmis-1:9443", "cmis-2:9443", "cmis-3:9443"]
 node_id       = 1                               # 1.. ; node 1 bootstraps
 data_dir      = "/var/lib/ferrogate/raft"       # hiqlite SQLite state + WAL (CMIS_RAFT_DIR)
+peer_tls      = true                            # CMIS_PEER_TLS=1 (rustls inter-node transport)
 
 [rim]
 allowlist     = "/var/lib/ferrogate/rim/current.json"

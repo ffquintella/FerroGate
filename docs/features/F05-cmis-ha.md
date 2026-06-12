@@ -80,13 +80,32 @@ removed.
       beefier CI worker.)
 - [x] No event field contains PII; only hashes and counters.
 
+## Inter-node transport security
+
+The Raft + management transports between replicas can run over TLS, so a
+cluster no longer has to be pinned to a trusted private network for
+confidentiality. Set `CMIS_PEER_TLS=1` to enable hiqlite's rustls transport
+with auto-generated self-signed certificates, or supply a stable PEM pair with
+`CMIS_PEER_TLS_CERT` + `CMIS_PEER_TLS_KEY`. Either way TLS provides on-the-wire
+encryption; peer *identity* is authenticated by the shared `CMIS_RAFT_SECRET` /
+`CMIS_API_SECRET` three-way handshake (the secret never crosses the wire), so
+certificate chains are not validated. Multi-node nodes must also bind a
+routable interface — `CMIS_RAFT_LISTEN` defaults to `0.0.0.0` so peers in other
+hosts/containers can reach them, rather than the loopback a single node uses.
+
+A runnable two-node example lives at
+[`docker/cluster-test/docker-compose.yml`](../../docker/cluster-test/docker-compose.yml);
+`crates/ferro-raft/tests/cluster_e2e.rs::tls_cluster_elects_a_leader_and_replicates`
+exercises the TLS transport in-process.
+
 ## Deferred design points
 
 - **QUIC peer transport with hybrid-PQC TLS.** Hiqlite owns its own peer
-  transport; PQC TLS between peers is now an upstream-hiqlite concern. The
-  F01 hybrid-PQC provider is still used for the public CMIS surface (MIA ↔
-  CMIS). Operators that need PQC peer TLS today pin the cluster to a private
-  network.
+  transport; the classical rustls TLS above secures it today. *PQC* peer TLS
+  specifically remains an upstream-hiqlite concern — the F01 hybrid-PQC
+  provider still fronts the public CMIS surface (MIA ↔ CMIS), but the peer
+  transport's TLS is classical. Operators who require PQC *between peers* until
+  hiqlite ships it pin the cluster to a private network.
 - **FoundationDB storage.** The original roadmap line mentioned FDB; hiqlite
   was picked instead because it bundles openraft + a durable SQLite state
   machine + the peer transport, eliminating an unverifiable FDB adapter from

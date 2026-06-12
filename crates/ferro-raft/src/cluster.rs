@@ -17,8 +17,59 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
+use hiqlite::tls::{ServerTlsConfig, ServerTlsConfigCerts};
 use hiqlite::{Client, Node, NodeConfig, Param};
 use tokio::time::timeout;
+
+/// TLS for the inter-node Raft + management transports.
+///
+/// Hiqlite encrypts the peer transport with rustls and authenticates the two
+/// ends with a shared-secret three-way handshake (the secret never crosses the
+/// wire). Enabling this is what lets a cluster span an untrusted network rather
+/// than being pinned to a private one — see `docs/features/F05-cmis-ha.md`.
+/// PQC peer TLS specifically remains an upstream-hiqlite concern; this is
+/// classical rustls.
+#[derive(Debug, Clone)]
+pub enum PeerTls {
+    /// Hiqlite generates self-signed certificates on startup. Certificate
+    /// identity is intentionally *not* validated — the shared-secret handshake
+    /// is what authenticates peers — so no cert distribution is needed. This is
+    /// the zero-config option and is sufficient for confidentiality + integrity
+    /// over an untrusted link.
+    SelfSigned,
+    /// Operator-supplied PEM certificate + private key, the same pair on every
+    /// node. Use when you want a stable certificate across restarts (e.g. for
+    /// external pinning) rather than the per-process ephemeral one `SelfSigned`
+    /// mints. As with `SelfSigned`, peer *identity* is authenticated by the
+    /// shared secret, not the certificate, so the cert is not chain-validated.
+    Certs {
+        /// Path to the PEM certificate (chain).
+        cert_path: String,
+        /// Path to the PEM private key.
+        key_path: String,
+    },
+}
+
+impl PeerTls {
+    fn to_hiqlite(&self) -> ServerTlsConfig {
+        match self {
+            PeerTls::SelfSigned => ServerTlsConfig::TlsAutoCertificates,
+            PeerTls::Certs {
+                cert_path,
+                key_path,
+            } => ServerTlsConfig::Specific(ServerTlsConfigCerts {
+                cert: Cow::Owned(cert_path.clone()),
+                key: Cow::Owned(key_path.clone()),
+                // Hiqlite has no API to register a custom CA root, and the
+                // shared-secret three-way handshake is what authenticates the
+                // peers; TLS here is for on-the-wire confidentiality. Skipping
+                // chain validation matches the `SelfSigned` path and hiqlite's
+                // own transport model.
+                danger_tls_no_verify: true,
+            }),
+        }
+    }
+}
 
 /// One peer in the cluster — its id and the two addresses hiqlite needs.
 #[derive(Debug, Clone)]
@@ -50,6 +101,11 @@ pub struct ClusterConfig {
     pub listen_addr_api: String,
     /// SQLite filename inside `data_dir`. `hiqlite.db` is the default.
     pub filename_db: String,
+    /// TLS for the inter-node transports. `None` leaves the peer transport in
+    /// cleartext (fine for loopback single-node and pinned private networks);
+    /// `Some(_)` encrypts and secret-authenticates it so the cluster can span
+    /// an untrusted network. Must be the same variant on every node.
+    pub peer_tls: Option<PeerTls>,
 }
 
 impl ClusterConfig {
@@ -67,7 +123,27 @@ impl ClusterConfig {
             listen_addr_raft: "127.0.0.1".to_string(),
             listen_addr_api: "127.0.0.1".to_string(),
             filename_db: "hiqlite.db".to_string(),
+            peer_tls: None,
         }
+    }
+
+    /// Set the inter-node TLS mode and return `self` (builder-style).
+    #[must_use]
+    pub fn with_peer_tls(mut self, peer_tls: Option<PeerTls>) -> Self {
+        self.peer_tls = peer_tls;
+        self
+    }
+
+    /// Set the bind interface for both inter-node transports and return `self`.
+    /// Multi-node clusters that span hosts/containers must bind a routable
+    /// interface (e.g. `0.0.0.0`) rather than the `127.0.0.1` default, or peers
+    /// cannot reach this node.
+    #[must_use]
+    pub fn with_listen_interface(mut self, listen: impl Into<String>) -> Self {
+        let listen = listen.into();
+        self.listen_addr_raft.clone_from(&listen);
+        self.listen_addr_api = listen;
+        self
     }
 
     /// Build a single-node config: node 1 is the only peer, so the Raft
@@ -152,6 +228,10 @@ impl Cluster {
             })
             .collect();
 
+        let peer_tls = cfg.peer_tls.as_ref().map(PeerTls::to_hiqlite);
+        if peer_tls.is_some() {
+            tracing::info!(node_id, "inter-node transport: rustls (secret-authenticated)");
+        }
         let node_config = NodeConfig {
             node_id,
             nodes,
@@ -161,6 +241,8 @@ impl Cluster {
             filename_db: Cow::Owned(cfg.filename_db.clone()),
             secret_raft: cfg.secret_raft.clone(),
             secret_api: cfg.secret_api.clone(),
+            tls_raft: peer_tls.clone(),
+            tls_api: peer_tls,
             health_check_delay_secs: 0,
             ..NodeConfig::default()
         };

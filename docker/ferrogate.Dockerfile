@@ -25,6 +25,15 @@
 #       -e RUST_LOG=debug \
 #       -e CMIS_LISTEN=0.0.0.0:8443 \
 #       ferrogate:latest
+#
+# Multi-node HA (F05): list every peer in CMIS_CLUSTER_PEERS as
+# `id=raft_addr,api_addr` entries (the addresses peers dial — use routable
+# hostnames), pick this node with CMIS_NODE_ID, share CMIS_RAFT_SECRET /
+# CMIS_API_SECRET across the fleet, and set CMIS_PEER_TLS=1 to encrypt the
+# inter-node transport (so the cluster need not be pinned to a private
+# network). The Raft transport binds CMIS_RAFT_LISTEN (default 0.0.0.0) on the
+# ports 9601/9602. See docker/cluster-test/docker-compose.yml for a runnable
+# two-node example and docs/operations.md §"Adding a CMIS replica".
 
 # ---------------------------------------------------------------------------
 # Stage 1: build the release binaries for linux/amd64.
@@ -101,7 +110,10 @@ ENV FERROGATE_CMIS_ENDPOINT=http://127.0.0.1:8443
 WORKDIR /opt/ferrogate
 USER ferrogate
 
-EXPOSE 8443
+# 8443 — public gRPC surface (MIA ↔ CMIS). 9601/9602 — inter-node Raft +
+# management transports for a multi-node HA cluster (F05); unused on a
+# single-node deployment.
+EXPOSE 8443 9601 9602
 
 # Persist tracing logs, the audit store, and the issuer signing key outside the
 # container. The issuer seed MUST persist across re-creation — losing it rotates
