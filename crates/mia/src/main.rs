@@ -176,9 +176,13 @@ fn main() -> anyhow::Result<()> {
             for d in discovered {
                 let label = d.environment.clone().unwrap_or_else(|| "default".to_string());
                 // Load each by its concrete path (no env-name re-resolution).
+                // Named environments load shared-only, so a process-wide
+                // FERROGATE_HELPER_SOCKET (e.g. from a pre-0.19 launchd plist)
+                // can't force them all onto the default environment's socket.
                 let source = mia::config::ConfigSource {
                     path: Some(d.path.clone()),
                     environment: None,
+                    discovered_named_env: d.environment.is_some(),
                 };
                 match source.load() {
                     Ok((config, _)) => {
@@ -319,10 +323,22 @@ async fn run_all(instances: Vec<EnvInstance>, log_reload: LogReload) -> anyhow::
                 if seen_sockets.insert(socket.to_path_buf()) {
                     serveable.push(inst);
                 } else {
+                    // Name the likely culprit when the colliding path matches a
+                    // process-wide FERROGATE_HELPER_SOCKET override.
+                    let from_env_override = std::env::var_os("FERROGATE_HELPER_SOCKET")
+                        .is_some_and(|v| std::path::Path::new(&v) == socket);
                     tracing::error!(
                         env = %inst.label, socket = %socket.display(),
+                        from_env_override,
                         "duplicate helper socket across environments; skipping this one \
-                         (each environment needs a distinct helper.socket)"
+                         (each environment needs a distinct helper.socket){}",
+                        if from_env_override {
+                            " — this path comes from the FERROGATE_HELPER_SOCKET environment \
+                             variable, which applies only to the default environment; set each \
+                             environment's helper.socket in its own mia-<env>.toml instead"
+                        } else {
+                            ""
+                        }
                     );
                 }
             }

@@ -355,6 +355,24 @@ pub struct AttestationConfig {
     pub ima_log: Option<PathBuf>,
 }
 
+/// Which environment-variable overrides [`Config::apply_env`] overlays.
+///
+/// `Full` is the normal case: an explicitly selected configuration
+/// (`--config`, `--environment`, `$FERROGATE_CONFIG`) or the default
+/// environment. `SharedOnly` is for *named* environments discovered by the
+/// daemon's serve-all scan: it skips `FERROGATE_HELPER_SOCKET`, because that
+/// process-wide path can only describe one environment's socket — applying it
+/// to all of them would collide every environment onto one path and leave all
+/// but the first unserved. All other overrides (including the socket
+/// `_MODE`/`_GID`) apply in both scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvOverrideScope {
+    /// Apply every override, including the helper-socket path.
+    Full,
+    /// Apply every override *except* the helper-socket path.
+    SharedOnly,
+}
+
 impl Config {
     /// Discover, parse, and env-overlay the configuration.
     ///
@@ -368,7 +386,7 @@ impl Config {
         environment: Option<&str>,
     ) -> anyhow::Result<(Self, Option<PathBuf>)> {
         let (mut config, source) = Self::load_file(explicit, environment)?;
-        config.apply_env()?;
+        config.apply_env(EnvOverrideScope::Full)?;
         Ok((config, source))
     }
 
@@ -435,13 +453,17 @@ impl Config {
 
     /// Overlay environment variables onto `self` (env wins). Reads the process
     /// environment.
-    pub fn apply_env(&mut self) -> anyhow::Result<()> {
-        self.apply_overrides(|k| std::env::var(k).ok())
+    pub fn apply_env(&mut self, scope: EnvOverrideScope) -> anyhow::Result<()> {
+        self.apply_overrides(scope, |k| std::env::var(k).ok())
     }
 
     /// Overlay overrides resolved by `get` onto `self`. Factored out so tests
     /// can supply a map instead of mutating the global environment.
-    fn apply_overrides(&mut self, get: impl Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+    fn apply_overrides(
+        &mut self,
+        scope: EnvOverrideScope,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<()> {
         if let Some(v) = get("RUST_LOG") {
             self.log = Some(v);
         }
@@ -454,8 +476,15 @@ impl Config {
         if let Some(v) = get("FERROGATE_CMIS_SPKI_PIN") {
             self.cmis.spki_pin = Some(v);
         }
-        if let Some(v) = get("FERROGATE_HELPER_SOCKET") {
-            self.helper.socket = Some(PathBuf::from(v));
+        // The socket *path* is per-environment: in serve-all mode a single
+        // process-wide FERROGATE_HELPER_SOCKET would force every environment
+        // onto one path, and the daemon's duplicate-socket guard would then
+        // serve only the first. Mode/gid below stay global — sharing those
+        // across environments is harmless and usually intended.
+        if scope == EnvOverrideScope::Full {
+            if let Some(v) = get("FERROGATE_HELPER_SOCKET") {
+                self.helper.socket = Some(PathBuf::from(v));
+            }
         }
         if let Some(v) = get("FERROGATE_HELPER_SOCKET_MODE") {
             self.helper.socket_mode = Some(v);
@@ -564,12 +593,27 @@ pub struct ConfigSource {
     pub path: Option<PathBuf>,
     /// The `--environment <env>` selector, if one was given.
     pub environment: Option<String>,
+    /// True when this source is a *named* environment found by the daemon's
+    /// serve-all discovery scan (its `path` points at the discovered
+    /// `mia-<env>.toml`), rather than one the operator selected explicitly.
+    /// Such sources load with [`EnvOverrideScope::SharedOnly`], so a
+    /// process-wide `FERROGATE_HELPER_SOCKET` cannot collapse every
+    /// environment onto one socket path.
+    pub discovered_named_env: bool,
 }
 
 impl ConfigSource {
     /// Resolve and load the configuration this source describes.
     pub fn load(&self) -> anyhow::Result<(Config, Option<PathBuf>)> {
-        Config::load(self.path.as_deref(), self.environment.as_deref())
+        let (mut config, path) =
+            Config::load_file(self.path.as_deref(), self.environment.as_deref())?;
+        let scope = if self.discovered_named_env {
+            EnvOverrideScope::SharedOnly
+        } else {
+            EnvOverrideScope::Full
+        };
+        config.apply_env(scope)?;
+        Ok((config, path))
     }
 }
 
@@ -775,8 +819,10 @@ mod tests {
             ("FERROGATE_HELPER_SOCKET", "/from/env.sock"),
             ("FERROGATE_ALLOWLIST_MAX_AGE_SECS", "120"),
         ]);
-        c.apply_overrides(|k| env.get(k).map(|s| (*s).to_string()))
-            .unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, |k| {
+            env.get(k).map(|s| (*s).to_string())
+        })
+        .unwrap();
 
         // Overridden by env.
         assert_eq!(c.log_directive(), "debug");
@@ -790,9 +836,43 @@ mod tests {
     fn env_fills_unset_file_values() {
         let mut c = Config::default();
         let env: HashMap<&str, &str> = HashMap::from([("FERROGATE_HELPER_SOCKET", "/run/x.sock")]);
-        c.apply_overrides(|k| env.get(k).map(|s| (*s).to_string()))
-            .unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, |k| {
+            env.get(k).map(|s| (*s).to_string())
+        })
+        .unwrap();
         assert_eq!(c.helper_socket(), Some(Path::new("/run/x.sock")));
+    }
+
+    #[test]
+    fn shared_only_scope_skips_socket_path_keeps_mode_and_gid() {
+        // A discovered named environment: the global socket *path* override
+        // must not displace its file value, but mode/gid still apply.
+        let mut c = Config::from_toml("[helper]\nsocket = \"/from/file.sock\"").unwrap();
+        let env: HashMap<&str, &str> = HashMap::from([
+            ("FERROGATE_HELPER_SOCKET", "/from/env.sock"),
+            ("FERROGATE_HELPER_SOCKET_MODE", "600"),
+            ("FERROGATE_HELPER_SOCKET_GID", "777"),
+        ]);
+        c.apply_overrides(EnvOverrideScope::SharedOnly, |k| {
+            env.get(k).map(|s| (*s).to_string())
+        })
+        .unwrap();
+        assert_eq!(c.helper_socket(), Some(Path::new("/from/file.sock")));
+        assert_eq!(c.socket_mode().unwrap(), 0o600);
+        assert_eq!(c.socket_gid().unwrap(), Some(777));
+    }
+
+    #[test]
+    fn shared_only_scope_leaves_unset_socket_unset() {
+        // Without a file value, SharedOnly must not fill the socket from the
+        // env either — the environment simply has no helper socket.
+        let mut c = Config::default();
+        let env: HashMap<&str, &str> = HashMap::from([("FERROGATE_HELPER_SOCKET", "/run/x.sock")]);
+        c.apply_overrides(EnvOverrideScope::SharedOnly, |k| {
+            env.get(k).map(|s| (*s).to_string())
+        })
+        .unwrap();
+        assert_eq!(c.helper_socket(), None);
     }
 
     #[test]
@@ -821,8 +901,10 @@ mod tests {
     fn socket_gid_env_override() {
         let mut c = Config::default();
         let env: HashMap<&str, &str> = HashMap::from([("FERROGATE_HELPER_SOCKET_GID", "777")]);
-        c.apply_overrides(|k| env.get(k).map(|s| (*s).to_string()))
-            .unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, |k| {
+            env.get(k).map(|s| (*s).to_string())
+        })
+        .unwrap();
         assert_eq!(c.socket_gid().unwrap(), Some(777));
     }
 
@@ -832,7 +914,9 @@ mod tests {
         let env: HashMap<&str, &str> =
             HashMap::from([("FERROGATE_ALLOWLIST_MAX_AGE_SECS", "soon")]);
         let err = c
-            .apply_overrides(|k| env.get(k).map(|s| (*s).to_string()))
+            .apply_overrides(EnvOverrideScope::Full, |k| {
+                env.get(k).map(|s| (*s).to_string())
+            })
             .unwrap_err();
         assert!(err.to_string().contains("MAX_AGE"));
     }
