@@ -160,6 +160,92 @@ pub fn validate_environment(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A configuration file discovered for the daemon's "serve every environment"
+/// mode: the environment it represents (`None` ⇒ the default `mia.toml`) and the
+/// file to load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredConfig {
+    /// The environment name, or `None` for the default `mia.toml`.
+    pub environment: Option<String>,
+    /// The resolved path to load.
+    pub path: PathBuf,
+}
+
+/// Discover every environment configuration file in the standard locations.
+///
+/// Scans the system config directory, then the per-user one, for `mia.toml`
+/// (the default environment) and `mia-<env>.toml` (named environments). When the
+/// same environment exists in both, the **system** copy wins (mirroring the
+/// single-file discovery precedence). The result is sorted with the default
+/// environment first, then environments by name, for a stable serve order.
+///
+/// Used by the daemon's default "serve all environments" mode; an explicit
+/// `--config` / `--environment` / `$FERROGATE_CONFIG` bypasses it.
+#[must_use]
+pub fn discover_environment_configs() -> Vec<DiscoveredConfig> {
+    let dirs: Vec<PathBuf> = [Some(system_config_dir()), user_config_dir()]
+        .into_iter()
+        .flatten()
+        .collect();
+    scan_config_dirs(&dirs)
+}
+
+/// The directory-scan core of [`discover_environment_configs`], split out so it
+/// can be tested against temporary directories instead of the OS paths.
+fn scan_config_dirs(dirs: &[PathBuf]) -> Vec<DiscoveredConfig> {
+    use std::collections::BTreeMap;
+
+    // `Option<String>` orders `None` (the default env) first, then names
+    // alphabetically — a stable, predictable serve order. `or_insert` keeps the
+    // first directory's copy, so the system dir (scanned first) wins on conflict.
+    let mut found: BTreeMap<Option<String>, PathBuf> = BTreeMap::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let env = match classify_config_filename(name) {
+                Some(ConfigFile::Default) => None,
+                // Defensively skip a file whose embedded name isn't a valid
+                // environment; the default `mia.toml` is always fine.
+                Some(ConfigFile::Named(env)) if validate_environment(&env).is_ok() => Some(env),
+                _ => continue,
+            };
+            found.entry(env).or_insert_with(|| dir.join(name));
+        }
+    }
+    found
+        .into_iter()
+        .map(|(environment, path)| DiscoveredConfig { environment, path })
+        .collect()
+}
+
+/// The classification of a config filename for environment discovery.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigFile {
+    /// `mia.toml` — the default environment.
+    Default,
+    /// `mia-<env>.toml` — a named environment.
+    Named(String),
+}
+
+/// Classify a filename: `mia.toml` ⇒ [`ConfigFile::Default`], `mia-<env>.toml`
+/// ⇒ [`ConfigFile::Named`], anything else ⇒ `None` (not a config file).
+fn classify_config_filename(name: &str) -> Option<ConfigFile> {
+    let stem = name.strip_suffix(".toml")?;
+    if stem == "mia" {
+        Some(ConfigFile::Default)
+    } else {
+        stem.strip_prefix("mia-")
+            .filter(|env| !env.is_empty())
+            .map(|env| ConfigFile::Named(env.to_string()))
+    }
+}
+
 /// Default helper-socket mode when unset (`0o660`).
 pub const DEFAULT_SOCKET_MODE: u32 = 0o660;
 
@@ -540,6 +626,50 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "../etc", "a b", "a\\b"] {
             assert!(validate_environment(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn classify_config_filename_classifies() {
+        assert_eq!(classify_config_filename("mia.toml"), Some(ConfigFile::Default));
+        assert_eq!(
+            classify_config_filename("mia-staging.toml"),
+            Some(ConfigFile::Named("staging".to_string()))
+        );
+        // Not config files.
+        assert_eq!(classify_config_filename("mia-.toml"), None);
+        assert_eq!(classify_config_filename("mia.txt"), None);
+        assert_eq!(classify_config_filename("allowlist.cbor"), None);
+        assert_eq!(classify_config_filename("notmia.toml"), None);
+    }
+
+    #[test]
+    fn scan_config_dirs_finds_and_orders_environments() {
+        let base = std::env::temp_dir().join(format!("mia-scan-{}", std::process::id()));
+        let sys = base.join("sys");
+        let user = base.join("user");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        // System: default + prod. User: staging + a *duplicate* prod that must lose.
+        std::fs::write(sys.join("mia.toml"), "").unwrap();
+        std::fs::write(sys.join("mia-prod.toml"), "").unwrap();
+        std::fs::write(user.join("mia-staging.toml"), "").unwrap();
+        std::fs::write(user.join("mia-prod.toml"), "").unwrap();
+        std::fs::write(user.join("ignore-me.toml"), "").unwrap();
+
+        let found = scan_config_dirs(&[sys.clone(), user.clone()]);
+        // Order: default (None) first, then prod, then staging.
+        assert_eq!(
+            found.iter().map(|d| d.environment.clone()).collect::<Vec<_>>(),
+            vec![None, Some("prod".to_string()), Some("staging".to_string())]
+        );
+        // The system copy of `prod` wins over the user one.
+        let prod = found
+            .iter()
+            .find(|d| d.environment.as_deref() == Some("prod"))
+            .unwrap();
+        assert_eq!(prod.path, sys.join("mia-prod.toml"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

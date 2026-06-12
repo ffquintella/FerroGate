@@ -165,6 +165,41 @@ file the standard discovery (step 3) looks for, leaving `$FERROGATE_CONFIG` and
 the `FERROGATE_*` env overlays unchanged. The daemon's SIGHUP live-reload
 re-reads the same `mia-<env>.toml` it started from.
 
+#### Serving every environment at once
+
+Run **without** a selector and the daemon serves *all* discovered environments
+concurrently in one process:
+
+```
+mia          # serve mia.toml AND every mia-<env>.toml found, each on its own socket
+```
+
+It scans the system and per-user config directories for `mia.toml` (the
+`default` environment) and every `mia-<env>.toml`, then for each one attests to
+that environment's CMIS and binds that environment's **own** `helper.socket`. A
+local caller fetches a token for whichever environment it needs by connecting to
+that environment's socket — so a single agent backs several deployments at once
+(e.g. `prod` and `staging` CMIS clusters side by side). Each environment runs its
+own attestation, allowlist fetch/propose, and CRL puller, including SRV-based HA
+fail-over, independently — one environment failing (unreachable CMIS, a socket
+that won't bind) is logged and isolated; the others keep serving.
+
+Notes and constraints:
+
+- **Each environment needs a distinct `helper.socket`.** `mia setup` already
+  suggests env-suffixed socket defaults (e.g. `mia-staging.sock`); a duplicate
+  socket across environments is skipped with an error rather than crash-looping
+  the one that bound first.
+- An environment with no `helper.socket` configured is left idle (not served).
+- `--config`, `--environment`, or `$FERROGATE_CONFIG` pins the daemon to **one**
+  environment (the all-environments scan is bypassed). To serve only the default
+  `mia.toml` when named environments also exist, pass its path with `--config`.
+- The process-wide log directive comes from the base `mia.toml` (or `RUST_LOG`);
+  every log line is tagged with its `environment`. A SIGHUP reloads all of them.
+- The `FERROGATE_*` environment overlay applies to every loaded config, so avoid
+  setting host-wide overrides like `FERROGATE_HELPER_SOCKET` in this mode (they
+  would collide across environments).
+
 A malformed file — including an unknown key — fails the daemon loudly at
 startup rather than being silently ignored. The packaged template (source:
 `crates/mia/dist/mia.toml`) is installed at the system path; every value is

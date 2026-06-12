@@ -26,6 +26,12 @@
 //! so one host can carry side-by-side configs for different deployments
 //! (`mia --environment staging`, `mia --environment prod`, …).
 //!
+//! With **no** selector at all (plain `mia`), the daemon serves *every*
+//! discovered environment at once — `mia.toml` plus each `mia-<env>.toml` — in
+//! one process, each attesting to its own CMIS and exposing its own helper
+//! socket, so a single agent can mint tokens for several deployments
+//! concurrently. `--config`/`--environment`/`$FERROGATE_CONFIG` pin it to one.
+//!
 //! The environment variables (each also a TOML key — see `dist/mia.toml`):
 //!
 //! - `FERROGATE_HELPER_SOCKET` (`helper.socket`) — socket path; its presence
@@ -59,6 +65,7 @@ use tracing_subscriber::{fmt, reload, EnvFilter};
 /// `reload::Handle` type so it threads cleanly through the serve path.
 type LogReload = Arc<dyn Fn(&str) + Send + Sync>;
 
+#[allow(clippy::too_many_lines)] // linear startup: dispatch → resolve configs → harden → serve
 fn main() -> anyhow::Result<()> {
     // Subcommand dispatch. `mia` with no subcommand is the daemon (the systemd
     // ExecStart); `mia setup` is the interactive configuration wizard, which
@@ -90,15 +97,32 @@ fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    // Resolve the configuration before logging/hardening: the file gives us the
-    // log directive, and a malformed file must fail loudly and early.
     let config_source = parse_daemon_flags(&args)?;
-    let (config, source) = config_source.load()?;
+
+    // An explicit selection (`--config`, `--environment`, or `$FERROGATE_CONFIG`)
+    // serves exactly that one configuration. Otherwise the daemon serves *every*
+    // discovered environment (`mia.toml` + `mia-<env>.toml`), attesting to each
+    // CMIS and exposing each environment's own helper socket, so a local caller
+    // can fetch tokens for whichever environment it needs.
+    let explicit = config_source.path.is_some()
+        || config_source.environment.is_some()
+        || std::env::var_os(mia::config::ENV_CONFIG).is_some();
+
+    // Resolve the configuration before logging/hardening: it gives us the log
+    // directive, and a malformed file must fail loudly and early. The primary
+    // config supplies the process-wide log directive; in all-environments mode
+    // that is the default `mia.toml` (env/defaults if it is absent).
+    let primary_source = if explicit {
+        config_source.clone()
+    } else {
+        mia::config::ConfigSource::default()
+    };
+    let (primary_config, primary_path) = primary_source.load()?;
 
     // A reloadable filter layer: SIGHUP re-reads the config and applies a
     // changed `log` directive live (see `spawn_reload_task`).
-    let filter =
-        EnvFilter::try_new(config.log_directive()).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(primary_config.log_directive())
+        .unwrap_or_else(|_| EnvFilter::new("info"));
     let (filter_layer, filter_handle) = reload::Layer::new(filter);
     tracing_subscriber::registry()
         .with(filter_layer)
@@ -120,11 +144,64 @@ fn main() -> anyhow::Result<()> {
         component = "mia",
         "FerroGate Machine Identity Agent"
     );
-    if let Some(path) = &source {
-        tracing::info!(config = %path.display(), "loaded configuration file");
+
+    // Build the set of environment instances to serve.
+    let instances = if explicit {
+        let label = config_source
+            .environment
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        if let Some(path) = &primary_path {
+            tracing::info!(env = %label, config = %path.display(), "loaded configuration file");
+        } else {
+            tracing::debug!(env = %label, "no configuration file; using environment and defaults");
+        }
+        vec![EnvInstance {
+            label,
+            config: primary_config,
+            source: config_source,
+        }]
     } else {
-        tracing::debug!("no configuration file; using environment and defaults");
-    }
+        let discovered = mia::config::discover_environment_configs();
+        if discovered.is_empty() {
+            tracing::debug!("no configuration files found; using environment and defaults");
+            vec![EnvInstance {
+                label: "default".to_string(),
+                config: primary_config,
+                source: mia::config::ConfigSource::default(),
+            }]
+        } else {
+            tracing::info!(count = discovered.len(), "serving all discovered environments");
+            let mut instances = Vec::new();
+            for d in discovered {
+                let label = d.environment.clone().unwrap_or_else(|| "default".to_string());
+                // Load each by its concrete path (no env-name re-resolution).
+                let source = mia::config::ConfigSource {
+                    path: Some(d.path.clone()),
+                    environment: None,
+                };
+                match source.load() {
+                    Ok((config, _)) => {
+                        tracing::info!(env = %label, config = %d.path.display(), "loaded environment configuration");
+                        instances.push(EnvInstance {
+                            label,
+                            config,
+                            source,
+                        });
+                    }
+                    // One broken environment must not take down the others.
+                    Err(e) => tracing::error!(
+                        env = %label, config = %d.path.display(), error = %e,
+                        "skipping environment: its configuration failed to load"
+                    ),
+                }
+            }
+            if instances.is_empty() {
+                anyhow::bail!("no environment configuration loaded successfully");
+            }
+            instances
+        }
+    };
 
     // Apply the hardening profile (feature F12) on the single startup thread,
     // *before* building the async runtime — so the seccomp filter is inherited
@@ -142,7 +219,16 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run(config, config_source, log_reload))
+    runtime.block_on(run_all(instances, log_reload))
+}
+
+/// One environment the daemon serves: its display label (`"default"` or the
+/// environment name), its loaded configuration, and the [`ConfigSource`] to
+/// re-read on SIGHUP.
+struct EnvInstance {
+    label: String,
+    config: mia::config::Config,
+    source: mia::config::ConfigSource,
 }
 
 /// Parse the daemon's config-source flags from `args`: `--config`/`-c <path>`
@@ -181,18 +267,21 @@ fn print_usage() {
          \x20      mia <command>\n\
          \n\
          commands:\n\
-         \x20 (none)            run the agent daemon\n\
+         \x20 (none)            run the agent daemon — serves every configured\n\
+         \x20                   environment (mia.toml + mia-<env>.toml) at once,\n\
+         \x20                   each on its own helper socket\n\
          \x20 setup             interactive wizard that writes the agent's config file\n\
          \x20 refresh-key       re-fetch the CMIS enrollment key into allowlist.key\n\
          \x20 resync-allowlist  re-fetch this host's signed allowlist from CMIS\n\
          \x20 test              check CMIS connectivity and helper-token issuance\n\
          \n\
          options:\n\
-         \x20 -c, --config <path>   TOML config file (default {}, then\n\
+         \x20 -c, --config <path>   serve only this TOML config file (otherwise the\n\
+         \x20                       daemon serves all environments; default base {}, then\n\
          \x20                       $FERROGATE_CONFIG; environment variables override it)\n\
-         \x20 -e, --environment <env>  select mia-<env>.toml from the standard config\n\
-         \x20                       locations instead of mia.toml (for side-by-side\n\
-         \x20                       deployments); mutually exclusive with --config\n\
+         \x20 -e, --environment <env>  serve only mia-<env>.toml from the standard config\n\
+         \x20                       locations instead of every environment; mutually\n\
+         \x20                       exclusive with --config\n\
          \x20     --reload          signal the running agent to reload its config and\n\
          \x20                       allowlist live (SIGHUP), then exit\n\
          \x20 -h, --help            show this help\n\
@@ -204,25 +293,97 @@ fn print_usage() {
     );
 }
 
-/// Daemon entry point. Starts the helper API when a helper socket is
-/// configured, otherwise prints a banner and exits.
+/// Daemon entry point. Serves every environment instance that has a helper
+/// socket configured, concurrently, in this one process — each attesting to its
+/// own CMIS and exposing its own helper socket. Environments without a helper
+/// socket are idle (logged, not served); a duplicate socket across environments
+/// is skipped (each needs a distinct `helper.socket`). With nothing to serve it
+/// prints the idle banner and exits.
 // The serve path holds a composite key (~4 KB ML-DSA) across awaits during
 // attestation; the large future is inherent, not a bug.
 #[allow(clippy::large_futures)]
-async fn run(
-    config: mia::config::Config,
-    config_source: mia::config::ConfigSource,
-    log_reload: LogReload,
-) -> anyhow::Result<()> {
-    if config.helper_socket().is_none() {
-        println!(
-            "mia v{} — daemon idle; set a helper socket (helper.socket / \
-             FERROGATE_HELPER_SOCKET) to start the helper API.",
-            env!("CARGO_PKG_VERSION")
-        );
-        return Ok(());
+async fn run_all(instances: Vec<EnvInstance>, log_reload: LogReload) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
+    // Keep only environments that actually serve a socket, rejecting duplicates
+    // so the second bind on a shared path can't crash-loop the first.
+    let mut seen_sockets: HashSet<std::path::PathBuf> = HashSet::new();
+    let mut serveable: Vec<EnvInstance> = Vec::new();
+    for inst in instances {
+        match inst.config.helper_socket() {
+            None => tracing::info!(
+                env = %inst.label,
+                "no helper socket configured for this environment; not serving it"
+            ),
+            Some(socket) => {
+                if seen_sockets.insert(socket.to_path_buf()) {
+                    serveable.push(inst);
+                } else {
+                    tracing::error!(
+                        env = %inst.label, socket = %socket.display(),
+                        "duplicate helper socket across environments; skipping this one \
+                         (each environment needs a distinct helper.socket)"
+                    );
+                }
+            }
+        }
     }
-    start_helper_api(&config, config_source, log_reload).await
+
+    match serveable.len() {
+        0 => {
+            println!(
+                "mia v{} — daemon idle; no environment has a helper socket configured \
+                 (helper.socket / FERROGATE_HELPER_SOCKET) to start the helper API.",
+                env!("CARGO_PKG_VERSION")
+            );
+            Ok(())
+        }
+        // A single environment serves inline, so its outcome (including a bind
+        // error) propagates as the process exit status, exactly as before.
+        1 => serve_one(serveable.pop().expect("len == 1"), log_reload).await,
+        n => {
+            tracing::info!(environments = n, "serving {n} environments concurrently");
+            // Run all environment serve loops on one task (each is I/O-bound and
+            // runs until shutdown). A per-environment failure is logged; the
+            // others keep serving.
+            let futures = serveable
+                .into_iter()
+                .map(|inst| serve_one(inst, log_reload.clone()));
+            futures::future::join_all(futures).await;
+            Ok(())
+        }
+    }
+}
+
+/// Serve one environment's helper API, tagged with its label so every log line
+/// names the environment it came from.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[allow(clippy::large_futures)] // attestation future holds a composite key
+async fn serve_one(instance: EnvInstance, log_reload: LogReload) -> anyhow::Result<()> {
+    use tracing::Instrument as _;
+
+    let EnvInstance {
+        label,
+        config,
+        source,
+    } = instance;
+    let span = tracing::info_span!("env", environment = %label);
+    async move {
+        if let Err(e) = start_helper_api(&config, source, log_reload).await {
+            tracing::error!(error = %e, "environment helper API exited with error");
+            return Err(e);
+        }
+        Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
+/// Serve one environment (fallback for platforms with no helper transport).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+async fn serve_one(instance: EnvInstance, log_reload: LogReload) -> anyhow::Result<()> {
+    let EnvInstance { config, source, .. } = instance;
+    start_helper_api(&config, source, log_reload).await
 }
 
 /// Build the platform's caller authenticator (Linux: SO_PEERCRED + IMA).
