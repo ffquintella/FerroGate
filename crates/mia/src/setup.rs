@@ -436,8 +436,12 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
 
         // Offer to keep the on-disk allowlist in sync with CMIS automatically.
         // This happens at daemon start (after attestation supplies the host's
-        // identity), so it needs a CMIS endpoint + pin — not at setup time.
-        if s.cmis_endpoint.is_some() && s.cmis_spki_pin.is_some() {
+        // identity), so it needs a CMIS source + pin — not at setup time. Either
+        // a static endpoint or an SRV record works: the daemon resolves both via
+        // `CmisResolver::from_config`, so don't gate on `endpoint` alone.
+        let cmis_reachable =
+            (s.cmis_endpoint.is_some() || s.cmis_srv.is_some()) && s.cmis_spki_pin.is_some();
+        if cmis_reachable {
             s.allowlist_fetch = Confirm::new("Fetch the signed allowlist from CMIS on each start?")
                 .with_default(existing.allowlist.fetch)
                 .with_help_message(
@@ -784,7 +788,8 @@ fn render(s: &Settings, environment: Option<&str>) -> String {
     ));
     out.push_str(
         "# Fetch this host's allowlist from CMIS at startup (by EK-UUID) and write it\n\
-         # to `path` before loading. Needs cmis.endpoint + spki_pin. Default: false.\n",
+         # to `path` before loading. Needs a cmis source (endpoint or srv) + spki_pin.\n\
+         # Default: false.\n",
     );
     if s.allowlist_fetch {
         out.push_str("fetch = true\n");
@@ -794,8 +799,8 @@ fn render(s: &Settings, environment: Option<&str>) -> String {
     out.push_str(
         "# Propose the local callers this host observes (granted and denied) to CMIS\n\
          # periodically. CMIS auto-adopts the first proposal on a host with no\n\
-         # allowlist (bootstrap/TOFU) or queues it for operator review. Needs\n\
-         # cmis.endpoint + spki_pin and a host SVID. Default: false.\n",
+         # allowlist (bootstrap/TOFU) or queues it for operator review. Needs a\n\
+         # cmis source (endpoint or srv) + spki_pin and a host SVID. Default: false.\n",
     );
     if s.allowlist_propose {
         out.push_str("propose = true\n");
