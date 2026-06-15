@@ -126,6 +126,29 @@ authentication differ per OS:
 The TPM attestation loop is Linux-only; on macOS/Windows MIA runs as the
 helper-API surface. The startup hardening profile applies on Linux only.
 
+### Running as a Windows service
+
+On Windows the daemon runs under the Service Control Manager as the **`mia`**
+service, so `Restart-Service mia` (or `sc start mia` / `sc stop mia`) works and
+the agent starts at boot. The Windows installer (`make pkg-win`) registers and
+starts it automatically; to manage it by hand:
+
+```powershell
+mia service install     # register an auto-start LocalSystem service (needs admin)
+mia service start
+mia service stop
+mia service uninstall
+Restart-Service mia      # once installed
+```
+
+The service runs as `LocalSystem`, reads its configuration from the system path
+(`%ProgramData%\FerroGate\mia.toml`), and — because it has no console — writes
+its logs to `%ProgramData%\FerroGate\logs\mia.log`. `mia service run` is the
+internal entry point the SCM launches and is not meant to be run by hand. Like
+every platform, the daemon exits cleanly (idle) when no helper socket is
+configured, so a freshly installed service shows as *Stopped* until you
+configure a helper pipe; it stays running once configured.
+
 ### Configuration file
 
 The file is discovered in this order:

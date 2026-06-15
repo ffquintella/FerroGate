@@ -31,3 +31,9 @@ pub use imp::{
     client_process_id, create_server_pipe, process_image_path, process_user_rid,
     verify_authenticode,
 };
+
+// Windows Service Control Manager integration for the `mia` daemon. Lives here
+// because `windows-service`'s service-main macro expands to `unsafe` glue and
+// `mia` is `#![forbid(unsafe_code)]`.
+#[cfg(windows)]
+pub mod service;

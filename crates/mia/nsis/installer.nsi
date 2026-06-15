@@ -124,10 +124,37 @@ Section "FerroGate MIA" SecMia
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   Call AddToPath
+
+  ; Register the Windows service (auto-start) so the agent runs in the
+  ; background and `Restart-Service mia` works. Non-fatal if it fails (e.g. an
+  ; older copy is still registered) — the binary and PATH entry are installed
+  ; regardless, and `mia service install` can be re-run by hand.
+  DetailPrint "Registering the mia Windows service..."
+  nsExec::ExecToLog '"$INSTDIR\mia.exe" service install'
+  Pop $0
+  ${If} $0 != 0
+    DetailPrint "WARNING: 'mia service install' exited with code $0 (the service may already exist)."
+  ${EndIf}
+
+  ; Start it now. mia exits cleanly (idle) until a helper socket is configured,
+  ; so a fresh install may show the service as Stopped — that is expected.
+  DetailPrint "Starting the mia service..."
+  nsExec::ExecToLog '"$INSTDIR\mia.exe" service start'
+  Pop $0
 SectionEnd
 
 Section "Uninstall"
   SetRegView 64
+
+  ; Stop and deregister the service before deleting files — a running service
+  ; holds mia.exe open. Give the process a moment to exit and release the lock.
+  DetailPrint "Stopping and removing the mia service..."
+  nsExec::ExecToLog '"$INSTDIR\mia.exe" service stop'
+  Pop $0
+  nsExec::ExecToLog '"$INSTDIR\mia.exe" service uninstall'
+  Pop $0
+  Sleep 2000
+
   Call un.RemoveFromPath
 
   Delete "$INSTDIR\mia.exe"

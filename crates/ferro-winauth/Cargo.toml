@@ -21,6 +21,11 @@ workspace = true
 
 [target.'cfg(windows)'.dependencies]
 tokio       = { workspace = true }
+anyhow      = { workspace = true }
+# Service Control Manager integration for the mia Windows service. Its
+# service-main macro expands to `unsafe` glue, so it lives in this crate
+# (mia is `#![forbid(unsafe_code)]`) rather than in mia itself.
+windows-service = "0.8"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Pipes",

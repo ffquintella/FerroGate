@@ -65,13 +65,13 @@ use tracing_subscriber::{fmt, reload, EnvFilter};
 /// `reload::Handle` type so it threads cleanly through the serve path.
 type LogReload = Arc<dyn Fn(&str) + Send + Sync>;
 
-#[allow(clippy::too_many_lines)] // linear startup: dispatch → resolve configs → harden → serve
 fn main() -> anyhow::Result<()> {
     // Subcommand dispatch. `mia` with no subcommand is the daemon (the systemd
-    // ExecStart); `mia setup` is the interactive configuration wizard, which
-    // must run BEFORE logging init, hardening, and the async runtime — it is
-    // synchronous terminal I/O and must not inherit the seccomp profile or the
-    // dropped privileges the daemon installs.
+    // ExecStart / the Windows service `service run`); `mia setup` is the
+    // interactive configuration wizard, which must run BEFORE logging init,
+    // hardening, and the async runtime — it is synchronous terminal I/O and must
+    // not inherit the seccomp profile or the dropped privileges the daemon
+    // installs.
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("setup") => return mia::setup::run(&args[1..]),
@@ -81,6 +81,9 @@ fn main() -> anyhow::Result<()> {
         // running agent (SIGHUP) to re-read its config + allowlist, then exits.
         Some("--reload") => return mia::resync::run_reload(&args[1..]),
         Some("test") => return mia::selftest::run(&args[1..]),
+        // Windows service management (install/uninstall/start/stop) and the
+        // internal `service run` the SCM launches. Windows-only.
+        Some("service") => return service_cmd(&args[1..]),
         Some("-h" | "--help") => {
             print_usage();
             return Ok(());
@@ -97,7 +100,19 @@ fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    let config_source = parse_daemon_flags(&args)?;
+    // No subcommand: run the daemon, logging to stdout (interactive / systemd /
+    // launchd capture it). The Windows service path calls `run_daemon` with
+    // `service_log = true` instead, since the SCM gives it no console.
+    run_daemon(&args, false)
+}
+
+/// Resolve configuration, apply the hardening profile, build the async runtime,
+/// and serve every configured environment until shutdown. Shared by the
+/// interactive/systemd/launchd path (`service_log = false`) and the Windows
+/// service path (`service_log = true`, which routes logs to a file).
+#[allow(clippy::too_many_lines)] // linear startup: resolve configs → harden → serve
+fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
+    let config_source = parse_daemon_flags(args)?;
 
     // An explicit selection (`--config`, `--environment`, or `$FERROGATE_CONFIG`)
     // serves exactly that one configuration. Otherwise the daemon serves *every*
@@ -124,9 +139,13 @@ fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_new(primary_config.log_directive())
         .unwrap_or_else(|_| EnvFilter::new("info"));
     let (filter_layer, filter_handle) = reload::Layer::new(filter);
+    // Under the Windows SCM there is no console, so route logs to a file beside
+    // the system config (%ProgramData%\FerroGate\logs\mia.log). Every other run
+    // logs to stdout, where systemd/launchd or the operator's terminal sees it.
+    let (writer, ansi) = log_writer(service_log)?;
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(fmt::layer())
+        .with(fmt::layer().with_ansi(ansi).with_writer(writer))
         .init();
     let log_reload: LogReload = Arc::new(move |directive: &str| {
         match EnvFilter::try_new(directive) {
@@ -262,6 +281,115 @@ fn parse_daemon_flags(args: &[String]) -> anyhow::Result<mia::config::ConfigSour
     Ok(source)
 }
 
+/// Resolve the tracing writer: a log file under `%ProgramData%\FerroGate\logs`
+/// (no ANSI) when running as a Windows service, otherwise stdout (ANSI on).
+fn log_writer(
+    service_log: bool,
+) -> anyhow::Result<(tracing_subscriber::fmt::writer::BoxMakeWriter, bool)> {
+    use anyhow::Context as _;
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+
+    if service_log {
+        let dir = mia::config::system_config_path()
+            .parent()
+            .map_or_else(|| std::path::PathBuf::from("logs"), |p| p.join("logs"));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating service log directory {}", dir.display()))?;
+        let path = dir.join("mia.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening service log file {}", path.display()))?;
+        Ok((BoxMakeWriter::new(std::sync::Mutex::new(file)), false))
+    } else {
+        Ok((BoxMakeWriter::new(std::io::stdout), true))
+    }
+}
+
+/// Dispatch `mia service <subcommand>` — manage the Windows service so the agent
+/// runs in the background and `Restart-Service mia` works. `run` is the internal
+/// entry the SCM launches; the rest are operator/installer commands.
+#[cfg(windows)]
+fn service_cmd(args: &[String]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    match args.first().map(String::as_str) {
+        Some("run") => {
+            ferro_winauth::service::run_dispatcher(ferro_winauth::service::ServiceHooks {
+                run: service_run_daemon,
+                request_stop: service_request_stop,
+            })
+        }
+        Some("install") => {
+            let exe = std::env::current_exe().context("resolving the mia executable path")?;
+            ferro_winauth::service::install(
+                &exe,
+                "FerroGate Machine Identity Agent",
+                "Attests this host to CMIS and serves the local helper API for minting child tokens.",
+            )?;
+            println!("installed the 'mia' service (auto-start). Start it with: Start-Service mia");
+            Ok(())
+        }
+        Some("uninstall") => {
+            ferro_winauth::service::uninstall()?;
+            println!("removed the 'mia' service.");
+            Ok(())
+        }
+        Some("start") => {
+            ferro_winauth::service::start()?;
+            println!("started the 'mia' service.");
+            Ok(())
+        }
+        Some("stop") => {
+            ferro_winauth::service::stop()?;
+            println!("stopped the 'mia' service.");
+            Ok(())
+        }
+        Some(other) => anyhow::bail!(
+            "unknown service subcommand: {other}\n\nusage: mia service <install|uninstall|start|stop>"
+        ),
+        None => {
+            println!(
+                "usage: mia service <install|uninstall|start|stop>\n\n\
+                 Manage the mia Windows service so it runs in the background and\n\
+                 `Restart-Service mia` works. `install` registers an auto-start\n\
+                 LocalSystem service that runs `mia service run` (used internally\n\
+                 by the Service Control Manager)."
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The daemon entry the SCM dispatcher runs: serves every configured environment
+/// with logs routed to a file, mapping the result to a process exit code.
+#[cfg(windows)]
+fn service_run_daemon() -> i32 {
+    match run_daemon(&[], true) {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!(error = format!("{e:#}"), "mia daemon exited with an error");
+            1
+        }
+    }
+}
+
+/// Ask the running daemon to stop. Called from the SCM control thread, so it
+/// only sets the shared watch flag that [`shutdown_signal`] awaits.
+#[cfg(windows)]
+fn service_request_stop() {
+    // `send_replace` (not `send`) so the flag is stored even if no serve loop
+    // has subscribed yet — `send` discards the value when there are no
+    // receivers, which would lose a stop that races startup.
+    let _ = service_stop_signal().send_replace(true);
+}
+
+/// `mia service` manages the Windows service and is unavailable elsewhere.
+#[cfg(not(windows))]
+fn service_cmd(_args: &[String]) -> anyhow::Result<()> {
+    anyhow::bail!("the `service` command manages the Windows service and is only available on Windows")
+}
+
 /// Top-level CLI usage banner.
 fn print_usage() {
     println!(
@@ -278,6 +406,7 @@ fn print_usage() {
          \x20 refresh-key       re-fetch the CMIS enrollment key into allowlist.key\n\
          \x20 resync-allowlist  re-fetch this host's signed allowlist from CMIS\n\
          \x20 test              check CMIS connectivity and helper-token issuance\n\
+         \x20 service           manage the Windows service (install/uninstall/start/stop)\n\
          \n\
          options:\n\
          \x20 -c, --config <path>   serve only this TOML config file (otherwise the\n\
@@ -1112,11 +1241,33 @@ async fn shutdown_signal() {
     }
 }
 
-/// Resolve when the process receives Ctrl-C / Ctrl-Break (Windows).
+/// Broadcast stop signal for the Windows service path. A `watch` channel so
+/// every environment's serve loop sees the stop (and so a stop that arrives
+/// before a loop subscribes is not missed); `send` is callable from the SCM
+/// control thread, which has no async context.
+#[cfg(windows)]
+fn service_stop_signal() -> &'static tokio::sync::watch::Sender<bool> {
+    static TX: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
+
+/// Resolve when the process is asked to stop on Windows: Ctrl-C / Ctrl-Break
+/// (interactive) or a Service Control Manager Stop/Shutdown (via the watch flag
+/// set by [`service_request_stop`]).
 #[cfg(windows)]
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("received Ctrl-C; shutting down");
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let service_stop = async {
+        let mut rx = service_stop_signal().subscribe();
+        // Returns immediately if a stop was already requested.
+        let _ = rx.wait_for(|&stop| stop).await;
+    };
+    tokio::select! {
+        () = ctrl_c => tracing::info!("received Ctrl-C; shutting down"),
+        () = service_stop => tracing::info!("received service stop; shutting down"),
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
