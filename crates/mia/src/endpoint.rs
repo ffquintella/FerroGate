@@ -168,10 +168,12 @@ impl CmisResolver {
 /// RFC 2782 preference (ascending priority, then descending weight, then target
 /// for a stable order). Uses the platform's configured DNS resolver.
 async fn resolve_srv(name: &str) -> anyhow::Result<Vec<String>> {
-    use hickory_resolver::TokioAsyncResolver;
+    use hickory_resolver::TokioResolver;
 
-    let resolver = TokioAsyncResolver::tokio_from_system_conf()
-        .context("initialising the system DNS resolver for the SRV lookup")?;
+    let resolver = TokioResolver::builder_tokio()
+        .context("initialising the system DNS resolver for the SRV lookup")?
+        .build()
+        .context("building the system DNS resolver for the SRV lookup")?;
     let lookup = tokio::time::timeout(SRV_LOOKUP_TIMEOUT, resolver.srv_lookup(name))
         .await
         .map_err(|_| {
@@ -185,11 +187,15 @@ async fn resolve_srv(name: &str) -> anyhow::Result<Vec<String>> {
     // (priority, weight, port, target) tuples; a "." target means "service
     // explicitly not available here" (RFC 2782) and is dropped.
     let records: Vec<(u16, u16, u16, String)> = lookup
+        .answers()
         .iter()
-        .map(|srv| {
-            let target = srv.target().to_utf8();
-            let target = target.trim_end_matches('.').to_string();
-            (srv.priority(), srv.weight(), srv.port(), target)
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::SRV(srv) => {
+                let target = srv.target.to_utf8();
+                let target = target.trim_end_matches('.').to_string();
+                Some((srv.priority, srv.weight, srv.port, target))
+            }
+            _ => None,
         })
         .filter(|(.., target)| !target.is_empty())
         .collect();

@@ -158,7 +158,7 @@ impl SoftwareMachineKey {
         // are astronomically rare for P-256, but the loop keeps it correct.
         for _ in 0..16 {
             let mut bytes = [0u8; 32];
-            getrandom::getrandom(&mut bytes)
+            getrandom::fill(&mut bytes)
                 .map_err(|e| SepError::KeyGen(format!("getrandom: {e}")))?;
             if let Ok(signing) = SigningKey::from_bytes((&bytes).into()) {
                 return Ok(Self { signing });
