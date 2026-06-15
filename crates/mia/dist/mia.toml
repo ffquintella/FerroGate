@@ -52,6 +52,11 @@
 # Windows only. Local group whose members may open the pipe (blank => default
 # pipe DACL).
 #windows_group = "FerroGateClients"
+# Windows only. Require a valid Authenticode signature on every caller's image
+# (the Code-Integrity analogue of the Linux IMA check). Default: true. Set false
+# for environments whose clients (and mia itself) are not code-signed — identity
+# then rests on PID + image SHA-384 + RID only.
+#require_authenticode = true
 
 # --- Allowlist --------------------------------------------------------------
 # Signed CBOR allowlist of vetted local callers. With no `path`, the helper API

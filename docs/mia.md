@@ -158,6 +158,18 @@ does not exist, the daemon cannot resolve its SID and fails to bind the pipe
 default DACL. On a manual `mia service install` (no installer), create the group
 yourself first.
 
+Past the pipe DACL, the daemon also authenticates each caller's *image*: by
+default it requires a valid **Authenticode** signature (the Code-Integrity
+analogue of the Linux IMA check). An unsigned caller — including an unsigned
+`mia.exe` running `mia test` — is refused as `untrusted-binary`. For
+environments that do not code-sign their binaries, set
+`helper.require_authenticode = false` (or `FERROGATE_HELPER_REQUIRE_AUTHENTICODE=0`);
+identity then rests on PID + image SHA-384 + RID, and `mia`'s self-trust still
+lets the agent talk to its own daemon. Token minting additionally needs a host
+SVID, which on Windows comes from host-key attestation
+([`ferro-machineid`](../crates/ferro-machineid) collects the SMBIOS/disk
+fingerprint); a host that CMIS has not enrolled is refused `no_host_svid`.
+
 ### Configuration file
 
 The file is discovered in this order:
@@ -270,6 +282,7 @@ Each key has an environment-variable equivalent that overrides it:
 | `helper.socket` | `FERROGATE_HELPER_SOCKET` |
 | `helper.socket_mode` | `FERROGATE_HELPER_SOCKET_MODE` |
 | `helper.windows_group` | `FERROGATE_HELPER_WINDOWS_GROUP` |
+| `helper.require_authenticode` | `FERROGATE_HELPER_REQUIRE_AUTHENTICODE` |
 | `allowlist.path` | `FERROGATE_ALLOWLIST` |
 | `allowlist.key` | `FERROGATE_ALLOWLIST_KEY` |
 | `allowlist.max_age_secs` | `FERROGATE_ALLOWLIST_MAX_AGE_SECS` |

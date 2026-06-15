@@ -547,11 +547,21 @@ fn build_auth(_config: &mia::config::Config) -> mia::helper::auth::MacCallerAuth
     mia::helper::auth::MacCallerAuth::new()
 }
 
-/// Build the platform's caller authenticator (Windows: PID + image hash +
-/// Authenticode).
+/// Build the platform's caller authenticator (Windows: PID + image hash + RID,
+/// plus an Authenticode trust check unless `helper.require_authenticode = false`
+/// for environments whose binaries are not code-signed).
 #[cfg(windows)]
-fn build_auth(_config: &mia::config::Config) -> mia::helper::auth::WindowsCallerAuth {
-    mia::helper::auth::WindowsCallerAuth::new()
+fn build_auth(config: &mia::config::Config) -> mia::helper::auth::WindowsCallerAuth {
+    use mia::helper::auth::WindowsCallerAuth;
+    if config.helper.require_authenticode.unwrap_or(true) {
+        WindowsCallerAuth::new()
+    } else {
+        tracing::warn!(
+            "helper.require_authenticode is false; caller images are NOT verified with \
+             Authenticode (identity rests on PID + image SHA-384 + RID only)"
+        );
+        WindowsCallerAuth::without_authenticode()
+    }
 }
 
 /// Start the local helper API. Supported on Linux, macOS, and Windows; the only

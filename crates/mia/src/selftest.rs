@@ -768,9 +768,16 @@ fn pipe_connect_advice(e: &std::io::Error) -> Vec<String> {
                 .to_string(),
         ],
         _ if e.kind() == std::io::ErrorKind::PermissionDenied => vec![
-            "The pipe exists but this user may not open it: its DACL restricts access to the \
-             configured Windows group (helper.windows_group). Add the user to that group or \
-             re-run the test as a permitted user."
+            "The pipe exists but this account may not open it. Its DACL grants access to SYSTEM, \
+             the local Administrators group, and the configured helper.windows_group \
+             (default FerroGateClients) only."
+                .to_string(),
+            "If you are an administrator, run this from an ELEVATED prompt: a non-elevated admin \
+             shell runs with a UAC-filtered token whose Administrators membership is deny-only, \
+             so the Administrators grant does not apply."
+                .to_string(),
+            "Otherwise add this account to the group and start a new session: \
+             `net localgroup FerroGateClients <account> /add`."
                 .to_string(),
         ],
         _ => vec![

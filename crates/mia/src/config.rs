@@ -314,6 +314,12 @@ pub struct HelperConfig {
     /// **Windows only.** Local group whose members may open the pipe (e.g.
     /// `FerroGateClients`). `None` ⇒ the pipe's default DACL applies.
     pub windows_group: Option<String>,
+    /// **Windows only.** Require a valid Authenticode signature on every caller's
+    /// image (the Code-Integrity analogue of the Linux IMA cross-check). `None`
+    /// ⇒ the default, which **requires** it. Set `false` for environments whose
+    /// clients (and `mia` itself) are not code-signed; identity then rests on
+    /// PID + image SHA-384 + RID only. Ignored off Windows.
+    pub require_authenticode: Option<bool>,
 }
 
 /// `[allowlist]` — the signed CBOR allowlist of vetted local callers.
@@ -494,6 +500,10 @@ impl Config {
         }
         if let Some(v) = get("FERROGATE_HELPER_WINDOWS_GROUP") {
             self.helper.windows_group = Some(v);
+        }
+        if let Some(v) = get("FERROGATE_HELPER_REQUIRE_AUTHENTICODE") {
+            self.helper.require_authenticode =
+                Some(parse_bool_env("FERROGATE_HELPER_REQUIRE_AUTHENTICODE", &v)?);
         }
         if let Some(v) = get("FERROGATE_ALLOWLIST") {
             self.allowlist.path = Some(PathBuf::from(v));
