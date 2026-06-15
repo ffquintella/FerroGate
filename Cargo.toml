@@ -122,7 +122,7 @@ uuid         = { version = "1", features = ["v8"] }
 # DNS SRV discovery for CMIS high availability (mia client): resolve a
 # `_cmis._tcp.<domain>` SRV record to the live CMIS nodes, then fail over
 # between them. Pure-Rust async resolver (reads the platform's resolver config).
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # misc
 parking_lot = "0.12"
