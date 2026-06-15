@@ -10,6 +10,32 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **MIA runs as a native Windows service.** The daemon now integrates with the
+  Windows Service Control Manager, so `Restart-Service mia` (and `sc start/stop
+  mia`) work and the agent starts at boot. A new `mia service
+  <install|uninstall|start|stop>` subcommand manages it (`mia service run` is the
+  internal entry point the SCM launches); the service runs as `LocalSystem`,
+  reads `%ProgramData%\FerroGate\mia.toml`, and — having no console — logs to
+  `%ProgramData%\FerroGate\logs\mia.log`. The SCM glue lives in `ferro-winauth`
+  (which permits `unsafe`) so `mia` stays `#![forbid(unsafe_code)]`. The Windows
+  installer registers and starts the service automatically. See
+  [docs/mia.md](docs/mia.md).
+
+- **Windows installer creates the `FerroGateClients` helper group.** The default
+  `helper.windows_group` restricts the helper pipe's DACL to this local group;
+  the installer now creates it on install (and removes it on uninstall) so the
+  daemon can resolve its SID and bind the pipe. Add vetted client accounts to the
+  group so they may request tokens.
+
+### Changed
+
+- **Windows packaging migrated from WiX/MSI to NSIS.** `make pkg-msi` (cargo-wix
+  + the end-of-life WiX v3 toolset) is replaced by `make pkg-win`, which builds a
+  self-contained `.exe` installer with NSIS from `crates/mia/nsis/installer.nsi`.
+  The installer drops `mia.exe` under `Program Files\FerroGate\MIA`, adds it to
+  the system PATH, registers the Windows service, and ships an uninstaller.
+  `make pkg-tools` installs NSIS via winget on Windows.
+
 - **`mia` self-trust — the binary never loses access to its own daemon.** `mia`
   ships as one executable serving as the daemon, the CLI, and the `mia test`
   self-test. The daemon now computes the `SHA-384` of its own executable once at
@@ -104,6 +130,14 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   allowlist *body* served from CMIS (per-host store + admin path) is planned.
 
 ### Fixed
+
+- **`mia test` step 5 (helper token mint) now runs on Windows.** It previously
+  bailed with "the named-pipe self-test is not supported on this platform yet";
+  it now connects the helper named pipe (mirroring the Unix UDS path) and either
+  mints a token or reports the real reason (pipe missing ⇒ service down, busy, a
+  DACL denial, or a daemon refusal such as `no_host_svid`) with remediation
+  hints. The request/response exchange is shared between the Unix and Windows
+  transports.
 
 - **CMIS split-brain detection now works on a self-signed peer-TLS cluster
   (`CMIS_PEER_TLS=1`).** hiqlite's periodic `split_brain_check` fetches
