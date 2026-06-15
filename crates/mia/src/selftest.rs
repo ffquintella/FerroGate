@@ -31,8 +31,8 @@ use anyhow::Context as _;
 use crate::config::Config;
 use crate::endpoint::CmisResolver;
 use crate::helper::crl::{CrlIngestError, CRL_FRESHNESS_LEEWAY_SECS};
-// Used only by `mint_failure_advice` (unix `check_mint` + tests).
-#[cfg(any(unix, test))]
+// Used only by `mint_failure_advice` (the helper mint step + tests).
+#[cfg(any(unix, windows, test))]
 use crate::helper::proto::ErrorCode;
 
 /// Timeout applied to each network step so a black-holed endpoint cannot make
@@ -578,43 +578,21 @@ async fn check_server_crl(
     }
 }
 
-/// Step 4: request a real child token through the helper socket and interpret
-/// the reply. Returns `true` when a token was minted.
-#[cfg(unix)]
-async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
+/// Step 5: send a real `HelperReq` over an already-connected helper transport
+/// (UDS on Unix, named pipe on Windows) and interpret the reply. Returns `true`
+/// when a token was minted.
+#[cfg(any(unix, windows))]
+async fn run_mint_exchange<S>(mut stream: S, label: &str, audience: &str, server_crl: ServerCrl) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use crate::helper::proto::{read_frame, write_frame, HelperReq, HelperResp};
-
-    let label = "[5/5] helper token mint";
-    let Some(socket) = config.helper_socket() else {
-        report(label, "FAIL", "helper.socket is not configured");
-        hints(&[
-            "The helper API is enabled by configuring a socket path (helper.socket / \
-                 FERROGATE_HELPER_SOCKET); without it no tokens can be served to local \
-                 applications. Run `mia setup` to configure one."
-                .to_string(),
-        ]);
-        return false;
-    };
-
-    let mut stream = match tokio::net::UnixStream::connect(socket).await {
-        Ok(s) => s,
-        Err(e) => {
-            report(
-                label,
-                "FAIL",
-                &format!("cannot open {}: {e}", socket.display()),
-            );
-            hints(&socket_connect_advice(e.kind()));
-            return false;
-        }
-    };
 
     // A syntactically valid DPoP thumbprint (base64url SHA-256) standing in
     // for a real caller key — the mint path only embeds it in the token.
-    let dpop_jkt = selftest_jkt();
     let req = HelperReq {
         audience: audience.to_string(),
-        dpop_jkt,
+        dpop_jkt: selftest_jkt(),
         ttl_secs: 60,
     };
 
@@ -675,6 +653,37 @@ async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> b
     }
 }
 
+/// Step 5 (Unix): connect the helper UDS, then run the mint exchange.
+#[cfg(unix)]
+async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
+    let label = "[5/5] helper token mint";
+    let Some(socket) = config.helper_socket() else {
+        report(label, "FAIL", "helper.socket is not configured");
+        hints(&[
+            "The helper API is enabled by configuring a socket path (helper.socket / \
+                 FERROGATE_HELPER_SOCKET); without it no tokens can be served to local \
+                 applications. Run `mia setup` to configure one."
+                .to_string(),
+        ]);
+        return false;
+    };
+
+    let stream = match tokio::net::UnixStream::connect(socket).await {
+        Ok(s) => s,
+        Err(e) => {
+            report(
+                label,
+                "FAIL",
+                &format!("cannot open {}: {e}", socket.display()),
+            );
+            hints(&socket_connect_advice(e.kind()));
+            return false;
+        }
+    };
+
+    run_mint_exchange(stream, label, audience, server_crl).await
+}
+
 /// Remediation hints for a failed connect to the helper socket.
 #[cfg(unix)]
 fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
@@ -708,17 +717,80 @@ fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
     }
 }
 
-/// Named-pipe self-test is not implemented; report it honestly rather than
-/// passing vacuously.
-// Must mirror the unix signature (the caller awaits it), so it stays `async`
-// even though this stub has nothing to await.
-#[cfg(not(unix))]
+/// Step 5 (Windows): connect the helper named pipe, then run the mint exchange.
+#[cfg(windows)]
+async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let label = "[5/5] helper token mint";
+    let Some(socket) = config.helper_socket() else {
+        report(label, "FAIL", "helper.socket is not configured");
+        hints(&[
+            "The helper API is enabled by configuring a pipe name (helper.socket / \
+                 FERROGATE_HELPER_SOCKET, e.g. \\\\.\\pipe\\ferrogate-mia); without it no \
+                 tokens can be served to local applications. Run `mia setup` to configure one."
+                .to_string(),
+        ]);
+        return false;
+    };
+
+    let stream = match ClientOptions::new().open(socket) {
+        Ok(s) => s,
+        Err(e) => {
+            report(
+                label,
+                "FAIL",
+                &format!("cannot open {}: {e}", socket.display()),
+            );
+            hints(&pipe_connect_advice(&e));
+            return false;
+        }
+    };
+
+    run_mint_exchange(stream, label, audience, server_crl).await
+}
+
+/// Remediation hints for a failed connect to the helper named pipe.
+#[cfg(windows)]
+fn pipe_connect_advice(e: &std::io::Error) -> Vec<String> {
+    // ERROR_FILE_NOT_FOUND (2): the pipe does not exist (daemon down, or a
+    // different helper.socket). ERROR_PIPE_BUSY (231): all instances are busy.
+    match e.raw_os_error() {
+        Some(2) => vec![
+            "The pipe does not exist — the mia service is probably not running (or runs with a \
+             different helper.socket name). Check `sc query mia` and the daemon log \
+             (%ProgramData%\\FerroGate\\logs\\mia.log) for 'helper API listening'."
+                .to_string(),
+        ],
+        Some(231) => vec![
+            "Every pipe instance is busy right now — retry the self-test. If it persists the \
+             daemon may be saturated or wedged; check the daemon log."
+                .to_string(),
+        ],
+        _ if e.kind() == std::io::ErrorKind::PermissionDenied => vec![
+            "The pipe exists but this user may not open it: its DACL restricts access to the \
+             configured Windows group (helper.windows_group). Add the user to that group or \
+             re-run the test as a permitted user."
+                .to_string(),
+        ],
+        _ => vec![
+            "Check `sc query mia`, the pipe name (helper.socket), and the daemon log \
+             (%ProgramData%\\FerroGate\\logs\\mia.log)."
+                .to_string(),
+        ],
+    }
+}
+
+/// The helper self-test needs a transport (UDS or named pipe); on platforms
+/// with neither, report it honestly rather than passing vacuously.
+// Must mirror the other signatures (the caller awaits it), so it stays `async`.
+#[cfg(not(any(unix, windows)))]
 #[allow(clippy::unused_async)]
 async fn check_mint(_config: &Config, _audience: &str, _server_crl: ServerCrl) -> bool {
     report(
         "[5/5] helper token mint",
         "FAIL",
-        "the named-pipe self-test is not supported on this platform yet",
+        "the helper self-test is not supported on this platform",
     );
     false
 }
@@ -727,7 +799,7 @@ async fn check_mint(_config: &Config, _audience: &str, _server_crl: ServerCrl) -
 /// server-side CRL check (step 3) found.
 // Only the unix `check_mint` calls this; `test` keeps it compiled for the
 // platform-independent advice-text tests below.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
     match code {
         ErrorCode::CrlStale => {
@@ -812,7 +884,7 @@ fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
 }
 
 /// Base64url SHA-256 thumbprint stand-in for the test request's DPoP key.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn selftest_jkt() -> String {
     use base64::Engine as _;
     use sha2::Digest as _;
