@@ -149,6 +149,15 @@ every platform, the daemon exits cleanly (idle) when no helper socket is
 configured, so a freshly installed service shows as *Stopped* until you
 configure a helper pipe; it stays running once configured.
 
+The pipe's DACL restricts access to the local group named by
+`helper.windows_group` (default `FerroGateClients`). The installer creates this
+group; **add the accounts of vetted client applications to it** so they may
+request tokens (`net localgroup FerroGateClients <account> /add`). If the group
+does not exist, the daemon cannot resolve its SID and fails to bind the pipe
+(`ERROR_NONE_MAPPED`); set `helper.windows_group` blank to fall back to the
+default DACL. On a manual `mia service install` (no installer), create the group
+yourself first.
+
 ### Configuration file
 
 The file is discovered in this order:

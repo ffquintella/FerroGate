@@ -35,6 +35,9 @@ ${UnStrRep}
 !define UNINST_KEY        "Software\Microsoft\Windows\CurrentVersion\Uninstall\FerroGate-MIA"
 !define APP_REG_KEY       "Software\FerroGate\MIA"
 !define ENV_REG           "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+; Local group whose members may open the helper pipe — must match the default
+; `helper.windows_group` in mia.toml, or the daemon cannot build the pipe DACL.
+!define HELPER_GROUP      "FerroGateClients"
 
 Name "${PRODUCT_NAME}"
 !ifdef OUTFILE
@@ -125,6 +128,16 @@ Section "FerroGate MIA" SecMia
 
   Call AddToPath
 
+  ; Create the local group that guards the helper pipe. The default config
+  ; (helper.windows_group = "${HELPER_GROUP}") restricts the pipe DACL to this
+  ; group; without it the daemon cannot resolve the SID and fails to bind the
+  ; pipe (ERROR_NONE_MAPPED). `net localgroup /add` returns non-zero if it
+  ; already exists — that is fine. Add the accounts of vetted client apps to
+  ; this group so they may request tokens.
+  DetailPrint "Creating the ${HELPER_GROUP} local group..."
+  nsExec::ExecToLog 'net localgroup ${HELPER_GROUP} /add /comment:"FerroGate MIA helper-API clients"'
+  Pop $0
+
   ; Register the Windows service (auto-start) so the agent runs in the
   ; background and `Restart-Service mia` works. Non-fatal if it fails (e.g. an
   ; older copy is still registered) — the binary and PATH entry are installed
@@ -161,6 +174,11 @@ Section "Uninstall"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
   RMDir "$PROGRAMFILES64\FerroGate"
+
+  ; Remove the helper-API client group the installer created.
+  DetailPrint "Removing the ${HELPER_GROUP} local group..."
+  nsExec::ExecToLog 'net localgroup ${HELPER_GROUP} /delete'
+  Pop $0
 
   DeleteRegKey HKLM "${UNINST_KEY}"
   DeleteRegKey HKLM "${APP_REG_KEY}"
