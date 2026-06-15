@@ -1,7 +1,7 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs container-image container-image-push \
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
-        pkg pkg-deb pkg-rpm pkg-msi pkg-macos pkg-tools pkg-sdk release deploy-release
+        pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk release deploy-release
 
 # Default target: list available targets with their descriptions.
 .DEFAULT_GOAL := help
@@ -188,8 +188,8 @@ formal-cryptoverif: ## Run the CryptoVerif hybrid AKE proof
 #           /Library/LaunchDaemons/com.ferrogate.mia.plist (bootstrapped+started)
 #   Linux : /usr/local/bin/mia  + systemd unit /etc/systemd/system/mia.service
 #           (daemon-reload + enable --now)
-#   Windows : $(PREFIX)\mia.exe (binary only; the service is registered by the
-#           .msi — run `make pkg-msi`). PREFIX defaults to
+#   Windows : $(PREFIX)\mia.exe (binary only; the full installer is built by
+#           `make pkg-win`). PREFIX defaults to
 #           %LOCALAPPDATA%\Programs\FerroGate; run under MSYS2/Git-Bash.
 #
 # Override the binary location with PREFIX=... (e.g. PREFIX=$$HOME/.local for a
@@ -237,7 +237,7 @@ ifeq ($(MIA_OS),windows)
 	@cp -f target/release/$(MIA_BIN) "$(BINDIR)/$(MIA_BIN)"
 	@echo "==> installed mia to $(BINDIR)/$(MIA_BIN)"
 	@echo "    Add $(BINDIR) to your PATH if it isn't already."
-	@echo "    Windows service registration is handled by the .msi — run 'make pkg-msi'."
+	@echo "    For a full Windows installer (adds mia to the system PATH), run 'make pkg-win'."
 else
 	@if [ -w "$(BINDIR)" ] || { [ ! -e "$(BINDIR)" ] && [ -w "$(PREFIX)" ]; }; then \
 	  install -d -m 0755 "$(BINDIR)"; \
@@ -292,7 +292,7 @@ endif
 mia-uninstall: ## Stop/deregister the mia service and remove the installed binary (PREFIX=... to override)
 ifeq ($(MIA_OS),windows)
 	@rm -f "$(BINDIR)/$(MIA_BIN)" && echo "==> removed $(BINDIR)/$(MIA_BIN)" || true
-	@echo "    Windows service deregistration is handled by the .msi uninstaller."
+	@echo "    The Windows installer (make pkg-win) ships its own uninstaller (Add/Remove Programs)."
 else ifeq ($(MIA_OS),macos)
 	@echo "==> deregistering launchd daemon $(MIA_LABEL)"
 	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
@@ -322,21 +322,30 @@ endif
 #
 #   make pkg-deb   -> .deb   (cargo-deb,          Debian/Ubuntu)
 #   make pkg-rpm   -> .rpm   (cargo-generate-rpm, Fedora/RHEL/SUSE)
-#   make pkg-msi   -> .msi   (cargo-wix,          Windows; run ON Windows)
+#   make pkg-win   -> .exe   (NSIS / makensis,    Windows; run ON Windows)
 #   make pkg-macos -> .pkg   (pkgbuild/productbuild, macOS; run ON macOS)
 #   make pkg       -> every format valid for the current host
-#   make pkg-tools -> install the cargo packaging tools (deb/rpm/msi)
+#   make pkg-tools -> install the packaging tools (deb/rpm; NSIS on Windows)
 #
 # Each package must be built on its target OS: DEB/RPM on Linux (the release
-# binary links the Linux TPM ESAPI stack), MSI on Windows with the WiX Toolset
-# v3, the .pkg on macOS (no TPM there — mia runs as the helper-API surface).
-# Outputs land under target/debian, target/generate-rpm, target/wix, target/macos.
+# binary links the Linux TPM ESAPI stack), the Windows installer on Windows
+# with NSIS, the .pkg on macOS (no TPM there — mia runs as the helper-API
+# surface). Outputs land under target/debian, target/generate-rpm, target/nsis,
+# target/macos.
 PKG_CRATE := mia
 # RPM/DEB ship for amd64 only; mia links the x86_64 Linux TPM ESAPI stack.
 RPM_ARCH  := x86_64
 
-pkg-tools: ## Install the cargo packaging tools (cargo-deb, cargo-generate-rpm, cargo-wix)
-	cargo install cargo-deb cargo-generate-rpm cargo-wix
+pkg-tools: ## Install the packaging tools (cargo-deb, cargo-generate-rpm; NSIS on Windows)
+	cargo install cargo-deb cargo-generate-rpm
+	@# The Windows installer is built with NSIS (makensis).
+	@case "$(UNAME_S)" in \
+	  MINGW*|MSYS*|CYGWIN*|Windows*) \
+	    command -v makensis >/dev/null 2>&1 || winget install --id NSIS.NSIS -e \
+	      --accept-source-agreements --accept-package-agreements || \
+	    echo "NOTE: install NSIS (https://nsis.sourceforge.io/) to build the Windows installer with 'make pkg-win'." ;; \
+	  *) echo "NOTE: build the Windows installer on Windows with 'make pkg-win' (needs NSIS / makensis)." ;; \
+	esac
 
 pkg-deb: ## Build the mia .deb package (Linux; needs cargo-deb)
 	@command -v cargo-deb >/dev/null 2>&1 || { echo "ERROR: cargo-deb not found — run 'make pkg-tools'"; exit 1; }
@@ -355,10 +364,17 @@ else
 	./scripts/build-rpm-amd64.sh
 endif
 
-pkg-msi: ## Build the mia .msi installer (Windows; needs cargo-wix + WiX Toolset)
-	@command -v cargo-wix >/dev/null 2>&1 || { echo "ERROR: cargo-wix not found — run 'make pkg-tools'"; exit 1; }
-	cargo wix -p $(PKG_CRATE) --nocapture
-	@echo "==> .msi written under target/wix/"
+NSIS_SRC := crates/$(PKG_CRATE)/nsis/installer.nsi
+WIN_OUT  := target/nsis/ferrogate-$(PKG_CRATE)-$(CARGO_VERSION)-x64-setup.exe
+pkg-win: ## Build the mia Windows installer (.exe; needs NSIS / makensis — run 'make pkg-tools')
+	@MAKENSIS="$$(command -v makensis 2>/dev/null)"; \
+	 [ -n "$$MAKENSIS" ] || for c in "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do \
+	   [ -x "$$c" ] && MAKENSIS="$$c" && break; done; \
+	 [ -n "$$MAKENSIS" ] || { echo "ERROR: makensis not found — run 'make pkg-tools' (installs NSIS)"; exit 1; }; \
+	 cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE) || exit 1; \
+	 mkdir -p target/nsis; \
+	 "$$MAKENSIS" -NOCD -DVERSION=$(CARGO_VERSION) -DBINDIR=target/release -DOUTFILE="$(WIN_OUT)" $(NSIS_SRC) || exit 1; \
+	 echo "==> Windows installer written to $(WIN_OUT)"
 
 # macOS component+product package built with the platform's own tools (no extra
 # cargo plugin). Stages a payload root, then pkgbuild → productbuild. Set
@@ -393,14 +409,14 @@ pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 	@rm -f target/macos/$(PKG_CRATE)-component.pkg
 	@echo "==> .pkg written to $(MACOS_PKG_OUT)"
 
-pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi/Windows, pkg/macOS)
+pkg: ## Build every client package valid for this host (deb+rpm/Linux, .exe/Windows, pkg/macOS)
 	@case "$(UNAME_S)" in \
 	  Linux)  $(MAKE) --no-print-directory pkg-deb pkg-rpm; \
-	          echo "NOTE: build the .msi on Windows ('make pkg-msi') and the .pkg on macOS ('make pkg-macos')." ;; \
+	          echo "NOTE: build the Windows installer on Windows ('make pkg-win') and the .pkg on macOS ('make pkg-macos')." ;; \
 	  Darwin) $(MAKE) --no-print-directory pkg-macos; \
-	          echo "NOTE: build the .deb/.rpm on Linux ('make pkg') and the .msi on Windows ('make pkg-msi')." ;; \
-	  *)      echo "Host is $(UNAME_S): build the .msi here with 'make pkg-msi'."; \
-	          $(MAKE) --no-print-directory pkg-msi ;; \
+	          echo "NOTE: build the .deb/.rpm on Linux ('make pkg') and the Windows installer on Windows ('make pkg-win')." ;; \
+	  *)      echo "Host is $(UNAME_S): building the Windows installer with 'make pkg-win'."; \
+	          $(MAKE) --no-print-directory pkg-win ;; \
 	esac
 
 # ── Integration SDK + release bundle ──────────────────────────────────────────

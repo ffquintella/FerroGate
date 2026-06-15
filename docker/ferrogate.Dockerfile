@@ -6,7 +6,7 @@
 # server and drive the admin RPCs against the local CMIS (status, list-svids,
 # revoke-svid, revoke-host, bump-epoch). The `mia` Machine Identity Agent is
 # NOT shipped here — it is the host-side client, installed directly on each
-# machine from the OS packages (`make pkg`: .deb / .rpm / .msi / .pkg).
+# machine from the OS packages (`make pkg`: .deb / .rpm / Windows .exe / .pkg).
 #
 # cmis emits tracing to stdout; the entrypoint tees that to a rotating log file
 # under /opt/ferrogate/logs (a mountable volume) while still writing to the
