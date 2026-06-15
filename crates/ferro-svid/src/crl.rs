@@ -42,7 +42,7 @@ pub const CRL_MAX_AGE_SECS: i64 = 300;
 /// live at most [`crate::MAX_TTL_SECS`]; once that elapses a revoked artefact
 /// can never reappear, so the entry can be pruned to bound CRL growth. (Set
 /// equal to the max SVID TTL — see the F11 "CRL bloat" risk note.)
-#[allow(clippy::cast_possible_wrap)] // MAX_TTL_SECS is 3600 — far inside i64.
+#[allow(clippy::cast_possible_wrap)] // MAX_TTL_SECS is ~2.6M — far inside i64.
 pub const CRL_ENTRY_TTL_SECS: i64 = crate::MAX_TTL_SECS as i64;
 
 /// What a single revocation targets.

@@ -42,8 +42,8 @@ pub const SVID_TYP: &str = "ferrogate-svid+jwt";
 /// reinterpreted across contexts.
 pub const SVID_SIGNING_CONTEXT: &[u8] = b"ferrogate-svid-v1";
 
-/// Maximum SVID lifetime: `exp - iat` may never exceed one hour.
-pub const MAX_TTL_SECS: u64 = 3600;
+/// Maximum SVID lifetime: `exp - iat` may never exceed 30 days.
+pub const MAX_TTL_SECS: u64 = 30 * 24 * 3600;
 
 /// `nbf` lookback applied at issuance to tolerate modest host clock skew.
 pub const NBF_LOOKBACK_SECS: i64 = 60;

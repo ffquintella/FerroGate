@@ -243,12 +243,12 @@ mod tests {
     }
 
     #[test]
-    fn ttl_is_clamped_to_one_hour() {
+    fn ttl_is_clamped_to_max() {
         let issuer = Issuer::generate("kid-1", "ferrogate.test").unwrap();
         let mut p = params();
-        p.ttl_secs = 999_999;
+        p.ttl_secs = crate::MAX_TTL_SECS + 999_999;
         let svid = issuer.issue(&p, 0).unwrap();
-        assert_eq!(svid.exp - svid.iat, 3600);
+        assert_eq!(svid.exp - svid.iat, crate::MAX_TTL_SECS as i64);
     }
 
     #[test]

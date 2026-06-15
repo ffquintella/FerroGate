@@ -64,7 +64,7 @@ impl ProposalPolicy {
 pub struct CmisConfig {
     /// SPIFFE trust domain, e.g. `ferrogate.prod`.
     pub trust_domain: String,
-    /// SVID lifetime in seconds (clamped to one hour by the issuer).
+    /// SVID lifetime in seconds (clamped to 30 days by the issuer).
     pub svid_ttl_secs: u64,
     /// The live RIM policy epoch. A bump forces re-attestation on `Rotate`.
     pub policy_epoch: u64,
@@ -76,7 +76,7 @@ impl Default for CmisConfig {
     fn default() -> Self {
         Self {
             trust_domain: "ferrogate.dev".to_string(),
-            svid_ttl_secs: 3600,
+            svid_ttl_secs: 30 * 24 * 3600,
             policy_epoch: 1,
             allowlist_proposal_policy: ProposalPolicy::default(),
         }
