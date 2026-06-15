@@ -216,14 +216,21 @@ else
 endif
 
 mia-install: ## Compile mia in release mode, install it, and register the OS service (PREFIX=... to override)
+	@command -v protoc >/dev/null 2>&1 || { \
+	  echo "ERROR: protoc not found — the build needs the Protocol Buffers compiler."; \
+	  echo "  Linux:   sudo apt-get install -y protobuf-compiler"; \
+	  echo "  macOS:   brew install protobuf"; \
+	  echo "  Windows: scoop install protobuf   (or set PROTOC=path\\to\\protoc.exe)"; \
+	  exit 1; }
 	@# Build as the invoking user even under `sudo make`, so target/ never becomes root-owned.
+	@# Use && so strip only runs on a successful build (a failed build must surface its own error).
 	@if [ "$$(id -u)" -eq 0 ] && [ -n "$$SUDO_USER" ]; then \
 	  echo "==> building as $$SUDO_USER (keeping target/ user-owned)"; \
-	  sudo -u "$$SUDO_USER" cargo build --release -p mia --bin mia; \
-	  sudo -u "$$SUDO_USER" strip target/release/$(MIA_BIN); \
+	  sudo -u "$$SUDO_USER" cargo build --release -p mia --bin mia \
+	    && sudo -u "$$SUDO_USER" strip target/release/$(MIA_BIN); \
 	else \
-	  cargo build --release -p mia --bin mia; \
-	  strip target/release/$(MIA_BIN); \
+	  cargo build --release -p mia --bin mia \
+	    && strip target/release/$(MIA_BIN); \
 	fi
 ifeq ($(MIA_OS),windows)
 	@mkdir -p "$(BINDIR)"

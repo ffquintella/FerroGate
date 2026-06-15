@@ -648,6 +648,9 @@ pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
 }
 
 /// An octal-mode validator (e.g. `660`, `0o640`).
+// Only the non-Windows socket-mode prompt uses this; `test` keeps it compiled
+// for the platform-independent validator tests below.
+#[cfg(any(not(windows), test))]
 fn octal_validator(input: &str) -> Result<Validation, inquire::CustomUserError> {
     let t = input.trim().trim_start_matches("0o");
     if t.is_empty() {

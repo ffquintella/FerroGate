@@ -31,6 +31,8 @@ use anyhow::Context as _;
 use crate::config::Config;
 use crate::endpoint::CmisResolver;
 use crate::helper::crl::{CrlIngestError, CRL_FRESHNESS_LEEWAY_SECS};
+// Used only by `mint_failure_advice` (unix `check_mint` + tests).
+#[cfg(any(unix, test))]
 use crate::helper::proto::ErrorCode;
 
 /// Timeout applied to each network step so a black-holed endpoint cannot make
@@ -708,7 +710,10 @@ fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
 
 /// Named-pipe self-test is not implemented; report it honestly rather than
 /// passing vacuously.
+// Must mirror the unix signature (the caller awaits it), so it stays `async`
+// even though this stub has nothing to await.
 #[cfg(not(unix))]
+#[allow(clippy::unused_async)]
 async fn check_mint(_config: &Config, _audience: &str, _server_crl: ServerCrl) -> bool {
     report(
         "[5/5] helper token mint",
@@ -720,6 +725,9 @@ async fn check_mint(_config: &Config, _audience: &str, _server_crl: ServerCrl) -
 
 /// Remediation hints for each helper-API refusal, specialised by what the
 /// server-side CRL check (step 3) found.
+// Only the unix `check_mint` calls this; `test` keeps it compiled for the
+// platform-independent advice-text tests below.
+#[cfg(any(unix, test))]
 fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
     match code {
         ErrorCode::CrlStale => {
@@ -804,6 +812,7 @@ fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
 }
 
 /// Base64url SHA-256 thumbprint stand-in for the test request's DPoP key.
+#[cfg(unix)]
 fn selftest_jkt() -> String {
     use base64::Engine as _;
     use sha2::Digest as _;
