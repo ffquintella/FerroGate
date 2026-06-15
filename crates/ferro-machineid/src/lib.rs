@@ -18,7 +18,9 @@
 //! All inputs are **public** hardware identifiers, so this crate stays
 //! `#![forbid(unsafe_code)]`. On macOS the values are read from
 //! `/usr/sbin/ioreg` (an absolute path, so `PATH` cannot be hijacked); on Linux
-//! from sysfs / DMI. A native IOKit backend confined to an `unsafe`-isolated
+//! from sysfs / DMI; on Windows from the SMBIOS / storage identifiers exposed by
+//! CIM, queried via an absolute-path PowerShell (same `PATH`-safety rationale as
+//! `ioreg`). A native IOKit / SMBIOS backend confined to an `unsafe`-isolated
 //! crate is a possible future refinement.
 
 #![forbid(unsafe_code)]
@@ -270,9 +272,107 @@ mod imp {
     }
 }
 
-// ---- Unsupported platforms (e.g. Windows for now) -----------------------
+// ---- Windows backend ----------------------------------------------------
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+mod imp {
+    use super::{MachineFacts, MachineIdError};
+    use std::process::Command;
+
+    /// Absolute path to Windows PowerShell, so `PATH` cannot be hijacked
+    /// (mirrors the macOS `ioreg` approach). `%SystemRoot%` is `C:\Windows` on a
+    /// default install; PowerShell 5.1 ships in-box on every supported Windows.
+    fn powershell() -> String {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe")
+    }
+
+    /// Query the burned-in SMBIOS / storage identifiers via CIM in one process,
+    /// emitting `key=value` lines we parse below. These are the Windows
+    /// analogues of the macOS `ioreg` / Linux DMI values: the SMBIOS system UUID
+    /// and baseboard serial (`Win32_ComputerSystemProduct` / `Win32_BaseBoard`)
+    /// and the lowest-index physical disk's serial (`Win32_DiskDrive`).
+    fn query() -> Result<String, MachineIdError> {
+        const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue';\
+            $p=Get-CimInstance Win32_ComputerSystemProduct;\
+            $b=Get-CimInstance Win32_BaseBoard;\
+            $d=Get-CimInstance Win32_DiskDrive | Sort-Object Index | Select-Object -First 1;\
+            Write-Output \"uuid=$($p.UUID)\";\
+            Write-Output \"board=$($b.SerialNumber)\";\
+            Write-Output \"product=$($p.IdentifyingNumber)\";\
+            Write-Output \"disk=$($d.SerialNumber)\"";
+        let out = Command::new(powershell())
+            .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+            .output()
+            .map_err(|e| MachineIdError::Query(format!("powershell: {e}")))?;
+        if !out.status.success() {
+            return Err(MachineIdError::Query(format!(
+                "powershell exited with {}",
+                out.status
+            )));
+        }
+        String::from_utf8(out.stdout)
+            .map_err(|e| MachineIdError::Query(format!("non-utf8 output: {e}")))
+    }
+
+    /// Common SMBIOS placeholder strings that are not real identifiers — treated
+    /// as absent so a board that ships "To Be Filled By O.E.M." falls back.
+    fn is_placeholder(v: &str) -> bool {
+        matches!(
+            v.trim().to_ascii_uppercase().as_str(),
+            "" | "TO BE FILLED BY O.E.M."
+                | "DEFAULT STRING"
+                | "SYSTEM SERIAL NUMBER"
+                | "NONE"
+                | "NOT SPECIFIED"
+                | "NOT APPLICABLE"
+                | "0"
+                | "00000000-0000-0000-0000-000000000000"
+                | "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"
+        )
+    }
+
+    /// Value of the `key=value` line for `key`, rejecting placeholder junk.
+    fn val(text: &str, key: &str) -> Option<String> {
+        let prefix = format!("{key}=");
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .map(str::trim)
+            .filter(|v| !is_placeholder(v))
+            .map(ToString::to_string)
+    }
+
+    pub(super) fn collect() -> Result<MachineFacts, MachineIdError> {
+        let text = query()?;
+        // The SMBIOS system UUID is the strong, stable anchor (the analogue of
+        // DMI `product_uuid`).
+        let platform_uuid = val(&text, "uuid").ok_or_else(|| {
+            MachineIdError::Unavailable(
+                "SMBIOS system UUID (Win32_ComputerSystemProduct.UUID)".to_string(),
+            )
+        })?;
+        // Baseboard serial is often blank on consumer hardware; fall back to the
+        // product identifying number (both are burned-in SMBIOS fields).
+        let board_serial = val(&text, "board")
+            .or_else(|| val(&text, "product"))
+            .ok_or_else(|| {
+                MachineIdError::Unavailable("baseboard / product serial".to_string())
+            })?;
+        let disk_serial = val(&text, "disk").ok_or_else(|| {
+            MachineIdError::Unavailable("boot disk serial (Win32_DiskDrive.SerialNumber)".to_string())
+        })?;
+
+        Ok(MachineFacts {
+            board_serial,
+            platform_uuid,
+            disk_serial,
+        })
+    }
+}
+
+// ---- Unsupported platforms ----------------------------------------------
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod imp {
     use super::{MachineFacts, MachineIdError};
 
