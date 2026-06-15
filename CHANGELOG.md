@@ -10,6 +10,25 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **Windows host-key attestation — `mia` can now obtain a host SVID on
+  Windows.** `ferro-machineid` gained a Windows backend that derives the stable
+  hardware fingerprint from the SMBIOS system UUID, the baseboard/product serial,
+  and the boot-disk serial (read via CIM through an absolute-path PowerShell, so
+  `PATH` cannot be hijacked — the same rationale as the macOS `ioreg` backend).
+  Previously `collect_facts()` returned "not supported on this platform", so the
+  daemon had no host SVID and refused every mint with `no_host_svid`; Windows
+  hosts can now attest via the TPM-less host-key profile (F15) like Linux/macOS,
+  subject to CMIS enrolment.
+
+- **`helper.require_authenticode` — opt out of the Windows caller Authenticode
+  check.** The Windows helper API verifies each caller's image with Authenticode
+  by default (the Code-Integrity analogue of the Linux IMA cross-check), which
+  rejects unsigned callers — including an unsigned `mia.exe` running `mia test` —
+  as `untrusted-binary`. The new `helper.require_authenticode` setting
+  (`FERROGATE_HELPER_REQUIRE_AUTHENTICODE`, default `true`) lets environments
+  whose binaries are not code-signed disable it; identity then rests on PID +
+  image SHA-384 + RID, and `mia`'s self-trust still applies.
+
 - **MIA runs as a native Windows service.** The daemon now integrates with the
   Windows Service Control Manager, so `Restart-Service mia` (and `sc start/stop
   mia`) work and the agent starts at boot. A new `mia service
