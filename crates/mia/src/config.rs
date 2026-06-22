@@ -249,8 +249,9 @@ fn classify_config_filename(name: &str) -> Option<ConfigFile> {
 /// Default helper-socket mode when unset (`0o660`).
 pub const DEFAULT_SOCKET_MODE: u32 = 0o660;
 
-/// Default maximum accepted allowlist age, in seconds.
-pub const DEFAULT_ALLOWLIST_MAX_AGE_SECS: i64 = 86_400;
+/// Default maximum accepted allowlist age, in seconds (96 h). Matches the CMIS
+/// issuer's default `allowlist_ttl_secs` so a freshly signed list is accepted.
+pub const DEFAULT_ALLOWLIST_MAX_AGE_SECS: i64 = 96 * 3600;
 
 /// Default interval between allowlist proposals when `allowlist.propose` is on.
 pub const DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS: u64 = 300;
@@ -760,7 +761,7 @@ mod tests {
         assert_eq!(c, Config::default());
         assert_eq!(c.log_directive(), "info");
         assert_eq!(c.socket_mode().unwrap(), 0o660);
-        assert_eq!(c.allowlist_max_age(), 86_400);
+        assert_eq!(c.allowlist_max_age(), 96 * 3600);
         assert!(c.helper_socket().is_none());
     }
 

@@ -56,6 +56,14 @@ secret material at rest — the expanded private key never touches disk.
 `ferrogate.dev`) set the published `kid` and trust domain and must stay constant
 for a given seed, since the `kid` is how verifiers resolve the JWKS key.
 
+**Signature lifetimes** are operator-tunable. `CMIS_SVID_TTL_SECS` (default 30
+days) sets the SVID lifetime and `CMIS_ALLOWLIST_TTL_SECS` (default 96 h) sets
+the caller-allowlist validity window. Both floor at 96 h and cap at 30 days; a
+value outside that range is clamped (a non-integer is ignored with a warning).
+The allowlist TTL must not exceed the MIA's `allowlist.max_age_secs`
+(`FERROGATE_ALLOWLIST_MAX_AGE_SECS`, also defaulting to 96 h) or freshly signed
+lists will be rejected as too old.
+
 **The seed lives in the Raft-replicated store, not a per-node file.** It is the
 cluster's single signing identity: on the first boot of a fresh cluster the
 *leader* establishes the seed once (adopting an existing on-disk seed if there

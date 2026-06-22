@@ -45,6 +45,11 @@ pub const SVID_SIGNING_CONTEXT: &[u8] = b"ferrogate-svid-v1";
 /// Maximum SVID lifetime: `exp - iat` may never exceed 30 days.
 pub const MAX_TTL_SECS: u64 = 30 * 24 * 3600;
 
+/// Floor FerroGate enforces on operator-configurable signature TTLs (SVIDs and
+/// caller-allowlists): 96 hours. Values supplied via the environment are
+/// clamped up to this so a misconfiguration cannot mint near-expired artefacts.
+pub const MIN_TTL_SECS: u64 = 96 * 3600;
+
 /// `nbf` lookback applied at issuance to tolerate modest host clock skew.
 pub const NBF_LOOKBACK_SECS: i64 = 60;
 

@@ -263,7 +263,7 @@ socket_mode = "660"
 [allowlist]
 path = "/etc/ferrogate/allowlist.cbor"
 key  = "/etc/ferrogate/allowlist.pub"
-max_age_secs = 86400
+max_age_secs = 345600   # 96 h; must be >= the CMIS allowlist TTL
 fetch = false   # fetch this host's allowlist from CMIS at startup and write `path`
 propose = false # propose the callers this host observes back to CMIS (bootstrap)
 

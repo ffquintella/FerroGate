@@ -47,7 +47,7 @@
 //!   enrollment public key used to verify the allowlist. Required whenever the
 //!   allowlist is set.
 //! - `FERROGATE_ALLOWLIST_MAX_AGE_SECS` (`allowlist.max_age_secs`) — max
-//!   allowlist age (default `86400`).
+//!   allowlist age (default `345600`, i.e. 96 h).
 //! - `FERROGATE_IMA_LOG` (`attestation.ima_log`) — override the IMA
 //!   runtime-measurement log path.
 //!

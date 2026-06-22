@@ -391,6 +391,18 @@ fn parse_peers(spec: &str) -> anyhow::Result<Vec<PeerNode>> {
     Ok(peers)
 }
 
+/// Read a TTL (seconds) from `var`, clamped to `[min, max]`. Returns `None`
+/// when the variable is unset (caller keeps its default) or holds a
+/// non-integer (logged, default kept), so a fat-finger can't shorten a TTL.
+fn ttl_from_env(var: &str, min: u64, max: u64) -> Option<u64> {
+    let raw = std::env::var(var).ok()?;
+    let Ok(n) = raw.parse::<u64>() else {
+        tracing::warn!(var, value = %raw, "TTL env var is not an integer; keeping default");
+        return None;
+    };
+    Some(n.clamp(min, max))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -439,6 +451,29 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         proposal_policy = ?cmis_config.allowlist_proposal_policy,
         "allowlist proposal policy"
+    );
+
+    // Signature lifetimes. Both floor at 96 h (`ferro_svid::MIN_TTL_SECS`) and
+    // cap at the issuer's hard ceiling (30 days) so a misconfigured value can
+    // mint neither a near-expired nor an unbounded artefact.
+    if let Some(n) = ttl_from_env(
+        "CMIS_SVID_TTL_SECS",
+        ferro_svid::MIN_TTL_SECS,
+        ferro_svid::MAX_TTL_SECS,
+    ) {
+        cmis_config.svid_ttl_secs = n;
+    }
+    if let Some(n) = ttl_from_env(
+        "CMIS_ALLOWLIST_TTL_SECS",
+        ferro_svid::MIN_TTL_SECS,
+        30 * 24 * 3600,
+    ) {
+        cmis_config.allowlist_ttl_secs = i64::try_from(n).unwrap_or(96 * 3600);
+    }
+    tracing::info!(
+        svid_ttl_secs = cmis_config.svid_ttl_secs,
+        allowlist_ttl_secs = cmis_config.allowlist_ttl_secs,
+        "signature lifetimes"
     );
 
     let state = Arc::new(CmisState::new(

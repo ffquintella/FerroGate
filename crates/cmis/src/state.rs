@@ -64,8 +64,13 @@ impl ProposalPolicy {
 pub struct CmisConfig {
     /// SPIFFE trust domain, e.g. `ferrogate.prod`.
     pub trust_domain: String,
-    /// SVID lifetime in seconds (clamped to 30 days by the issuer).
+    /// SVID lifetime in seconds. Floored at [`ferro_svid::MIN_TTL_SECS`] (96 h)
+    /// and clamped to [`ferro_svid::MAX_TTL_SECS`] (30 days) by the issuer.
     pub svid_ttl_secs: u64,
+    /// Caller-allowlist signature lifetime in seconds. Floored at
+    /// [`ferro_svid::MIN_TTL_SECS`] (96 h) and capped at 30 days when loaded
+    /// from the environment. Must not exceed the MIA's `allowlist.max_age_secs`.
+    pub allowlist_ttl_secs: i64,
     /// The live RIM policy epoch. A bump forces re-attestation on `Rotate`.
     pub policy_epoch: u64,
     /// How host-driven allowlist proposals are handled (`ProposeAllowlist`).
@@ -77,6 +82,8 @@ impl Default for CmisConfig {
         Self {
             trust_domain: "ferrogate.dev".to_string(),
             svid_ttl_secs: 30 * 24 * 3600,
+            // ferro_svid::MIN_TTL_SECS (96 h), as i64 for the not-after stamp.
+            allowlist_ttl_secs: 96 * 3600,
             policy_epoch: 1,
             allowlist_proposal_policy: ProposalPolicy::default(),
         }

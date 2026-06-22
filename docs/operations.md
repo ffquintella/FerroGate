@@ -160,7 +160,8 @@ signs them with the enrollment key.
   actions at the transport, exactly like revocation; `GetAllowlist` is
   unauthenticated (the body is signature-protected and not secret). Each set or
   delete records an audit event (`AllowlistSet` / `AllowlistDeleted`). CMIS
-  stamps a validity window (default one day, capped at 30); re-issue rather than
+  stamps a validity window (default 96 h via `CMIS_ALLOWLIST_TTL_SECS`, floored
+  at 96 h and capped at 30 days); re-issue rather than
   mint long-lived lists. Full workflow: [allowlist-provisioning.md](allowlist-provisioning.md).
 
 ## Root key rotation

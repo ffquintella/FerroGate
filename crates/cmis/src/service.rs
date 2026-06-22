@@ -76,10 +76,6 @@ impl MachineIdentitySvc {
     }
 }
 
-/// Default caller-allowlist validity when the operator does not specify a TTL
-/// (one day) — matches the MIA's default `allowlist.max_age_secs`.
-const DEFAULT_ALLOWLIST_TTL_SECS: i64 = 86_400;
-
 /// Upper bound on a caller-allowlist validity window (30 days). Operators
 /// re-issue rather than mint long-lived lists, keeping the signed artefact
 /// short enough that the MIA's freshness check stays meaningful.
@@ -769,9 +765,10 @@ impl MachineIdentity for MachineIdentitySvc {
             });
         }
 
-        // Clamp the validity window to something sane; 0 ⇒ a default day.
+        // Clamp the validity window to something sane; 0 ⇒ the configured
+        // default (`CMIS_ALLOWLIST_TTL_SECS`, 96 h floor).
         let ttl = if req.ttl_secs <= 0 {
-            DEFAULT_ALLOWLIST_TTL_SECS
+            self.state.config.allowlist_ttl_secs
         } else {
             req.ttl_secs.min(MAX_ALLOWLIST_TTL_SECS)
         };
@@ -938,7 +935,7 @@ impl MachineIdentity for MachineIdentitySvc {
         };
 
         if auto_adopt {
-            let not_after = now.saturating_add(DEFAULT_ALLOWLIST_TTL_SECS);
+            let not_after = now.saturating_add(self.state.config.allowlist_ttl_secs);
             let signed = self
                 .state
                 .issuer

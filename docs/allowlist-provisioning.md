@@ -225,7 +225,8 @@ startup.)
   runs a one-node Raft, so the SQLite store under `CMIS_RAFT_DIR` (default
   `/var/lib/ferrogate/raft`) survives restarts.
 - **Validity.** `SetAllowlist` stamps `issued_at = now` and
-  `not_after = now + ttl` (default one day, capped at 30 days). Re-issue rather
+  `not_after = now + ttl` (default 96 h via `CMIS_ALLOWLIST_TTL_SECS`, floored
+  at 96 h and capped at 30 days). Re-issue rather
   than mint long-lived lists so the MIA's freshness check stays meaningful.
 - **Admin authorization.** `SetAllowlist`/`DeleteAllowlist`/`ListAllowlists` are
   admin RPCs, authenticated out of band as operator actions exactly like
