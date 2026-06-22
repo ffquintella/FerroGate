@@ -236,6 +236,6 @@ async fn ttl_zero_falls_back_to_a_default_window() {
         .await
         .expect("set ok")
         .into_inner();
-    // Default is one day.
-    assert_eq!(set.not_after - set.issued_at, 86_400);
+    // Default is the 96 h floor (`ferro_svid::MIN_TTL_SECS`).
+    assert_eq!(set.not_after - set.issued_at, 96 * 3600);
 }
