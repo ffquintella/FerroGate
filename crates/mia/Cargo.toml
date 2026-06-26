@@ -99,10 +99,11 @@ tss-esapi    = { workspace = true }
 ferro-attest = { path = "../ferro-attest" }
 
 # ── OS package metadata ──────────────────────────────────────────────────────
-# Consumed by `cargo-deb` (DEB) and `cargo-generate-rpm` (RPM). The Windows
-# installer is built from crates/mia/nsis/installer.nsi with NSIS. Drive them
-# via the repo Makefile: `make pkg` (or pkg-deb / pkg-rpm / pkg-win). The
-# packaged artifact is the `mia` client agent.
+# Consumed by `cargo-deb` (DEB) and `cargo-generate-rpm` (RPM). The Windows MSI
+# is built from crates/mia/wix/mia.wxs with msitools (wixl) and wrapped in a
+# Chocolatey/NuGet package (crates/mia/nuget/) — both cross-built in a container
+# by scripts/build-msi-amd64.sh. Drive them via the repo Makefile: `make pkg`
+# (or pkg-deb / pkg-rpm / pkg-win). The packaged artifact is the `mia` client agent.
 
 # cargo-deb: https://github.com/kornelski/cargo-deb
 # Asset source paths are resolved relative to THIS crate's directory.
@@ -151,5 +152,5 @@ auto-req = "no"
 # TPM 2.0 ESAPI runtime stack (Fedora/RHEL package name).
 tpm2-tss = "*"
 
-# The Windows installer is built with NSIS (makensis) from
-# crates/mia/nsis/installer.nsi — see `make pkg-win`.
+# The Windows MSI is built with msitools (wixl) from crates/mia/wix/mia.wxs and
+# wrapped in a Chocolatey/NuGet package — see `make pkg-win`.

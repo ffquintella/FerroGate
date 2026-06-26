@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Chocolatey/NuGet manifest for the FerroGate Machine Identity Agent (MIA).
+  The package wraps the MSI built by scripts/build-msi-amd64.sh; tools/
+  chocolateyInstall.ps1 invokes msiexec on the bundled MSI. The __VERSION__
+  token is substituted with the workspace version at pack time.
+-->
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+  <metadata>
+    <id>ferrogate-mia</id>
+    <version>__VERSION__</version>
+    <title>FerroGate Machine Identity Agent</title>
+    <authors>FerroGate contributors</authors>
+    <owners>FerroGate contributors</owners>
+    <projectUrl>https://github.com/ffquintella/FerroGate</projectUrl>
+    <licenseUrl>https://github.com/ffquintella/FerroGate/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <summary>Host-side machine identity agent for FerroGate.</summary>
+    <description>
+FerroGate Machine Identity Agent (MIA): the host-side agent that attests the
+machine to the Central Machine Identity Service (CMIS) over hybrid-PQC TLS and
+exposes a local helper API for minting DPoP-bound child tokens to vetted
+callers. This package installs the bundled MSI, which drops mia.exe under
+Program Files\FerroGate\MIA, adds it to the system PATH, creates the
+FerroGateClients helper group, and registers + starts the mia Windows service.
+    </description>
+    <tags>ferrogate mia machine-identity attestation admin</tags>
+  </metadata>
+</package>

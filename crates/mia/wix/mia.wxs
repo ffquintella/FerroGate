@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX source for the FerroGate Machine Identity Agent (MIA) Windows MSI.
+
+  Built on Linux (no Windows host required) by scripts/build-msi-amd64.sh with
+  msitools' `wixl`:
+
+    wixl --arch x64 -D Version=x.y.z -D BinDir=<dir with mia.exe> -o out.msi mia.wxs
+
+  The MSI mirrors the legacy NSIS installer (crates/mia/nsis/installer.nsi):
+    * installs mia.exe under "Program Files\FerroGate\MIA",
+    * adds that directory to the system PATH,
+    * creates the FerroGateClients local group that guards the helper pipe, and
+    * registers + starts the mia Windows service.
+
+  The binary owns its own service definition, so the service is driven via
+  `mia.exe service <install|start|stop|uninstall>` custom actions (matching
+  NSIS) rather than a static <ServiceInstall> element. The service custom
+  actions run deferred + non-impersonated (LocalSystem), which the Service
+  Control Manager requires.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="FerroGate Machine Identity Agent"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="FerroGate contributors"
+           UpgradeCode="6F9B1F2E-1C3A-4E84-9A2D-2B7E5C0A1D44">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="FerroGate Machine Identity Agent installer"
+             Comments="https://github.com/ffquintella/FerroGate" />
+
+    <!-- Replace any previously installed version on upgrade. -->
+    <Upgrade Id="6F9B1F2E-1C3A-4E84-9A2D-2B7E5C0A1D44">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes"
+                      OnlyDetect="no" Property="OLDERVERSIONFOUND" />
+    </Upgrade>
+
+    <Media Id="1" Cabinet="product.cab" EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="FerroGateDir" Name="FerroGate">
+          <Directory Id="INSTALLDIR" Name="MIA" />
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="MiaExe" Guid="2C8E0A11-94B6-4D7C-8B0E-7B0F4A9C2E01">
+        <File Id="miaExe" Name="mia.exe" Source="$(var.BinDir)/mia.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="MiaPath" Guid="3D9F1B22-A5C7-4E8D-9C1F-8C1A5BAD3F12">
+        <!-- Append the install dir to the system PATH; removed on uninstall. -->
+        <Environment Id="MiaSystemPath" Name="PATH" Value="[INSTALLDIR]"
+                     Permanent="no" Part="last" Action="set" System="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="FerroGate MIA" Level="1">
+      <ComponentRef Id="MiaExe" />
+      <ComponentRef Id="MiaPath" />
+    </Feature>
+
+    <!-- ── Service + helper-group lifecycle (mirrors the NSIS installer) ──── -->
+    <CustomAction Id="CreateHelperGroup" Directory="INSTALLDIR"
+        ExeCommand="&quot;[SystemFolder]net.exe&quot; localgroup FerroGateClients /add /comment:&quot;FerroGate MIA helper-API clients&quot;"
+        Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="SvcInstall" FileKey="miaExe" ExeCommand="service install"
+        Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="SvcStart" FileKey="miaExe" ExeCommand="service start"
+        Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <CustomAction Id="SvcStop" FileKey="miaExe" ExeCommand="service stop"
+        Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="SvcUninstall" FileKey="miaExe" ExeCommand="service uninstall"
+        Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RemoveHelperGroup" Directory="INSTALLDIR"
+        ExeCommand="&quot;[SystemFolder]net.exe&quot; localgroup FerroGateClients /delete"
+        Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- On install/upgrade: lay down files, then group → service install → start. -->
+      <Custom Action="CreateHelperGroup" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="SvcInstall" After="CreateHelperGroup">NOT REMOVE</Custom>
+      <Custom Action="SvcStart" After="SvcInstall">NOT REMOVE</Custom>
+
+      <!-- On uninstall: stop + deregister the service and drop the group while
+           mia.exe still exists (before RemoveFiles). -->
+      <Custom Action="SvcStop" Before="RemoveFiles">REMOVE="ALL"</Custom>
+      <Custom Action="SvcUninstall" After="SvcStop">REMOVE="ALL"</Custom>
+      <Custom Action="RemoveHelperGroup" After="SvcUninstall">REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>

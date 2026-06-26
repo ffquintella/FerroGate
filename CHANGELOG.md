@@ -10,6 +10,15 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **Windows MSI + NuGet/Chocolatey packaging for `mia`, cross-built in a
+  container.** `make pkg-win` no longer needs a Windows host: it cross-compiles
+  `mia.exe` to `x86_64-pc-windows-msvc` with cargo-xwin in a `linux/amd64`
+  container, builds an MSI with msitools (`wixl`, from `crates/mia/wix/mia.wxs`),
+  and wraps it in a Chocolatey/NuGet package (`crates/mia/nuget/`) that installs
+  the MSI via `msiexec`. The MSI mirrors the previous NSIS installer — installs
+  to `Program Files\FerroGate\MIA`, adds it to the system PATH, creates the
+  `FerroGateClients` helper group, and registers + starts the mia service. See
+  `scripts/build-msi-amd64.sh`.
 - **`mia --resync` — one-shot, no-restart allowlist resync.** Re-fetches this
   host's signed caller allowlist from CMIS and swaps it into the running agent
   live (SIGHUP), so the helper socket never drops and no restart is needed. It is

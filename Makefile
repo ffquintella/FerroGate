@@ -320,32 +320,26 @@ endif
 # metadata from `crates/mia/Cargo.toml` (deb/rpm/msi) plus the assets in
 # `crates/mia/dist/`:
 #
-#   make pkg-deb   -> .deb   (cargo-deb,          Debian/Ubuntu)
-#   make pkg-rpm   -> .rpm   (cargo-generate-rpm, Fedora/RHEL/SUSE)
-#   make pkg-win   -> .exe   (NSIS / makensis,    Windows; run ON Windows)
-#   make pkg-macos -> .pkg   (pkgbuild/productbuild, macOS; run ON macOS)
+#   make pkg-deb   -> .deb           (cargo-deb,          Debian/Ubuntu)
+#   make pkg-rpm   -> .rpm           (cargo-generate-rpm, Fedora/RHEL/SUSE)
+#   make pkg-win   -> .msi + .nupkg  (msitools/wixl + NuGet, in a container)
+#   make pkg-macos -> .pkg           (pkgbuild/productbuild, macOS; run ON macOS)
 #   make pkg       -> every format valid for the current host
-#   make pkg-tools -> install the packaging tools (deb/rpm; NSIS on Windows)
+#   make pkg-tools -> install the Linux packaging tools (deb/rpm)
 #
-# Each package must be built on its target OS: DEB/RPM on Linux (the release
-# binary links the Linux TPM ESAPI stack), the Windows installer on Windows
-# with NSIS, the .pkg on macOS (no TPM there — mia runs as the helper-API
-# surface). Outputs land under target/debian, target/generate-rpm, target/nsis,
-# target/macos.
+# DEB/RPM must be built on Linux (the release binary links the Linux TPM ESAPI
+# stack); the .pkg must be built on macOS. The Windows MSI + NuGet package are
+# cross-built in a linux/amd64 container (cargo-xwin → x86_64-pc-windows-msvc),
+# so `make pkg-win` runs on any host with Docker. Outputs land under
+# target/debian, target/generate-rpm, target/wix, target/nuget, target/macos.
 PKG_CRATE := mia
 # RPM/DEB ship for amd64 only; mia links the x86_64 Linux TPM ESAPI stack.
 RPM_ARCH  := x86_64
 
-pkg-tools: ## Install the packaging tools (cargo-deb, cargo-generate-rpm; NSIS on Windows)
+pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
 	cargo install cargo-deb cargo-generate-rpm
-	@# The Windows installer is built with NSIS (makensis).
-	@case "$(UNAME_S)" in \
-	  MINGW*|MSYS*|CYGWIN*|Windows*) \
-	    command -v makensis >/dev/null 2>&1 || winget install --id NSIS.NSIS -e \
-	      --accept-source-agreements --accept-package-agreements || \
-	    echo "NOTE: install NSIS (https://nsis.sourceforge.io/) to build the Windows installer with 'make pkg-win'." ;; \
-	  *) echo "NOTE: build the Windows installer on Windows with 'make pkg-win' (needs NSIS / makensis)." ;; \
-	esac
+	@echo "NOTE: the Windows MSI + NuGet package build in a linux/amd64 container ('make pkg-win'); only Docker is required."
+	@echo "NOTE: the macOS .pkg builds on macOS ('make pkg-macos')."
 
 pkg-deb: ## Build the mia .deb package (Linux; needs cargo-deb)
 	@command -v cargo-deb >/dev/null 2>&1 || { echo "ERROR: cargo-deb not found — run 'make pkg-tools'"; exit 1; }
@@ -364,17 +358,17 @@ else
 	./scripts/build-rpm-amd64.sh
 endif
 
-NSIS_SRC := crates/$(PKG_CRATE)/nsis/installer.nsi
-WIN_OUT  := target/nsis/ferrogate-$(PKG_CRATE)-$(CARGO_VERSION)-x64-setup.exe
-pkg-win: ## Build the mia Windows installer (.exe; needs NSIS / makensis — run 'make pkg-tools')
-	@MAKENSIS="$$(command -v makensis 2>/dev/null)"; \
-	 [ -n "$$MAKENSIS" ] || for c in "/c/Program Files (x86)/NSIS/makensis.exe" "/c/Program Files/NSIS/makensis.exe"; do \
-	   [ -x "$$c" ] && MAKENSIS="$$c" && break; done; \
-	 [ -n "$$MAKENSIS" ] || { echo "ERROR: makensis not found — run 'make pkg-tools' (installs NSIS)"; exit 1; }; \
-	 cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE) || exit 1; \
-	 mkdir -p target/nsis; \
-	 "$$MAKENSIS" -NOCD -DVERSION=$(CARGO_VERSION) -DBINDIR=target/release -DOUTFILE="$(WIN_OUT)" $(NSIS_SRC) || exit 1; \
-	 echo "==> Windows installer written to $(WIN_OUT)"
+# The Windows artifacts are cross-built in a linux/amd64 container (no Windows
+# host needed): an MSI (msitools/wixl, from crates/mia/wix/mia.wxs) and a
+# Chocolatey/NuGet package that wraps and installs that MSI (crates/mia/nuget/).
+# mia.exe is cross-compiled to x86_64-pc-windows-msvc with cargo-xwin. See
+# scripts/build-msi-amd64.sh. (The legacy NSIS source in crates/mia/nsis/ is no
+# longer used by this target.)
+WIN_MSI   := target/wix/ferrogate-$(PKG_CRATE)-$(CARGO_VERSION)-x64.msi
+WIN_NUPKG := target/nuget/ferrogate-$(PKG_CRATE).$(CARGO_VERSION).nupkg
+pkg-win: ## Build the mia Windows MSI + Chocolatey/NuGet package in a linux/amd64 container (needs Docker)
+	@command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found — the Windows MSI/nupkg build runs in a linux/amd64 container"; exit 1; }
+	./scripts/build-msi-amd64.sh $(CARGO_VERSION)
 
 # macOS component+product package built with the platform's own tools (no extra
 # cargo plugin). Stages a payload root, then pkgbuild → productbuild. Set
@@ -409,13 +403,13 @@ pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 	@rm -f target/macos/$(PKG_CRATE)-component.pkg
 	@echo "==> .pkg written to $(MACOS_PKG_OUT)"
 
-pkg: ## Build every client package valid for this host (deb+rpm/Linux, .exe/Windows, pkg/macOS)
+pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi+nupkg/Windows, pkg/macOS)
 	@case "$(UNAME_S)" in \
 	  Linux)  $(MAKE) --no-print-directory pkg-deb pkg-rpm; \
-	          echo "NOTE: build the Windows installer on Windows ('make pkg-win') and the .pkg on macOS ('make pkg-macos')." ;; \
+	          echo "NOTE: build the Windows MSI/nupkg with 'make pkg-win' (containerized) and the .pkg on macOS ('make pkg-macos')." ;; \
 	  Darwin) $(MAKE) --no-print-directory pkg-macos; \
-	          echo "NOTE: build the .deb/.rpm on Linux ('make pkg') and the Windows installer on Windows ('make pkg-win')." ;; \
-	  *)      echo "Host is $(UNAME_S): building the Windows installer with 'make pkg-win'."; \
+	          echo "NOTE: build the .deb/.rpm on Linux ('make pkg') and the Windows MSI/nupkg with 'make pkg-win' (containerized)." ;; \
+	  *)      echo "Host is $(UNAME_S): building the Windows MSI + NuGet package with 'make pkg-win'."; \
 	          $(MAKE) --no-print-directory pkg-win ;; \
 	esac
 
