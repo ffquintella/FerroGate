@@ -1,10 +1,22 @@
 $ErrorActionPreference = 'Stop'
-
-# Install the MSI bundled alongside this script. The MSI itself adds mia.exe to
-# the system PATH, creates the FerroGateClients helper group, and registers +
-# starts the mia Windows service (see crates/mia/wix/mia.wxs).
 $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$installDir = Join-Path $env:ProgramFiles 'FerroGate\MIA'
 
+# 1. Create the local group that guards the helper pipe BEFORE installing, so
+#    the service (started by the MSI) finds it when it binds the named pipe.
+#    The default config (helper.windows_group = "FerroGateClients") restricts the
+#    pipe DACL to this group; without it the daemon cannot resolve the SID. Add
+#    vetted client accounts to this group so they may request tokens. `net
+#    localgroup /add` is non-zero if the group already exists — that is fine.
+Write-Host 'Ensuring the FerroGateClients local group exists…'
+& net.exe localgroup FerroGateClients /add /comment:"FerroGate MIA helper-API clients" 2>&1 | Out-Null
+
+# 2. Add the install dir to the system PATH (Chocolatey records it for clean
+#    removal on uninstall).
+Install-ChocolateyPath -PathToInstall $installDir -PathType 'Machine'
+
+# 3. Install the bundled MSI. The MSI lays down mia.exe and registers + starts
+#    the mia Windows service.
 $packageArgs = @{
     packageName    = 'ferrogate-mia'
     fileType       = 'msi'
@@ -12,5 +24,4 @@ $packageArgs = @{
     silentArgs     = '/qn /norestart'
     validExitCodes = @(0, 3010, 1641)
 }
-
 Install-ChocolateyInstallPackage @packageArgs
