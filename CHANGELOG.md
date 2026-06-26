@@ -10,6 +10,11 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **`mia --resync` — one-shot, no-restart allowlist resync.** Re-fetches this
+  host's signed caller allowlist from CMIS and swaps it into the running agent
+  live (SIGHUP), so the helper socket never drops and no restart is needed. It is
+  `mia resync-allowlist` with the live reload always on; on platforms without
+  SIGHUP it falls back to the restart hint, and honors `--config`/`--environment`.
 - **Windows host-key attestation — `mia` can now obtain a host SVID on
   Windows.** `ferro-machineid` gained a Windows backend that derives the stable
   hardware fingerprint from the SMBIOS system UUID, the baseboard/product serial,

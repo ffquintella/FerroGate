@@ -109,6 +109,22 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     runtime.block_on(resync(&config, reload))
 }
 
+/// Run the top-level `mia --resync` command: the same fetch as
+/// `resync-allowlist`, but with the live reload always on, so the running agent
+/// picks up the freshly fetched allowlist without a restart. This is the
+/// no-restart resync — `resync-allowlist` writes the body and (without
+/// `--reload`) leaves the operator to restart; `--resync` writes it and signals
+/// the agent (SIGHUP) in one shot.
+pub fn run_resync(args: &[String]) -> anyhow::Result<()> {
+    let Some(config) = load(args, USAGE_RESYNC, print_help_resync, "allowlist resync")? else {
+        return Ok(()); // --help printed
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(resync(&config, true))
+}
+
 /// Run the `mia refresh-key` subcommand. `args` is everything after
 /// `refresh-key` on the command line.
 pub fn run_refresh_key(args: &[String]) -> anyhow::Result<()> {

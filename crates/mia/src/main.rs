@@ -76,6 +76,10 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("setup") => return mia::setup::run(&args[1..]),
         Some("resync-allowlist") => return mia::resync::run(&args[1..]),
+        // `--resync` re-fetches this host's signed allowlist from CMIS and swaps it
+        // into the running agent live (SIGHUP) — the one-shot, no-restart resync.
+        // It is `resync-allowlist` with the reload always on.
+        Some("--resync") => return mia::resync::run_resync(&args[1..]),
         Some("refresh-key") => return mia::resync::run_refresh_key(&args[1..]),
         // `--reload` is a management flag, not a daemon option: it signals the
         // running agent (SIGHUP) to re-read its config + allowlist, then exits.
@@ -417,6 +421,9 @@ fn print_usage() {
          \x20                       exclusive with --config\n\
          \x20     --reload          signal the running agent to reload its config and\n\
          \x20                       allowlist live (SIGHUP), then exit\n\
+         \x20     --resync          re-fetch this host's signed allowlist from CMIS and\n\
+         \x20                       reload it into the running agent live (no restart),\n\
+         \x20                       then exit\n\
          \x20 -h, --help            show this help\n\
          \x20 -V, --version         print the version\n\
          \n\
