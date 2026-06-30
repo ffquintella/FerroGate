@@ -503,6 +503,7 @@ async fn run_attest(
             },
             bundle: issued.clone(),
             hostname,
+            child_pub: Some(csr.composite_pub.clone()),
         })
         .await;
 
@@ -656,6 +657,7 @@ async fn run_attest_host_key(
             },
             bundle: issued.clone(),
             hostname,
+            child_pub: Some(csr.composite_pub.clone()),
         })
         .await;
 

@@ -139,7 +139,7 @@ async fn enrolled_host_key_attests_end_to_end() {
     let mut client = spawn_server(state).await;
 
     let key = SoftwareMachineKey::generate().unwrap();
-    let attested = run_attest_host_key(&mut client, &facts, &key, "dpop-thumb".to_string())
+    let attested = run_attest_host_key(&mut client, &facts, &key, "dpop-thumb".to_string(), None)
         .await
         .expect("host-key attestation succeeds");
 
@@ -176,7 +176,7 @@ async fn unenrolled_host_key_is_rejected() {
     let key = SoftwareMachineKey::generate().unwrap();
     // The server returns permission_denied; it reaches the client as a transport
     // status error on the response stream.
-    match run_attest_host_key(&mut client, &sample_facts(), &key, "dpop".to_string()).await {
+    match run_attest_host_key(&mut client, &sample_facts(), &key, "dpop".to_string(), None).await {
         Err(AttestClientError::Transport(_)) => {}
         Ok(_) => panic!("un-enrolled host must be refused"),
         Err(other) => panic!("expected transport/permission error, got {other:?}"),
@@ -201,7 +201,7 @@ async fn forged_facts_are_rejected() {
         ..genuine
     };
     let key = SoftwareMachineKey::generate().unwrap();
-    match run_attest_host_key(&mut client, &tampered, &key, "dpop".to_string()).await {
+    match run_attest_host_key(&mut client, &tampered, &key, "dpop".to_string(), None).await {
         Err(AttestClientError::Transport(_)) => {}
         Ok(_) => panic!("forged facts must be refused"),
         Err(other) => panic!("expected transport/permission error, got {other:?}"),
@@ -217,21 +217,21 @@ async fn tofu_pin_rejects_a_rebind_with_a_different_key() {
 
     // First attestation pins key A on first use.
     let key_a = SoftwareMachineKey::generate().unwrap();
-    run_attest_host_key(&mut client, &facts, &key_a, "dpop".to_string())
+    run_attest_host_key(&mut client, &facts, &key_a, "dpop".to_string(), None)
         .await
         .expect("first attestation pins the key");
 
     // A second attestation for the same fingerprint with a *different* key is a
     // rebind attempt and must be refused.
     let key_b = SoftwareMachineKey::generate().unwrap();
-    match run_attest_host_key(&mut client, &facts, &key_b, "dpop".to_string()).await {
+    match run_attest_host_key(&mut client, &facts, &key_b, "dpop".to_string(), None).await {
         Err(AttestClientError::Transport(_)) => {}
         Ok(_) => panic!("rebind with a new key must be refused"),
         Err(other) => panic!("expected transport/permission error, got {other:?}"),
     }
 
     // The original key still attests — the pin binds the fingerprint to it.
-    run_attest_host_key(&mut client, &facts, &key_a, "dpop".to_string())
+    run_attest_host_key(&mut client, &facts, &key_a, "dpop".to_string(), None)
         .await
         .expect("the originally pinned key still attests");
 }
@@ -268,14 +268,61 @@ async fn preregistered_key_is_required_from_first_attestation() {
     // A different key is rejected even though the fingerprint is enrolled —
     // there is no trust-on-first-use when a key is pre-registered.
     let wrong = SoftwareMachineKey::generate().unwrap();
-    match run_attest_host_key(&mut client, &facts, &wrong, "dpop".to_string()).await {
+    match run_attest_host_key(&mut client, &facts, &wrong, "dpop".to_string(), None).await {
         Err(AttestClientError::Transport(_)) => {}
         Ok(_) => panic!("a non-pre-registered key must be refused"),
         Err(other) => panic!("expected transport/permission error, got {other:?}"),
     }
 
     // The pre-registered key attests.
-    run_attest_host_key(&mut client, &facts, &expected, "dpop".to_string())
+    run_attest_host_key(&mut client, &facts, &expected, "dpop".to_string(), None)
         .await
         .expect("the pre-registered key attests");
+}
+
+#[tokio::test]
+async fn persistent_seed_keeps_a_stable_child_signing_kid() {
+    let state = build_state().await;
+    let facts = sample_facts();
+    enroll_machines(&state, &[facts.fingerprint().to_hex()]);
+    let mut client = spawn_server(state).await;
+
+    // The same machine key re-attests (TOFU pins the fingerprint to it), so any
+    // change in the issued composite key comes from the seed, not the binding.
+    let key = SoftwareMachineKey::generate().unwrap();
+    let seed = [7u8; 32];
+
+    let first = run_attest_host_key(&mut client, &facts, &key, "dpop".to_string(), Some(&seed))
+        .await
+        .expect("first seeded attestation succeeds");
+    let second = run_attest_host_key(&mut client, &facts, &key, "dpop".to_string(), Some(&seed))
+        .await
+        .expect("second seeded attestation succeeds");
+
+    // Same seed ⇒ identical composite key ⇒ identical kid across restarts, even
+    // though CMIS minted two distinct SVIDs (fresh `iat`/`exp` each time).
+    assert_eq!(
+        first.svid_public.to_concat_bytes(),
+        second.svid_public.to_concat_bytes(),
+        "a persisted seed must derive the same composite key"
+    );
+    assert_eq!(
+        ferro_svid::child_signing_kid(&first.svid_public),
+        ferro_svid::child_signing_kid(&second.svid_public),
+        "a stable composite key must yield a stable child-signing kid"
+    );
+    assert_ne!(
+        first.bundle.jws, second.bundle.jws,
+        "each attestation still issues a fresh SVID bundle"
+    );
+
+    // A different seed derives a different key, hence a different kid.
+    let other = run_attest_host_key(&mut client, &facts, &key, "dpop".to_string(), Some(&[9u8; 32]))
+        .await
+        .expect("attestation with a different seed succeeds");
+    assert_ne!(
+        ferro_svid::child_signing_kid(&first.svid_public),
+        ferro_svid::child_signing_kid(&other.svid_public),
+        "a different seed must produce a different kid"
+    );
 }

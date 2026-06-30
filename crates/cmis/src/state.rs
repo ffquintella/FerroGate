@@ -106,6 +106,12 @@ pub struct IssuedRecord {
     /// The host's self-reported hostname at the last full attestation.
     /// Display-only operator convenience — never identity, never verified.
     pub hostname: Option<String>,
+    /// The host's composite child-token signing key (F09) as concat bytes, when
+    /// the attestation CSR carried a well-formed one. Persisted so any replica —
+    /// and any restarted instance — can republish it into the JWKS by `kid` (see
+    /// [`CmisState::rehydrate_child_keys`]); `None` for records written before
+    /// this field existed or whose CSR key failed to parse.
+    pub child_pub: Option<Vec<u8>>,
 }
 
 /// Process-wide CMIS state behind an `Arc`.
@@ -350,6 +356,43 @@ impl CmisState {
             return;
         }
         keys.push(Jwk::from_public_key(kid, pk));
+    }
+
+    /// Repopulate the in-memory child-key registry from the replicated
+    /// issued-SVID store. Called once at startup so a freshly restarted (or
+    /// never-attested-to) replica still publishes every host's child-token
+    /// signing key by `kid` — without this, a child token minted before the
+    /// restart fails verification with `no key for kid host-…` until its host
+    /// happens to re-attest. Counterpart to [`register_child_key`], which only
+    /// updates the live process at attestation time.
+    ///
+    /// A record with no stored `child_pub` (written before the field existed)
+    /// or an unparseable one is skipped — it simply will not be republished
+    /// until that host next attests, the same as the pre-persistence behaviour.
+    ///
+    /// [`register_child_key`]: CmisState::register_child_key
+    pub async fn rehydrate_child_keys(&self) {
+        let records = self.list_svids().await;
+        let mut restored = 0usize;
+        for rec in records {
+            let Some(bytes) = rec.child_pub.as_deref() else {
+                continue;
+            };
+            match CompositePublicKey::from_concat_bytes(bytes) {
+                Ok(pk) => {
+                    self.register_child_key(&pk);
+                    restored += 1;
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    spiffe_id = %rec.bundle.spiffe_id,
+                    "stored child key did not parse; skipping JWKS rehydration"
+                ),
+            }
+        }
+        if restored > 0 {
+            tracing::info!(restored, "rehydrated host child-token keys into the JWKS");
+        }
     }
 
     /// Add a revocation to the working set (feature F11). Idempotent per target:

@@ -164,6 +164,27 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **Child tokens no longer fail with `no key for kid host-…` after a `mia` or
+  CMIS restart.** A host's child-token signing key (F09) has a `kid` derived
+  from its composite public key, and two independent causes made that key
+  disappear from the verifier's view:
+  - On the TPM-less **host-key** profile, `mia` generated a *fresh* composite
+    SVID key on every daemon start (the persistent thing was the machine key,
+    not the SVID key), so each restart rotated the `kid`. `mia` now persists a
+    32-byte **SVID seed** beside `host-key.bin` (`svid-seed.bin`, `0600`) and
+    derives the composite key deterministically with
+    `CompositeSecretKey::from_seed`, so a restart re-attests under the same key
+    and keeps the same `kid`. If the seed cannot be persisted the daemon falls
+    back to an ephemeral key (the previous behaviour) and logs it.
+  - CMIS held the per-host child keys only in a process-local in-memory
+    registry, so a restarted (or never-attested-to HA replica) served a JWKS
+    with just the issuer root key until each host happened to re-attest. The
+    host's `composite_pub` is now persisted in the replicated issued-SVID store
+    and **rehydrated into the JWKS at startup**, so any replica republishes
+    every known host key by `kid`. Records written before this change carry no
+    stored key and are simply skipped (republished on the host's next
+    attestation), and the wire format stays backward-compatible.
+
 - **CMIS now auto-renews allowlists on serve, so they no longer rot and lock
   hosts out.** `GetAllowlist` re-stamps an aging allowlist with a fresh validity
   window (re-signs `(now, now+ttl)` with the same entries) once its window is

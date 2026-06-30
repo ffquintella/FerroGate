@@ -306,6 +306,7 @@ pub async fn run_attest<T: AttestEvidence>(
 /// on a SEP-equipped Mac, or a [`ferro_sep::SoftwareMachineKey`] elsewhere. The
 /// fingerprint `H` is derived from `facts`; `key` signs `nonce ‖ H` in phase 2
 /// and the composite CSR in phase 4.
+#[allow(clippy::too_many_lines)] // linear 3-phase handshake, mirrors `run_attest`
 pub async fn run_attest_host_key(
     // `+ Sync` so the borrowed key is `Send` across this fn's awaits and the
     // whole attestation future can run on a spawned task (the background
@@ -315,6 +316,13 @@ pub async fn run_attest_host_key(
     facts: &ferro_machineid::MachineFacts,
     key: &(dyn ferro_sep::MachineKey + Sync),
     dpop_jkt: String,
+    // When `Some`, the composite SVID key is derived deterministically from this
+    // 32-byte seed (`CompositeSecretKey::from_seed`) so the host keeps a stable
+    // child-signing `kid` across daemon restarts and re-attestations; CMIS
+    // re-issues a fresh SVID over the same key. `None` generates an ephemeral key
+    // (the kid rotates every restart) — used by tests and as the fallback when
+    // the seed cannot be persisted.
+    svid_seed: Option<&[u8; 32]>,
 ) -> Result<AttestedSvid, AttestClientError> {
     let (tx, rx) = mpsc::channel::<AttestRequest>(8);
     let mut responses = client
@@ -350,10 +358,14 @@ pub async fn run_attest_host_key(
     };
     send(&tx, ReqPhase::Init(init)).await?;
 
-    // Phase 4 — generate the composite SVID key, machine-key-sign it, send CSR.
-    // (No phase-3 challenge: residency is not separately proven on this profile.)
-    let (svid_secret, svid_public) =
-        CompositeSecretKey::generate().map_err(|e| AttestClientError::KeyGen(e.to_string()))?;
+    // Phase 4 — derive (from the persistent seed) or generate the composite SVID
+    // key, machine-key-sign it, send CSR. (No phase-3 challenge: residency is not
+    // separately proven on this profile.)
+    let (svid_secret, svid_public) = match svid_seed {
+        Some(seed) => CompositeSecretKey::from_seed(seed),
+        None => CompositeSecretKey::generate()
+            .map_err(|e| AttestClientError::KeyGen(e.to_string()))?,
+    };
     let composite_pub = svid_public.to_concat_bytes();
     let aik_sig = key
         .sign(&composite_pub)

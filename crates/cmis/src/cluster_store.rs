@@ -76,6 +76,16 @@ pub struct WireIssuedRecord {
     /// existed still decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+
+    /// The host's composite child-token signing key (F09), hex-encoded concat
+    /// bytes. Persisting it here lets any replica — and any restarted
+    /// instance — republish the key into the JWKS by `kid` on startup, so a
+    /// child token does not fail verification with `no key for kid host-…`
+    /// just because the issuing CMIS process is not the one that witnessed the
+    /// attestation. Optional with a default so records written before the field
+    /// existed (and SVIDs whose CSR key was malformed) still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_pub_hex: Option<String>,
 }
 
 fn hex_48(field: &'static str, s: &str) -> Result<[u8; 48], WireError> {
@@ -113,6 +123,7 @@ impl WireIssuedRecord {
             iat: r.bundle.iat,
             exp: r.bundle.exp,
             hostname: r.hostname.clone(),
+            child_pub_hex: r.child_pub.as_ref().map(hex::encode),
         }
     }
 
@@ -137,11 +148,19 @@ impl WireIssuedRecord {
             iat: self.iat,
             exp: self.exp,
         };
+        let child_pub = match self.child_pub_hex {
+            Some(h) => Some(hex::decode(&h).map_err(|e| WireError::Hex {
+                field: "child_pub_hex",
+                reason: e.to_string(),
+            })?),
+            None => None,
+        };
         Ok(IssuedRecord {
             params,
             last_attestation,
             bundle,
             hostname: self.hostname,
+            child_pub,
         })
     }
 }
@@ -184,6 +203,7 @@ mod tests {
                 exp: 1_700_003_600,
             },
             hostname: Some("segdc1vds0005".into()),
+            child_pub: Some(vec![0xCD; 1984]),
         }
     }
 
@@ -204,6 +224,28 @@ mod tests {
         assert_eq!(back.bundle.jws, r.bundle.jws);
         assert_eq!(back.bundle.spiffe_id, r.bundle.spiffe_id);
         assert_eq!(back.hostname, r.hostname);
+        assert_eq!(back.child_pub, r.child_pub);
+    }
+
+    #[test]
+    fn decodes_record_written_before_child_pub_existed() {
+        let mut wire =
+            serde_json::to_value(WireIssuedRecord::from_record(&sample_record())).unwrap();
+        wire.as_object_mut().unwrap().remove("child_pub_hex");
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.child_pub, None);
+    }
+
+    #[test]
+    fn rejects_invalid_child_pub_hex() {
+        let mut wire = WireIssuedRecord::from_record(&sample_record());
+        wire.child_pub_hex = Some("zz".into());
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        match decode(&bytes).unwrap_err() {
+            WireError::Hex { field, .. } => assert_eq!(field, "child_pub_hex"),
+            WireError::Json(e) => panic!("expected hex error, got json: {e}"),
+        }
     }
 
     #[test]

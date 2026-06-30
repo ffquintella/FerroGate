@@ -599,6 +599,57 @@ fn host_key_path() -> std::path::PathBuf {
     )
 }
 
+/// Resolve where this host's persistent SVID seed lives — beside the machine
+/// signing key. The 32-byte seed deterministically derives the composite SVID
+/// keypair (`CompositeSecretKey::from_seed`), so a daemon restart re-attests
+/// under the *same* key and keeps the same child-signing `kid` — and thus the
+/// same JWKS entry on CMIS — instead of rotating it every boot.
+fn svid_seed_path() -> std::path::PathBuf {
+    mia::config::system_config_path().parent().map_or_else(
+        || std::path::PathBuf::from("mia-svid-seed.bin"),
+        |d| d.join("svid-seed.bin"),
+    )
+}
+
+/// Load the persistent 32-byte SVID seed, generating and persisting a fresh one
+/// (`0600`) if the file is absent or malformed. The seed is a subordinate secret
+/// — anyone who can read it already has the machine key beside it — so it is
+/// stored with the same protection as `host-key.bin` rather than separately
+/// sealed.
+fn load_or_create_svid_seed(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    use rand_core::{OsRng, RngCore};
+
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                return Ok(seed);
+            }
+            tracing::warn!(
+                path = %path.display(),
+                "SVID seed file has the wrong length; regenerating (the child-signing kid will change once)"
+            );
+        }
+        // Absent on first boot — create it. Any other error (e.g. permission
+        // denied) is propagated so we never overwrite an unreadable seed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    std::fs::write(path, seed)?;
+    #[cfg(unix)]
+    restrict_to_owner(path)?;
+    Ok(seed)
+}
+
+/// Tighten a freshly written secret file to `0600` (owner read/write only),
+/// matching how the machine key beside it is protected.
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
 /// Bootstrap the host SVID via the TPM-less **host-key** attestation profile
 /// (feature F15) and build the child-token minter the helper API mints with.
 ///
@@ -650,14 +701,32 @@ async fn bootstrap_host_svid(resolver: &mia::endpoint::CmisResolver) -> Option<H
             return None;
         }
     };
-    let attested = match mia::client::run_attest_host_key(&mut client, &facts, &key, dpop_jkt).await
-    {
-        Ok(a) => a,
+    // Recover (or first-boot create) the persistent SVID seed so the composite
+    // key — and therefore the child-signing kid and its JWKS entry — is stable
+    // across restarts. If the seed cannot be persisted we fall back to an
+    // ephemeral key: minting still works, the kid just rotates as it did before.
+    let seed_path = svid_seed_path();
+    let seed = match load_or_create_svid_seed(&seed_path) {
+        Ok(s) => Some(s),
         Err(e) => {
-            tracing::error!(error = %e, "host-key attestation failed");
-            return None;
+            tracing::warn!(
+                error = %e,
+                path = %seed_path.display(),
+                "cannot persist the SVID seed; using an ephemeral key (the child-signing kid will rotate on restart)"
+            );
+            None
         }
     };
+    let attested =
+        match mia::client::run_attest_host_key(&mut client, &facts, &key, dpop_jkt, seed.as_ref())
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "host-key attestation failed");
+                return None;
+            }
+        };
 
     let mut parent = [0u8; 48];
     parent.copy_from_slice(&Sha384::digest(attested.bundle.jws.as_bytes()));

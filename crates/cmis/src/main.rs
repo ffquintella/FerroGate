@@ -484,6 +484,12 @@ async fn main() -> anyhow::Result<()> {
         cluster,
     ));
 
+    // Republish every host's child-token signing key from the replicated store
+    // into this process's JWKS (F09). Without this a restarted replica would
+    // serve a JWKS with only the issuer root key until each host re-attests, so
+    // child tokens minted before the restart fail with `no key for kid host-…`.
+    state.rehydrate_child_keys().await;
+
     // F13 zero-touch enrolment. If a signed fleet manifest is configured, load
     // it now (fail-closed: a configured-but-unloadable manifest aborts startup
     // rather than admitting every host) and spawn a watcher to hot-reload it.
