@@ -204,13 +204,59 @@ fn verify_proposing_svid(
     Ok((host_uuid, claims.cnf.jkt, claims.sub))
 }
 
-/// Decode the entry set of a stored, already-signed live allowlist (metadata
+/// Decode a stored, already-signed live allowlist into its document (metadata
 /// only — no re-verify, it is our own artefact). `None` on any decode failure.
-fn decode_live_entries(bytes: &[u8]) -> Option<Vec<ferro_svid::AllowEntry>> {
+fn decode_live_doc(bytes: &[u8]) -> Option<ferro_svid::AllowlistDoc> {
     ferro_svid::allowlist::decode(bytes)
         .and_then(|s| ferro_svid::allowlist::decode_body(&s.body))
         .ok()
-        .map(|doc| doc.entries)
+}
+
+/// Decode the entry set of a stored, already-signed live allowlist (metadata
+/// only — no re-verify, it is our own artefact). `None` on any decode failure.
+fn decode_live_entries(bytes: &[u8]) -> Option<Vec<ferro_svid::AllowEntry>> {
+    decode_live_doc(bytes).map(|doc| doc.entries)
+}
+
+/// Re-stamp a stored allowlist with a fresh validity window when its current one
+/// is past half-life (or already expired), so a fetching MIA always loads an
+/// allowlist comfortably inside its `max_age_secs` staleness bound instead of
+/// rejecting an aged one as `TooOld`/`Expired` and failing closed.
+///
+/// Only `issued_at`/`not_after` move — the entry set (and the issuer's trust
+/// domain) are reproduced unchanged, re-signed with the issuance key. The
+/// issuer seed is replicated across the cluster, so any node (leader or
+/// follower) can do this on the read path with no Raft write: the refreshed
+/// bytes are *served*, not persisted, leaving the stored artefact (and the
+/// `issued_at` an operator sees via `ListAllowlists`) as provisioned.
+///
+/// Fails safe: on any decode/sign/encode failure the stored bytes are served
+/// unchanged — the MIA still applies its own freshness check, so a stale serve
+/// degrades to the previous behaviour rather than handing out nothing.
+fn refresh_served_allowlist(
+    issuer: &ferro_svid::Issuer,
+    stored: Vec<u8>,
+    ttl_secs: i64,
+    now: i64,
+) -> Vec<u8> {
+    let Some(doc) = decode_live_doc(&stored) else {
+        return stored;
+    };
+    // Serve the stored bytes untouched while the window is less than half spent
+    // and not yet expired — re-signing every fetch would be needless work.
+    let half_life = doc.issued_at.saturating_add(ttl_secs / 2);
+    if now <= half_life && now <= doc.not_after {
+        return stored;
+    }
+    let not_after = now.saturating_add(ttl_secs);
+    match issuer
+        .sign_allowlist(doc.entries, now, not_after)
+        .ok()
+        .and_then(|signed| ferro_svid::allowlist::encode(&signed).ok())
+    {
+        Some(fresh) => fresh,
+        None => stored,
+    }
 }
 
 /// Order-insensitive equality of two `(uid, bin_sha)` entry sets.
@@ -738,7 +784,20 @@ impl MachineIdentity for MachineIdentitySvc {
         // Unauthenticated by design: the body is integrity-protected by its
         // signature and is not secret. Absent ⇒ empty bytes, not an error, so a
         // host can poll before one is provisioned.
-        let signed_allowlist = self.state.get_allowlist(&host_uuid).await.unwrap_or_default();
+        //
+        // Re-stamp an aging allowlist with a fresh validity window before serving
+        // it (auto-renewal), so a long-lived but unchanged allowlist never rots
+        // into a `TooOld`/`Expired` rejection on the MIA — the entry set is
+        // unchanged, only the window moves. Served, not persisted.
+        let signed_allowlist = match self.state.get_allowlist(&host_uuid).await {
+            Some(stored) => refresh_served_allowlist(
+                &self.state.issuer,
+                stored,
+                self.state.config.allowlist_ttl_secs,
+                unix_now(),
+            ),
+            None => Vec::new(),
+        };
         Ok(Response::new(GetAllowlistResponse { signed_allowlist }))
     }
 
@@ -1286,7 +1345,73 @@ fn to_proto_sth(sth: &ferro_audit::SignedTreeHead) -> Result<SignedTreeHead, Sta
 
 #[cfg(test)]
 mod tests {
-    use super::{display_hostname, validate_bin_sha};
+    use super::{decode_live_doc, display_hostname, refresh_served_allowlist, validate_bin_sha};
+
+    fn test_issuer() -> ferro_svid::Issuer {
+        ferro_svid::Issuer::from_seed(&[7u8; 32], "cmis-test", "ferrogate.test")
+    }
+
+    fn sign_at(issuer: &ferro_svid::Issuer, issued_at: i64, ttl: i64) -> Vec<u8> {
+        let entries = vec![ferro_svid::AllowEntry {
+            uid: Some(503),
+            bin_sha: "*".to_string(),
+        }];
+        let signed = issuer
+            .sign_allowlist(entries, issued_at, issued_at + ttl)
+            .unwrap();
+        ferro_svid::allowlist::encode(&signed).unwrap()
+    }
+
+    #[test]
+    fn fresh_allowlist_is_served_unchanged() {
+        let issuer = test_issuer();
+        let ttl = 72 * 3600;
+        let stored = sign_at(&issuer, 1_000_000, ttl);
+        // now is only a third into the window — below half-life, so untouched.
+        let served = refresh_served_allowlist(&issuer, stored.clone(), ttl, 1_000_000 + ttl / 3);
+        assert_eq!(served, stored, "a still-fresh allowlist must not be re-signed");
+    }
+
+    #[test]
+    fn aged_allowlist_is_restamped_with_a_fresh_window() {
+        let issuer = test_issuer();
+        let ttl = 72 * 3600;
+        let issued_at = 1_000_000;
+        let stored = sign_at(&issuer, issued_at, ttl);
+        // Past half-life: must be re-stamped to (now, now + ttl).
+        let now = issued_at + ttl / 2 + 1;
+        let served = refresh_served_allowlist(&issuer, stored.clone(), ttl, now);
+        assert_ne!(served, stored, "an aged allowlist must be re-signed");
+        let doc = decode_live_doc(&served).expect("served allowlist decodes");
+        assert_eq!(doc.issued_at, now);
+        assert_eq!(doc.not_after, now + ttl);
+        // Entries (and trust domain) are preserved across the renewal.
+        assert_eq!(doc.entries.len(), 1);
+        assert_eq!(doc.entries[0].uid, Some(503));
+        assert_eq!(doc.entries[0].bin_sha, "*");
+    }
+
+    #[test]
+    fn expired_allowlist_is_renewed_not_dropped() {
+        let issuer = test_issuer();
+        let ttl = 72 * 3600;
+        let issued_at = 1_000_000;
+        let stored = sign_at(&issuer, issued_at, ttl);
+        // Well past not_after — still renewed so a host is never locked out.
+        let now = issued_at + ttl * 10;
+        let served = refresh_served_allowlist(&issuer, stored, ttl, now);
+        let doc = decode_live_doc(&served).expect("served allowlist decodes");
+        assert_eq!(doc.issued_at, now);
+        assert_eq!(doc.not_after, now + ttl);
+    }
+
+    #[test]
+    fn undecodable_bytes_are_served_unchanged() {
+        let issuer = test_issuer();
+        let garbage = vec![0xde, 0xad, 0xbe, 0xef];
+        let served = refresh_served_allowlist(&issuer, garbage.clone(), 72 * 3600, 9_999_999);
+        assert_eq!(served, garbage, "unparseable bytes fail safe (served as-is)");
+    }
 
     #[test]
     fn validate_bin_sha_accepts_hex_and_wildcard_rejects_garbage() {

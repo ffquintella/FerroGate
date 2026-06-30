@@ -453,9 +453,9 @@ async fn main() -> anyhow::Result<()> {
         "allowlist proposal policy"
     );
 
-    // Signature lifetimes. Both floor at 96 h (`ferro_svid::MIN_TTL_SECS`) and
-    // cap at the issuer's hard ceiling (30 days) so a misconfigured value can
-    // mint neither a near-expired nor an unbounded artefact.
+    // SVID lifetime floors at 96 h (`ferro_svid::MIN_TTL_SECS`) and caps at the
+    // issuer's hard ceiling (30 days) so a misconfigured value can mint neither a
+    // near-expired nor an unbounded SVID.
     if let Some(n) = ttl_from_env(
         "CMIS_SVID_TTL_SECS",
         ferro_svid::MIN_TTL_SECS,
@@ -463,12 +463,11 @@ async fn main() -> anyhow::Result<()> {
     ) {
         cmis_config.svid_ttl_secs = n;
     }
-    if let Some(n) = ttl_from_env(
-        "CMIS_ALLOWLIST_TTL_SECS",
-        ferro_svid::MIN_TTL_SECS,
-        30 * 24 * 3600,
-    ) {
-        cmis_config.allowlist_ttl_secs = i64::try_from(n).unwrap_or(96 * 3600);
+    // The allowlist window floors at 1 h (it is auto-renewed past half-life on
+    // each `GetAllowlist`, so a short window is safe and just renews more often)
+    // and caps at 30 days. Default 72 h (see `CmisConfig::default`).
+    if let Some(n) = ttl_from_env("CMIS_ALLOWLIST_TTL_SECS", 3600, 30 * 24 * 3600) {
+        cmis_config.allowlist_ttl_secs = i64::try_from(n).unwrap_or(72 * 3600);
     }
     tracing::info!(
         svid_ttl_secs = cmis_config.svid_ttl_secs,

@@ -164,6 +164,21 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **CMIS now auto-renews allowlists on serve, so they no longer rot and lock
+  hosts out.** `GetAllowlist` re-stamps an aging allowlist with a fresh validity
+  window (re-signs `(now, now+ttl)` with the same entries) once its window is
+  past half-life or expired, so a host that keeps fetching never sees its
+  allowlist rejected as `TooOld`/`Expired` and fall closed. Previously CMIS
+  served the stored blob verbatim and nothing refreshed it — the propose loop
+  dedups unchanged caller sets, and the MIA only checks freshness at load — so a
+  stable allowlist eventually aged past `max_age_secs` and denied every caller.
+  The refresh is stateless and HA-safe (served, not persisted; signed with the
+  replicated issuer key, so any node can do it with no Raft write) and fails
+  safe (serves the stored bytes unchanged on any error). The default allowlist
+  validity window is now **72 h** on both sides (CMIS `allowlist_ttl_secs` and
+  the MIA's `allowlist.max_age_secs`); the CMIS env floor drops to 1 h since the
+  window is continuously renewed.
+
 - **`mia` now recovers a missing host SVID on its own — no restart needed.**
   When attestation to CMIS fails at startup (CMIS unreachable, or — the common
   case — DNS/VPN not up yet right after boot), the daemon used to serve forever

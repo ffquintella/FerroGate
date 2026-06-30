@@ -64,8 +64,10 @@
 [allowlist]
 #path = "/etc/ferrogate/allowlist.cbor"
 #key = "/etc/ferrogate/allowlist.pub"
-# Maximum accepted allowlist age in seconds. Default: 86400.
-#max_age_secs = 86400
+# Maximum accepted allowlist age in seconds. Default: 259200 (72 h). CMIS
+# auto-renews an aging allowlist on each fetch, so it stays inside this bound as
+# long as the host can reach CMIS; keep it ≥ the CMIS allowlist_ttl_secs.
+#max_age_secs = 259200
 # Fetch this host's signed allowlist from CMIS at startup (the GetAllowlist RPC,
 # keyed by the host's EK-derived UUID) and write it to `path` before loading, so
 # the on-disk artefact stays in sync with what the operator provisioned. Needs

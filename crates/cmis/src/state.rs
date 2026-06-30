@@ -67,9 +67,13 @@ pub struct CmisConfig {
     /// SVID lifetime in seconds. Floored at [`ferro_svid::MIN_TTL_SECS`] (96 h)
     /// and clamped to [`ferro_svid::MAX_TTL_SECS`] (30 days) by the issuer.
     pub svid_ttl_secs: u64,
-    /// Caller-allowlist signature lifetime in seconds. Floored at
-    /// [`ferro_svid::MIN_TTL_SECS`] (96 h) and capped at 30 days when loaded
-    /// from the environment. Must not exceed the MIA's `allowlist.max_age_secs`.
+    /// Caller-allowlist signature lifetime in seconds — the validity window
+    /// stamped on each served allowlist. `GetAllowlist` auto-renews an aging
+    /// allowlist (re-signs with a fresh window once it is past half-life), so a
+    /// host that keeps fetching never sees its allowlist rot into a `TooOld`/
+    /// `Expired` rejection. Should be ≤ the MIA's `allowlist.max_age_secs` so the
+    /// served window and the MIA's staleness bound agree (both default 72 h).
+    /// Capped at 30 days and floored at 1 h when loaded from the environment.
     pub allowlist_ttl_secs: i64,
     /// The live RIM policy epoch. A bump forces re-attestation on `Rotate`.
     pub policy_epoch: u64,
@@ -82,8 +86,8 @@ impl Default for CmisConfig {
         Self {
             trust_domain: "ferrogate.dev".to_string(),
             svid_ttl_secs: 30 * 24 * 3600,
-            // ferro_svid::MIN_TTL_SECS (96 h), as i64 for the not-after stamp.
-            allowlist_ttl_secs: 96 * 3600,
+            // 72 h served window; auto-renewed past half-life on each fetch.
+            allowlist_ttl_secs: 72 * 3600,
             policy_epoch: 1,
             allowlist_proposal_policy: ProposalPolicy::default(),
         }
