@@ -7,7 +7,10 @@ use ferro_audit::AuditEvent;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Semaphore};
 
-use super::{serve_connection, AllowlistReloader, Clock, HelperServerConfig, ServerError, Shared};
+use super::{
+    serve_connection, AllowlistReloader, Clock, HelperServerConfig, MinterReloader, ServerError,
+    Shared,
+};
 use crate::helper::allowlist::Allowlist;
 use crate::helper::auth::{AuthError, CallerAuth, PeerCred};
 use crate::helper::crl::CrlCache;
@@ -88,6 +91,15 @@ impl<A: CallerAuth> HelperServer<A> {
     #[must_use]
     pub fn allowlist_reloader(&self) -> AllowlistReloader<A> {
         AllowlistReloader {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// A clonable handle to switch minting on after serving has started (used by
+    /// the background re-attestation task when CMIS was unreachable at startup).
+    #[must_use]
+    pub fn minter_reloader(&self) -> MinterReloader<A> {
+        MinterReloader {
             shared: Arc::clone(&self.shared),
         }
     }

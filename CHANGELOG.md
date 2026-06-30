@@ -164,6 +164,17 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **`mia` now recovers a missing host SVID on its own — no restart needed.**
+  When attestation to CMIS fails at startup (CMIS unreachable, or — the common
+  case — DNS/VPN not up yet right after boot), the daemon used to serve forever
+  with minting disabled (`no_host_svid`) because attestation ran only once at
+  startup. It now retries host-key attestation every 5 minutes in the
+  background; the first success live-swaps the minter into the running server
+  (minting on, no socket downtime), refreshes the signed allowlist from CMIS,
+  and — if configured — starts the allowlist-propose task. Mirrors the CRL
+  puller's stance that CMIS being down at boot must not permanently disable
+  minting.
+
 - **`mia test` step 5 (helper token mint) now runs on Windows.** It previously
   bailed with "the named-pipe self-test is not supported on this platform yet";
   it now connects the helper named pipe (mirroring the Unix UDS path) and either

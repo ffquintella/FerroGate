@@ -109,8 +109,10 @@ pub enum ServerError {
 /// Shared, hot-swappable handles the connection tasks read.
 struct Shared<A: CallerAuth> {
     auth: A,
-    /// `None` ⇒ the MIA holds no valid host SVID ⇒ refuse all minting.
-    minter: Option<ChildTokenMinter>,
+    /// `None` ⇒ the MIA holds no valid host SVID ⇒ refuse all minting. Behind a
+    /// lock so a host SVID obtained by a late re-attestation (CMIS unreachable at
+    /// startup) switches minting on without a restart — like the allowlist below.
+    minter: RwLock<Option<ChildTokenMinter>>,
     /// `None` ⇒ no valid allowlist loaded ⇒ fail closed, deny all callers.
     allowlist: RwLock<Option<Allowlist>>,
     /// The CRL freshness gate (feature F11). A stale or missing CRL, or one
@@ -144,7 +146,7 @@ impl<A: CallerAuth> Shared<A> {
     ) -> Self {
         Self {
             auth,
-            minter,
+            minter: RwLock::new(minter),
             allowlist: RwLock::new(allowlist),
             crl,
             audit_tx,
@@ -156,6 +158,10 @@ impl<A: CallerAuth> Shared<A> {
 
     async fn set_allowlist(&self, allowlist: Option<Allowlist>) {
         *self.allowlist.write().await = allowlist;
+    }
+
+    async fn set_minter(&self, minter: Option<ChildTokenMinter>) {
+        *self.minter.write().await = minter;
     }
 }
 
@@ -197,6 +203,34 @@ impl<A: CallerAuth> AllowlistReloader<A> {
     /// closed), matching startup semantics.
     pub async fn set(&self, allowlist: Option<Allowlist>) {
         self.shared.set_allowlist(allowlist).await;
+    }
+}
+
+/// A cheap, clonable handle that switches minting on (or off) while the server
+/// is already serving — held by the background re-attestation task so a host
+/// SVID obtained after a startup where CMIS was unreachable enables minting
+/// without a restart. Obtained via [`HelperServer::minter_reloader`].
+pub struct MinterReloader<A: CallerAuth> {
+    shared: Arc<Shared<A>>,
+}
+
+// As with `AllowlistReloader`, a derived `Clone` would demand `A: Clone`; the
+// handle only ever clones the `Arc`.
+impl<A: CallerAuth> Clone for MinterReloader<A> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<A: CallerAuth> MinterReloader<A> {
+    /// Swap the live minter. `Some` enables minting under the given host SVID;
+    /// `None` disables it (callers get `no_host_svid`), matching startup
+    /// semantics.
+    #[allow(clippy::large_futures)] // moves the host minter (composite ML-DSA key)
+    pub async fn set(&self, minter: Option<ChildTokenMinter>) {
+        self.shared.set_minter(minter).await;
     }
 }
 
@@ -286,8 +320,11 @@ async fn process_request<A: CallerAuth>(
         return err(ErrorCode::MalformedRequest, None);
     }
 
-    // 3. The MIA must hold a valid host SVID to mint anything.
-    let Some(minter) = shared.minter.as_ref() else {
+    // 3. The MIA must hold a valid host SVID to mint anything. The read guard is
+    //    held across the CRL gate and the mint below; a late re-attestation takes
+    //    the write lock to swap the minter in, so the two serialize cleanly.
+    let minter_guard = shared.minter.read().await;
+    let Some(minter) = minter_guard.as_ref() else {
         deny(shared, id.pid, id.uid, id.bin_sha, "no-host-svid").await;
         return err(ErrorCode::NoHostSvid, None);
     };

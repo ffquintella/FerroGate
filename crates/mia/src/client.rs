@@ -307,9 +307,13 @@ pub async fn run_attest<T: AttestEvidence>(
 /// fingerprint `H` is derived from `facts`; `key` signs `nonce ‖ H` in phase 2
 /// and the composite CSR in phase 4.
 pub async fn run_attest_host_key(
+    // `+ Sync` so the borrowed key is `Send` across this fn's awaits and the
+    // whole attestation future can run on a spawned task (the background
+    // re-attestation loop). `SoftwareMachineKey` is `Sync`; this only excludes a
+    // hypothetical non-`Sync` backend, which could not be spawned anyway.
     client: &mut MachineIdentityClient<Channel>,
     facts: &ferro_machineid::MachineFacts,
-    key: &dyn ferro_sep::MachineKey,
+    key: &(dyn ferro_sep::MachineKey + Sync),
     dpop_jkt: String,
 ) -> Result<AttestedSvid, AttestClientError> {
     let (tx, rx) = mpsc::channel::<AttestRequest>(8);

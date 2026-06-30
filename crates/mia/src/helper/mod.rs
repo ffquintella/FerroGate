@@ -35,5 +35,6 @@ pub use token::{ChildTokenMinter, MintedToken, MinterConfig, MAX_CHILD_TTL_SECS}
 
 #[cfg(any(unix, windows))]
 pub use server::{
-    system_clock, AllowlistReloader, Clock, HelperServer, HelperServerConfig, ServerError,
+    system_clock, AllowlistReloader, Clock, HelperServer, HelperServerConfig, MinterReloader,
+    ServerError,
 };

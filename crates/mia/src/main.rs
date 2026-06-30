@@ -707,14 +707,15 @@ fn host_uuid_from_spiffe_id(spiffe_id: &str) -> Option<&str> {
 /// is), exactly as if auto-fetch were off.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 async fn maybe_fetch_allowlist(
-    config: &mia::config::Config,
+    fetch: bool,
+    allowlist_path: Option<&std::path::Path>,
     resolver: Option<&mia::endpoint::CmisResolver>,
     host_spiffe_id: Option<&str>,
 ) {
-    if !config.allowlist.fetch {
+    if !fetch {
         return;
     }
-    let Some(path) = config.allowlist.path.as_deref() else {
+    let Some(path) = allowlist_path else {
         tracing::warn!("allowlist.fetch is set but allowlist.path is unset; nothing to write");
         return;
     };
@@ -1000,10 +1001,131 @@ fn maybe_spawn_crl_puller(
     });
 }
 
+/// How often the background re-attestation task retries after a failed startup
+/// attestation. Five minutes balances quick recovery (the network coming up
+/// shortly after boot) against load on CMIS for a host that stays offline.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const REATTEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The owned configuration the re-attestation task needs to finish wiring up a
+/// late-arriving host SVID (refresh the allowlist, optionally start proposing).
+/// Captured before the task is spawned because [`mia::config::Config`] is
+/// borrowed for the lifetime of `serve` and the task must be `'static`.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+struct ReattestParams {
+    allowlist_fetch: bool,
+    allowlist_path: Option<std::path::PathBuf>,
+    allowlist_key: Option<std::path::PathBuf>,
+    allowlist_max_age_secs: i64,
+    propose: bool,
+    propose_interval: u64,
+}
+
+/// When startup attestation fails — CMIS unreachable, or (commonly) DNS/VPN not
+/// up yet right after boot — the daemon serves but cannot mint: every caller
+/// gets `no_host_svid`. Rather than wait for a manual restart, retry host-key
+/// attestation every [`REATTEST_INTERVAL`]. The first success live-swaps the
+/// minter into the running server (minting on, no restart), refreshes the signed
+/// allowlist from CMIS, and — if configured — starts the allowlist-propose task;
+/// then the task exits. Mirrors the CRL puller's stance that CMIS being down at
+/// boot must not permanently disable minting ([`maybe_spawn_crl_puller`]).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[allow(clippy::large_futures)] // attestation future holds a composite key
+fn spawn_reattest_task<A>(
+    resolver: mia::endpoint::CmisResolver,
+    minter_reloader: mia::helper::MinterReloader<A>,
+    allowlist_reloader: mia::helper::AllowlistReloader<A>,
+    ledger: mia::helper::CallerLedger,
+    params: ReattestParams,
+    clock: mia::helper::Clock,
+) where
+    A: mia::helper::auth::CallerAuth,
+{
+    tracing::info!(
+        interval_secs = REATTEST_INTERVAL.as_secs(),
+        cmis = %resolver.describe(),
+        "no host SVID at startup; scheduling background re-attestation"
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(REATTEST_INTERVAL);
+        // The first tick fires immediately; the startup attempt already failed,
+        // so wait a full interval before retrying.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(session) = bootstrap_host_svid(&resolver).await else {
+                continue; // the failure is logged inside bootstrap; retry next tick
+            };
+            let spiffe_id = session.spiffe_id.clone();
+            let jws = session.jws.clone();
+
+            // 1. Switch minting on now that we hold a host SVID.
+            minter_reloader.set(Some(session.minter)).await;
+            tracing::info!(%spiffe_id, "re-attestation succeeded; token minting enabled");
+
+            // 2. Refresh the signed allowlist from CMIS and live-swap it. Without
+            //    this, minting is on but every non-self caller is denied
+            //    (not-allowlisted) when the on-disk allowlist was missing or
+            //    expired at startup — exactly the state a boot-time failure leaves.
+            maybe_fetch_allowlist(
+                params.allowlist_fetch,
+                params.allowlist_path.as_deref(),
+                Some(&resolver),
+                Some(&spiffe_id),
+            )
+            .await;
+            match (params.allowlist_path.as_deref(), params.allowlist_key.as_deref()) {
+                (Some(path), Some(key)) => {
+                    match mia::helper::allowlist::load_at_startup(
+                        path,
+                        key,
+                        clock(),
+                        params.allowlist_max_age_secs,
+                    ) {
+                        Ok(al) => {
+                            let loaded = al.is_some();
+                            allowlist_reloader.set(al).await;
+                            if loaded {
+                                tracing::info!("allowlist reloaded after re-attestation");
+                            } else {
+                                tracing::warn!(
+                                    "allowlist absent or unverified after re-attestation; serving deny-all (fail closed)"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not reload allowlist after re-attestation; keeping current"
+                        ),
+                    }
+                }
+                (Some(_), None) => tracing::warn!(
+                    "allowlist.path set but allowlist.key missing; not reloading after re-attestation"
+                ),
+                (None, _) => {}
+            }
+
+            // 3. Start proposing the observed callers back to CMIS, if configured
+            //    (startup skipped this because there was no host SVID then).
+            if params.propose {
+                maybe_spawn_propose_task(
+                    Some(&resolver),
+                    Some(&spiffe_id),
+                    Some(jws),
+                    ledger,
+                    params.propose_interval,
+                );
+            }
+            return; // host SVID obtained; nothing left to retry
+        }
+    });
+}
+
 /// Bind and serve the helper API with the given caller authenticator. Shared by
 /// every supported platform.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[allow(clippy::large_futures)] // attestation future holds a composite key
+#[allow(clippy::too_many_lines)] // linear startup wiring: attest → bind → spawn background tasks
 async fn serve<A>(
     config: &mia::config::Config,
     socket_path: std::path::PathBuf,
@@ -1072,7 +1194,13 @@ where
 
     // Optionally refresh the on-disk allowlist from CMIS before loading it, so
     // the served body stays in sync with what the operator provisioned.
-    maybe_fetch_allowlist(config, resolver.as_ref(), host_spiffe_id.as_deref()).await;
+    maybe_fetch_allowlist(
+        config.allowlist.fetch,
+        config.allowlist.path.as_deref(),
+        resolver.as_ref(),
+        host_spiffe_id.as_deref(),
+    )
+    .await;
 
     // Allowlist: configured ⇒ load and verify, denying all callers (fail
     // closed) on a missing file or a verification failure rather than crashing
@@ -1123,7 +1251,7 @@ where
     // a reload can pick up a newly-added allowlist or a changed log directive;
     // reload mirrors startup's fail-closed semantics.
     #[cfg(unix)]
-    spawn_reload_task(server.allowlist_reloader(), config_source, log_reload, clock);
+    spawn_reload_task(server.allowlist_reloader(), config_source, log_reload, clock.clone());
     #[cfg(not(unix))]
     let _ = (&config_source, &log_reload, &clock);
 
@@ -1137,6 +1265,30 @@ where
             server.ledger(),
             config.allowlist_propose_interval(),
         );
+    }
+
+    // If startup attestation failed but CMIS is configured, keep retrying in the
+    // background so minting (and the allowlist + propose wiring) recover on their
+    // own once CMIS becomes reachable — e.g. the network wasn't up yet at boot —
+    // instead of requiring a manual restart.
+    if host_spiffe_id.is_none() {
+        if let Some(r) = resolver.clone() {
+            spawn_reattest_task(
+                r,
+                server.minter_reloader(),
+                server.allowlist_reloader(),
+                server.ledger(),
+                ReattestParams {
+                    allowlist_fetch: config.allowlist.fetch,
+                    allowlist_path: config.allowlist.path.clone(),
+                    allowlist_key: config.allowlist.key.clone(),
+                    allowlist_max_age_secs: max_age,
+                    propose: config.allowlist.propose,
+                    propose_interval: config.allowlist_propose_interval(),
+                },
+                clock.clone(),
+            );
+        }
     }
 
     server.serve_with_shutdown(shutdown_signal()).await;
