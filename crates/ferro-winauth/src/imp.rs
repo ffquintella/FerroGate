@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -200,7 +202,7 @@ pub fn create_server_pipe(
     opts.first_pipe_instance(first);
 
     let Some(group) = group else {
-        return opts.create(addr);
+        return map_first_instance_err(opts.create(addr), first);
     };
 
     let sid = lookup_group_sid_string(group)?;
@@ -234,7 +236,30 @@ pub fn create_server_pipe(
     };
     // SAFETY: `psd` was allocated by the conversion call above.
     unsafe { LocalFree(psd) };
-    pipe
+    map_first_instance_err(pipe, first)
+}
+
+/// `ERROR_ACCESS_DENIED` (os error 5) when creating the *first* pipe instance
+/// almost always means a pipe of that name already exists — i.e. another `mia`
+/// (typically the Windows service) is already running and owns it. Windows
+/// reports this as a bare "Access is denied", which hides the real cause, so
+/// rewrite it into an actionable message. Subsequent instances (`first ==
+/// false`) and all other errors pass through unchanged.
+fn map_first_instance_err(
+    res: io::Result<NamedPipeServer>,
+    first: bool,
+) -> io::Result<NamedPipeServer> {
+    match res {
+        Err(e) if first && e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "the helper pipe already exists; another mia instance is already \
+                 running (e.g. the FerroGate service) — stop it before starting another \
+                 (Stop-Service mia)",
+            ))
+        }
+        other => other,
+    }
 }
 
 /// Resolve a local group name to its SID, formatted as an SDDL `S-...` string.

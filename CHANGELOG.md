@@ -164,6 +164,15 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **Clearer error when the Windows helper pipe is already owned by another
+  `mia`.** Creating the first helper-pipe instance while the `mia` service (or
+  any other instance) is already running failed with the bare, baffling `socket
+  setup: Access is denied. (os error 5)` — Windows returns `ERROR_ACCESS_DENIED`
+  for `FILE_FLAG_FIRST_PIPE_INSTANCE` when a pipe of that name already exists.
+  `ferro-winauth::create_server_pipe` now translates that specific case into an
+  actionable message naming the cause (another instance already running; stop
+  the service first). All other errors and subsequent pipe instances are
+  unchanged.
 - **Child tokens no longer fail with `no key for kid host-…` after a `mia` or
   CMIS restart.** A host's child-token signing key (F09) has a `kid` derived
   from its composite public key, and two independent causes made that key
