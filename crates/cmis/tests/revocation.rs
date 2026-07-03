@@ -84,7 +84,7 @@ fn params() -> IssueParams {
 
 async fn fetch_jwks(svc: &MachineIdentitySvc) -> ferro_svid_verify::JwkSet {
     let resp = svc
-        .jwks(tonic::Request::new(JwksRequest {}))
+        .jwks(tonic::Request::new(JwksRequest::default()))
         .await
         .unwrap()
         .into_inner();
@@ -96,7 +96,7 @@ async fn fetch_jwks(svc: &MachineIdentitySvc) -> ferro_svid_verify::JwkSet {
 /// internals private — it only exposes `verify_unrevoked`).
 async fn jwks_native(svc: &MachineIdentitySvc) -> ferro_svid::JwkSet {
     let resp = svc
-        .jwks(tonic::Request::new(JwksRequest {}))
+        .jwks(tonic::Request::new(JwksRequest::default()))
         .await
         .unwrap()
         .into_inner();

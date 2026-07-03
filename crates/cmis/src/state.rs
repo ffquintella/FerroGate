@@ -395,6 +395,43 @@ impl CmisState {
         }
     }
 
+    /// On-miss rehydrate for a single requested `kid` (the `JWKS` RPC's
+    /// `kid_hint`). `register_child_key` is process-local, so a replica that
+    /// never witnessed a host's attestation — and has been up since before it,
+    /// missing the startup [`rehydrate_child_keys`] pass — serves a JWKS
+    /// without that host's key and every cross-node verification fails with
+    /// `no key for kid host-…`. When a verifier names the kid it needs and the
+    /// published set misses it, re-read the replicated store (where the
+    /// attesting node persisted `child_pub`) before answering.
+    ///
+    /// Only `host-…` kids trigger the store read: issuer root kids are never
+    /// in the issued-SVID store, so rescanning for them is pure waste. The
+    /// full rehydrate (not a single-record fetch) is deliberate — it costs the
+    /// same one store listing and heals every other missing host at once.
+    /// Returns whether the kid is published after the attempt; the caller
+    /// serves the (possibly refreshed) set either way, so an unknown kid
+    /// still yields the verifier's normal `no key for kid` — just no longer
+    /// spuriously.
+    ///
+    /// [`rehydrate_child_keys`]: CmisState::rehydrate_child_keys
+    pub async fn ensure_child_key_published(&self, kid: &str) -> bool {
+        let published = |keys: &[Jwk]| keys.iter().any(|k| k.kid == kid);
+        if published(&self.published_keys.read()) {
+            return true;
+        }
+        if !kid.starts_with("host-") {
+            return false;
+        }
+        self.rehydrate_child_keys().await;
+        let found = published(&self.published_keys.read());
+        if found {
+            tracing::info!(kid, "on-miss rehydrate published the requested child key");
+        } else {
+            tracing::warn!(kid, "kid requested via JWKS hint is not in the issued-SVID store");
+        }
+        found
+    }
+
     /// Add a revocation to the working set (feature F11). Idempotent per target:
     /// re-revoking the same SVID or host refreshes the reason/timestamp rather
     /// than appending a duplicate. The caller publishes a fresh CRL afterwards

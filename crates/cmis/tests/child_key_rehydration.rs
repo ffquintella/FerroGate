@@ -120,6 +120,37 @@ async fn rehydrate_republishes_persisted_child_keys() {
 }
 
 #[tokio::test]
+async fn ensure_child_key_published_rehydrates_on_miss() {
+    let state = state().await;
+
+    // Persisted by a *different* replica at attestation time; this process's
+    // JWKS has never seen the key and no startup rehydration has run — the
+    // exact cross-node gap behind spurious `no key for kid host-…` failures.
+    let (_sk, pk) = CompositeSecretKey::generate().unwrap();
+    let kid = child_signing_kid(&pk);
+    state
+        .record(record_with_child_key(
+            "spiffe://ferrogate.test/host/other-node",
+            pk.to_concat_bytes(),
+        ))
+        .await;
+    assert!(state.published_jwks().find(&kid).is_none());
+
+    // A JWKS request hinting at the missing kid pulls it from the store.
+    assert!(
+        state.ensure_child_key_published(&kid).await,
+        "on-miss rehydrate must publish a kid present in the replicated store"
+    );
+    assert!(state.published_jwks().find(&kid).is_some());
+
+    // Already-published (the fast path) stays true; a kid in nobody's store
+    // and a non-host kid both report absent without publishing anything.
+    assert!(state.ensure_child_key_published(&kid).await);
+    assert!(!state.ensure_child_key_published("host-0000000000000000").await);
+    assert!(!state.ensure_child_key_published("not-a-host-kid").await);
+}
+
+#[tokio::test]
 async fn rehydrate_skips_records_without_a_child_key() {
     let state = state().await;
     let before = state.published_jwks().keys.len();

@@ -127,7 +127,7 @@ pub async fn refresh_once(
     cache: &CrlCache,
 ) -> Result<u64, CrlRefreshError> {
     let jwks_json = client
-        .jwks(tonic::Request::new(ferro_proto::v1::JwksRequest {}))
+        .jwks(tonic::Request::new(ferro_proto::v1::JwksRequest::default()))
         .await?
         .into_inner()
         .jwks_json;

@@ -124,7 +124,7 @@ async fn pinned_hybrid_client_completes_jwks_over_tls() {
         .await
         .expect("pinned hybrid client must connect over the TLS transport");
     let resp = client
-        .jwks(ferro_proto::v1::JwksRequest {})
+        .jwks(ferro_proto::v1::JwksRequest::default())
         .await
         .expect("JWKS RPC over TLS")
         .into_inner();

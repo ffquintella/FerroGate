@@ -310,7 +310,7 @@ async fn spawn_server(state: Arc<CmisState>) -> MachineIdentityClient<tonic::tra
 
 async fn fetch_jwks(client: &mut MachineIdentityClient<tonic::transport::Channel>) -> String {
     client
-        .jwks(ferro_proto::v1::JwksRequest {})
+        .jwks(ferro_proto::v1::JwksRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -498,7 +498,7 @@ async fn rim_loader_hot_swap_admits_a_freshly_published_generation() {
         .expect("attestation succeeds against the loaded RIM");
     let jwks = ferro_svid_verify::JwkSet::from_json(
         &client
-            .jwks(ferro_proto::v1::JwksRequest {})
+            .jwks(ferro_proto::v1::JwksRequest::default())
             .await
             .unwrap()
             .into_inner()

@@ -236,6 +236,9 @@ async fn ttl_zero_falls_back_to_a_default_window() {
         .await
         .expect("set ok")
         .into_inner();
-    // Default is the 96 h floor (`ferro_svid::MIN_TTL_SECS`).
-    assert_eq!(set.not_after - set.issued_at, 96 * 3600);
+    // Default is the 72 h served window (`CmisConfig::default`), matched to the
+    // MIA's `allowlist.max_age_secs` default so the served window never outruns
+    // the MIA's staleness bound. (This is unrelated to `ferro_svid::MIN_TTL_SECS`,
+    // the 96 h SVID lifetime floor — the allowlist window floors at 1 h.)
+    assert_eq!(set.not_after - set.issued_at, 72 * 3600);
 }

@@ -245,7 +245,15 @@ message RotateRequest {
   uint64 known_epoch = 3;             // policy epoch the client believes is live
 }
 
-message JWKSRequest {}
+message JWKSRequest {
+  // Optional `kid` the caller is about to verify against (e.g. `host-<hex>`
+  // from a child token's JOSE header). When set and the kid is not in this
+  // replica's published set, the replica re-reads the replicated issued-SVID
+  // store before answering — so a verifier that hits a node which never
+  // witnessed the host's attestation still gets the host's child-token key
+  // (on-miss rehydrate). Empty = no hint; serve the published set as-is.
+  string kid_hint = 1;
+}
 
 message JWKSResponse {
   string jwks_json = 1;

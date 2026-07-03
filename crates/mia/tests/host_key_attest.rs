@@ -151,7 +151,7 @@ async fn enrolled_host_key_attests_end_to_end() {
 
     // The issued JWS verifies under the JWKS the server publishes.
     let jwks_json = client
-        .jwks(ferro_proto::v1::JwksRequest {})
+        .jwks(ferro_proto::v1::JwksRequest::default())
         .await
         .unwrap()
         .into_inner()

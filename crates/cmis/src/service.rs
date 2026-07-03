@@ -758,7 +758,15 @@ impl MachineIdentity for MachineIdentitySvc {
         }
     }
 
-    async fn jwks(&self, _request: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {
+    async fn jwks(&self, request: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {
+        // On-miss rehydrate: a verifier that names the kid it is about to
+        // check gives this replica the chance to pull a host key it never
+        // witnessed out of the replicated store before answering (the
+        // cross-node gap `register_child_key` being process-local leaves).
+        let kid_hint = &request.get_ref().kid_hint;
+        if !kid_hint.is_empty() {
+            self.state.ensure_child_key_published(kid_hint).await;
+        }
         let json = serde_json::to_string(&self.state.published_jwks())
             .map_err(|_| Status::internal("jwks encode"))?;
         Ok(Response::new(JwksResponse { jwks_json: json }))

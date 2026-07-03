@@ -176,6 +176,21 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **Cross-node `no key for kid host-…` on HA CMIS clusters — JWKS on-miss
+  rehydrate.** A host's child-token signing key was published into the JWKS
+  only by the CMIS replica that witnessed its attestation
+  (`register_child_key` is process-local); startup rehydration (F09) healed a
+  *restarted* replica, but a replica up since before the attestation kept
+  serving a JWKS without that host's kid, so any verifier routed to it failed
+  child-token verification spuriously. `JWKSRequest` gained an optional
+  `kid_hint` field (wire-compatible; older clients send nothing and are
+  unaffected): when a caller names a `host-…` kid missing from the replica's
+  published set, the replica re-reads the replicated issued-SVID store —
+  where the attesting node persisted the key — before answering
+  (`CmisState::ensure_child_key_published`). A kid in nobody's store still
+  fails exactly as before; the hint can only turn spurious misses into
+  successes.
+
 - **Clearer error when the Windows helper pipe is already owned by another
   `mia`.** Creating the first helper-pipe instance while the `mia` service (or
   any other instance) is already running failed with the bare, baffling `socket

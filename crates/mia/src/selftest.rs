@@ -479,7 +479,7 @@ async fn check_server_crl(
     let label = "[4/5] CMIS CRL publishing";
     let jwks = match tokio::time::timeout(
         STEP_TIMEOUT,
-        client.jwks(tonic::Request::new(ferro_proto::v1::JwksRequest {})),
+        client.jwks(tonic::Request::new(ferro_proto::v1::JwksRequest::default())),
     )
     .await
     {
