@@ -561,6 +561,7 @@ fn build_auth(_config: &mia::config::Config) -> mia::helper::auth::MacCallerAuth
 fn build_auth(config: &mia::config::Config) -> mia::helper::auth::WindowsCallerAuth {
     use mia::helper::auth::WindowsCallerAuth;
     if config.helper.require_authenticode.unwrap_or(true) {
+        warn_if_own_image_untrusted();
         WindowsCallerAuth::new()
     } else {
         tracing::warn!(
@@ -568,6 +569,30 @@ fn build_auth(config: &mia::config::Config) -> mia::helper::auth::WindowsCallerA
              Authenticode (identity rests on PID + image SHA-384 + RID only)"
         );
         WindowsCallerAuth::without_authenticode()
+    }
+}
+
+/// With the Authenticode caller check on, probe mia's own image once at
+/// startup: if it fails (an unsigned build, e.g. stock `make pkg-win`), every
+/// caller built the same way — including `mia test` — will be refused with
+/// 'untrusted-binary'. Self-trust covers only the allowlist, not caller
+/// authentication, so warn here rather than letting the first mint fail with
+/// no daemon-side explanation.
+#[cfg(windows)]
+fn warn_if_own_image_untrusted() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if !matches!(ferro_winauth::verify_authenticode(&exe), Ok(true)) {
+        tracing::warn!(
+            image = %exe.display(),
+            "mia's own binary does not pass Authenticode verification while \
+             helper.require_authenticode is on (the default): unsigned local callers — \
+             including `mia test` — will be refused with 'untrusted-binary'. Sign the \
+             binaries (see WIN_SIGN_PFX in scripts/build-msi-amd64.sh), or set \
+             helper.require_authenticode = false in mia.toml for hosts whose clients \
+             are not code-signed"
+        );
     }
 }
 

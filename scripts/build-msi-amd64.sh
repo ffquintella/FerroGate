@@ -16,6 +16,17 @@
 # additionally creates the FerroGateClients group and adds the install dir to
 # PATH before invoking the MSI (see crates/mia/nuget/ and crates/mia/wix/).
 #
+# Optional Authenticode signing: mia's helper API refuses unsigned caller
+# binaries by default on Windows (`helper.require_authenticode`), so an
+# unsigned mia.exe fails its own `mia test` out of the box. Set
+#
+#   WIN_SIGN_PFX=/path/to/codesign.pfx   PKCS#12 code-signing bundle
+#   WIN_SIGN_PASS=...                    its password (optional)
+#   WIN_SIGN_TS=http://timestamp.digicert.com   RFC 3161 timestamp URL (optional)
+#
+# to sign mia.exe (before the MSI embeds it) and the MSI with osslsigncode.
+# Without WIN_SIGN_PFX the artifacts are built unsigned and a NOTE is printed.
+#
 # Usage: scripts/build-msi-amd64.sh [version]   (version defaults to Cargo.toml)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -23,6 +34,18 @@ cd "$(dirname "$0")/.."
 VERSION="${1:-$(awk '/^\[workspace.package\]/{p=1} p&&/^version/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)}"
 [ -n "$VERSION" ] || { echo "ERROR: could not determine the workspace version from Cargo.toml" >&2; exit 1; }
 echo "==> building FerroGate MIA Windows artifacts v$VERSION"
+
+WIN_SIGN_PFX="${WIN_SIGN_PFX:-}"
+SIGN_MOUNT=()
+if [ -n "$WIN_SIGN_PFX" ]; then
+  [ -f "$WIN_SIGN_PFX" ] || { echo "ERROR: WIN_SIGN_PFX=$WIN_SIGN_PFX does not exist" >&2; exit 1; }
+  SIGN_MOUNT=(
+    -v "$(cd "$(dirname "$WIN_SIGN_PFX")" && pwd)/$(basename "$WIN_SIGN_PFX")":/signing.pfx:ro
+    -e WIN_SIGN=1
+    -e WIN_SIGN_PASS="${WIN_SIGN_PASS:-}"
+    -e WIN_SIGN_TS="${WIN_SIGN_TS:-}"
+  )
+fi
 
 # ── Stage 1: cross-compile mia.exe (x86_64-pc-windows-msvc) ───────────────────
 echo "==> [1/2] cross-compiling mia.exe in rust:bookworm…"
@@ -45,13 +68,32 @@ echo "==> [2/2] building MSI + NuGet package in fedora…"
 docker run --rm --platform linux/amd64 \
   -v "$PWD":/work -w /work \
   -e VERSION="$VERSION" -e BINDIR="$BINDIR" \
+  ${SIGN_MOUNT[@]+"${SIGN_MOUNT[@]}"} \
   fedora:41 bash -euo pipefail -c '
-    dnf install -y -q msitools zip >/dev/null
+    dnf install -y -q msitools zip ${WIN_SIGN:+osslsigncode} >/dev/null
+
+    # Authenticode-sign a PE/MSI in place with the mounted PKCS#12 bundle.
+    sign_file() {
+      echo "==> signing $1 with osslsigncode…"
+      osslsigncode sign -pkcs12 /signing.pfx \
+        ${WIN_SIGN_PASS:+-pass "$WIN_SIGN_PASS"} \
+        ${WIN_SIGN_TS:+-ts "$WIN_SIGN_TS"} \
+        -h sha256 \
+        -n "FerroGate Machine Identity Agent" \
+        -i "https://github.com/ffquintella/FerroGate" \
+        -in "$1" -out "$1.signed"
+      mv "$1.signed" "$1"
+    }
+
+    # Sign mia.exe BEFORE wixl embeds it, so the installed binary passes the
+    # helper API'\''s default-on Authenticode caller check.
+    [ -z "${WIN_SIGN:-}" ] || sign_file "$BINDIR/mia.exe"
 
     echo "==> building MSI with wixl…"
     mkdir -p target/wix
     MSI="target/wix/ferrogate-mia-${VERSION}-x64.msi"
     wixl --arch x64 -D Version="$VERSION" -D BinDir="$BINDIR" -o "$MSI" crates/mia/wix/mia.wxs
+    [ -z "${WIN_SIGN:-}" ] || sign_file "$MSI"
 
     echo "==> assembling Chocolatey/NuGet package…"
     STAGE="$(mktemp -d)"
@@ -106,3 +148,11 @@ echo ""
 echo "==> Windows artifacts (v$VERSION):"
 echo "    MSI:   target/wix/ferrogate-mia-${VERSION}-x64.msi"
 echo "    nupkg: target/nuget/ferrogate-mia.${VERSION}.nupkg"
+if [ -z "$WIN_SIGN_PFX" ]; then
+  echo ""
+  echo "NOTE: mia.exe and the MSI are UNSIGNED (no WIN_SIGN_PFX given). On Windows the"
+  echo "      helper API's default-on Authenticode caller check (helper.require_authenticode)"
+  echo "      refuses unsigned callers — 'mia test' step 5 will fail with 'untrusted-binary'."
+  echo "      Sign the build (WIN_SIGN_PFX=/path/to/codesign.pfx) or set"
+  echo "      helper.require_authenticode = false in mia.toml on the target hosts."
+fi

@@ -191,6 +191,20 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   fails exactly as before; the hint can only turn spurious misses into
   successes.
 
+- **Clearer guidance when an unsigned Windows `mia.exe` fails its own `mia
+  test`.** On Windows the helper API's caller check requires a valid
+  Authenticode signature by default (`helper.require_authenticode`), and the
+  `mia.exe` that `make pkg-win` produces is unsigned — so `mia test` step 5
+  (helper token mint) failed out of the box with `PermissionDenied`
+  (`untrusted-binary`), and self-trust does not bypass caller authentication.
+  Three things now make this diagnosable and fixable: the step-5 failure hint
+  names the `untrusted-binary` reason and the `helper.require_authenticode`
+  knob; the daemon warns at startup on Windows when its own binary fails
+  Authenticode while the check is enabled; and `make pkg-win` gained an
+  optional signing step (`WIN_SIGN_PFX=…`, plus `WIN_SIGN_PASS` / `WIN_SIGN_TS`)
+  that Authenticode-signs `mia.exe` and the MSI with `osslsigncode`, printing a
+  NOTE when the build is left unsigned.
+
 - **Clearer error when the Windows helper pipe is already owned by another
   `mia`.** Creating the first helper-pipe instance while the `mia` service (or
   any other instance) is already running failed with the bare, baffling `socket

@@ -853,6 +853,14 @@ fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
              after the daemon started, so its hash no longer matches), or the host SVID was \
              revoked ('svid-revoked')."
                 .to_string(),
+            "On Windows the out-of-the-box reason is 'untrusted-binary': with \
+             helper.require_authenticode on (the default) the daemon requires a valid \
+             Authenticode signature on every caller's image, and the mia.exe that `make \
+             pkg-win` produces is unsigned — self-trust covers only the allowlist, not \
+             caller authentication, so even this self-test is refused. Sign the client \
+             binaries and mia.exe (see WIN_SIGN_PFX in scripts/build-msi-amd64.sh), or set \
+             `helper.require_authenticode = false` in mia.toml and restart the mia service."
+                .to_string(),
             "If the reason is 'not-allowlisted' for some *other* caller, everything upstream \
              (socket, caller auth, host SVID, CRL gate) works — provision that caller with \
              `ferrogate allowlist set`, or enable allowlist.propose and approve the pending \
@@ -979,6 +987,9 @@ mod tests {
         let advice = mint_failure_advice(ErrorCode::PermissionDenied, ServerCrl::Fresh).join("\n");
         assert!(advice.contains("allowlist"));
         assert!(advice.contains("LocalDenied"));
+        // The Windows Authenticode refusal is named, with both remediations.
+        assert!(advice.contains("untrusted-binary"));
+        assert!(advice.contains("helper.require_authenticode = false"));
     }
 
     #[test]

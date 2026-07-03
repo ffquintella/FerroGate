@@ -161,7 +161,11 @@ yourself first.
 Past the pipe DACL, the daemon also authenticates each caller's *image*: by
 default it requires a valid **Authenticode** signature (the Code-Integrity
 analogue of the Linux IMA check). An unsigned caller — including an unsigned
-`mia.exe` running `mia test` — is refused as `untrusted-binary`. For
+`mia.exe` running `mia test` — is refused as `untrusted-binary`. Note that the
+stock `make pkg-win` build is unsigned, so this refusal happens out of the box;
+pass `WIN_SIGN_PFX=/path/to/codesign.pfx` to `make pkg-win` to sign `mia.exe`
+and the MSI (the daemon also warns at startup when its own image would fail the
+check it enforces). For
 environments that do not code-sign their binaries, set
 `helper.require_authenticode = false` (or `FERROGATE_HELPER_REQUIRE_AUTHENTICODE=0`);
 identity then rests on PID + image SHA-384 + RID, and `mia`'s self-trust still

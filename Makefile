@@ -364,6 +364,11 @@ endif
 # mia.exe is cross-compiled to x86_64-pc-windows-msvc with cargo-xwin. See
 # scripts/build-msi-amd64.sh. (The legacy NSIS source in crates/mia/nsis/ is no
 # longer used by this target.)
+#
+# Set WIN_SIGN_PFX=/path/to/codesign.pfx (plus WIN_SIGN_PASS / WIN_SIGN_TS as
+# needed) to Authenticode-sign mia.exe and the MSI. Unsigned builds trip the
+# helper API's default-on caller check on Windows (`helper.require_authenticode`)
+# and `mia test` step 5 fails with 'untrusted-binary' — see docs/mia.md.
 WIN_MSI   := target/wix/ferrogate-$(PKG_CRATE)-$(CARGO_VERSION)-x64.msi
 WIN_NUPKG := target/nuget/ferrogate-$(PKG_CRATE).$(CARGO_VERSION).nupkg
 pkg-win: ## Build the mia Windows MSI + Chocolatey/NuGet package in a linux/amd64 container (needs Docker)
