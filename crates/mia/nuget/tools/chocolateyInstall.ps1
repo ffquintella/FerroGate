@@ -37,12 +37,55 @@ try {
 Install-ChocolateyPath -PathToInstall $installDir -PathType 'Machine'
 
 # 3. Install the bundled MSI. The MSI lays down mia.exe and registers + starts
-#    the mia Windows service.
+#    the mia Windows service. Keep a verbose msiexec log next to Chocolatey's
+#    own logs: the MSI declares the service non-vital (a bare-MSI install must
+#    not hard-fail on service quirks), so this log is the only record of a
+#    failed InstallServices/StartServices action.
+$msiLog = Join-Path $env:ProgramData 'chocolatey\logs\ferrogate-mia.msi.install.log'
 $packageArgs = @{
     packageName    = 'ferrogate-mia'
     fileType       = 'msi'
     file           = Join-Path $toolsDir 'ferrogate-mia.msi'
-    silentArgs     = '/qn /norestart'
+    silentArgs     = "/qn /norestart /l*v `"$msiLog`""
     validExitCodes = @(0, 3010, 1641)
 }
 Install-ChocolateyInstallPackage @packageArgs
+
+# 4. Verify the MSI actually registered the service, and repair if it did not.
+#    ServiceInstall in the MSI is non-vital, so Windows Installer can report
+#    success while CreateService failed (e.g. a stale service still marked for
+#    deletion). mia.exe ships its own registration (`mia service install`,
+#    identical parameters), so use it as the authoritative fallback.
+$miaExe = Join-Path $installDir 'mia.exe'
+if (-not (Get-Service -Name 'mia' -ErrorAction SilentlyContinue)) {
+    Write-Warning "The MSI did not register the 'mia' service (see $msiLog); registering it via mia.exe..."
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $miaExe service install
+        if ($LASTEXITCODE -ne 0) {
+            throw "mia.exe service install failed with exit code $LASTEXITCODE."
+        }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
+# 5. Make sure the service is running (the MSI's StartServices is fire-and-
+#    forget). A start failure is a warning, not an error: on first install the
+#    config (mia.env / mia.toml) is typically laid down by the config-management
+#    agent right after this package, which then ensures the service is running.
+$svc = Get-Service -Name 'mia' -ErrorAction SilentlyContinue
+if (-not $svc) {
+    throw "The 'mia' service is still not registered after the fallback; see $msiLog."
+}
+if ($svc.Status -ne 'Running') {
+    try {
+        Start-Service -Name 'mia' -ErrorAction Stop
+        Write-Host "Started the 'mia' service."
+    } catch {
+        Write-Warning "The 'mia' service is registered but could not be started yet: $($_.Exception.Message)"
+    }
+} else {
+    Write-Host "The 'mia' service is registered and running."
+}

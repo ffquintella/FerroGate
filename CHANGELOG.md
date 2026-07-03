@@ -196,6 +196,19 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   mirror-image bug (`/delete` on an already-removed group) and is guarded the
   same way.
 
+- **The `ferrogate-mia` Chocolatey package now guarantees the `mia` service is
+  registered, and no longer masks a failed service registration.** The MSI
+  declares its `ServiceInstall` non-vital (a bare-MSI install must not
+  hard-fail on service quirks), so Windows Installer can report success even
+  when `CreateService` failed at runtime — leaving a "successful" install with
+  no `mia` service. `chocolateyInstall.ps1` now (a) passes `/l*v` to msiexec so
+  a verbose MSI log lands in `chocolatey\logs\ferrogate-mia.msi.install.log`,
+  (b) verifies the service exists after the MSI and, if not, registers it via
+  `mia.exe service install` (identical parameters), failing loudly if that also
+  fails, and (c) starts the service if it is not running, downgrading a start
+  failure to a warning (on first install the config is typically laid down by
+  the config-management agent right after the package).
+
 - **Child tokens no longer fail with `no key for kid host-…` after a `mia` or
   CMIS restart.** A host's child-token signing key (F09) has a `kid` derived
   from its composite public key, and two independent causes made that key
