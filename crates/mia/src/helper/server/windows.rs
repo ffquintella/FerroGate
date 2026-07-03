@@ -87,6 +87,14 @@ impl<A: CallerAuth> HelperServer<A> {
         self.shared.ledger.clone()
     }
 
+    /// `SHA-384` of the daemon's own executable (the self-trust digest), for the
+    /// allowlist-propose task's self-registration entry. `None` if the binary
+    /// could not be read at startup.
+    #[must_use]
+    pub fn self_sha(&self) -> Option<[u8; 48]> {
+        self.shared.self_sha
+    }
+
     /// The bound pipe name (for diagnostics / tests).
     #[must_use]
     pub fn socket_path(&self) -> &std::path::Path {

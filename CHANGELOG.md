@@ -10,6 +10,18 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **`mia` self-registers with CMIS at startup (allowlist.propose).** The
+  allowlist-propose task no longer waits for a local caller plus a full
+  interval before its first proposal: it now fires immediately at startup, and
+  every proposal carries a uid-wildcard entry for `mia`'s own binary — the
+  proposal-side mirror of the helper API's self-trust, which already permits
+  `mia` under any uid. A freshly provisioned host therefore appears in CMIS
+  (a bootstrap-adopted allowlist, or a queued proposal under
+  `CMIS_ALLOWLIST_PROPOSALS=off`) the moment its daemon attests, instead of
+  staying invisible until a caller happened to connect. Previously a new host
+  with `propose = true` proposed nothing at all until both a caller had been
+  observed and the 300 s interval had elapsed.
+
 - **Windows MSI + NuGet/Chocolatey packaging for `mia`, cross-built in a
   container.** `make pkg-win` no longer needs a Windows host: it cross-compiles
   `mia.exe` to `x86_64-pc-windows-msvc` with cargo-xwin in a `linux/amd64`

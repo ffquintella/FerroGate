@@ -379,11 +379,17 @@ delivery. See [allowlist-provisioning.md](allowlist-provisioning.md) for the ful
 workflow.
 
 **`allowlist.propose`** closes the bootstrap gap from the other direction. With
-it enabled the daemon periodically sends CMIS the local callers it has actually
-observed — every `(uid, binary SHA-384)` it authenticates, *granted or denied* —
-via the `ProposeAllowlist` RPC. Proposals carry the concrete observed uid; an
-operator may relax an approved entry to a wildcard (any user) where the uid is
-ephemeral — see [ADR-0002](adr/0002-allowlist-optional-uid.md). The proposal is signed by the host machine key
+it enabled the daemon sends CMIS the local callers it has actually observed —
+every `(uid, binary SHA-384)` it authenticates, *granted or denied* — via the
+`ProposeAllowlist` RPC. The first proposal goes out immediately at startup and
+always includes a **self-registration entry**: a uid-wildcard entry for `mia`'s
+own binary, mirroring the helper API's self-trust (which already permits `mia`
+under any uid). A freshly installed host therefore shows up in CMIS — as a
+bootstrap-adopted allowlist or a queued proposal, per policy below — as soon as
+its daemon starts, before any real caller has connected. Observed entries carry
+the concrete uid; an operator may relax an approved entry to a wildcard (any
+user) where the uid is ephemeral — see
+[ADR-0002](adr/0002-allowlist-optional-uid.md). The proposal is signed by the host machine key
 and accompanied by the host SVID, so CMIS can prove which attested host sent it
 (there is no mTLS; the SVID is the in-band proof). What CMIS does with it is set
 by its `CMIS_ALLOWLIST_PROPOSALS` policy:

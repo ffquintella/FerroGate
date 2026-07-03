@@ -343,13 +343,16 @@ pub struct AllowlistConfig {
     /// `cmis.spki_pin` and a successful attestation; a fetch failure is
     /// non-fatal and falls back to whatever is already at `path`.
     pub fetch: bool,
-    /// When `true`, the daemon periodically proposes the local callers it has
-    /// observed (granted *and* denied) to CMIS (the `ProposeAllowlist` RPC). On
-    /// a host with no allowlist yet CMIS may auto-adopt the first proposal
-    /// (first-use bootstrap); otherwise it queues it for operator review.
-    /// Requires `cmis.endpoint` + `cmis.spki_pin` and a host SVID. Opt-in
-    /// (default `false`) — enable it to let a fresh host bootstrap its own
-    /// allowlist instead of an operator hand-enumerating callers.
+    /// When `true`, the daemon proposes the local callers it has observed
+    /// (granted *and* denied) to CMIS (the `ProposeAllowlist` RPC). The first
+    /// proposal is sent immediately at startup and every proposal includes a
+    /// uid-wildcard self-registration entry for `mia`'s own binary, so a fresh
+    /// host becomes visible to CMIS before any caller connects. On a host with
+    /// no allowlist yet CMIS may auto-adopt the proposal (first-use bootstrap);
+    /// otherwise it queues it for operator review. Requires `cmis.endpoint` +
+    /// `cmis.spki_pin` and a host SVID. Opt-in (default `false`) — enable it to
+    /// let a fresh host bootstrap its own allowlist instead of an operator
+    /// hand-enumerating callers.
     pub propose: bool,
     /// How often (seconds) to propose the observed caller set when `propose` is
     /// enabled. `None` ⇒ [`DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS`].

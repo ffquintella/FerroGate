@@ -854,6 +854,14 @@ fn write_allowlist_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<
 /// host with no allowlist (TOFU) or queues it for operator review; see
 /// `ProposeAllowlist`.
 ///
+/// Every proposal also carries a *self-registration* entry for the daemon's own
+/// binary (`self_sha`, uid-wildcard — mirroring the helper API's self-trust,
+/// which already permits `mia` under any uid), and the first proposal is sent
+/// immediately at startup. A fresh host therefore registers itself with CMIS
+/// the moment it starts, before any real caller has connected — without this,
+/// a new host stayed invisible (no allowlist, no proposal) until both a caller
+/// appeared and a full interval elapsed.
+///
 /// Every precondition failure logs and returns without spawning — proposing is
 /// strictly opt-in best-effort. The SVID presented is the one obtained at
 /// startup; once it expires CMIS rejects further proposals until mia restarts
@@ -865,6 +873,7 @@ fn maybe_spawn_propose_task(
     host_spiffe_id: Option<&str>,
     host_jws: Option<String>,
     ledger: mia::helper::CallerLedger,
+    self_sha: Option<[u8; 48]>,
     propose_interval_secs: u64,
 ) {
     use ferro_sep::MachineKey as _;
@@ -900,14 +909,14 @@ fn maybe_spawn_propose_task(
     tokio::spawn(async move {
         let mut last_sent: Option<Vec<(u32, [u8; 48])>> = None;
         let mut ticker = tokio::time::interval(interval);
-        // The first tick fires immediately; skip it so we never propose before a
-        // caller has connected.
-        ticker.tick().await;
         loop {
+            // The first tick fires immediately: the initial proposal is the
+            // host's self-registration with CMIS, sent before any caller has
+            // connected.
             ticker.tick().await;
             let mut snapshot = ledger.snapshot();
-            if snapshot.is_empty() {
-                continue;
+            if snapshot.is_empty() && self_sha.is_none() {
+                continue; // nothing observed and no self entry to register
             }
             snapshot.sort_unstable();
             if last_sent.as_ref() == Some(&snapshot) {
@@ -916,15 +925,7 @@ fn maybe_spawn_propose_task(
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-            let mut entries: Vec<ferro_svid::AllowEntry> = snapshot
-                .iter()
-                // Proposals carry the concrete observed uid; relaxing an entry
-                // to a wildcard (uid = None) is an operator decision (ADR-0002).
-                .map(|(uid, bin)| ferro_svid::AllowEntry {
-                    uid: Some(*uid),
-                    bin_sha: hex::encode(bin),
-                })
-                .collect();
+            let mut entries = proposal_entries(&snapshot, self_sha);
             // Resolve + dial CMIS with fail-over for this round (re-resolving SRV
             // so a failed-over or rescaled cluster is followed); the one
             // connection serves both the live-allowlist fetch and the proposal.
@@ -1017,6 +1018,37 @@ fn maybe_spawn_propose_task(
     });
 }
 
+/// Build the entry set for one allowlist proposal: every observed caller with
+/// its concrete uid, plus a uid-wildcard entry for the daemon's own binary
+/// (`self_sha`) so the host registers itself with CMIS even before any caller
+/// has connected.
+///
+/// Observed entries carry the concrete uid; relaxing one to a wildcard
+/// (uid = None) is an operator decision (ADR-0002). The self entry is the one
+/// exception: the helper API's self-trust already permits `mia`'s own binary
+/// under any uid, so the wildcard grants nothing the daemon does not already
+/// enforce locally — it only makes that standing grant visible in CMIS.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn proposal_entries(
+    snapshot: &[(u32, [u8; 48])],
+    self_sha: Option<[u8; 48]>,
+) -> Vec<ferro_svid::AllowEntry> {
+    let mut entries: Vec<ferro_svid::AllowEntry> = snapshot
+        .iter()
+        .map(|(uid, bin)| ferro_svid::AllowEntry {
+            uid: Some(*uid),
+            bin_sha: hex::encode(bin),
+        })
+        .collect();
+    if let Some(sha) = self_sha {
+        entries.push(ferro_svid::AllowEntry {
+            uid: None,
+            bin_sha: hex::encode(sha),
+        });
+    }
+    entries
+}
+
 /// Interval between CRL pulls. CMIS republishes every 60 s and the helper-API
 /// mint gate tolerates 300 s + 60 s leeway, so pulling at the publish cadence
 /// keeps the cache fresh with margin for several consecutive failed pulls.
@@ -1088,6 +1120,8 @@ struct ReattestParams {
     allowlist_max_age_secs: i64,
     propose: bool,
     propose_interval: u64,
+    /// The daemon's own executable digest, for the proposal's self entry.
+    self_sha: Option<[u8; 48]>,
 }
 
 /// When startup attestation fails — CMIS unreachable, or (commonly) DNS/VPN not
@@ -1182,6 +1216,7 @@ fn spawn_reattest_task<A>(
                     Some(&spiffe_id),
                     Some(jws),
                     ledger,
+                    params.self_sha,
                     params.propose_interval,
                 );
             }
@@ -1332,6 +1367,7 @@ where
             host_spiffe_id.as_deref(),
             host_jws,
             server.ledger(),
+            server.self_sha(),
             config.allowlist_propose_interval(),
         );
     }
@@ -1354,6 +1390,7 @@ where
                     allowlist_max_age_secs: max_age,
                     propose: config.allowlist.propose,
                     propose_interval: config.allowlist_propose_interval(),
+                    self_sha: server.self_sha(),
                 },
                 clock.clone(),
             );
@@ -1510,7 +1547,35 @@ async fn shutdown_signal() {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod tests {
-    use super::host_uuid_from_spiffe_id;
+    use super::{host_uuid_from_spiffe_id, proposal_entries};
+
+    #[test]
+    fn proposal_carries_observed_uids_plus_wildcard_self_entry() {
+        let snapshot = vec![(1000, [0xAA; 48]), (503, [0xBB; 48])];
+        let entries = proposal_entries(&snapshot, Some([0xCC; 48]));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].uid, Some(1000));
+        assert_eq!(entries[0].bin_sha, hex::encode([0xAA; 48]));
+        assert_eq!(entries[1].uid, Some(503));
+        // The self entry is uid-wildcard, mirroring the helper API's self-trust.
+        assert_eq!(entries[2].uid, None);
+        assert_eq!(entries[2].bin_sha, hex::encode([0xCC; 48]));
+    }
+
+    #[test]
+    fn empty_ledger_still_yields_the_self_registration_entry() {
+        let entries = proposal_entries(&[], Some([0xCC; 48]));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uid, None);
+    }
+
+    #[test]
+    fn no_self_sha_yields_only_observed_entries() {
+        assert!(proposal_entries(&[], None).is_empty());
+        let entries = proposal_entries(&[(0, [0x11; 48])], None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uid, Some(0));
+    }
 
     #[test]
     fn extracts_host_uuid_from_spiffe_id() {
