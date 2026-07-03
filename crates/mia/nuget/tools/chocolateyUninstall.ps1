@@ -18,9 +18,17 @@ if ($keys.Count -eq 0) {
 }
 
 # 2. Drop the helper-API client group the installer created (mirrors NSIS).
-#    Non-fatal if it is already gone.
+#    Non-fatal if it is already gone. Stderr must not be redirected under
+#    ErrorActionPreference=Stop (it becomes a terminating error), so relax
+#    the preference around the net.exe call.
 Write-Host 'Removing the FerroGateClients local group...'
-& (Join-Path $env:SystemRoot 'System32\net.exe') localgroup FerroGateClients /delete 2>&1 | Out-Null
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & (Join-Path $env:SystemRoot 'System32\net.exe') localgroup FerroGateClients /delete *> $null
+} finally {
+    $ErrorActionPreference = $prevEap
+}
 
 # The PATH entry added via Install-ChocolateyPath is removed by Chocolatey
 # automatically when the package is uninstalled.

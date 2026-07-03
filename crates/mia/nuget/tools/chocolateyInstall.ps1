@@ -6,13 +6,31 @@ $installDir = Join-Path $env:ProgramFiles 'FerroGate\MIA'
 #    the service (started by the MSI) finds it when it binds the named pipe.
 #    The default config (helper.windows_group = "FerroGateClients") restricts the
 #    pipe DACL to this group; without it the daemon cannot resolve the SID. Add
-#    vetted client accounts to this group so they may request tokens. `net
-#    localgroup /add` is non-zero if the group already exists - that is fine.
+#    vetted client accounts to this group so they may request tokens.
 #    net.exe is referenced by absolute path: config-management agents (Puppet,
 #    SCCM) run choco with a minimal PATH that may not contain System32.
+#    NOTE: do NOT redirect net.exe stderr (2>&1) here - under
+#    ErrorActionPreference=Stop that turns stderr output (e.g. system error
+#    1379, "group already exists") into a terminating error. Instead, probe
+#    for the group first and only create it when missing.
 $netExe = Join-Path $env:SystemRoot 'System32\net.exe'
 Write-Host 'Ensuring the FerroGateClients local group exists...'
-& $netExe localgroup FerroGateClients /add /comment:"FerroGate MIA helper-API clients" 2>&1 | Out-Null
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $netExe localgroup FerroGateClients *> $null
+    if ($LASTEXITCODE -ne 0) {
+        & $netExe localgroup FerroGateClients /add /comment:"FerroGate MIA helper-API clients" *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create the FerroGateClients local group (net.exe exit code $LASTEXITCODE)."
+        }
+        Write-Host 'Created local group FerroGateClients.'
+    } else {
+        Write-Host 'Local group FerroGateClients already exists.'
+    }
+} finally {
+    $ErrorActionPreference = $prevEap
+}
 
 # 2. Add the install dir to the system PATH (Chocolatey records it for clean
 #    removal on uninstall).

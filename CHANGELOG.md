@@ -183,6 +183,19 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   'net.exe' is not recognized`, aborting the install before the MSI step runs.
   Both scripts now resolve `net.exe` via `$env:SystemRoot\System32\net.exe`.
 
+- **The `ferrogate-mia` Chocolatey package no longer fails when the
+  `FerroGateClients` group already exists.** `chocolateyInstall.ps1` ran `net
+  localgroup FerroGateClients /add` with its stderr redirected (`2>&1`);
+  under `$ErrorActionPreference = 'Stop'` PowerShell turns a native command's
+  stderr output into a terminating error, so on hosts where the group was
+  left behind by a previous install the script aborted with `Erro de sistema
+  1379` ("the specified local group already exists") before the MSI step ran.
+  The install script now probes for the group and only creates it when
+  missing, checking `$LASTEXITCODE` explicitly with the error preference
+  relaxed around the `net.exe` calls; `chocolateyUninstall.ps1` had the
+  mirror-image bug (`/delete` on an already-removed group) and is guarded the
+  same way.
+
 - **Child tokens no longer fail with `no key for kid host-…` after a `mia` or
   CMIS restart.** A host's child-token signing key (F09) has a `kid` derived
   from its composite public key, and two independent causes made that key
