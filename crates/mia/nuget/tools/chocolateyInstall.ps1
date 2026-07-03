@@ -7,9 +7,12 @@ $installDir = Join-Path $env:ProgramFiles 'FerroGate\MIA'
 #    The default config (helper.windows_group = "FerroGateClients") restricts the
 #    pipe DACL to this group; without it the daemon cannot resolve the SID. Add
 #    vetted client accounts to this group so they may request tokens. `net
-#    localgroup /add` is non-zero if the group already exists — that is fine.
-Write-Host 'Ensuring the FerroGateClients local group exists…'
-& net.exe localgroup FerroGateClients /add /comment:"FerroGate MIA helper-API clients" 2>&1 | Out-Null
+#    localgroup /add` is non-zero if the group already exists - that is fine.
+#    net.exe is referenced by absolute path: config-management agents (Puppet,
+#    SCCM) run choco with a minimal PATH that may not contain System32.
+$netExe = Join-Path $env:SystemRoot 'System32\net.exe'
+Write-Host 'Ensuring the FerroGateClients local group exists...'
+& $netExe localgroup FerroGateClients /add /comment:"FerroGate MIA helper-API clients" 2>&1 | Out-Null
 
 # 2. Add the install dir to the system PATH (Chocolatey records it for clean
 #    removal on uninstall).

@@ -173,6 +173,16 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   actionable message naming the cause (another instance already running; stop
   the service first). All other errors and subsequent pipe instances are
   unchanged.
+
+- **The `ferrogate-mia` Chocolatey package no longer fails to install under a
+  service account with a minimal `PATH`.** Both `chocolateyInstall.ps1` and
+  `chocolateyUninstall.ps1` invoked `net.exe` by bare name, which PowerShell
+  resolves via `PATH`; when Chocolatey is driven by a config-management agent
+  (e.g. Puppet running as a Windows service) rather than an interactive admin
+  shell, `PATH` may not include `System32` and the call fails with `The term
+  'net.exe' is not recognized`, aborting the install before the MSI step runs.
+  Both scripts now resolve `net.exe` via `$env:SystemRoot\System32\net.exe`.
+
 - **Child tokens no longer fail with `no key for kid host-…` after a `mia` or
   CMIS restart.** A host's child-token signing key (F09) has a `kid` derived
   from its composite public key, and two independent causes made that key
