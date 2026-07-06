@@ -136,6 +136,16 @@ fn restrict_caps_to_ipc_lock() -> Result<(), HardenError> {
 
     let cap_err = |e: caps::errors::CapsError| HardenError::Capabilities(e.to_string());
 
+    // Dropping a capability from the bounding set (PR_CAPBSET_DROP) requires
+    // CAP_SETPCAP in the caller's *effective* set. When [`drop_privileges`] ran
+    // first, its setuid() away from root cleared the effective set — PR_SET_KEEPCAPS
+    // preserves only the *permitted* set — so CAP_SETPCAP, though still permitted,
+    // is no longer effective and the drops below would fail with EPERM. Re-raise
+    // it (alongside the CAP_IPC_LOCK we mean to retain) before trimming the set.
+    let mut working = keep.clone();
+    working.insert(Capability::CAP_SETPCAP);
+    caps::set(None, CapSet::Effective, &working).map_err(cap_err)?;
+
     // Drop everything except CAP_IPC_LOCK from the bounding set so it can never
     // be re-acquired.
     let bounding = caps::read(None, CapSet::Bounding).map_err(cap_err)?;
@@ -145,8 +155,11 @@ fn restrict_caps_to_ipc_lock() -> Result<(), HardenError> {
         }
     }
 
-    caps::set(None, CapSet::Permitted, &keep).map_err(cap_err)?;
+    // Collapse to exactly {CAP_IPC_LOCK}, which also sheds the CAP_SETPCAP raised
+    // just above. Lower effective before permitted: the kernel requires the
+    // effective set to remain a subset of the permitted set at all times.
     caps::set(None, CapSet::Effective, &keep).map_err(cap_err)?;
+    caps::set(None, CapSet::Permitted, &keep).map_err(cap_err)?;
     caps::set(None, CapSet::Inheritable, &HashSet::new()).map_err(cap_err)?;
     caps::clear(None, CapSet::Ambient).map_err(cap_err)?;
     Ok(())
@@ -411,6 +424,57 @@ mod tests {
                 libc::SIGSYS,
                 "child should die from SIGSYS (seccomp), got signal {}",
                 libc::WTERMSIG(status)
+            );
+        }
+    }
+
+    // Regression for the crash-loop observed in production: after the setuid()
+    // in `drop_privileges` clears the effective set (KEEPCAPS keeps only the
+    // permitted set), `restrict_caps_to_ipc_lock` must re-raise CAP_SETPCAP
+    // before PR_CAPBSET_DROP — otherwise the bounding-set trim fails with EPERM
+    // ("PR_CAPBSET_DROP failure: Operation not permitted"). We reproduce that
+    // exact precondition (effective emptied, permitted intact) and assert the
+    // trim now succeeds, leaving effective == {CAP_IPC_LOCK}.
+    //
+    // Needs root (only a privileged process holds CAP_SETPCAP in its permitted
+    // set); skipped otherwise, like the swtpm integration tests.
+    #[test]
+    fn restrict_caps_recovers_setpcap_after_cleared_effective() {
+        if !is_root() {
+            eprintln!("not root; skipping capability-restriction regression test");
+            return;
+        }
+        // The bounding-set drop is irreversible for the process, so isolate it
+        // in a forked child rather than poisoning sibling tests.
+        //
+        // SAFETY: fork() in a test. The child only reads/writes its own
+        // capability sets and then _exit()s; it does not touch shared test
+        // state. (As with `seccomp_enforce_kills_forbidden_syscall`, this forks
+        // from a possibly-threaded harness; the child avoids other threads'
+        // state entirely.)
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", last_os_error());
+
+        if pid == 0 {
+            // Child: empty the effective set (mimics the post-setuid state),
+            // then run the real restriction and verify the final effective set.
+            let empty: HashSet<Capability> = HashSet::new();
+            let ok = caps::set(None, CapSet::Effective, &empty).is_ok()
+                && restrict_caps_to_ipc_lock().is_ok()
+                && caps::read(None, CapSet::Effective).is_ok_and(|e| {
+                    e.len() == 1 && e.contains(&Capability::CAP_IPC_LOCK)
+                });
+            // SAFETY: _exit is async-signal-safe.
+            unsafe { libc::_exit(i32::from(!ok)) };
+        } else {
+            let mut status: libc::c_int = 0;
+            // SAFETY: waitpid on our own child.
+            let w = unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert_eq!(w, pid, "waitpid failed: {}", last_os_error());
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "restrict_caps_to_ipc_lock must recover CAP_SETPCAP into the \
+                 effective set before PR_CAPBSET_DROP; child status={status:#x}"
             );
         }
     }

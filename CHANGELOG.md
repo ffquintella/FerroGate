@@ -8,6 +8,19 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+### Fixed
+
+- **`mia` crash-loop on Linux during privilege-drop hardening
+  (`PR_CAPBSET_DROP failure: Operation not permitted`).** When `mia` started as
+  root and dropped to the non-root `_ferrogate` service user, the `setuid()`
+  cleared the effective capability set (`PR_SET_KEEPCAPS` preserves only the
+  *permitted* set), so the subsequent bounding-set trim — which needs
+  `CAP_SETPCAP` in the *effective* set — failed with `EPERM`, the hardening step
+  aborted, and systemd restarted the agent in a tight loop (it never attested).
+  `ferro-harden` now re-raises `CAP_SETPCAP` into the effective set before
+  `PR_CAPBSET_DROP` and collapses to `{CAP_IPC_LOCK}` afterwards. Any Linux host
+  running as root with the default non-root privilege drop was affected.
+
 ### Added
 
 - **In-process software virtual TPM for TPM-less dev/test hosts.** A new
