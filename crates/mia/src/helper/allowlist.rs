@@ -22,6 +22,18 @@ pub use ferro_svid::allowlist::{
     ALLOWLIST_SIGNING_CONTEXT, BIN_SHA_WILDCARD,
 };
 
+/// Clock-skew tolerance applied to the allowlist not-before (`issued_at`)
+/// check (seconds).
+///
+/// CMIS timestamps the allowlist from its own clock; if that clock runs a
+/// hair ahead of this host, a freshly fetched allowlist can carry an
+/// `issued_at` a fraction of a second in the future, and a strict
+/// `now < issued_at` test would reject it as `NotYetValid` and fail closed
+/// (deny every caller) until the next re-attestation. Tolerating a small
+/// future skew here mirrors [`crate::helper::crl::CRL_FRESHNESS_LEEWAY_SECS`]
+/// on the CRL freshness gate.
+pub const ALLOWLIST_NOT_BEFORE_LEEWAY_SECS: i64 = 60;
+
 /// How an allowlisted binary is gated on the caller's uid (ADR-0002).
 #[derive(Debug, Clone)]
 enum UidScope {
@@ -88,7 +100,10 @@ impl Allowlist {
     ///
     /// `trusted` is the CMIS enrollment public key; `now` is the reference
     /// clock; `max_age_secs` bounds how stale the file may be (`issued_at`).
-    /// Any failure is fatal and fails closed.
+    /// The not-before check tolerates up to
+    /// [`ALLOWLIST_NOT_BEFORE_LEEWAY_SECS`] of forward clock skew so a freshly
+    /// signed allowlist is not spuriously rejected. Any failure is fatal and
+    /// fails closed.
     pub fn load(
         bytes: &[u8],
         trusted: &CompositePublicKey,
@@ -99,7 +114,11 @@ impl Allowlist {
         // Signature is checked before the body is parsed/trusted.
         let doc = ferro_svid::allowlist::verify(&signed, trusted)?;
 
-        if now < doc.issued_at {
+        // Tolerate a small clock skew: CMIS may stamp `issued_at` a fraction
+        // of a second ahead of this host's clock, and a strict check would
+        // reject the fresh allowlist and fail closed. See
+        // `ALLOWLIST_NOT_BEFORE_LEEWAY_SECS`.
+        if now < doc.issued_at - ALLOWLIST_NOT_BEFORE_LEEWAY_SECS {
             return Err(AllowlistError::NotYetValid);
         }
         if now > doc.not_after {
@@ -408,6 +427,43 @@ mod tests {
         // within not_after (issued 1000, not_after 4600) but issued long ago.
         let err = Allowlist::load(&bytes, &pk, 4000, 60).unwrap_err();
         assert!(matches!(err, AllowlistError::TooOld));
+    }
+
+    /// A freshly signed allowlist whose `issued_at` is a hair in the future
+    /// (CMIS clock slightly ahead of this host) is accepted within the skew
+    /// leeway, rather than failing closed as `NotYetValid`.
+    #[test]
+    fn small_future_skew_is_tolerated() {
+        let (sk, pk) = keypair();
+        // issued_at = 1000, verified at 999 (1s before) — inside the leeway.
+        let bytes = signed_bytes(&doc(1000), &sk);
+        let al = Allowlist::load(&bytes, &pk, 999, 86_400).unwrap();
+        assert!(al.permits(1001, &[0xAA; 48]));
+        // At exactly the leeway boundary it is still accepted.
+        let al = Allowlist::load(
+            &bytes,
+            &pk,
+            1000 - ALLOWLIST_NOT_BEFORE_LEEWAY_SECS,
+            86_400,
+        )
+        .unwrap();
+        assert!(al.permits(1001, &[0xAA; 48]));
+    }
+
+    /// A `issued_at` further in the future than the skew leeway is still
+    /// rejected as `NotYetValid` (a genuinely not-yet-valid file).
+    #[test]
+    fn large_future_skew_is_rejected() {
+        let (sk, pk) = keypair();
+        let bytes = signed_bytes(&doc(1000), &sk);
+        let err = Allowlist::load(
+            &bytes,
+            &pk,
+            1000 - ALLOWLIST_NOT_BEFORE_LEEWAY_SECS - 1,
+            86_400,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AllowlistError::NotYetValid));
     }
 
     #[test]

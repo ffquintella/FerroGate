@@ -176,6 +176,18 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **Clock-skew race rejected a freshly signed allowlist as "not yet valid",
+  putting the helper API in deny-all.** `mia` verifies the CMIS-signed caller
+  allowlist with a strict not-before check (`now < issued_at`). When the CMIS
+  clock ran a hair ahead of the host, a just-fetched allowlist carried an
+  `issued_at` a fraction of a second in the future, so verification failed
+  `NotYetValid` and the helper socket fell to fail-closed (deny every caller —
+  no wildcard or exact-hash entry could admit anyone) until the next
+  re-attestation. The not-before check now tolerates up to
+  `ALLOWLIST_NOT_BEFORE_LEEWAY_SECS` (60 s) of forward skew, mirroring the
+  CRL freshness gate's existing `CRL_FRESHNESS_LEEWAY_SECS`; a genuinely
+  future-dated allowlist beyond the leeway is still rejected.
+
 - **Cross-node `no key for kid host-…` on HA CMIS clusters — JWKS on-miss
   rehydrate.** A host's child-token signing key was published into the JWKS
   only by the CMIS replica that witnessed its attestation
