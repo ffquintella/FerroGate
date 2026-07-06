@@ -6,14 +6,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Optional extra cargo features for the packaged binary (e.g. "virtual-tpm").
+# Passed through from `make pkg-rpm MIA_FEATURES=...`; empty by default.
+MIA_FEATURES="${MIA_FEATURES:-}"
+
 docker run --rm --platform linux/amd64 \
   -v "$PWD":/work -w /work \
   -e CARGO_TERM_COLOR=always \
+  -e MIA_FEATURES="$MIA_FEATURES" \
   rust:bookworm bash -euo pipefail -c '
     apt-get update -qq
     apt-get install -y -qq libtss2-dev pkg-config protobuf-compiler >/dev/null
     cargo install cargo-generate-rpm --quiet
-    cargo build --release -p mia --bin mia
+    cargo build --release -p mia --bin mia ${MIA_FEATURES:+--features "$MIA_FEATURES"}
     strip target/release/mia
     cargo generate-rpm -p crates/mia -a x86_64
   '

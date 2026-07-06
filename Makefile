@@ -336,6 +336,18 @@ PKG_CRATE := mia
 # RPM/DEB ship for amd64 only; mia links the x86_64 Linux TPM ESAPI stack.
 RPM_ARCH  := x86_64
 
+# Optional extra cargo features compiled into the packaged mia binary
+# (space- or comma-separated). Empty by default so release packages ship the
+# production build. Example:
+#
+#   make pkg-rpm MIA_FEATURES=virtual-tpm
+#
+# bundles the in-process software virtual TPM (INSECURE, dev/test only — see
+# docs/mia.md "Attestation backend"). The daemon still uses it only when
+# `attestation.backend = "virtual-tpm"` is set.
+MIA_FEATURES ?=
+CARGO_FEATURE_FLAG := $(if $(strip $(MIA_FEATURES)),--features $(MIA_FEATURES),)
+
 pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
 	cargo install cargo-deb cargo-generate-rpm
 	@echo "NOTE: the Windows MSI + NuGet package build in a linux/amd64 container ('make pkg-win'); only Docker is required."
@@ -349,13 +361,13 @@ pkg-deb: ## Build the mia .deb package (Linux; needs cargo-deb)
 pkg-rpm: ## Build the mia .rpm package for x86_64/amd64 (Fedora/RHEL/SUSE)
 ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
 	@command -v cargo-generate-rpm >/dev/null 2>&1 || { echo "ERROR: cargo-generate-rpm not found — run 'make pkg-tools'"; exit 1; }
-	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE)
+	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE) $(CARGO_FEATURE_FLAG)
 	strip target/release/$(PKG_CRATE)
 	cargo generate-rpm -p crates/$(PKG_CRATE) -a $(RPM_ARCH)
 	@echo "==> $(RPM_ARCH) .rpm written under target/generate-rpm/"
 else
 	@echo "==> host is $(UNAME_S)/$(HOST_ARCH), not Linux/x86_64; building the amd64 .rpm in a linux/amd64 container"
-	./scripts/build-rpm-amd64.sh
+	MIA_FEATURES="$(MIA_FEATURES)" ./scripts/build-rpm-amd64.sh
 endif
 
 # The Windows artifacts are cross-built in a linux/amd64 container (no Windows

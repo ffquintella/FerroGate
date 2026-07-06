@@ -50,3 +50,9 @@ pub mod tpm;
 /// PCR-bound sealing of the SVID cache (feature F04). Linux-only.
 #[cfg(target_os = "linux")]
 pub mod seal;
+
+/// In-process software **virtual TPM** for TPM-less dev/test hosts (macOS,
+/// Windows, CI). INSECURE — never for production. Behind the off-by-default
+/// `virtual-tpm` cargo feature; cross-platform (no TSS2 stack needed).
+#[cfg(feature = "virtual-tpm")]
+pub mod virtual_tpm;

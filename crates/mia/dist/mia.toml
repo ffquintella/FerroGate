@@ -86,3 +86,13 @@
 [attestation]
 # Override the IMA runtime-measurement log path.
 #ima_log = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements"
+
+# Attestation backend. Default "host-key" (TPM-less profile: hardware
+# fingerprint + machine signing key), works on every platform.
+#
+# "virtual-tpm" runs the full TPM attestation handshake against an INSECURE
+# in-process software TPM — dev/test only, and only when the daemon was built
+# with the `virtual-tpm` cargo feature (a release build refuses it, fail
+# closed). It only succeeds against a CMIS configured to trust the software
+# EK root and PCR digest logged at startup. Never use in production.
+#backend = "host-key"

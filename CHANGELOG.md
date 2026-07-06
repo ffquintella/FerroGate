@@ -10,6 +10,20 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Added
 
+- **In-process software virtual TPM for TPM-less dev/test hosts.** A new
+  `mia::virtual_tpm::VirtualTpm` implements the `AttestEvidence` contract in pure
+  Rust, so the full four-phase TPM attestation handshake can run on any OS
+  (macOS, Windows, CI) without a real TPM or `swtpm` — unlike `mia::tpm`, which
+  is Linux-only and needs hardware. It emits wire-correct TPM 2.0 structures the
+  CMIS-side verifier accepts, persists a stable synthetic EK/AIK identity, and is
+  gated behind the off-by-default `virtual-tpm` cargo feature. The daemon selects
+  it only via `attestation.backend = "virtual-tpm"` (env `FERROGATE_ATTEST_BACKEND`);
+  a build without the feature refuses that backend and fails closed. It is
+  **insecure by construction** (no hardware root of trust) and for dev/test only.
+  `make pkg-rpm MIA_FEATURES=virtual-tpm` builds an RPM with the feature compiled
+  in. The two integration-test mocks were de-duplicated onto this module. See
+  docs/mia.md "Attestation backend".
+
 - **`mia` self-registers with CMIS at startup (allowlist.propose).** The
   allowlist-propose task no longer waits for a local caller plus a full
   interval before its first proposal: it now fires immediately at startup, and

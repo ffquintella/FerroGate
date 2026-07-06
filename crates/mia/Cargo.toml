@@ -19,6 +19,14 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# INSECURE, dev/test only. Compiles in the in-process software `virtual_tpm`
+# module so the TPM attestation handshake can run on hosts without a real TPM
+# or `swtpm` (macOS, Windows, CI). Off by default; even when built in, the
+# daemon uses it only when `attestation.backend = "virtual-tpm"` is set. Never
+# enable for a production build.
+virtual-tpm = ["dep:p256", "dep:rcgen"]
+
 [dependencies]
 ferro-crypto    = { path = "../ferro-crypto" }
 ferro-transport = { path = "../ferro-transport" }
@@ -53,7 +61,16 @@ base64             = { workspace = true }
 inquire            = { workspace = true }
 toml               = { workspace = true }
 
+# Enabled only by the off-by-default `virtual-tpm` feature (software TPM for
+# TPM-less dev/test hosts). Both are pure-Rust and build on every platform.
+p256               = { workspace = true, optional = true }
+rcgen              = { workspace = true, optional = true }
+
 [dev-dependencies]
+# Self dev-dependency with `virtual-tpm` on: this turns the feature on for the
+# crate's own test targets (so the software TPM is available to integration
+# tests) without enabling it for normal `cargo build` / release builds.
+mia               = { path = ".", features = ["virtual-tpm"] }
 cmis              = { path = "../cmis" }
 ferro-raft        = { path = "../ferro-raft" }
 ferro-svid        = { path = "../ferro-svid" }

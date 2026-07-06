@@ -365,6 +365,26 @@ pub struct AllowlistConfig {
 pub struct AttestationConfig {
     /// Override the IMA runtime-measurement log path.
     pub ima_log: Option<PathBuf>,
+    /// Which attestation backend the daemon uses to obtain its host SVID.
+    /// Defaults to [`AttestBackend::HostKey`].
+    pub backend: AttestBackend,
+}
+
+/// Which backend `mia` attests with to obtain its host SVID.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttestBackend {
+    /// The TPM-less **host-key** profile (feature F15): a hardware fingerprint
+    /// plus a machine signing key. The production default; works on every
+    /// supported platform.
+    #[default]
+    HostKey,
+    /// The in-process software **virtual TPM** — INSECURE, dev/test only. Runs
+    /// the full TPM attestation handshake against a specially-configured dev
+    /// CMIS. Requires `mia` to be built with the `virtual-tpm` cargo feature;
+    /// a daemon built without it refuses to attest (fail closed) when this is
+    /// selected.
+    VirtualTpm,
 }
 
 /// Which environment-variable overrides [`Config::apply_env`] overlays.
@@ -537,6 +557,15 @@ impl Config {
         }
         if let Some(v) = get("FERROGATE_IMA_LOG") {
             self.attestation.ima_log = Some(PathBuf::from(v));
+        }
+        if let Some(v) = get("FERROGATE_ATTEST_BACKEND") {
+            self.attestation.backend = match v.trim().to_ascii_lowercase().as_str() {
+                "host-key" => AttestBackend::HostKey,
+                "virtual-tpm" => AttestBackend::VirtualTpm,
+                other => anyhow::bail!(
+                    "FERROGATE_ATTEST_BACKEND must be \"host-key\" or \"virtual-tpm\", got {other:?}"
+                ),
+            };
         }
         Ok(())
     }
@@ -790,6 +819,7 @@ mod tests {
 
             [attestation]
             ima_log = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements"
+            backend = "virtual-tpm"
         "#;
         let c = Config::from_toml(toml).unwrap();
         assert_eq!(c.log_directive(), "mia=debug,info");
@@ -808,6 +838,13 @@ mod tests {
             Some(Path::new("/etc/ferrogate/allowlist.pub"))
         );
         assert!(c.attestation.ima_log.is_some());
+        assert_eq!(c.attestation.backend, AttestBackend::VirtualTpm);
+    }
+
+    #[test]
+    fn attestation_backend_defaults_to_host_key() {
+        let c = Config::from_toml("").unwrap();
+        assert_eq!(c.attestation.backend, AttestBackend::HostKey);
     }
 
     #[test]

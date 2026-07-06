@@ -689,12 +689,13 @@ fn restrict_to_owner(path: &std::path::Path) -> std::io::Result<()> {
 /// cryptographic core is already proven by `ferro-sep`'s live test.
 #[allow(clippy::too_many_lines)] // linear bootstrap: dial → attest → build minter
 #[allow(clippy::large_futures)] // holds a composite key (~4 KB ML-DSA) across awaits
-async fn bootstrap_host_svid(resolver: &mia::endpoint::CmisResolver) -> Option<HostSession> {
+async fn bootstrap_host_svid_host_key(
+    resolver: &mia::endpoint::CmisResolver,
+) -> Option<HostSession> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use ferro_sep::MachineKey as _;
-    use mia::helper::{ChildTokenMinter, MinterConfig};
-    use sha2::{Digest, Sha256, Sha384};
+    use sha2::{Digest, Sha256};
 
     let facts = match ferro_machineid::collect_facts() {
         Ok(f) => f,
@@ -753,6 +754,40 @@ async fn bootstrap_host_svid(resolver: &mia::endpoint::CmisResolver) -> Option<H
             }
         };
 
+    tracing::info!(
+        spiffe_id = %attested.bundle.spiffe_id,
+        fingerprint = %facts.fingerprint().to_hex(),
+        cmis = %endpoint,
+        "host SVID obtained via host-key attestation; token minting enabled"
+    );
+    Some(host_session_from_attested(attested))
+}
+
+/// Dispatch host-SVID bootstrap to the configured attestation backend.
+///
+/// The default `host-key` profile ([`bootstrap_host_svid_host_key`]) works on
+/// every platform. The `virtual-tpm` backend is a dev/test-only software TPM
+/// ([`bootstrap_host_svid_virtual_tpm`]) and requires the `virtual-tpm` cargo
+/// feature; a build without it refuses to attest (fail closed) when selected.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[allow(clippy::large_futures)] // attestation future holds a composite key
+async fn bootstrap_host_svid(
+    resolver: &mia::endpoint::CmisResolver,
+    backend: mia::config::AttestBackend,
+) -> Option<HostSession> {
+    match backend {
+        mia::config::AttestBackend::HostKey => bootstrap_host_svid_host_key(resolver).await,
+        mia::config::AttestBackend::VirtualTpm => bootstrap_host_svid_virtual_tpm(resolver).await,
+    }
+}
+
+/// Build the running [`HostSession`] (token minter + host identity) from a
+/// completed attestation, regardless of which backend produced it.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn host_session_from_attested(attested: mia::client::AttestedSvid) -> HostSession {
+    use mia::helper::{ChildTokenMinter, MinterConfig};
+    use sha2::{Digest, Sha384};
+
     let mut parent = [0u8; 48];
     parent.copy_from_slice(&Sha384::digest(attested.bundle.jws.as_bytes()));
     let cfg = MinterConfig {
@@ -760,17 +795,98 @@ async fn bootstrap_host_svid(resolver: &mia::endpoint::CmisResolver) -> Option<H
         parent_svid_sha384: parent,
         kid: ferro_svid::child_signing_kid(&attested.svid_public),
     };
-    tracing::info!(
-        spiffe_id = %attested.bundle.spiffe_id,
-        fingerprint = %facts.fingerprint().to_hex(),
-        cmis = %endpoint,
-        "host SVID obtained via host-key attestation; token minting enabled"
-    );
-    Some(HostSession {
+    HostSession {
         spiffe_id: attested.bundle.spiffe_id.clone(),
         jws: attested.bundle.jws.clone(),
         minter: ChildTokenMinter::new(attested.svid_secret, cfg),
-    })
+    }
+}
+
+/// Resolve where the virtual TPM's persistent identity lives — beside the
+/// machine signing key, so its synthetic EK/AIK is stable across restarts.
+#[cfg(feature = "virtual-tpm")]
+fn virtual_tpm_path() -> std::path::PathBuf {
+    mia::config::system_config_path().parent().map_or_else(
+        || std::path::PathBuf::from("mia-virtual-tpm.json"),
+        |d| d.join("virtual-tpm.json"),
+    )
+}
+
+/// Bootstrap the host SVID via the in-process software **virtual TPM** — the
+/// full four-phase TPM handshake, off real hardware. INSECURE; dev/test only.
+///
+/// This only succeeds against a CMIS configured to trust the synthetic EK root
+/// and approve the synthetic PCR digest (both logged at startup) and to use a
+/// matching software credential channel. A production CMIS rejects it.
+#[cfg(feature = "virtual-tpm")]
+#[allow(clippy::large_futures)] // attestation future holds a composite key
+async fn bootstrap_host_svid_virtual_tpm(
+    resolver: &mia::endpoint::CmisResolver,
+) -> Option<HostSession> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use mia::virtual_tpm::{expected_pcr_digest, VirtualTpm};
+    use sha2::{Digest, Sha256, Sha384};
+
+    tracing::warn!(
+        "attestation.backend = \"virtual-tpm\": using the INSECURE in-process software TPM \
+         (no hardware root of trust). For dev/test only — never production."
+    );
+
+    let path = virtual_tpm_path();
+    let mut vtpm = match VirtualTpm::open_or_create(&path) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, path = %path.display(), "cannot open virtual-TPM state");
+            return None;
+        }
+    };
+    tracing::info!(
+        ek_root_sha384 = %hex::encode(Sha384::digest(vtpm.ek_root_der())),
+        pcr_digest_sha384 = %hex::encode(expected_pcr_digest()),
+        "virtual-TPM identity ready (CMIS must trust this EK root and approve this PCR digest)"
+    );
+
+    let dpop_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(vtpm.aik_public_marshaled()));
+
+    let (endpoint, mut client) = match resolver.connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, cmis = %resolver.describe(), "could not connect to CMIS for attestation");
+            return None;
+        }
+    };
+    let attested = match mia::client::run_attest(&mut client, &mut vtpm, dpop_jkt).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "virtual-TPM attestation failed");
+            return None;
+        }
+    };
+    tracing::info!(
+        spiffe_id = %attested.bundle.spiffe_id,
+        cmis = %endpoint,
+        "host SVID obtained via virtual-TPM attestation; token minting enabled"
+    );
+    Some(host_session_from_attested(attested))
+}
+
+/// Fallback when the daemon was built without the `virtual-tpm` feature but the
+/// config selects that backend: refuse to attest rather than silently fall back
+/// to a different identity path (fail closed).
+#[cfg(all(
+    not(feature = "virtual-tpm"),
+    any(target_os = "linux", target_os = "macos", windows)
+))]
+async fn bootstrap_host_svid_virtual_tpm(
+    _resolver: &mia::endpoint::CmisResolver,
+) -> Option<HostSession> {
+    tracing::error!(
+        "attestation.backend = \"virtual-tpm\" but mia was built without the `virtual-tpm` cargo \
+         feature; refusing to attest (fail closed). Rebuild with `--features virtual-tpm` for \
+         dev/test, or set attestation.backend = \"host-key\"."
+    );
+    None
 }
 
 /// The outcome of a successful host attestation: the token minter the helper API
@@ -1147,6 +1263,8 @@ struct ReattestParams {
     propose_interval: u64,
     /// The daemon's own executable digest, for the proposal's self entry.
     self_sha: Option<[u8; 48]>,
+    /// Which attestation backend the background re-attestation uses.
+    backend: mia::config::AttestBackend,
 }
 
 /// When startup attestation fails — CMIS unreachable, or (commonly) DNS/VPN not
@@ -1181,7 +1299,7 @@ fn spawn_reattest_task<A>(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let Some(session) = bootstrap_host_svid(&resolver).await else {
+            let Some(session) = bootstrap_host_svid(&resolver, params.backend).await else {
                 continue; // the failure is logged inside bootstrap; retry next tick
             };
             let spiffe_id = session.spiffe_id.clone();
@@ -1309,7 +1427,7 @@ where
     // token minter. When CMIS isn't configured or attestation fails, there is no
     // session — the helper API still serves but refuses to mint (`no_host_svid`).
     let session = match &resolver {
-        Some(r) => bootstrap_host_svid(r).await,
+        Some(r) => bootstrap_host_svid(r, config.attestation.backend).await,
         None => None,
     };
     let host_spiffe_id = session.as_ref().map(|s| s.spiffe_id.clone());
@@ -1416,6 +1534,7 @@ where
                     propose: config.allowlist.propose,
                     propose_interval: config.allowlist_propose_interval(),
                     self_sha: server.self_sha(),
+                    backend: config.attestation.backend,
                 },
                 clock.clone(),
             );

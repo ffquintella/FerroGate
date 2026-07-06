@@ -273,6 +273,7 @@ propose = false # propose the callers this host observes back to CMIS (bootstrap
 
 [attestation]
 ima_log = "/sys/kernel/security/integrity/ima/ascii_runtime_measurements"
+backend = "host-key"   # or "virtual-tpm" (INSECURE, dev/test only — see below)
 ```
 
 Each key has an environment-variable equivalent that overrides it:
@@ -294,6 +295,24 @@ Each key has an environment-variable equivalent that overrides it:
 | `allowlist.propose` | `FERROGATE_ALLOWLIST_PROPOSE` |
 | `allowlist.propose_interval_secs` | `FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS` |
 | `attestation.ima_log` | `FERROGATE_IMA_LOG` |
+| `attestation.backend` | `FERROGATE_ATTEST_BACKEND` |
+
+#### Attestation backend
+
+`attestation.backend` selects how the host obtains its SVID:
+
+- **`host-key`** (default) — the TPM-less profile (feature F15): a hardware
+  fingerprint plus a machine signing key. Works on every supported platform and
+  is the correct choice for hosts without a usable TPM.
+- **`virtual-tpm`** — runs the full four-phase TPM attestation handshake against
+  an **in-process software virtual TPM**. This is **insecure** — there is no
+  hardware root of trust — and exists only to exercise the TPM path on dev/test
+  hosts (macOS, Windows, CI) that have neither a real TPM nor `swtpm`. It is
+  available only when `mia` is built with the off-by-default `virtual-tpm` cargo
+  feature (`cargo build -p mia --features virtual-tpm`); a normal release build
+  refuses this backend and declines to attest (fail closed). It also only
+  succeeds against a CMIS configured to trust the synthetic EK root and PCR
+  digest that `mia` logs at startup. **Never enable it in production.**
 
 ### High availability via DNS SRV discovery
 
