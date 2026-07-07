@@ -151,6 +151,16 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     // are created 0600 via `open` and never chmod'd; see mia's seed writer.)
     "unlink",
     "chmod",
+    // `mkdir`/`mkdirat`: a dropped process creates its own runtime/state dirs at
+    // startup (the CMIS allow-list cache under the state dir, the helper-socket
+    // parent). `std::fs::create_dir_all` issues the `mkdir(2)` syscall
+    // *unconditionally* — even when the directory already exists it lets the
+    // kernel reject it with EEXIST — so the syscall must be allowed or the first
+    // post-drop `create_dir_all` on an existing dir dies with SIGSYS. `mkdir` is
+    // x86_64-only (arm64 has just the `*at` form); `build_program` skips a name
+    // that resolves to `None`.
+    "mkdir",
+    "mkdirat",
     "getdents64",
     "newfstatat",
     "fstat",

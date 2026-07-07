@@ -291,6 +291,10 @@ fn syscall_nr(name: &str) -> Option<i64> {
         "readlink" => libc::SYS_readlink,
         "unlink" => libc::SYS_unlink,
         "chmod" => libc::SYS_chmod,
+        // `mkdir` is x86_64-only; arm64 exposes only the `mkdirat` variant.
+        #[cfg(target_arch = "x86_64")]
+        "mkdir" => libc::SYS_mkdir,
+        "mkdirat" => libc::SYS_mkdirat,
         "getdents64" => libc::SYS_getdents64,
         #[cfg(target_arch = "x86_64")]
         "fstat" => libc::SYS_fstat,
@@ -381,7 +385,7 @@ mod tests {
         // (and thus over-block at runtime). The exception is a handful of legacy
         // syscalls that exist only on x86_64 (arm64 kept only the `*at` /
         // `*_pwait` forms); `build_program` skips them where they don't resolve.
-        const X86_64_ONLY: &[&str] = &["fstat", "poll", "epoll_wait"];
+        const X86_64_ONLY: &[&str] = &["fstat", "poll", "epoll_wait", "mkdir"];
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         for name in ALLOWED_SYSCALLS {
             if X86_64_ONLY.contains(name) && !cfg!(target_arch = "x86_64") {

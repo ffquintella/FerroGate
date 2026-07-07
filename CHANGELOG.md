@@ -10,6 +10,17 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **mia no longer SIGSYS-crash-loops when it creates a runtime/state directory
+  under seccomp.** The F12 seccomp allow-list omitted `mkdir`/`mkdirat`. Rust's
+  `std::fs::create_dir_all` issues the `mkdir(2)` syscall *unconditionally* —
+  even when the target directory already exists it lets the kernel reject it
+  with `EEXIST` — so the first post-drop `create_dir_all` (e.g. caching the
+  CMIS-fetched allowlist under the state dir right after the host SVID is
+  obtained) was killed with `SIGSYS` before the syscall ran, leaving the daemon
+  in a `code=dumped, status=31/SYS` restart loop. `mkdir` (x86_64) and
+  `mkdirat` (all arches) are now on the allow-list, matching how the daemon
+  already manages its own socket and state files (`unlink`, `chmod`).
+
 - **Helper caller-auth works on hosts that don't enforce IMA.** The Linux
   authenticator cross-checked every caller's binary hash against the kernel IMA
   measurement log; on a host running `FERROGATE_REQUIRE_IMA=0` (IMA not enforced,
