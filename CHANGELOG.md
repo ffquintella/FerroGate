@@ -10,6 +10,18 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **Helper API can authenticate callers again after the non-root drop.** Once
+  the daemon stayed up and served (0.20.21), the helper API refused every caller
+  with `exe-unreadable`: caller authentication reads and hashes the caller's
+  `/proc/<pid>/exe`, but a daemon dropped to `_ferrogate` fails
+  `ptrace_may_access` on any caller under a different UID (including root's
+  `mia test`), so it could authenticate no one but itself. The privilege drop now
+  retains **`CAP_SYS_PTRACE`** alongside `CAP_IPC_LOCK` (`restrict_capabilities`),
+  which re-enables that read-access check. The `ptrace` **syscall** stays off the
+  seccomp allow-list, so this grants read access to callers' `/proc` entries only
+  — not active tracing/injection — and is strictly less privileged than running
+  the daemon as root.
+
 - **seccomp allow-list completed for mia's attestation and async-runtime path.**
   With the fingerprint building (0.20.20), `mia` finally exercised its full
   post-drop path — attesting to CMIS and running the tokio reactor — and was

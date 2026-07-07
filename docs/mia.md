@@ -20,7 +20,10 @@ defences applied at startup, before any network or TPM I/O:
 - `seccomp-bpf` allowlist of approximately 35 syscalls (TPM ioctl, socket,
   read/write, epoll, futex, mmap with guards, …).
 - Drops to dedicated UID `_ferrogate` with capabilities reduced to
-  `CAP_IPC_LOCK` only.
+  `CAP_IPC_LOCK` (keep secret memory `mlock`'d) and `CAP_SYS_PTRACE` (read a
+  helper-API caller's `/proc/<pid>/exe` to authenticate it — a non-root daemon
+  needs this to identify callers under other UIDs; the `ptrace` **syscall**
+  itself stays blocked by the seccomp allowlist, so this is read-access only).
 - Linux kernel command line is expected to include
   `ima_appraise=enforce ima_policy=appraise_tcb` so IMA-measured binary hashes
   are kernel-enforced.

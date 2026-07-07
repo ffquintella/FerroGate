@@ -14,7 +14,9 @@ In:
 - `prctl(PR_SET_DUMPABLE, 0)`, `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
 - `mlockall(MCL_CURRENT | MCL_FUTURE)`.
 - seccomp-bpf allowlist (~35 syscalls); explicit allow-list, not deny-list.
-- Drop to `_ferrogate` UID with `CAP_IPC_LOCK` only.
+- Drop to `_ferrogate` UID retaining `CAP_IPC_LOCK` + `CAP_SYS_PTRACE` (the
+  latter so the non-root daemon can read a helper caller's `/proc/<pid>/exe`;
+  the `ptrace` syscall stays seccomp-blocked).
 - IMA-enforcement check: refuse to start if not active.
 - Static-PIE build with reproducible-build flags.
 - `unsafe` forbidden in MIA crates (CI gate).
@@ -57,11 +59,13 @@ See [../mia.md](../mia.md) §"Hardening profile".
       (`ferro_harden::apply` runs `mlockall(MCL_CURRENT|MCL_FUTURE)` first and
       returns a fatal `HardenError::Mlock`; `harden()` propagates it so `main`
       exits non-zero.)
-- [x] Capabilities at runtime are exactly `{CAP_IPC_LOCK}`.
-      (`restrict_caps_to_ipc_lock` drops the bounding set, sets
-      effective/permitted to the single cap, and clears inheritable/ambient;
-      `harden()` reads back `effective_capabilities()` and aborts if it is not
-      exactly `["CAP_IPC_LOCK"]`.)
+- [x] Capabilities at runtime are exactly `{CAP_IPC_LOCK, CAP_SYS_PTRACE}`.
+      (`restrict_capabilities` drops the bounding set, sets effective/permitted
+      to those two caps, and clears inheritable/ambient; `harden()` reads back
+      `effective_capabilities()` and aborts if it is not exactly
+      `["CAP_IPC_LOCK", "CAP_SYS_PTRACE"]`. `CAP_SYS_PTRACE` lets the non-root
+      daemon read a helper caller's `/proc/<pid>/exe`; the `ptrace` syscall
+      stays off the seccomp allow-list.)
 - [x] `cargo clippy -- -D warnings` is clean and no `unsafe` blocks exist
       under `crates/mia`. (`#![forbid(unsafe_code)]` on every MIA module; all
       FFI lives in `ferro-harden` / `ferro-winauth`. The `no-unsafe-in-mia` CI

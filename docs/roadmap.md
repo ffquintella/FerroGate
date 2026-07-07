@@ -256,9 +256,11 @@ recorded in [features/F11-revocation.md](features/F11-revocation.md) §"Status".
       allow-list via `seccompiler`; `FERROGATE_SECCOMP=enforce|audit|off`. The
       enforcing filter is proven to `SIGSYS`-kill a forbidden syscall by a
       unit test.)
-- [x] Drop to `_ferrogate` UID with `CAP_IPC_LOCK` only. (`drop_privileges` +
-      `restrict_caps_to_ipc_lock`; `harden()` verifies the post-drop effective
-      set is exactly `{CAP_IPC_LOCK}`.)
+- [x] Drop to `_ferrogate` UID retaining `CAP_IPC_LOCK` + `CAP_SYS_PTRACE`
+      (the latter to read a helper caller's `/proc/<pid>/exe`; `ptrace` syscall
+      stays seccomp-blocked). (`drop_privileges` + `restrict_capabilities`;
+      `harden()` verifies the post-drop effective set is exactly
+      `{CAP_IPC_LOCK, CAP_SYS_PTRACE}`.)
 - [x] Fail-closed IMA-enforcement check. (`mia::hardening` refuses to start
       unless `/proc/cmdline` requests `ima_appraise=enforce`.)
 - [x] Reproducible build job in CI (byte-identical re-builds).

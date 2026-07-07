@@ -4,7 +4,8 @@
 //! §"Hardening profile" at startup, **before** any TPM or network I/O: it
 //! refuses to start unless IMA appraisal is kernel-enforced, then drives the
 //! syscall-level steps in `ferro_harden` (mlockall, no-dumpable, drop to
-//! `_ferrogate` retaining only `CAP_IPC_LOCK`, no-new-privs, seccomp allow-list).
+//! `_ferrogate` retaining `CAP_IPC_LOCK` + `CAP_SYS_PTRACE`, no-new-privs,
+//! seccomp allow-list).
 //!
 //! `mia` is `#![forbid(unsafe_code)]`; every privileged syscall lives in the
 //! `ferro-harden` crate. The pieces that need no FFI — the IMA cmdline parser
@@ -199,12 +200,15 @@ mod linux {
 
         ferro_harden::apply(&profile).context("applying hardening profile")?;
 
-        // Confirm the post-drop capability set is exactly {CAP_IPC_LOCK} when we
-        // dropped privileges.
+        // Confirm the post-drop capability set is exactly the retained pair
+        // (CAP_IPC_LOCK for mlock'd memory; CAP_SYS_PTRACE so the non-root daemon
+        // can read a helper caller's /proc/<pid>/exe to authenticate it — the
+        // `ptrace` syscall itself stays seccomp-blocked). `effective_capabilities`
+        // returns the names sorted.
         if drop_to.is_some() {
             match ferro_harden::effective_capabilities() {
                 Ok(caps) => {
-                    if caps != ["CAP_IPC_LOCK"] {
+                    if caps != ["CAP_IPC_LOCK", "CAP_SYS_PTRACE"] {
                         bail!("unexpected effective capabilities after drop: {caps:?}");
                     }
                     tracing::info!(?caps, "capabilities reduced");

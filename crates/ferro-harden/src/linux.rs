@@ -21,7 +21,7 @@ pub(crate) fn apply(profile: &HardenProfile) -> Result<(), HardenError> {
     }
     if let Some(run_as) = profile.drop_to {
         drop_privileges(run_as)?;
-        restrict_caps_to_ipc_lock()?;
+        restrict_capabilities()?;
     }
     // `no_new_privs` is mandatory before installing a seccomp filter without
     // CAP_SYS_ADMIN, so force it on whenever seccomp is requested.
@@ -75,7 +75,7 @@ fn set_no_new_privs() -> Result<(), HardenError> {
 
 /// Drop the supplementary groups, then the gid, then the uid, keeping
 /// capabilities across the uid change (`PR_SET_KEEPCAPS`) so the subsequent
-/// [`restrict_caps_to_ipc_lock`] can retain `CAP_IPC_LOCK`.
+/// [`restrict_capabilities`] can retain [`RETAINED_CAPS`].
 fn drop_privileges(run_as: RunAs) -> Result<(), HardenError> {
     // Retain the permitted capability set across the setuid() that follows.
     // SAFETY: prctl with this option ignores the remaining args.
@@ -127,12 +127,22 @@ fn drop_privileges(run_as: RunAs) -> Result<(), HardenError> {
     Ok(())
 }
 
-/// Reduce every capability set to exactly `{CAP_IPC_LOCK}`: drop everything else
-/// from the bounding set, set effective/permitted to the single capability, and
-/// clear the inheritable and ambient sets.
-fn restrict_caps_to_ipc_lock() -> Result<(), HardenError> {
-    let mut keep = HashSet::new();
-    keep.insert(Capability::CAP_IPC_LOCK);
+/// The capabilities the daemon retains after dropping privileges:
+///
+/// - `CAP_IPC_LOCK` — keep secret-bearing pages `mlock`'d out of swap.
+/// - `CAP_SYS_PTRACE` — read a helper-API caller's `/proc/<pid>/exe` to hash and
+///   authenticate it (see `mia::helper::auth`). Without it a non-root daemon
+///   fails `ptrace_may_access` on any caller running under a different uid
+///   (including root), so it could authenticate no one but itself. Note the
+///   seccomp filter still **forbids the `ptrace` syscall** — this grants the
+///   read-access check only, not active tracing/injection.
+const RETAINED_CAPS: [Capability; 2] = [Capability::CAP_IPC_LOCK, Capability::CAP_SYS_PTRACE];
+
+/// Reduce every capability set to exactly [`RETAINED_CAPS`]: drop everything else
+/// from the bounding set, set effective/permitted to those, and clear the
+/// inheritable and ambient sets.
+fn restrict_capabilities() -> Result<(), HardenError> {
+    let keep: HashSet<Capability> = RETAINED_CAPS.into_iter().collect();
 
     let cap_err = |e: caps::errors::CapsError| HardenError::Capabilities(e.to_string());
 
@@ -141,23 +151,23 @@ fn restrict_caps_to_ipc_lock() -> Result<(), HardenError> {
     // first, its setuid() away from root cleared the effective set — PR_SET_KEEPCAPS
     // preserves only the *permitted* set — so CAP_SETPCAP, though still permitted,
     // is no longer effective and the drops below would fail with EPERM. Re-raise
-    // it (alongside the CAP_IPC_LOCK we mean to retain) before trimming the set.
+    // it (alongside the caps we mean to retain) before trimming the set.
     let mut working = keep.clone();
     working.insert(Capability::CAP_SETPCAP);
     caps::set(None, CapSet::Effective, &working).map_err(cap_err)?;
 
-    // Drop everything except CAP_IPC_LOCK from the bounding set so it can never
-    // be re-acquired.
+    // Drop everything except the retained caps from the bounding set so they can
+    // never be re-acquired.
     let bounding = caps::read(None, CapSet::Bounding).map_err(cap_err)?;
     for cap in bounding {
-        if cap != Capability::CAP_IPC_LOCK {
+        if !keep.contains(&cap) {
             caps::drop(None, CapSet::Bounding, cap).map_err(cap_err)?;
         }
     }
 
-    // Collapse to exactly {CAP_IPC_LOCK}, which also sheds the CAP_SETPCAP raised
-    // just above. Lower effective before permitted: the kernel requires the
-    // effective set to remain a subset of the permitted set at all times.
+    // Collapse to exactly the retained caps, which also sheds the CAP_SETPCAP
+    // raised just above. Lower effective before permitted: the kernel requires
+    // the effective set to remain a subset of the permitted set at all times.
     caps::set(None, CapSet::Effective, &keep).map_err(cap_err)?;
     caps::set(None, CapSet::Permitted, &keep).map_err(cap_err)?;
     caps::set(None, CapSet::Inheritable, &HashSet::new()).map_err(cap_err)?;
@@ -457,16 +467,16 @@ mod tests {
 
     // Regression for the crash-loop observed in production: after the setuid()
     // in `drop_privileges` clears the effective set (KEEPCAPS keeps only the
-    // permitted set), `restrict_caps_to_ipc_lock` must re-raise CAP_SETPCAP
-    // before PR_CAPBSET_DROP — otherwise the bounding-set trim fails with EPERM
+    // permitted set), `restrict_capabilities` must re-raise CAP_SETPCAP before
+    // PR_CAPBSET_DROP — otherwise the bounding-set trim fails with EPERM
     // ("PR_CAPBSET_DROP failure: Operation not permitted"). We reproduce that
     // exact precondition (effective emptied, permitted intact) and assert the
-    // trim now succeeds, leaving effective == {CAP_IPC_LOCK}.
+    // trim now succeeds, leaving effective == RETAINED_CAPS.
     //
     // Needs root (only a privileged process holds CAP_SETPCAP in its permitted
     // set); skipped otherwise, like the swtpm integration tests.
     #[test]
-    fn restrict_caps_recovers_setpcap_after_cleared_effective() {
+    fn restrict_capabilities_recovers_setpcap_after_cleared_effective() {
         if !is_root() {
             eprintln!("not root; skipping capability-restriction regression test");
             return;
@@ -484,13 +494,13 @@ mod tests {
 
         if pid == 0 {
             // Child: empty the effective set (mimics the post-setuid state),
-            // then run the real restriction and verify the final effective set.
+            // then run the real restriction and verify the final effective set
+            // is exactly the retained caps.
             let empty: HashSet<Capability> = HashSet::new();
+            let want: HashSet<Capability> = RETAINED_CAPS.into_iter().collect();
             let ok = caps::set(None, CapSet::Effective, &empty).is_ok()
-                && restrict_caps_to_ipc_lock().is_ok()
-                && caps::read(None, CapSet::Effective).is_ok_and(|e| {
-                    e.len() == 1 && e.contains(&Capability::CAP_IPC_LOCK)
-                });
+                && restrict_capabilities().is_ok()
+                && caps::read(None, CapSet::Effective).is_ok_and(|e| e == want);
             // SAFETY: _exit is async-signal-safe.
             unsafe { libc::_exit(i32::from(!ok)) };
         } else {
@@ -500,8 +510,8 @@ mod tests {
             assert_eq!(w, pid, "waitpid failed: {}", last_os_error());
             assert!(
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                "restrict_caps_to_ipc_lock must recover CAP_SETPCAP into the \
-                 effective set before PR_CAPBSET_DROP; child status={status:#x}"
+                "restrict_capabilities must recover CAP_SETPCAP into the effective \
+                 set before PR_CAPBSET_DROP; child status={status:#x}"
             );
         }
     }
