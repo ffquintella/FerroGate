@@ -10,6 +10,18 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **Helper caller-auth works on hosts that don't enforce IMA.** The Linux
+  authenticator cross-checked every caller's binary hash against the kernel IMA
+  measurement log; on a host running `FERROGATE_REQUIRE_IMA=0` (IMA not enforced,
+  log empty and root-only) this failed with `ima-unavailable`, so the helper API
+  refused all callers even after the daemon was otherwise healthy. The IMA
+  cross-check now tracks the same `FERROGATE_REQUIRE_IMA` switch as the startup
+  check: when IMA is not required, `ImaCallerAuth::without_ima` authenticates by
+  the SHA-384 of the caller's loaded binary (read through `/proc/<pid>/exe`) plus
+  the allowlist, skipping the measurement-log lookup — mirroring how the Windows
+  authenticator drops its Authenticode check when not required. When IMA *is*
+  required the full cross-check is unchanged.
+
 - **Helper API can authenticate callers again after the non-root drop.** Once
   the daemon stayed up and served (0.20.21), the helper API refused every caller
   with `exe-unreadable`: caller authentication reads and hashes the caller's

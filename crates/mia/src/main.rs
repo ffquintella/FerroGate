@@ -537,12 +537,28 @@ async fn serve_one(instance: EnvInstance, log_reload: LogReload) -> anyhow::Resu
 }
 
 /// Build the platform's caller authenticator (Linux: SO_PEERCRED + IMA).
+///
+/// The IMA cross-check tracks the same `FERROGATE_REQUIRE_IMA` switch as the
+/// startup enforcement check: when IMA is not required (dev / IMA-off hosts)
+/// there is no measurement log to check against, so caller-auth falls back to
+/// hashing the caller's loaded binary alone.
 #[cfg(target_os = "linux")]
 fn build_auth(config: &mia::config::Config) -> mia::helper::auth::ImaCallerAuth {
     use mia::helper::auth::ImaCallerAuth;
-    match config.attestation.ima_log.as_deref() {
+    let auth = match config.attestation.ima_log.as_deref() {
         Some(p) => ImaCallerAuth::with_ima_log(p.to_path_buf()),
         None => ImaCallerAuth::new(),
+    };
+    // Mirror `mia::hardening`: IMA is required unless FERROGATE_REQUIRE_IMA=0.
+    let require_ima = std::env::var("FERROGATE_REQUIRE_IMA").map_or(true, |v| v != "0");
+    if require_ima {
+        auth
+    } else {
+        tracing::warn!(
+            "FERROGATE_REQUIRE_IMA=0: helper caller-auth skips the IMA cross-check; \
+             caller identity rests on the loaded-binary hash + allowlist (dev only)"
+        );
+        auth.without_ima()
     }
 }
 

@@ -353,17 +353,31 @@ mod linux {
     /// Default location of the IMA runtime measurement log.
     pub(crate) const DEFAULT_IMA_LOG: &str = "/sys/kernel/security/ima/binary_runtime_measurements";
 
-    /// The production caller authenticator: `SO_PEERCRED` + IMA cross-check.
+    /// The Linux caller authenticator: `SO_PEERCRED` + a SHA-384 of the caller's
+    /// `/proc/<pid>/exe`.
+    ///
+    /// When `require_ima` is set (the production default) that hash is
+    /// cross-checked against the kernel IMA measurement log, so a caller whose
+    /// binary was not IMA-measured — or whose on-disk bytes no longer match its
+    /// measurement — is rejected. When it is clear (the daemon started with
+    /// `FERROGATE_REQUIRE_IMA=0`, i.e. IMA is not enforced on this host) the IMA
+    /// cross-check is skipped and identity rests on the hash of the loaded binary
+    /// alone — mirroring how [`WindowsCallerAuth`](super::WindowsCallerAuth) drops
+    /// the Authenticode check when it is not required. The hash is always read
+    /// *through* the `/proc/<pid>/exe` handle, so it covers the bytes the process
+    /// was actually loaded from even if the on-disk path was swapped.
     pub struct ImaCallerAuth {
         ima_log_path: PathBuf,
+        require_ima: bool,
     }
 
     impl ImaCallerAuth {
-        /// Use the default IMA log path.
+        /// Use the default IMA log path, cross-checking against IMA.
         #[must_use]
         pub fn new() -> Self {
             Self {
                 ima_log_path: PathBuf::from(DEFAULT_IMA_LOG),
+                require_ima: true,
             }
         }
 
@@ -372,7 +386,17 @@ mod linux {
         pub fn with_ima_log(path: impl Into<PathBuf>) -> Self {
             Self {
                 ima_log_path: path.into(),
+                require_ima: true,
             }
+        }
+
+        /// Authenticate by the loaded-binary hash alone, without the IMA
+        /// cross-check. For hosts that do not enforce IMA (`FERROGATE_REQUIRE_IMA=0`),
+        /// where there is no measurement log to check against.
+        #[must_use]
+        pub fn without_ima(mut self) -> Self {
+            self.require_ima = false;
+            self
         }
     }
 
@@ -401,6 +425,17 @@ mod linux {
             let contents =
                 std::fs::read(&exe_link).map_err(|_| AuthError::ExeUnreadable { partial })?;
             let disk_sha: [u8; 48] = Sha384::digest(&contents).into();
+
+            // IMA not enforced on this host: trust the hash of the loaded binary
+            // (read through /proc/<pid>/exe) without a measurement-log cross-check.
+            if !self.require_ima {
+                return Ok(CallerIdentity {
+                    pid,
+                    uid,
+                    gid,
+                    bin_sha: disk_sha,
+                });
+            }
 
             let ima_log = std::fs::read_to_string(&self.ima_log_path)
                 .map_err(|_| AuthError::ImaUnavailable { partial })?;
@@ -436,6 +471,26 @@ mod tests {
         let h = sha(0xAB);
         let log = line("/usr/bin/foo", "sha384", &h);
         assert_eq!(cross_check_ima(&h, "/usr/bin/foo", &log).unwrap(), h);
+    }
+
+    // With IMA not required, identify() hashes the caller's loaded binary
+    // (/proc/<pid>/exe) and returns it directly, never touching the IMA log — so
+    // a host without a readable/populated IMA log can still authenticate callers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_ima_authenticates_by_loaded_binary_hash() {
+        // Point at a bogus IMA path to prove the log is never read on this path.
+        let auth = ImaCallerAuth::with_ima_log("/nonexistent/ima/log").without_ima();
+        let cred = PeerCred {
+            pid: Some(std::process::id()),
+            uid: 0,
+            gid: 0,
+        };
+        let id = auth
+            .identify(cred)
+            .expect("without_ima identify should succeed with no IMA log");
+        assert_eq!(id.pid, std::process::id());
+        assert_ne!(id.bin_sha, [0u8; 48], "bin_sha must be the real binary hash");
     }
 
     #[test]
