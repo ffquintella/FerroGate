@@ -144,6 +144,13 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "ftruncate",
     "openat",
     "readlinkat",
+    "readlink",
+    // `unlink`: remove a stale helper-API Unix socket before rebinding it.
+    // `chmod`: set that socket to its configured mode (e.g. 0660) after bind —
+    // a dropped process adjusting permissions on its own socket. (File secrets
+    // are created 0600 via `open` and never chmod'd; see mia's seed writer.)
+    "unlink",
+    "chmod",
     "getdents64",
     "newfstatat",
     "statx",
@@ -156,6 +163,7 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "mlockall",
     // Sockets / networking (UDS helper + CMIS gRPC client).
     "socket",
+    "socketpair",
     "connect",
     "bind",
     "listen",
@@ -196,6 +204,9 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "pipe2",
     "dup3",
     "tgkill",
+    // `prctl`: tokio names its worker threads (PR_SET_NAME) after the filter is
+    // installed. (The hardening steps' own prctl calls run before it.)
+    "prctl",
     // Identity / limits / entropy / housekeeping.
     "getpid",
     "gettid",
@@ -346,9 +357,11 @@ mod tests {
     #[test]
     fn dangerous_syscalls_are_absent() {
         // A few syscalls a hardened MIA must never need; their presence would be
-        // a regression in the allow-list.
+        // a regression in the allow-list. (`chmod` is intentionally *not* here:
+        // mia legitimately sets its helper socket's mode after bind — see the
+        // allow-list comment. Process-execution and tracing stay forbidden.)
         for forbidden in [
-            "execve", "execveat", "ptrace", "mount", "chmod", "fork", "vfork",
+            "execve", "execveat", "ptrace", "mount", "fork", "vfork",
         ] {
             assert!(
                 !ALLOWED_SYSCALLS.contains(&forbidden),

@@ -10,6 +10,21 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **`mia` completes hardened startup on hosts without a disk serial, and the
+  seccomp allow-list now covers its real runtime.** After 0.20.19 let hardening
+  finish, two more never-exercised gaps surfaced: (1) the machine fingerprint
+  could not be built on VMware VMs, which expose no block-device serial — the
+  disk serial is now **best-effort** (`ferro-machineid`), with identity resting
+  on the board serial + SMBIOS `product_uuid` (both stable and unique); hosts
+  that *do* report a disk serial still fold it in, so their fingerprint is
+  unchanged. (2) The daemon was killed by `SIGSYS` on syscalls the allow-list
+  had never seen at runtime — `prctl` (tokio thread naming), `socketpair`
+  (runtime), `unlink` + `chmod` (stale-socket removal and helper-socket mode),
+  and `readlink`; all five are now allow-listed. The complete set was captured
+  in one pass via a seccomp audit-mode run. `chmod` is now permitted (a dropped
+  process setting its own socket's mode); process-execution and tracing remain
+  forbidden.
+
 - **`mia` still failed to start after the `PR_CAPBSET_DROP` fix — the non-root
   privilege drop was never fully wired.** With hardening able to complete, three
   further problems surfaced, all because root-only work ran *after* dropping to

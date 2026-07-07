@@ -77,12 +77,18 @@ impl MachineFacts {
         Fingerprint(out)
     }
 
-    /// True iff every identifier is non-empty after trimming. A fingerprint
-    /// built from a blank field is worthless, so collection rejects it.
+    /// True iff the machine is sufficiently identified after trimming.
+    ///
+    /// The board serial and the SMBIOS `product_uuid` are required — both stable
+    /// and unique per machine. The disk serial is **best-effort**: many
+    /// virtualised hosts (e.g. VMware SCSI disks) expose none, and a fingerprint
+    /// built from board serial + UUID is still unique, so a blank disk serial no
+    /// longer rejects the machine. Hosts that *do* report a disk serial still
+    /// fold it into the fingerprint, so their identity is unchanged.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         let n = self.normalised();
-        !n.board_serial.is_empty() && !n.platform_uuid.is_empty() && !n.disk_serial.is_empty()
+        !n.board_serial.is_empty() && !n.platform_uuid.is_empty()
     }
 }
 
@@ -261,8 +267,11 @@ mod imp {
         let platform_uuid = read_trim("/sys/class/dmi/id/product_uuid").ok_or_else(|| {
             MachineIdError::Unavailable("DMI product_uuid (needs root?)".to_string())
         })?;
-        let disk_serial = disk_serial()
-            .ok_or_else(|| MachineIdError::Unavailable("block device serial".to_string()))?;
+        // Best-effort: absent on many virtualised hosts (VMware SCSI disks
+        // expose no serial / wwid / VPD page). The fingerprint stays
+        // well-defined without it (board serial + product UUID); see
+        // [`MachineFacts::is_complete`].
+        let disk_serial = disk_serial().unwrap_or_default();
 
         Ok(MachineFacts {
             board_serial,
