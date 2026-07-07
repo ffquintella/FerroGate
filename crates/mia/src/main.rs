@@ -230,15 +230,13 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
         }
     };
 
-    // Apply the hardening profile (feature F12) on the single startup thread,
-    // *before* building the async runtime — so the seccomp filter is inherited
-    // by every tokio worker and `mlockall(MCL_FUTURE)` covers their allocations,
-    // and before any TPM or network I/O. Fatal on failure: a MIA that cannot
-    // harden must not serve.
-    #[cfg(target_os = "linux")]
-    mia::hardening::harden()?;
-    #[cfg(not(target_os = "linux"))]
-    tracing::debug!("hardening profile (seccomp/mlockall/privilege-drop) applies on Linux only");
+    // Prefetch root-only inputs, hand the daemon's writable directories to the
+    // privilege-drop user, then apply the hardening profile (feature F12) — all
+    // on the single startup thread, *before* building the async runtime, so the
+    // seccomp filter is inherited by every tokio worker and `mlockall(MCL_FUTURE)`
+    // covers their allocations, and before any TPM or network I/O. Fatal on
+    // failure: a MIA that cannot harden must not serve.
+    prepare_and_harden(&instances)?;
 
     // Build the multi-threaded runtime by hand (rather than `#[tokio::main]`) so
     // hardening runs first. `enable_all` wires the I/O and time drivers the
@@ -615,13 +613,32 @@ async fn start_helper_api(
     serve(config, socket_path, build_auth(config), config_source, log_reload).await
 }
 
-/// Resolve where the persistent machine signing key lives — beside the system
-/// config (e.g. `/Library/Application Support/FerroGate/host-key.bin` on macOS).
+/// Directory for mia's writable runtime state — the persistent machine signing
+/// key and SVID seed.
+///
+/// On Linux this is a dedicated state directory (`/var/lib/ferrogate`) that the
+/// daemon creates and hands to the `_ferrogate` privilege-drop user *before*
+/// dropping (see [`prepare_and_harden`]), so the unprivileged process can write
+/// its key and seed. The config directory (`/etc/ferrogate`) stays root-owned
+/// and read-only. On macOS / Windows — where the daemon does not drop — state
+/// stays beside the system config, as it always has.
+fn state_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::PathBuf::from("/var/lib/ferrogate")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        mia::config::system_config_path()
+            .parent()
+            .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
+    }
+}
+
+/// Resolve where the persistent machine signing key lives — in the service
+/// [`state_dir`] (e.g. `/var/lib/ferrogate/host-key.bin` on Linux).
 fn host_key_path() -> std::path::PathBuf {
-    mia::config::system_config_path().parent().map_or_else(
-        || std::path::PathBuf::from("mia-host-key.bin"),
-        |d| d.join("host-key.bin"),
-    )
+    state_dir().join("host-key.bin")
 }
 
 /// Resolve where this host's persistent SVID seed lives — beside the machine
@@ -630,10 +647,69 @@ fn host_key_path() -> std::path::PathBuf {
 /// under the *same* key and keeps the same child-signing `kid` — and thus the
 /// same JWKS entry on CMIS — instead of rotating it every boot.
 fn svid_seed_path() -> std::path::PathBuf {
-    mia::config::system_config_path().parent().map_or_else(
-        || std::path::PathBuf::from("mia-svid-seed.bin"),
-        |d| d.join("svid-seed.bin"),
-    )
+    state_dir().join("svid-seed.bin")
+}
+
+/// The machine fingerprint, collected once *before* the privilege drop (the DMI
+/// serials it hashes are root-only) and reused by attestation afterwards.
+static PREFETCHED_FACTS: std::sync::OnceLock<Option<ferro_machineid::MachineFacts>> =
+    std::sync::OnceLock::new();
+
+/// Collect the machine fingerprint while still privileged and cache it for the
+/// post-drop attestation. Called once, before hardening drops to `_ferrogate`.
+fn prefetch_machine_facts() {
+    match ferro_machineid::collect_facts() {
+        Ok(facts) => {
+            let _ = PREFETCHED_FACTS.set(Some(facts));
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cannot collect a hardware fingerprint; host-key attestation will be unavailable"
+            );
+            let _ = PREFETCHED_FACTS.set(None);
+        }
+    }
+}
+
+/// The machine fingerprint prefetched by [`prefetch_machine_facts`], if any.
+fn prefetched_facts() -> Option<&'static ferro_machineid::MachineFacts> {
+    PREFETCHED_FACTS.get().and_then(Option::as_ref)
+}
+
+/// Do the root-requiring startup work, then apply the hardening profile.
+///
+/// A privilege-dropping daemon must perform everything that needs root *before*
+/// it drops: the machine fingerprint (root-only DMI serials) is prefetched, and
+/// the directories the unprivileged process will write — each environment's
+/// helper-socket directory plus the [`state_dir`] holding the machine key and
+/// SVID seed — are created and handed to the `_ferrogate` user. Only then does
+/// [`hardening::harden`] drop privileges. Fatal on failure: a MIA that cannot
+/// harden must not serve.
+fn prepare_and_harden(instances: &[EnvInstance]) -> anyhow::Result<()> {
+    // Prefetch the fingerprint on every platform so attestation reads it the
+    // same way; on Linux it is the only chance to read the root-only DMI files.
+    prefetch_machine_facts();
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut dirs = vec![state_dir()];
+        for inst in instances {
+            if let Some(parent) = inst.config.helper_socket().and_then(std::path::Path::parent) {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+        mia::hardening::prepare_runtime_paths(&dirs)?;
+        mia::hardening::harden()?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = instances;
+        tracing::debug!(
+            "hardening profile (seccomp/mlockall/privilege-drop) applies on Linux only"
+        );
+    }
+    Ok(())
 }
 
 /// Load the persistent 32-byte SVID seed, generating and persisting a fresh one
@@ -661,18 +737,35 @@ fn load_or_create_svid_seed(path: &std::path::Path) -> std::io::Result<[u8; 32]>
     }
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
-    std::fs::write(path, seed)?;
-    #[cfg(unix)]
-    restrict_to_owner(path)?;
+    write_secret_file(path, &seed)?;
     Ok(seed)
 }
 
-/// Tighten a freshly written secret file to `0600` (owner read/write only),
-/// matching how the machine key beside it is protected.
-#[cfg(unix)]
-fn restrict_to_owner(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+/// Write `bytes` to `path` as an owner-only (`0600`) secret, creating or
+/// truncating the file.
+///
+/// On Unix the mode is applied by `open(2)` at creation, so the bytes are never
+/// briefly world-readable *and* no separate `chmod` is needed — the hardened
+/// seccomp profile deliberately forbids `chmod` (see `ferro-harden`), so a
+/// post-write `set_permissions` would be killed with `SIGSYS` once the daemon
+/// has dropped privileges.
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
 }
 
 /// Bootstrap the host SVID via the TPM-less **host-key** attestation profile
@@ -697,12 +790,9 @@ async fn bootstrap_host_svid_host_key(
     use ferro_sep::MachineKey as _;
     use sha2::{Digest, Sha256};
 
-    let facts = match ferro_machineid::collect_facts() {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot collect a hardware fingerprint; host-key attestation skipped");
-            return None;
-        }
+    let Some(facts) = prefetched_facts() else {
+        tracing::warn!("no hardware fingerprint available; host-key attestation skipped");
+        return None;
     };
     let key_path = host_key_path();
     let key = match ferro_sep::SoftwareMachineKey::open_or_create(&key_path) {
@@ -744,7 +834,7 @@ async fn bootstrap_host_svid_host_key(
         }
     };
     let attested =
-        match mia::client::run_attest_host_key(&mut client, &facts, &key, dpop_jkt, seed.as_ref())
+        match mia::client::run_attest_host_key(&mut client, facts, &key, dpop_jkt, seed.as_ref())
             .await
         {
             Ok(a) => a,
@@ -806,10 +896,7 @@ fn host_session_from_attested(attested: mia::client::AttestedSvid) -> HostSessio
 /// machine signing key, so its synthetic EK/AIK is stable across restarts.
 #[cfg(feature = "virtual-tpm")]
 fn virtual_tpm_path() -> std::path::PathBuf {
-    mia::config::system_config_path().parent().map_or_else(
-        || std::path::PathBuf::from("mia-virtual-tpm.json"),
-        |d| d.join("virtual-tpm.json"),
-    )
+    state_dir().join("virtual-tpm.json")
 }
 
 /// Bootstrap the host SVID via the in-process software **virtual TPM** — the

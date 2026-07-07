@@ -45,7 +45,7 @@ pub fn ima_cmdline_enforced(cmdline: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{harden, ima_enforced};
+pub use linux::{harden, ima_enforced, prepare_runtime_paths};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -98,6 +98,43 @@ mod linux {
                 "service user {SERVICE_USER} not found; create it or set FERROGATE_RUN_AS_UID/GID"
             )
         })
+    }
+
+    /// Prepare, as root, the directories the daemon will write to *after* it
+    /// drops to the service user: create each one (mode `0750`) if missing and
+    /// hand ownership to the privilege-drop target. Must be called before
+    /// [`harden`]; the two resolve the same target via [`resolve_run_as`].
+    ///
+    /// This is what lets a MIA that starts as root, then drops to `_ferrogate`,
+    /// still bind its helper socket under `/run/ferrogate` and persist its key
+    /// and seed under the state directory — both of which live in root-owned
+    /// trees the unprivileged process could not otherwise create files in.
+    ///
+    /// A no-op when hardening is skipped or we are not root (no drop follows, so
+    /// ownership is already correct). `mia` stays `#![forbid(unsafe_code)]`:
+    /// `std::os::unix::fs::chown` is a safe wrapper over the syscall.
+    pub fn prepare_runtime_paths(dirs: &[std::path::PathBuf]) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if env_flag_set("FERROGATE_SKIP_HARDENING") || !ferro_harden::is_root() {
+            return Ok(());
+        }
+        let run_as = resolve_run_as()?;
+        for dir in dirs {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create runtime directory {}", dir.display()))?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))
+                .with_context(|| format!("set mode on {}", dir.display()))?;
+            std::os::unix::fs::chown(dir, Some(run_as.uid), Some(run_as.gid))
+                .with_context(|| format!("chown {} to the service user", dir.display()))?;
+            tracing::info!(
+                dir = %dir.display(),
+                uid = run_as.uid,
+                gid = run_as.gid,
+                "handed runtime directory to the privilege-drop user"
+            );
+        }
+        Ok(())
     }
 
     /// The configured seccomp mode, or `None` to skip seccomp

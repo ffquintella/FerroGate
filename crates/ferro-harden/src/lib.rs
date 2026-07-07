@@ -203,6 +203,12 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "geteuid",
     "getgid",
     "getegid",
+    // `capget`: the caps crate reads the capability sets here — mia verifies its
+    // post-drop effective set (`effective_capabilities`) immediately after the
+    // filter is installed, and any later capability introspection also lands
+    // here. (`capset` is deliberately absent: all capability *edits* happen
+    // during the drop, before the filter is in place.)
+    "capget",
     "getrandom",
     "prlimit64",
     "uname",

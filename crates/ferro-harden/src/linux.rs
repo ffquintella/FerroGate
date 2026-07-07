@@ -332,6 +332,7 @@ fn syscall_nr(name: &str) -> Option<i64> {
         "geteuid" => libc::SYS_geteuid,
         "getgid" => libc::SYS_getgid,
         "getegid" => libc::SYS_getegid,
+        "capget" => libc::SYS_capget,
         "getrandom" => libc::SYS_getrandom,
         "prlimit64" => libc::SYS_prlimit64,
         "uname" => libc::SYS_uname,

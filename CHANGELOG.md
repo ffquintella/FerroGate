@@ -10,6 +10,24 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **`mia` still failed to start after the `PR_CAPBSET_DROP` fix — the non-root
+  privilege drop was never fully wired.** With hardening able to complete, three
+  further problems surfaced, all because root-only work ran *after* dropping to
+  the unprivileged `_ferrogate` user: (1) the seccomp filter killed `mia` with
+  `SIGSYS` on `capget` (its own post-drop capability check) — `capget` is now in
+  the allow-list; (2) the machine fingerprint could not be read (DMI serials are
+  root-only) — it is now **prefetched before the drop** and cached for
+  attestation; (3) the helper socket (`/run/ferrogate`) and the persistent key +
+  SVID seed (previously under the root-owned `/etc/ferrogate`) could not be
+  written. The key and seed now live in a dedicated state directory
+  (`/var/lib/ferrogate` on Linux) that `mia`, while still root, creates and hands
+  to `_ferrogate` — along with the helper-socket directory — *before* dropping
+  privileges. The SVID seed is written `0600` at creation rather than via a
+  post-drop `chmod` (which the seccomp profile forbids). `ferro-harden` gains
+  `prepare_runtime_paths` for the pre-drop directory hand-off, and mia now does
+  all root-requiring startup in a single `prepare_and_harden` step. The config
+  directory (`/etc/ferrogate`) stays root-owned and read-only.
+
 - **`mia` crash-loop on Linux during privilege-drop hardening
   (`PR_CAPBSET_DROP failure: Operation not permitted`).** When `mia` started as
   root and dropped to the non-root `_ferrogate` service user, the `setuid()`
