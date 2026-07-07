@@ -10,6 +10,19 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ### Fixed
 
+- **seccomp allow-list completed for mia's attestation and async-runtime path.**
+  With the fingerprint building (0.20.20), `mia` finally exercised its full
+  post-drop path — attesting to CMIS and running the tokio reactor — and was
+  killed by `SIGSYS` on syscalls the allow-list still lacked: `epoll_wait`
+  (the reactor on kernels that use it over `epoll_pwait`), `poll`, `fstat`, and
+  `sendmmsg` (DNS). All four are now allow-listed (`epoll_wait`/`poll`/`fstat`
+  gated to x86_64, where those legacy syscalls exist; arm64 uses the `*at` /
+  `*_pwait` forms). The complete set was captured by enumerating seccomp audit
+  records **by executable** rather than thread name — tokio renames its worker
+  threads, so a `comm`-based filter had missed the reactor's syscalls. With this,
+  `mia` attests, obtains a host SVID, and serves the helper API under full
+  seccomp enforce.
+
 - **`mia` completes hardened startup on hosts without a disk serial, and the
   seccomp allow-list now covers its real runtime.** After 0.20.19 let hardening
   finish, two more never-exercised gaps surfaced: (1) the machine fingerprint

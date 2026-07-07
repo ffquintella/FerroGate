@@ -282,6 +282,8 @@ fn syscall_nr(name: &str) -> Option<i64> {
         "unlink" => libc::SYS_unlink,
         "chmod" => libc::SYS_chmod,
         "getdents64" => libc::SYS_getdents64,
+        #[cfg(target_arch = "x86_64")]
+        "fstat" => libc::SYS_fstat,
         "newfstatat" => libc::SYS_newfstatat,
         "statx" => libc::SYS_statx,
         "mmap" => libc::SYS_mmap,
@@ -292,6 +294,7 @@ fn syscall_nr(name: &str) -> Option<i64> {
         "mlockall" => libc::SYS_mlockall,
         "socket" => libc::SYS_socket,
         "socketpair" => libc::SYS_socketpair,
+        "sendmmsg" => libc::SYS_sendmmsg,
         "connect" => libc::SYS_connect,
         "bind" => libc::SYS_bind,
         "listen" => libc::SYS_listen,
@@ -309,6 +312,12 @@ fn syscall_nr(name: &str) -> Option<i64> {
         "epoll_create1" => libc::SYS_epoll_create1,
         "epoll_ctl" => libc::SYS_epoll_ctl,
         "epoll_pwait" => libc::SYS_epoll_pwait,
+        // `epoll_wait`, `poll`, and `fstat` are legacy syscalls that arm64
+        // never implemented (it has only the `*_pwait` / `*at` variants), so
+        // the `libc::SYS_*` constants do not exist there — gate them to x86_64.
+        // `build_program` skips any name that resolves to `None`.
+        #[cfg(target_arch = "x86_64")]
+        "epoll_wait" => libc::SYS_epoll_wait,
         "eventfd2" => libc::SYS_eventfd2,
         "futex" => libc::SYS_futex,
         "nanosleep" => libc::SYS_nanosleep,
@@ -326,6 +335,8 @@ fn syscall_nr(name: &str) -> Option<i64> {
         "set_robust_list" => libc::SYS_set_robust_list,
         "rseq" => libc::SYS_rseq,
         "membarrier" => libc::SYS_membarrier,
+        #[cfg(target_arch = "x86_64")]
+        "poll" => libc::SYS_poll,
         "ppoll" => libc::SYS_ppoll,
         "pipe2" => libc::SYS_pipe2,
         "dup3" => libc::SYS_dup3,
@@ -355,12 +366,22 @@ mod tests {
 
     #[test]
     fn every_allowlisted_name_resolves_on_this_arch() {
-        // On the two architectures we target, every name must resolve — a
-        // typo or a name missing from the table would silently shrink the
-        // allow-list (and thus over-block at runtime).
+        // On the two architectures we target, every name must resolve — a typo
+        // or a name missing from the table would silently shrink the allow-list
+        // (and thus over-block at runtime). The exception is a handful of legacy
+        // syscalls that exist only on x86_64 (arm64 kept only the `*at` /
+        // `*_pwait` forms); `build_program` skips them where they don't resolve.
+        const X86_64_ONLY: &[&str] = &["fstat", "poll", "epoll_wait"];
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         for name in ALLOWED_SYSCALLS {
-            assert!(syscall_nr(name).is_some(), "unresolved syscall: {name}");
+            if X86_64_ONLY.contains(name) && !cfg!(target_arch = "x86_64") {
+                assert!(
+                    syscall_nr(name).is_none(),
+                    "{name} is expected to be x86_64-only but resolved on this arch"
+                );
+            } else {
+                assert!(syscall_nr(name).is_some(), "unresolved syscall: {name}");
+            }
         }
     }
 

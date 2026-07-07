@@ -153,6 +153,7 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "chmod",
     "getdents64",
     "newfstatat",
+    "fstat",
     "statx",
     // Memory.
     "mmap",
@@ -175,6 +176,7 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "sendto",
     "recvfrom",
     "sendmsg",
+    "sendmmsg",
     "recvmsg",
     "shutdown",
     // TPM and generic device control.
@@ -183,6 +185,9 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "epoll_create1",
     "epoll_ctl",
     "epoll_pwait",
+    // mio/tokio on some kernels (e.g. UEK 5.15) reaches for the older
+    // `epoll_wait`/`poll` rather than the `*_pwait` variants.
+    "epoll_wait",
     "eventfd2",
     "futex",
     "nanosleep",
@@ -200,6 +205,7 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "set_robust_list",
     "rseq",
     "membarrier",
+    "poll",
     "ppoll",
     "pipe2",
     "dup3",
