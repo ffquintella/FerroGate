@@ -229,7 +229,7 @@ mod imp {
     fn disk_serial() -> Option<String> {
         let entries = fs::read_dir("/sys/block").ok()?;
         let mut candidates: Vec<String> = entries
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             // skip virtual / removable devices
             .filter(|n| !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("dm-"))
