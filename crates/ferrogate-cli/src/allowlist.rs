@@ -278,7 +278,7 @@ async fn proposals(client: &mut MachineIdentityClient<Channel>) -> anyhow::Resul
         println!("  proposed_at: {} (unix)", p.proposed_at);
         println!("  entries:     {}", p.entries.len());
     }
-    println!("\nReview one with `ferrogate allowlist review <host>`.");
+    println!("\nReview one with `ferrogate allowlist review --host <uuid>`.");
     Ok(())
 }
 
@@ -347,7 +347,7 @@ async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
              an additive proposal would keep them."
         );
     }
-    println!("\nApprove with `ferrogate allowlist approve {host_uuid}` or reject with `… reject {host_uuid}`.");
+    println!("\nApprove with `ferrogate allowlist approve --host {host_uuid}` or reject with `… reject --host {host_uuid}`.");
     Ok(())
 }
 

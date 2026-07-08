@@ -207,7 +207,7 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
     else {
         println!("CMIS has no allowlist for this host — nothing written.");
         println!(
-            "  Provision callers on CMIS (`ferrogate allowlist set {uuid} …`), or enable\n  \
+            "  Provision callers on CMIS (`ferrogate allowlist set --host {uuid} …`), or enable\n  \
              allowlist.propose so the daemon proposes the callers it observes for approval."
         );
         anyhow::bail!("no allowlist available for this host");
