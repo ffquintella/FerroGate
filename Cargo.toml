@@ -104,7 +104,7 @@ tss-esapi = "7.5"
 # Hiqlite bundles openraft + SQLite + replication transport; we wrap it in
 # `ferro-raft` to expose typed access to issued-SVID metadata and the RIM
 # version pointer without leaking the Raft library into the rest of the tree.
-hiqlite      = { version = "0.13", default-features = false, features = ["sqlite", "auto-heal"] }
+hiqlite      = { version = "0.14", default-features = false, features = ["sqlite", "auto-heal"] }
 async-trait  = "0.1"
 
 # gRPC / protobuf (F04 — MachineIdentity service surface)
