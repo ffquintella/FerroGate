@@ -8,6 +8,23 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.1] — 2026-07-15
+
+### Fixed
+
+- **`ferro-harden` now compiles and runs on `aarch64`.** The seccomp
+  name→number table mapped `readlink`/`unlink`/`chmod` to the legacy
+  `libc::SYS_readlink`/`SYS_unlink`/`SYS_chmod` constants, which do not exist on
+  `aarch64` (arm64 kept only the `*at` forms), so the crate failed to build for
+  that target. Those three arms are now gated to `x86_64`, and `unlinkat` /
+  `fchmodat` join the allow-list (`readlinkat` was already present). This is not
+  only a compile fix: mia's dropped, seccomp'd runtime calls
+  `std::fs::remove_file` / `set_permissions` / `read_link`, whose glibc wrappers
+  dispatch to `unlinkat` / `fchmodat` / `readlinkat` on arm64 — without the new
+  entries the daemon would `SIGSYS` on its first helper-socket cleanup or chmod
+  under the enforcing filter. Verified building and testing `ferro-harden` on
+  native `aarch64-unknown-linux-gnu`.
+
 ## [0.21.0] — 2026-07-15
 
 ### Added

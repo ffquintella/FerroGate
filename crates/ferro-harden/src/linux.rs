@@ -288,8 +288,20 @@ fn syscall_nr(name: &str) -> Option<i64> {
         "ftruncate" => libc::SYS_ftruncate,
         "openat" => libc::SYS_openat,
         "readlinkat" => libc::SYS_readlinkat,
+        "unlinkat" => libc::SYS_unlinkat,
+        "fchmodat" => libc::SYS_fchmodat,
+        // `readlink`/`unlink`/`chmod` are legacy syscalls that arm64 never
+        // implemented (it has only the `*at` forms), so the `libc::SYS_*`
+        // constants do not exist there — gate them to x86_64. glibc's
+        // `readlink`/`unlink`/`chmod` wrappers dispatch to `readlinkat`/
+        // `unlinkat`/`fchmodat` on arm64, all allow-listed above, so the runtime
+        // behaviour is preserved. `build_program` skips any name that resolves to
+        // `None`.
+        #[cfg(target_arch = "x86_64")]
         "readlink" => libc::SYS_readlink,
+        #[cfg(target_arch = "x86_64")]
         "unlink" => libc::SYS_unlink,
+        #[cfg(target_arch = "x86_64")]
         "chmod" => libc::SYS_chmod,
         // `mkdir` is x86_64-only; arm64 exposes only the `mkdirat` variant.
         #[cfg(target_arch = "x86_64")]
@@ -385,7 +397,8 @@ mod tests {
         // (and thus over-block at runtime). The exception is a handful of legacy
         // syscalls that exist only on x86_64 (arm64 kept only the `*at` /
         // `*_pwait` forms); `build_program` skips them where they don't resolve.
-        const X86_64_ONLY: &[&str] = &["fstat", "poll", "epoll_wait", "mkdir"];
+        const X86_64_ONLY: &[&str] =
+            &["fstat", "poll", "epoll_wait", "mkdir", "readlink", "unlink", "chmod"];
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         for name in ALLOWED_SYSCALLS {
             if X86_64_ONLY.contains(name) && !cfg!(target_arch = "x86_64") {

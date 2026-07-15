@@ -143,13 +143,20 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     "fdatasync",
     "ftruncate",
     "openat",
-    "readlinkat",
-    "readlink",
+    // `readlink`: resolve `/proc/<pid>/exe` to authenticate a helper-API caller.
     // `unlink`: remove a stale helper-API Unix socket before rebinding it.
     // `chmod`: set that socket to its configured mode (e.g. 0660) after bind —
     // a dropped process adjusting permissions on its own socket. (File secrets
     // are created 0600 via `open` and never chmod'd; see mia's seed writer.)
+    // Each has a legacy form (x86_64-only) and an `*at` form: arm64 dropped the
+    // legacy syscalls entirely, and glibc's `readlink`/`unlink`/`chmod` wrappers
+    // issue `readlinkat`/`unlinkat`/`fchmodat` there, so both forms are listed
+    // and `syscall_nr` skips whichever the target arch lacks.
+    "readlinkat",
+    "readlink",
+    "unlinkat",
     "unlink",
+    "fchmodat",
     "chmod",
     // `mkdir`/`mkdirat`: a dropped process creates its own runtime/state dirs at
     // startup (the CMIS allow-list cache under the state dir, the helper-socket
