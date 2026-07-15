@@ -24,7 +24,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.20.24"
+version      = "0.21.0"
 edition      = "2021"
 rust-version = "1.88"
 license      = "Apache-2.0"
@@ -77,6 +77,8 @@ ring          = "0.17"
 sha2          = "0.11"
 subtle        = "2.6"
 hex           = "0.4"
+hkdf          = "0.13"
+chacha20poly1305 = "0.10"
 fips204       = "0.4"
 base64        = "0.22"
 der           = { version = "0.8", features = ["alloc", "derive", "oid"] }

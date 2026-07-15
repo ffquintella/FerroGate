@@ -811,7 +811,14 @@ async fn bootstrap_host_svid_host_key(
         return None;
     };
     let key_path = host_key_path();
-    let key = match ferro_sep::SoftwareMachineKey::open_or_create(&key_path) {
+    // Seal the software key at rest to the hardware fingerprint: a key file
+    // copied to another host won't decrypt there (its fingerprint differs). This
+    // is clone resistance bound to machine identity, not a hardware root of
+    // trust — see docs/features/F16.
+    let key = match ferro_sep::SoftwareMachineKey::open_or_create_sealed(
+        &key_path,
+        facts.fingerprint().as_bytes(),
+    ) {
         Ok(k) => k,
         Err(e) => {
             tracing::error!(error = %e, path = %key_path.display(), "cannot open machine signing key");
@@ -869,22 +876,192 @@ async fn bootstrap_host_svid_host_key(
     Some(host_session_from_attested(attested))
 }
 
+/// The owned attestation inputs the bootstrap and re-attestation paths need:
+/// which backend to use, plus the operator-supplied EK certificate chain for
+/// the genuine TPM backend. Cloned out of [`mia::config::Config`] so the
+/// `'static` re-attestation task can hold it.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[derive(Clone, Default)]
+struct HostAttestConfig {
+    backend: mia::config::AttestBackend,
+    tpm_ek_cert: Option<std::path::PathBuf>,
+    // Only read by the Linux TPM bootstrap; unused on TPM-less platforms.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    tpm_ek_intermediates: Vec<std::path::PathBuf>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+impl HostAttestConfig {
+    fn from_config(c: &mia::config::Config) -> Self {
+        Self {
+            backend: c.attestation.backend,
+            tpm_ek_cert: c.attestation.tpm.ek_cert.clone(),
+            tpm_ek_intermediates: c.attestation.tpm.ek_intermediates.clone(),
+        }
+    }
+}
+
+/// Whether a usable TPM resource-manager device is present.
+///
+/// On Linux this opens `/dev/tpmrm0`: a device that is present but unusable
+/// (permissions, no resource manager) reports unavailable, so `auto` degrades to
+/// the software tier instead of committing to a TPM it cannot drive. Opening a
+/// context is cheap and creates no persistent objects. On other platforms mia is
+/// built without TPM support, so there is never a usable TPM.
+#[cfg(target_os = "linux")]
+fn tpm_available() -> bool {
+    mia::tpm::TpmEngine::open_device().is_ok()
+}
+#[cfg(all(not(target_os = "linux"), any(target_os = "macos", windows)))]
+fn tpm_available() -> bool {
+    false
+}
+
 /// Dispatch host-SVID bootstrap to the configured attestation backend.
 ///
-/// The default `host-key` profile ([`bootstrap_host_svid_host_key`]) works on
-/// every platform. The `virtual-tpm` backend is a dev/test-only software TPM
+/// `auto` (the default) picks the strongest usable tier: the genuine TPM path
+/// ([`bootstrap_host_svid_tpm`]) when a usable TPM *and* an EK certificate are
+/// present, otherwise the software `host-key` profile
+/// ([`bootstrap_host_svid_host_key`]). Selecting `tpm` explicitly is fail-closed
+/// — a missing TPM/EK cert refuses to attest rather than downgrading. The
+/// `virtual-tpm` backend is a dev/test-only software TPM
 /// ([`bootstrap_host_svid_virtual_tpm`]) and requires the `virtual-tpm` cargo
 /// feature; a build without it refuses to attest (fail closed) when selected.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[allow(clippy::large_futures)] // attestation future holds a composite key
 async fn bootstrap_host_svid(
     resolver: &mia::endpoint::CmisResolver,
-    backend: mia::config::AttestBackend,
+    attest: &HostAttestConfig,
 ) -> Option<HostSession> {
-    match backend {
-        mia::config::AttestBackend::HostKey => bootstrap_host_svid_host_key(resolver).await,
-        mia::config::AttestBackend::VirtualTpm => bootstrap_host_svid_virtual_tpm(resolver).await,
+    use mia::config::AttestBackend;
+    let effective = match attest.backend {
+        AttestBackend::Auto if tpm_available() && attest.tpm_ek_cert.is_some() => {
+            tracing::info!(
+                "attestation.backend = \"auto\": usable TPM detected; using the TPM attestation tier"
+            );
+            AttestBackend::Tpm
+        }
+        AttestBackend::Auto if tpm_available() => {
+            tracing::warn!(
+                "attestation.backend = \"auto\": a TPM is present but attestation.tpm.ek_cert is not \
+                 configured; using the host-key software tier (set attestation.tpm.ek_cert to use the TPM)"
+            );
+            AttestBackend::HostKey
+        }
+        AttestBackend::Auto => {
+            tracing::info!(
+                "attestation.backend = \"auto\": no usable TPM; using the host-key software tier"
+            );
+            AttestBackend::HostKey
+        }
+        other => other,
+    };
+    match effective {
+        AttestBackend::Auto => None, // unreachable: resolved above
+        AttestBackend::Tpm => bootstrap_host_svid_tpm(resolver, attest).await,
+        AttestBackend::HostKey => bootstrap_host_svid_host_key(resolver).await,
+        AttestBackend::VirtualTpm => bootstrap_host_svid_virtual_tpm(resolver).await,
     }
+}
+
+/// Bootstrap the host SVID via the genuine **TPM 2.0** path (feature F02): drive
+/// the resource-manager device `/dev/tpmrm0` through the shared 4-phase
+/// [`mia::client::run_attest`] handshake. Hardware-rooted; also covers hypervisor
+/// vTPMs, which present as a normal TPM device.
+///
+/// The EK certificate (and any intermediates) are operator-supplied via
+/// `[attestation.tpm]` — mia does not read the EK cert out of NV. Missing/unusable
+/// TPM or EK cert is fail-closed: it refuses to attest rather than downgrading.
+#[cfg(target_os = "linux")]
+#[allow(clippy::large_futures)] // attestation future holds a composite key
+async fn bootstrap_host_svid_tpm(
+    resolver: &mia::endpoint::CmisResolver,
+    attest: &HostAttestConfig,
+) -> Option<HostSession> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use mia::client::AttestEvidence as _;
+    use mia::tpm::{TpmEngine, TpmEvidence};
+    use sha2::{Digest, Sha256};
+
+    let Some(ek_cert_path) = attest.tpm_ek_cert.as_deref() else {
+        tracing::error!(
+            "attestation.backend = \"tpm\" but attestation.tpm.ek_cert is not configured; \
+             refusing to attest (fail closed)"
+        );
+        return None;
+    };
+    let ek_cert = match std::fs::read(ek_cert_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, path = %ek_cert_path.display(), "cannot read attestation.tpm.ek_cert");
+            return None;
+        }
+    };
+    let mut ek_intermediates = Vec::with_capacity(attest.tpm_ek_intermediates.len());
+    for p in &attest.tpm_ek_intermediates {
+        match std::fs::read(p) {
+            Ok(b) => ek_intermediates.push(b),
+            Err(e) => {
+                tracing::error!(error = %e, path = %p.display(), "cannot read an attestation.tpm.ek_intermediates entry");
+                return None;
+            }
+        }
+    }
+
+    let engine = match TpmEngine::open_device() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot open the TPM device (/dev/tpmrm0); refusing to attest (fail closed)");
+            return None;
+        }
+    };
+    let mut evidence = match TpmEvidence::new(engine, ek_cert, ek_intermediates) {
+        Ok(ev) => ev,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot initialize TPM attestation evidence (EK/AIK)");
+            return None;
+        }
+    };
+
+    let dpop_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(evidence.aik_pub()));
+
+    let (endpoint, mut client) = match resolver.connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, cmis = %resolver.describe(), "could not connect to CMIS for attestation");
+            return None;
+        }
+    };
+    let attested = match mia::client::run_attest(&mut client, &mut evidence, dpop_jkt).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "TPM attestation failed");
+            return None;
+        }
+    };
+    tracing::info!(
+        spiffe_id = %attested.bundle.spiffe_id,
+        cmis = %endpoint,
+        "host SVID obtained via TPM attestation; token minting enabled"
+    );
+    Some(host_session_from_attested(attested))
+}
+
+/// Fallback when the `tpm` backend is selected on a non-Linux host, where mia is
+/// built without a TSS2 stack: refuse to attest (fail closed) rather than
+/// silently downgrading to a different identity path.
+#[cfg(all(not(target_os = "linux"), any(target_os = "macos", windows)))]
+#[allow(clippy::unused_async)] // matches the Linux signature the dispatcher awaits
+async fn bootstrap_host_svid_tpm(
+    _resolver: &mia::endpoint::CmisResolver,
+    _attest: &HostAttestConfig,
+) -> Option<HostSession> {
+    tracing::error!(
+        "attestation.backend = \"tpm\" is only supported on Linux (it needs a TSS2 stack); \
+         refusing to attest (fail closed). Use \"host-key\" on this platform."
+    );
+    None
 }
 
 /// Build the running [`HostSession`] (token minter + host identity) from a
@@ -1139,7 +1316,17 @@ fn maybe_spawn_propose_task(
         tracing::warn!("allowlist.propose is set but CMIS is not configured; not proposing");
         return;
     };
-    let key = match ferro_sep::SoftwareMachineKey::open_or_create(&host_key_path()) {
+    // Open the same machine key the host-key bootstrap uses. It is sealed to the
+    // hardware fingerprint when one is available (matching `bootstrap_host_svid_host_key`);
+    // a host with no fingerprint (e.g. the TPM backend) falls back to the plaintext key.
+    let key_path = host_key_path();
+    let key = match prefetched_facts() {
+        Some(facts) => {
+            ferro_sep::SoftwareMachineKey::open_or_create_sealed(&key_path, facts.fingerprint().as_bytes())
+        }
+        None => ferro_sep::SoftwareMachineKey::open_or_create(&key_path),
+    };
+    let key = match key {
         Ok(k) => k,
         Err(e) => {
             tracing::error!(error = %e, "cannot open machine key; not proposing");
@@ -1366,8 +1553,9 @@ struct ReattestParams {
     propose_interval: u64,
     /// The daemon's own executable digest, for the proposal's self entry.
     self_sha: Option<[u8; 48]>,
-    /// Which attestation backend the background re-attestation uses.
-    backend: mia::config::AttestBackend,
+    /// The attestation inputs (backend + TPM EK chain) the background
+    /// re-attestation uses.
+    attest: HostAttestConfig,
 }
 
 /// When startup attestation fails — CMIS unreachable, or (commonly) DNS/VPN not
@@ -1402,7 +1590,7 @@ fn spawn_reattest_task<A>(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let Some(session) = bootstrap_host_svid(&resolver, params.backend).await else {
+            let Some(session) = bootstrap_host_svid(&resolver, &params.attest).await else {
                 continue; // the failure is logged inside bootstrap; retry next tick
             };
             let spiffe_id = session.spiffe_id.clone();
@@ -1530,7 +1718,7 @@ where
     // token minter. When CMIS isn't configured or attestation fails, there is no
     // session — the helper API still serves but refuses to mint (`no_host_svid`).
     let session = match &resolver {
-        Some(r) => bootstrap_host_svid(r, config.attestation.backend).await,
+        Some(r) => bootstrap_host_svid(r, &HostAttestConfig::from_config(config)).await,
         None => None,
     };
     let host_spiffe_id = session.as_ref().map(|s| s.spiffe_id.clone());
@@ -1637,7 +1825,7 @@ where
                     propose: config.allowlist.propose,
                     propose_interval: config.allowlist_propose_interval(),
                     self_sha: server.self_sha(),
-                    backend: config.attestation.backend,
+                    attest: HostAttestConfig::from_config(config),
                 },
                 clock.clone(),
             );

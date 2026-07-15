@@ -19,6 +19,10 @@ pub enum Vendor {
     St,
     /// Intel PTT (firmware TPM).
     IntelPtt,
+    /// An operator-run EK-signing CA for on-prem hypervisor vTPMs (swtpm,
+    /// vSphere) whose EK is not chained to a hardware vendor. Has no compiled-in
+    /// bundle: roots are provisioned at runtime (see `add_root_pem`).
+    OnPrem,
 }
 
 impl Vendor {
@@ -38,6 +42,7 @@ impl Vendor {
             Vendor::Nuvoton => "nuvoton",
             Vendor::St => "st",
             Vendor::IntelPtt => "intel-ptt",
+            Vendor::OnPrem => "on-prem",
         }
     }
 
@@ -58,6 +63,8 @@ impl Vendor {
             Vendor::Nuvoton => include_str!(concat!(env!("OUT_DIR"), "/nuvoton.pem")),
             Vendor::St => include_str!(concat!(env!("OUT_DIR"), "/st.pem")),
             Vendor::IntelPtt => include_str!(concat!(env!("OUT_DIR"), "/intel.pem")),
+            // No compiled-in bundle; operator provisions roots at runtime.
+            Vendor::OnPrem => "",
         }
     }
 }

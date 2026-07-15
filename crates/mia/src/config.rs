@@ -366,18 +366,54 @@ pub struct AttestationConfig {
     /// Override the IMA runtime-measurement log path.
     pub ima_log: Option<PathBuf>,
     /// Which attestation backend the daemon uses to obtain its host SVID.
-    /// Defaults to [`AttestBackend::HostKey`].
+    /// Defaults to [`AttestBackend::Auto`] (real TPM when available, else the
+    /// software host-key profile).
     pub backend: AttestBackend,
+    /// `[attestation.tpm]` — inputs for the genuine TPM backend.
+    pub tpm: TpmConfig,
+}
+
+/// `[attestation.tpm]` — configuration for the genuine TPM 2.0 backend
+/// ([`AttestBackend::Tpm`]).
+///
+/// A hardware TPM stores its EK certificate in NV, but hypervisor vTPMs
+/// (`swtpm`, vSphere) frequently do not provision one, and mia does not read NV
+/// today. So the EK certificate the daemon presents to CMIS is operator-supplied
+/// here: extract it once from the (v)TPM's EK-CA and point `ek_cert` at the DER.
+/// Without it the `tpm` backend cannot attest (and `auto` falls back to the
+/// software host-key tier).
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TpmConfig {
+    /// Path to the EK certificate (DER) presented to CMIS.
+    pub ek_cert: Option<PathBuf>,
+    /// Paths to intermediate CA certificates (DER) bridging the EK certificate
+    /// to a root CMIS trusts, leaf-to-root order.
+    pub ek_intermediates: Vec<PathBuf>,
 }
 
 /// Which backend `mia` attests with to obtain its host SVID.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AttestBackend {
-    /// The TPM-less **host-key** profile (feature F15): a hardware fingerprint
-    /// plus a machine signing key. The production default; works on every
-    /// supported platform.
+    /// **Capability-aware selection** (the production default): use a real
+    /// (v)TPM when one is present and usable ([`AttestBackend::Tpm`]),
+    /// otherwise fall back to the software [`AttestBackend::HostKey`] profile.
+    /// Unlike `Tpm`, a missing TPM is *not* fatal here — the downgrade to the
+    /// host-key tier is the documented contract and is logged at `warn`.
     #[default]
+    Auto,
+    /// The genuine **TPM 2.0** path (feature F02): drives the kernel resource
+    /// manager `/dev/tpmrm0` to produce a hardware-rooted quote. This is the
+    /// strongest tier and covers hypervisor vTPMs, which present as a normal
+    /// TPM device. Selecting it explicitly is fail-closed: if no usable TPM is
+    /// found the daemon refuses to attest rather than silently downgrading.
+    /// Linux-only.
+    Tpm,
+    /// The TPM-less **host-key** profile (feature F15): a hardware fingerprint
+    /// plus a machine signing key. Works on every supported platform; a
+    /// lower-assurance tier (no hardware root of trust) used when no TPM is
+    /// available.
     HostKey,
     /// The in-process software **virtual TPM** — INSECURE, dev/test only. Runs
     /// the full TPM attestation handshake against a specially-configured dev
@@ -560,12 +596,18 @@ impl Config {
         }
         if let Some(v) = get("FERROGATE_ATTEST_BACKEND") {
             self.attestation.backend = match v.trim().to_ascii_lowercase().as_str() {
+                "auto" => AttestBackend::Auto,
+                "tpm" => AttestBackend::Tpm,
                 "host-key" => AttestBackend::HostKey,
                 "virtual-tpm" => AttestBackend::VirtualTpm,
                 other => anyhow::bail!(
-                    "FERROGATE_ATTEST_BACKEND must be \"host-key\" or \"virtual-tpm\", got {other:?}"
+                    "FERROGATE_ATTEST_BACKEND must be \"auto\", \"tpm\", \"host-key\", or \
+                     \"virtual-tpm\", got {other:?}"
                 ),
             };
+        }
+        if let Some(v) = get("FERROGATE_TPM_EK_CERT") {
+            self.attestation.tpm.ek_cert = Some(PathBuf::from(v));
         }
         Ok(())
     }
@@ -842,9 +884,17 @@ mod tests {
     }
 
     #[test]
-    fn attestation_backend_defaults_to_host_key() {
+    fn attestation_backend_defaults_to_auto() {
         let c = Config::from_toml("").unwrap();
-        assert_eq!(c.attestation.backend, AttestBackend::HostKey);
+        assert_eq!(c.attestation.backend, AttestBackend::Auto);
+    }
+
+    #[test]
+    fn attestation_backend_parses_tpm_and_auto() {
+        let c = Config::from_toml("[attestation]\nbackend = \"tpm\"").unwrap();
+        assert_eq!(c.attestation.backend, AttestBackend::Tpm);
+        let c = Config::from_toml("[attestation]\nbackend = \"auto\"").unwrap();
+        assert_eq!(c.attestation.backend, AttestBackend::Auto);
     }
 
     #[test]

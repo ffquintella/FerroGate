@@ -8,6 +8,12 @@
 > `enrolled_machine_id` enrollment, and the `mia` `run_attest_host_key` client.
 > The Apple attestation tiers (MDA / App Attest) under "Future hardening"
 > remain unbuilt. See "Implementation map" at the end.
+>
+> **On Linux VMs**, this `host-key` profile is the software fallback tier of
+> [F16](F16-vtpm-tiered-attestation.md): mia uses a real (v)TPM when the host has
+> one and this profile only when it does not. F16 also hardens the software key
+> by sealing it at rest to the hardware fingerprint (clone resistance) and adds a
+> CMIS knob to require fleet-manifest pre-registration instead of trust-on-first-use.
 
 A Mac has no TPM and cannot run the TSS2 / `tss-esapi` stack that F02 and F04
 depend on. As a pragmatic first step (and a useful fallback on any TPM-less

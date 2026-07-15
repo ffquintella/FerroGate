@@ -29,6 +29,24 @@ fingerprint against the vendor's published value, then rebuild and commit). See
 [`crates/ferro-attest/vendor-roots/README.md`](../crates/ferro-attest/vendor-roots/README.md)
 for the step-by-step procedure.
 
+## On-prem vTPM (swtpm / vSphere) — feature F16
+
+A hypervisor vTPM presents as an ordinary TPM 2.0 device, so mia drives it through
+the same engine as hardware (`mia::tpm::TpmEngine`, backend `tpm`/`auto`). Its EK,
+however, is signed by the **hypervisor's / operator's EK-CA**, not a hardware
+vendor. Two extra provisioning steps make such a quote verifiable:
+
+1. **EK certificate.** mia does not read the EK cert out of NV; point
+   `attestation.tpm.ek_cert` at the DER extracted from your EK-CA. On CMIS, trust
+   that CA by listing its PEM in `CMIS_VTPM_EK_ROOTS` (`:`-separated) — it is
+   loaded under the `Vendor::OnPrem` tag.
+2. **PCR / RIM.** The guest image's PCR-aggregate digest is image-specific;
+   approve it in the RIM bundle (`CMIS_RIM_BUNDLE`) with its own `policy_id`.
+
+Where a host has **no** vTPM, mia falls back to the software `host-key` tier (F15)
+— a lower-assurance identity with no hardware root of trust. See
+[F16](features/F16-vtpm-tiered-attestation.md) for the full tier matrix.
+
 ## PCR policy
 
 | PCR | Measures | Allowed values |

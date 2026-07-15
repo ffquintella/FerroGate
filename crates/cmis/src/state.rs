@@ -79,6 +79,17 @@ pub struct CmisConfig {
     pub policy_epoch: u64,
     /// How host-driven allowlist proposals are handled (`ProposeAllowlist`).
     pub allowlist_proposal_policy: ProposalPolicy,
+    /// Require software **host-key** nodes (F15/F16) to be pre-registered in the
+    /// fleet manifest, refusing trust-on-first-use. The software host-key tier
+    /// has no hardware root of trust, so TOFU means the first attester for a
+    /// fingerprint defines the identity; enabling this closes that window.
+    /// Defaults to `false` (TOFU) for backward compatibility; production
+    /// deployments that use the software tier should enable it.
+    pub require_preregistered_host_key: bool,
+    /// Optional shorter SVID lifetime (seconds) for the software host-key tier.
+    /// `None` ⇒ use [`Self::svid_ttl_secs`]. A shorter TTL makes the
+    /// lower-assurance software identities re-attest more often.
+    pub host_key_svid_ttl_secs: Option<u64>,
 }
 
 impl Default for CmisConfig {
@@ -90,6 +101,8 @@ impl Default for CmisConfig {
             allowlist_ttl_secs: 72 * 3600,
             policy_epoch: 1,
             allowlist_proposal_policy: ProposalPolicy::default(),
+            require_preregistered_host_key: false,
+            host_key_svid_ttl_secs: None,
         }
     }
 }
@@ -195,6 +208,9 @@ pub enum HostKeyBinding {
     PreRegistered,
     /// The presented key does not match the bound key — reject and audit.
     Mismatch,
+    /// Strict mode ([`CmisConfig::require_preregistered_host_key`]) is on and
+    /// this fingerprint has no pre-registered key — reject without TOFU-pinning.
+    RejectedNotPreRegistered,
 }
 
 /// The mutable revocation working set.
@@ -261,7 +277,16 @@ impl CmisState {
     /// and pin it for every later attestation. A presented key that differs
     /// from the bound one returns [`HostKeyBinding::Mismatch`] and is rejected
     /// by the caller.
-    pub fn bind_host_key(&self, fingerprint: &[u8; 48], sep_pub: &[u8]) -> HostKeyBinding {
+    ///
+    /// When `require_preregistered` is set, a fingerprint with no pre-registered
+    /// key is refused ([`HostKeyBinding::RejectedNotPreRegistered`]) instead of
+    /// being TOFU-pinned.
+    pub fn bind_host_key(
+        &self,
+        fingerprint: &[u8; 48],
+        sep_pub: &[u8],
+        require_preregistered: bool,
+    ) -> HostKeyBinding {
         // Operator pre-registration takes precedence over TOFU.
         if let Some(expected) = self.fleet.preregistered(fingerprint) {
             return if expected == sep_pub {
@@ -269,6 +294,12 @@ impl CmisState {
             } else {
                 HostKeyBinding::Mismatch
             };
+        }
+        // Strict mode: with no pre-registered key, refuse *without* pinning — a
+        // TOFU pin here would let the next attempt appear `Pinned` and slip past
+        // the requirement.
+        if require_preregistered {
+            return HostKeyBinding::RejectedNotPreRegistered;
         }
         let mut pins = self.host_key_pins.lock();
         match pins.get(fingerprint) {

@@ -8,6 +8,27 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-07-15
+
+### Added
+
+- **F16 — tiered attestation for VMs (vTPM when available, hardened software
+  otherwise).** mia now selects an attestation tier at boot. The new default
+  `attestation.backend = "auto"` uses a real (v)TPM when the host has a usable
+  one *and* an EK certificate is configured (`[attestation.tpm].ek_cert`),
+  otherwise it falls back to the software `host-key` profile; `"tpm"` forces the
+  TPM and is fail-closed. A new `TpmEvidence` adapter drives the genuine
+  `TpmEngine` through the shared `run_attest` handshake, so hypervisor vTPMs
+  (swtpm, vSphere) attest hardware-rooted. The software tier is hardened: the
+  P-256 machine key is sealed at rest (ChaCha20-Poly1305 + HKDF) to the hardware
+  fingerprint for clone resistance — a key file copied to another host will not
+  decrypt there — with transparent in-place migration of pre-F16 plaintext keys.
+  CMIS gains `CMIS_REQUIRE_PREREGISTERED_HOST_KEY` (refuse trust-on-first-use for
+  un-enrolled software nodes), `CMIS_HOST_KEY_SVID_TTL_SECS` (shorter lifetime for
+  the lower-assurance tier), and `CMIS_VTPM_EK_ROOTS` (trust an operator-run EK-CA
+  for on-prem vTPMs, under the new `Vendor::OnPrem`). See
+  [docs/features/F16-vtpm-tiered-attestation.md](docs/features/F16-vtpm-tiered-attestation.md).
+
 ### Fixed
 
 - **mia no longer SIGSYS-crash-loops when it creates a runtime/state directory

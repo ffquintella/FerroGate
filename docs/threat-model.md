@@ -31,6 +31,25 @@
   backdated or long-lived SVIDs; key reconstruction requires a threshold of
   enclaves with valid attestation.
 
+## Attestation assurance tiers (F16)
+
+Not every host has a TPM. mia attests at the strongest tier a host supports, and
+CMIS distinguishes them:
+
+- **Tier A — (v)TPM (F02/F16).** Satisfies G1/G2: a hardware or hypervisor vTPM
+  quote chaining to a trusted EK root (vendor, or an operator EK-CA for on-prem
+  vTPMs via `Vendor::OnPrem`) with an approved PCR/RIM digest.
+- **Tier B — software host-key (F15/F16).** For TPM-less hosts. **Does not meet
+  G1 or G2** — there is no hardware root of trust and no measured boot. Identity
+  is a machine-fingerprint-derived signing key. The at-rest key is sealed to the
+  fingerprint (clone *resistance* against a copied key file), but this is **not**
+  confidentiality against a local root attacker, who can re-derive the seal secret
+  from DMI. Tier B is therefore gated: offline-signed fleet-manifest enrollment
+  (optionally requiring pre-registration, refusing trust-on-first-use), a distinct
+  `host-key` policy id so trust domains can refuse it, and an optionally shorter
+  SVID TTL. Treat tier-B identities as continuity-of-a-key, not proof of a genuine
+  machine.
+
 ## Out of scope
 
 - Physical attacks against the TPM package (decapping, side-channel against

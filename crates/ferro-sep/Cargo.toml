@@ -29,6 +29,12 @@ sha2      = { workspace = true }
 hex       = { workspace = true }
 thiserror = { workspace = true }
 getrandom = "0.4"
+# Clone-resistant at-rest sealing of the software machine key (F16): HKDF-SHA256
+# derives an AEAD key from a machine-bound seal secret; ChaCha20-Poly1305 seals
+# the P-256 scalar so a key file copied to another host cannot be decrypted.
+hkdf             = { workspace = true }
+chacha20poly1305 = { workspace = true }
+zeroize          = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3", optional = true }

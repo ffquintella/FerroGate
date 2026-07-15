@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
+
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::fleet_manifest::FleetManifestLoader;
 use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
@@ -246,6 +248,44 @@ fn now_unix() -> i64 {
 /// `CMIS_CLUSTER_PEERS` as `id=raft_addr,api_addr` entries separated by `;`,
 /// pick which entry is "this node" with `CMIS_NODE_ID`, and must share real
 /// `CMIS_RAFT_SECRET` / `CMIS_API_SECRET` values across the fleet.
+/// Build the EK-chain trust store. On-prem hypervisor vTPMs (swtpm, vSphere)
+/// present an EK not chained to a hardware TPM vendor; `CMIS_VTPM_EK_ROOTS`
+/// (`:`-separated PEM paths) loads the operator-run EK-CA root(s) under
+/// `Vendor::OnPrem` so those quotes can chain to trust (feature F16).
+fn load_vendor_trust() -> anyhow::Result<VendorTrustStore> {
+    let mut trust = VendorTrustStore::default();
+    if let Ok(paths) = std::env::var("CMIS_VTPM_EK_ROOTS") {
+        for path in paths.split(':').filter(|p| !p.is_empty()) {
+            let pem = std::fs::read(path)
+                .with_context(|| format!("reading CMIS_VTPM_EK_ROOTS entry {path}"))?;
+            trust
+                .add_root_pem(&pem, ferro_attest::Vendor::OnPrem)
+                .with_context(|| format!("loading on-prem vTPM EK root {path}"))?;
+            tracing::info!(path, "trusting on-prem vTPM EK-CA root");
+        }
+    }
+    Ok(trust)
+}
+
+/// Apply the software host-key tier (F15/F16) hardening knobs from the
+/// environment. `CMIS_REQUIRE_PREREGISTERED_HOST_KEY` refuses trust-on-first-use
+/// for host-key nodes not pre-registered in the fleet manifest;
+/// `CMIS_HOST_KEY_SVID_TTL_SECS` gives that lower-assurance tier a shorter
+/// lifetime (same floor/ceiling as the SVID TTL).
+fn apply_host_key_hardening(cmis_config: &mut CmisConfig) {
+    if let Ok(v) = std::env::var("CMIS_REQUIRE_PREREGISTERED_HOST_KEY") {
+        cmis_config.require_preregistered_host_key =
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    if let Some(n) = ttl_from_env(
+        "CMIS_HOST_KEY_SVID_TTL_SECS",
+        ferro_svid::MIN_TTL_SECS,
+        ferro_svid::MAX_TTL_SECS,
+    ) {
+        cmis_config.host_key_svid_ttl_secs = Some(n);
+    }
+}
+
 async fn start_cluster() -> anyhow::Result<Arc<Cluster>> {
     let data_dir =
         std::env::var("CMIS_RAFT_DIR").unwrap_or_else(|_| "/var/lib/ferrogate/raft".to_string());
@@ -423,7 +463,7 @@ async fn main() -> anyhow::Result<()> {
     // The verifier and the RIM loader share one `RimStore` handle so a signed
     // bundle applied by the loader is immediately visible to quote verification.
     let rim_store = RimStore::new();
-    let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), rim_store.clone());
+    let verifier = TpmQuoteVerifier::new(load_vendor_trust()?, rim_store.clone());
 
     // M3 audit log: local-disk WORM store + in-process composite signer. The
     // production swap to a TEE threshold signer lands with the hardware TEE
@@ -469,9 +509,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(n) = ttl_from_env("CMIS_ALLOWLIST_TTL_SECS", 3600, 30 * 24 * 3600) {
         cmis_config.allowlist_ttl_secs = i64::try_from(n).unwrap_or(72 * 3600);
     }
+    apply_host_key_hardening(&mut cmis_config);
     tracing::info!(
         svid_ttl_secs = cmis_config.svid_ttl_secs,
         allowlist_ttl_secs = cmis_config.allowlist_ttl_secs,
+        require_preregistered_host_key = cmis_config.require_preregistered_host_key,
+        host_key_svid_ttl_secs = ?cmis_config.host_key_svid_ttl_secs,
         "signature lifetimes"
     );
 

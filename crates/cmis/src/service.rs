@@ -578,7 +578,11 @@ async fn run_attest_host_key(
     // pre-registered key must match exactly; otherwise the key is trusted on
     // first use and pinned. A key that differs from the bound one is a rebind
     // attempt — refuse it.
-    match state.bind_host_key(&verified.fingerprint, &evidence.sep_pub) {
+    match state.bind_host_key(
+        &verified.fingerprint,
+        &evidence.sep_pub,
+        state.config.require_preregistered_host_key,
+    ) {
         HostKeyBinding::Mismatch => {
             tracing::warn!("host-key binding mismatch: presented key != bound key");
             audit_record(
@@ -586,6 +590,20 @@ async fn run_attest_host_key(
                 AuditEvent::HostRejected {
                     ek_sha: fp_sha,
                     reason: "key-rebind".to_string(),
+                },
+                now,
+            );
+            return Err(Status::permission_denied("attestation failed"));
+        }
+        HostKeyBinding::RejectedNotPreRegistered => {
+            tracing::warn!(
+                "host-key node is not pre-registered and require_preregistered_host_key is set; refusing TOFU"
+            );
+            audit_record(
+                &state,
+                AuditEvent::HostRejected {
+                    ek_sha: fp_sha,
+                    reason: "not-preregistered".to_string(),
                 },
                 now,
             );
@@ -629,7 +647,12 @@ async fn run_attest_host_key(
         pcr_digest: verified.fingerprint,
         policy_id: HOST_KEY_POLICY_ID.to_string(),
         dpop_jkt: csr.dpop_jkt,
-        ttl_secs: state.config.svid_ttl_secs,
+        // The software host-key tier may carry a shorter lifetime so its
+        // lower-assurance identities re-attest more often.
+        ttl_secs: state
+            .config
+            .host_key_svid_ttl_secs
+            .unwrap_or(state.config.svid_ttl_secs),
         tee_evidence_id: None,
     };
     let issued = state.issuer.issue(&params, now).map_err(|e| {

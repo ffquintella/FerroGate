@@ -36,6 +36,8 @@ use tss_esapi::{
     Context,
 };
 
+use crate::client::{AttestEvidence, QuoteEvidence};
+
 /// The policy PCR set quoted on every attestation (see `docs/tpm.md`).
 const POLICY_PCRS: [PcrSlot; 11] = [
     PcrSlot::Slot0,
@@ -322,6 +324,83 @@ impl TpmEngine {
     /// Borrow the underlying context (escape hatch for advanced callers/tests).
     pub fn context_mut(&mut self) -> &mut Context {
         &mut self.ctx
+    }
+}
+
+/// A [`TpmEngine`] driven through the shared [`AttestEvidence`] handshake
+/// (`client::run_attest`), so the genuine TPM backend uses exactly the same
+/// 4-phase state machine as the dev-only virtual TPM.
+///
+/// Construction creates the EK and a fresh restricted AIK; the EK certificate
+/// (and any intermediates) are supplied by the caller — read from operator
+/// configuration, since mia does not read the EK cert out of NV.
+pub struct TpmEvidence {
+    engine: TpmEngine,
+    ek: LoadedKey,
+    aik: LoadedKey,
+    ek_cert: Vec<u8>,
+    ek_intermediates: Vec<Vec<u8>>,
+}
+
+impl TpmEvidence {
+    /// Open the resource-manager device, create the EK + AIK, and bind the
+    /// operator-supplied EK certificate chain.
+    ///
+    /// # Errors
+    /// Propagates any TPM error creating the EK or AIK.
+    pub fn new(
+        mut engine: TpmEngine,
+        ek_cert: Vec<u8>,
+        ek_intermediates: Vec<Vec<u8>>,
+    ) -> Result<Self> {
+        let ek = engine.load_ek().context("load EK")?;
+        let aik = engine.create_aik(&ek).context("create AIK")?;
+        Ok(Self {
+            engine,
+            ek,
+            aik,
+            ek_cert,
+            ek_intermediates,
+        })
+    }
+}
+
+impl AttestEvidence for TpmEvidence {
+    fn ek_cert(&self) -> Vec<u8> {
+        self.ek_cert.clone()
+    }
+
+    fn ek_intermediates(&self) -> Vec<Vec<u8>> {
+        self.ek_intermediates.clone()
+    }
+
+    fn aik_pub(&self) -> Vec<u8> {
+        self.aik.public_marshaled.clone()
+    }
+
+    fn quote(&mut self, nonce: &[u8]) -> Result<QuoteEvidence> {
+        let q = self.engine.quote(&self.aik, nonce)?;
+        Ok(QuoteEvidence {
+            attest_blob: q.attest_marshaled,
+            signature: q.signature_marshaled,
+            pcr_values: q.pcr_values,
+        })
+    }
+
+    fn activate(&mut self, credential_blob: &[u8], secret_blob: &[u8]) -> Result<Vec<u8>> {
+        // The wire blobs are the `TPM2B_ID_OBJECT` / `TPM2B_ENCRYPTED_SECRET`
+        // buffer contents (see `cmis::credential::WrappedCredential`); rebuild the
+        // ESAPI buffer types `TPM2_ActivateCredential` expects.
+        let id_object =
+            IdObject::try_from(credential_blob.to_vec()).context("parse credential_blob")?;
+        let secret =
+            EncryptedSecret::try_from(secret_blob.to_vec()).context("parse secret_blob")?;
+        self.engine
+            .activate_credential(&self.aik, &self.ek, id_object, secret)
+    }
+
+    fn sign_aik(&mut self, message: &[u8]) -> Result<Vec<u8>> {
+        self.engine.sign_aik(&self.aik, message)
     }
 }
 

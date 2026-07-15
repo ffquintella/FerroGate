@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use ferro_attest::verify::{PcrSet, QuoteVerification, RejectReason};
 use ferro_attest::{PolicyId, RimStore, TpmQuoteVerifier, Vendor, VendorTrustStore};
 
-use mia::tpm::TpmEngine;
+use mia::client::AttestEvidence;
+use mia::tpm::{TpmEngine, TpmEvidence};
 
 use sha2::{Digest as _, Sha384};
 use tss_esapi::structures::{Digest, EncryptedSecret, IdObject};
@@ -221,6 +222,63 @@ fn swtpm_quote_is_accepted_end_to_end() {
 
     // Phase 3: credential activation round-trips and compares constant-time.
     credential_activation_roundtrips(&mut engine, &ek, &aik);
+}
+
+/// The `TpmEvidence` adapter (what `client::run_attest` drives) must produce a
+/// quote the CMIS verifier accepts, exposing the same EK cert / AIK it was built
+/// with. This exercises the F16 adapter end-to-end against a real software TPM,
+/// short of the gRPC handshake.
+#[test]
+fn tpm_evidence_adapter_quote_is_accepted() {
+    let Some(swtpm) = Swtpm::start() else {
+        return; // environment without swtpm; treated as skipped.
+    };
+    let _keep = &swtpm;
+
+    let (leaf_der, root_der) = ek_chain();
+    let engine = TpmEngine::new(Swtpm::tcti()).expect("open swtpm");
+    let mut evidence =
+        TpmEvidence::new(engine, leaf_der.clone(), Vec::new()).expect("build TpmEvidence");
+
+    // The adapter surfaces exactly the EK cert it was constructed with.
+    assert_eq!(evidence.ek_cert(), leaf_der);
+    assert!(evidence.ek_intermediates().is_empty());
+
+    let nonce = [0x11u8; 32];
+    let quote = evidence.quote(&nonce).expect("adapter quote");
+
+    let mut trust = VendorTrustStore::new();
+    trust.add_root_der(&root_der, Vendor::Infineon).unwrap();
+    let mut pcrs = PcrSet::new();
+    let mut agg = Sha384::new();
+    for (idx, value) in &quote.pcr_values {
+        pcrs.insert(*idx, value.clone());
+        agg.update(value);
+    }
+    let mut digest = [0u8; 48];
+    digest.copy_from_slice(&agg.finalize());
+    let rim = RimStore::new();
+    rim.approve(digest, PolicyId("swtpm-adapter-test".into()));
+    let verifier = TpmQuoteVerifier::new(trust, rim);
+
+    let good = QuoteVerification {
+        ek_cert_der: &evidence.ek_cert(),
+        ek_intermediates: &[],
+        aik_pub: &evidence.aik_pub(),
+        quote_blob: &quote.attest_blob,
+        signature: &quote.signature,
+        nonce: &nonce,
+        pcrs: &pcrs,
+        now: NOW,
+    };
+    let accepted = verifier
+        .verify_quote(&good)
+        .expect("adapter quote must verify");
+    assert_eq!(accepted.policy_id.as_str(), "swtpm-adapter-test");
+
+    // Phase 4: the adapter's restricted AIK signs the composite key bytes.
+    let sig = evidence.sign_aik(b"composite-public-key-bytes").expect("adapter sign");
+    assert!(!sig.is_empty());
 }
 
 /// Rebuild a `QuoteVerification` borrowing the same evidence (the struct holds
