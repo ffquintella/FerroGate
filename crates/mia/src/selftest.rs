@@ -20,8 +20,12 @@
 //! Every failing step prints targeted remediation hints (mirroring the
 //! runbooks under `docs/operations/runbooks/`), and the command exits non-zero
 //! so provisioning scripts can gate on it. Like `mia setup`, this is a client
-//! command: it runs without the daemon's hardening profile and never touches
-//! the TPM.
+//! command: it runs without the daemon's hardening profile and never *drives*
+//! the TPM — it only probes for one (a cheap, read-only device open) to report,
+//! informationally, whether a hardware root of trust is present and whether the
+//! daemon will attest with it. That line is never a pass/fail condition: a
+//! TPM-less host (the common VM case) is fully supported via the host-key
+//! software tier.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -127,7 +131,8 @@ fn print_help() {
          Runs four checks: configuration, the pinned hybrid-PQC TLS connection\n\
          to CMIS, CMIS CRL publishing, and a live token mint through the local\n\
          helper socket. Prints remediation hints on failure and exits non-zero\n\
-         if any check fails.\n\
+         if any check fails. It also reports, informationally, whether a real\n\
+         TPM is present and in use for attestation (never a pass/fail result).\n\
          \n\
          options:\n\
          \x20 -c, --config <path>     TOML config file (same resolution as the daemon)\n\
@@ -160,6 +165,11 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
     if resolver.is_none() {
         failures.push("configuration");
     }
+
+    // Informational: is a real TPM present, and will the daemon attest with it?
+    // Never contributes to `failures` — a TPM-less host attests via the
+    // host-key software tier, which is a fully supported (lower-assurance) tier.
+    report_attestation(config);
 
     // 2. CMIS connection / 3. CRL publishing ------------------------------
     let mut server_crl = ServerCrl::Unknown;
@@ -914,6 +924,98 @@ fn unix_now() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
+/// Whether a usable TPM resource-manager device is present on this host.
+///
+/// Mirrors the daemon's own capability probe (`main.rs::tpm_available`): on
+/// Linux it opens `/dev/tpmrm0`, which is cheap and creates no persistent
+/// objects; a device that is absent or unusable (permissions, no resource
+/// manager) reports `false`, exactly as the daemon treats it. Non-Linux builds
+/// carry no TPM support, so there is never a usable TPM.
+///
+/// Because the probe runs as whoever invoked `mia test` (often root or an
+/// operator) rather than as the daemon's service account, a `true`/`false`
+/// here reflects *this* caller's access — which is why the reported detail says
+/// "usable" rather than merely "present".
+#[cfg(target_os = "linux")]
+fn tpm_detected() -> bool {
+    crate::tpm::TpmEngine::open_device().is_ok()
+}
+#[cfg(not(target_os = "linux"))]
+fn tpm_detected() -> bool {
+    false
+}
+
+/// Classify the daemon's attestation posture for the informational line.
+///
+/// Pure — TPM detection and the EK-cert presence are passed in — so the backend
+/// selection (which mirrors `main.rs::bootstrap_host_svid`) is unit-testable
+/// without hardware. Returns `(status, detail)` where `status` is `"info"` for
+/// a healthy posture and `"warn"` for a configuration that cannot attest;
+/// neither is ever counted as a self-test failure.
+fn attestation_detail(
+    configured: crate::config::AttestBackend,
+    tpm_detected: bool,
+    ek_cert: bool,
+) -> (&'static str, String) {
+    use crate::config::AttestBackend;
+    match configured {
+        // `auto` picks the strongest usable tier, exactly as the daemon does.
+        AttestBackend::Auto if tpm_detected && ek_cert => (
+            "info",
+            "real TPM detected and in use — hardware-rooted attestation (backend = auto)".to_string(),
+        ),
+        AttestBackend::Auto if tpm_detected => (
+            "info",
+            "real TPM detected but NOT in use — attestation.tpm.ek_cert is unset, so the daemon \
+             attests via the host-key software tier (set attestation.tpm.ek_cert to use the TPM)"
+                .to_string(),
+        ),
+        AttestBackend::Auto => (
+            "info",
+            "no usable TPM detected — attesting via the host-key software tier \
+             (expected on VMs and TPM-less hosts)"
+                .to_string(),
+        ),
+        // `tpm` is fail-closed: a missing TPM refuses to attest rather than
+        // downgrading, so flag it as a warning (still not a self-test failure).
+        AttestBackend::Tpm if tpm_detected => (
+            "info",
+            "real TPM detected and in use — hardware-rooted attestation (backend = tpm)".to_string(),
+        ),
+        AttestBackend::Tpm => (
+            "warn",
+            "backend = tpm but no usable TPM detected — the daemon fails closed and obtains no host \
+             SVID (set backend = auto to allow the host-key software tier)"
+                .to_string(),
+        ),
+        // `host-key` never uses the TPM even when one is present.
+        AttestBackend::HostKey if tpm_detected => (
+            "info",
+            "backend = host-key (software tier) — a real TPM is present but is not used".to_string(),
+        ),
+        AttestBackend::HostKey => (
+            "info",
+            "backend = host-key (software tier) — no usable TPM detected".to_string(),
+        ),
+        AttestBackend::VirtualTpm => (
+            "warn",
+            "backend = virtual-tpm (INSECURE, dev/test only) — TPM hardware is not used; requires a \
+             build with the `virtual-tpm` feature or the daemon fails closed"
+                .to_string(),
+        ),
+    }
+}
+
+/// Print the informational TPM / attestation-backend line (never pass/fail).
+fn report_attestation(config: &Config) {
+    let (status, detail) = attestation_detail(
+        config.attestation.backend,
+        tpm_detected(),
+        config.attestation.tpm.ek_cert.is_some(),
+    );
+    report("attestation", status, &detail);
+}
+
 /// Print one aligned check line.
 fn report(step: &str, status: &str, detail: &str) {
     println!("{step:<28} {status:<5} {detail}");
@@ -962,6 +1064,35 @@ mod tests {
     fn parse_rejects_unknown_flags() {
         let args = vec!["--bogus".to_string()];
         assert!(Opts::parse(&args).is_err());
+    }
+
+    #[test]
+    fn attestation_detail_mirrors_daemon_backend_selection() {
+        use crate::config::AttestBackend::{Auto, HostKey, Tpm, VirtualTpm};
+
+        // `auto` upgrades to the TPM only when a usable TPM *and* an EK cert are
+        // present — otherwise it degrades to the host-key tier (never a warning).
+        assert_eq!(attestation_detail(Auto, true, true).0, "info");
+        assert!(attestation_detail(Auto, true, true).1.contains("in use"));
+        assert!(attestation_detail(Auto, true, false).1.contains("NOT in use"));
+        assert!(attestation_detail(Auto, false, false).1.contains("no usable TPM"));
+        // A missing EK cert must never be reported as an error condition.
+        assert_eq!(attestation_detail(Auto, true, false).0, "info");
+        assert_eq!(attestation_detail(Auto, false, false).0, "info");
+
+        // `tpm` is fail-closed: no usable TPM is a warning, not silent downgrade.
+        assert_eq!(attestation_detail(Tpm, true, false).0, "info");
+        assert_eq!(attestation_detail(Tpm, false, false).0, "warn");
+        assert!(attestation_detail(Tpm, false, false).1.contains("fails closed"));
+
+        // `host-key` never uses a present TPM, and is informational either way.
+        assert_eq!(attestation_detail(HostKey, true, false).0, "info");
+        assert_eq!(attestation_detail(HostKey, false, false).0, "info");
+        assert!(attestation_detail(HostKey, true, false).1.contains("not used"));
+
+        // `virtual-tpm` is always flagged as the insecure dev/test tier.
+        assert_eq!(attestation_detail(VirtualTpm, false, false).0, "warn");
+        assert!(attestation_detail(VirtualTpm, true, true).1.contains("INSECURE"));
     }
 
     #[test]

@@ -8,6 +8,22 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.2] — 2026-07-22
+
+### Added
+
+- **`mia test` now reports the TPM / attestation posture.** A new
+  informational `attestation` line (printed after the configuration check)
+  states whether a real TPM was detected on the host and whether the daemon
+  will actually attest with it — mirroring the daemon's own backend selection
+  (`auto` → TPM when a usable device *and* `attestation.tpm.ek_cert` are
+  present, otherwise the host-key software tier). The line is never a pass/fail
+  result: a TPM-less host (the common VM case) is fully supported via the
+  software tier, so it prints `info`; only a configuration that cannot attest
+  (`backend = tpm` with no usable TPM, or `virtual-tpm`) prints `warn`, and
+  neither affects the exit code. The probe is a cheap, read-only device open
+  and never drives the TPM.
+
 ## [0.21.1] — 2026-07-15
 
 ### Fixed
