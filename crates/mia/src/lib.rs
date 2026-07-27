@@ -33,6 +33,9 @@ pub mod hardening;
 pub mod helper;
 pub mod scheduler;
 
+/// `mia machine-id` — print this host's fingerprint-derived machine identity.
+pub mod machine_id;
+
 /// `mia resync-allowlist` on-demand allowlist re-fetch.
 pub mod resync;
 

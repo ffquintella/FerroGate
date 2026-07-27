@@ -8,6 +8,23 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.3] — 2026-07-22
+
+### Added
+
+- **`mia machine-id` — a dedicated command to print this host's machine
+  identity.** The identity is the `<uuid>` in the host's SPIFFE id
+  `spiffe://<trust-domain>/host/<uuid>` — the value CMIS keys the host's signed
+  allowlist and host SVID under — derived locally from the hardware fingerprint
+  (feature F15) via the same code path as `resync-allowlist`'s `host: <uuid>`
+  line. Default output is the bare UUID on one line so it composes in scripts
+  (e.g. `ferrogate allowlist set --host "$(mia machine-id)" …`); `--verbose`
+  also prints the SHA-384 fingerprint and the raw hardware facts (board serial,
+  platform UUID, disk serial). The command is read-only and offline — it never
+  contacts CMIS, reads the daemon config, or touches the running agent, and
+  warns on stderr (keeping stdout clean) when the hardware identifiers are
+  incomplete.
+
 ## [0.21.2] — 2026-07-22
 
 ### Added

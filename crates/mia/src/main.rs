@@ -81,6 +81,10 @@ fn main() -> anyhow::Result<()> {
         // It is `resync-allowlist` with the reload always on.
         Some("--resync") => return mia::resync::run_resync(&args[1..]),
         Some("refresh-key") => return mia::resync::run_refresh_key(&args[1..]),
+        // Print this host's fingerprint-derived machine identity (the
+        // `host/<uuid>` CMIS keys its allowlist and host SVID under). Read-only
+        // and offline — no config, no CMIS, no daemon contact.
+        Some("machine-id") => return mia::machine_id::run(&args[1..]),
         // `--reload` is a management flag, not a daemon option: it signals the
         // running agent (SIGHUP) to re-read its config + allowlist, then exits.
         Some("--reload") => return mia::resync::run_reload(&args[1..]),
@@ -407,6 +411,7 @@ fn print_usage() {
          \x20 setup             interactive wizard that writes the agent's config file\n\
          \x20 refresh-key       re-fetch the CMIS enrollment key into allowlist.key\n\
          \x20 resync-allowlist  re-fetch this host's signed allowlist from CMIS\n\
+         \x20 machine-id        print this host's fingerprint-derived machine identity\n\
          \x20 test              check CMIS connectivity and helper-token issuance\n\
          \x20 service           manage the Windows service (install/uninstall/start/stop)\n\
          \n\
