@@ -8,6 +8,30 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.4] — 2026-07-27
+
+### Fixed
+
+- **Removable drives no longer take part in the machine fingerprint (F15/F16).**
+  The hardware fingerprint `H` folds in a disk serial, and every platform
+  backend picked the *first* disk it enumerated — including a drive in an
+  external enclosure. On macOS an attached Thunderbolt/USB NVMe enclosure can
+  register ahead of the built-in SSD, so plugging one in silently changed `H`:
+  the sealed machine key stopped decrypting (`sealed machine key did not
+  decrypt (wrong host or corrupt file)`), the daemon never obtained a host SVID,
+  and every mint was refused with `no-host-svid` — which surfaces as `mia test`
+  failing at *helper token mint* while its own CMIS steps pass. `ferro-machineid`
+  now considers only built-in storage: macOS skips NVMe controllers reporting
+  `Physical Interconnect Location = External`, Linux skips devices flagged
+  `removable` or sitting behind a USB/FireWire controller, and Windows filters
+  `Win32_DiskDrive` down to non-USB, non-removable media. A host with no
+  internal disk serial now contributes an empty one (already tolerated by the
+  fingerprint) rather than borrowing a removable drive's identity or refusing to
+  collect facts at all. Hosts enrolled while a removable drive supplied the
+  serial will report a different `mia machine-id` after this change and need
+  re-enrolling; hosts affected by the bug go back to their originally enrolled
+  fingerprint.
+
 ## [0.21.3] — 2026-07-22
 
 ### Added

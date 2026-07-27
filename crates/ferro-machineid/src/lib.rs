@@ -43,8 +43,13 @@ pub struct MachineFacts {
     pub board_serial: String,
     /// Stable platform hardware UUID (`IOPlatformUUID` / DMI `product_uuid`).
     pub platform_uuid: String,
-    /// Boot-disk hardware serial (the NVMe/SATA device serial — tied to the
-    /// physical drive, survives a reformat).
+    /// Built-in boot-disk hardware serial (the NVMe/SATA device serial — tied to
+    /// the physical drive, survives a reformat).
+    ///
+    /// Only *internal* disks count: a serial read off a removable drive would
+    /// make the host's identity depend on what happens to be plugged in. See
+    /// [`MachineFacts::is_complete`] — this field is best-effort and may be
+    /// empty.
     pub disk_serial: String,
 }
 
@@ -81,10 +86,12 @@ impl MachineFacts {
     ///
     /// The board serial and the SMBIOS `product_uuid` are required — both stable
     /// and unique per machine. The disk serial is **best-effort**: many
-    /// virtualised hosts (e.g. VMware SCSI disks) expose none, and a fingerprint
-    /// built from board serial + UUID is still unique, so a blank disk serial no
-    /// longer rejects the machine. Hosts that *do* report a disk serial still
-    /// fold it into the fingerprint, so their identity is unchanged.
+    /// virtualised hosts (e.g. VMware SCSI disks) expose none, and hosts whose
+    /// only disks are removable contribute none by design (see the platform
+    /// backends). A fingerprint built from board serial + UUID is still unique,
+    /// so a blank disk serial does not reject the machine. Hosts that *do*
+    /// report an internal disk serial still fold it into the fingerprint, so
+    /// their identity is unchanged.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         let n = self.normalised();
@@ -172,6 +179,62 @@ mod imp {
             .map_err(|e| MachineIdError::Query(format!("{IOREG} {class}: non-utf8 output: {e}")))
     }
 
+    /// Split `ioreg -rd1 -c <class>` output into one block per matched device.
+    ///
+    /// Every block starts with a `+-o <name>` header at column 0; a host with a
+    /// plugged-in NVMe enclosure matches more than one, so the properties have
+    /// to be read per device rather than off the concatenated text.
+    fn devices(text: &str) -> Vec<&str> {
+        let mut starts = Vec::new();
+        let mut offset = 0usize;
+        for line in text.split_inclusive('\n') {
+            if line.starts_with("+-o ") {
+                starts.push(offset);
+            }
+            offset += line.len();
+        }
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, &start)| &text[start..starts.get(i + 1).copied().unwrap_or(text.len())])
+            .collect()
+    }
+
+    /// Whether the device block reports the given `Physical Interconnect
+    /// Location` — `"Internal"` for a soldered/bay drive, `"External"` for one
+    /// behind a Thunderbolt or USB enclosure.
+    fn located(block: &str, location: &str) -> bool {
+        prop(block, "Physical Interconnect Location")
+            .is_some_and(|v| v.eq_ignore_ascii_case(location))
+    }
+
+    /// Serial of the machine's **built-in** NVMe controller, or `None` when it
+    /// has none.
+    ///
+    /// `ioreg` lists controllers in registry order, so an attached Thunderbolt /
+    /// USB NVMe enclosure can enumerate *ahead* of the internal SSD. Folding a
+    /// removable drive's serial into the fingerprint would tie the host's
+    /// identity to what is plugged in: attaching or removing the enclosure
+    /// changes `H`, the sealed machine key stops decrypting, and the host can no
+    /// longer attest (see docs/features/F16). External controllers are therefore
+    /// excluded outright; among the rest an explicitly `Internal` one wins over
+    /// an unlabelled one.
+    ///
+    /// `None` — an Intel Mac booting from SATA with only an external NVMe
+    /// attached, say — leaves the disk serial blank, which the fingerprint
+    /// tolerates ([`MachineFacts::is_complete`]).
+    fn internal_disk_serial(text: &str) -> Option<String> {
+        let internal: Vec<&str> = devices(text)
+            .into_iter()
+            .filter(|b| !located(b, "External"))
+            .collect();
+        internal
+            .iter()
+            .find(|b| located(b, "Internal"))
+            .or_else(|| internal.first())
+            .and_then(|b| prop(b, "Serial Number"))
+    }
+
     /// Extract the value of an `ioreg` line of the form `"key" = "value"`.
     fn prop(text: &str, key: &str) -> Option<String> {
         let needle = format!("\"{key}\"");
@@ -198,15 +261,95 @@ mod imp {
         let platform_uuid = prop(&platform, "IOPlatformUUID")
             .ok_or_else(|| MachineIdError::Unavailable("IOPlatformUUID".to_string()))?;
 
-        let nvme = ioreg("IONVMeController")?;
-        let disk_serial = prop(&nvme, "Serial Number")
-            .ok_or_else(|| MachineIdError::Unavailable("NVMe Serial Number".to_string()))?;
+        // Best-effort: only a built-in controller counts, and a machine may have
+        // none (see `internal_disk_serial`).
+        let disk_serial = internal_disk_serial(&ioreg("IONVMeController")?).unwrap_or_default();
 
         Ok(MachineFacts {
             board_serial,
             platform_uuid,
             disk_serial,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{devices, internal_disk_serial};
+
+        /// An external NVMe enclosure enumerating ahead of the built-in SSD —
+        /// the layout that broke attestation on an operator's Mac (F16).
+        const EXTERNAL_FIRST: &str = concat!(
+            "+-o IONVMeController  <class IONVMeController, id 0x100000ab7>\n",
+            "    {\n",
+            "      \"Physical Interconnect\" = \"PCI-Express\"\n",
+            "      \"Physical Interconnect Location\" = \"External\"\n",
+            "      \"Serial Number\" = \"P300FBCA23101920021\"\n",
+            "      \"Model Number\" = \"Patriot M.2 P300 1024GB\"\n",
+            "    }\n",
+            "\n",
+            "+-o AppleANS3CGv2Controller  <class AppleANS3CGv2Controller, id 0x100000502>\n",
+            "    {\n",
+            "      \"Physical Interconnect\" = \"Apple Fabric\"\n",
+            "      \"Physical Interconnect Location\" = \"Internal\"\n",
+            "      \"Serial Number\" = \"0ba0206164386025\"\n",
+            "      \"Model Number\" = \"APPLE SSD AP0512Z\"\n",
+            "    }\n",
+        );
+
+        const INTERNAL_ONLY: &str = concat!(
+            "+-o AppleANS3CGv2Controller  <class AppleANS3CGv2Controller, id 0x100000502>\n",
+            "    {\n",
+            "      \"Physical Interconnect Location\" = \"Internal\"\n",
+            "      \"Serial Number\" = \"0ba0206164386025\"\n",
+            "    }\n",
+        );
+
+        #[test]
+        fn splits_one_block_per_controller() {
+            assert_eq!(devices(EXTERNAL_FIRST).len(), 2);
+            assert_eq!(devices(INTERNAL_ONLY).len(), 1);
+            assert!(devices("").is_empty());
+        }
+
+        #[test]
+        fn ignores_an_external_enclosure_listed_first() {
+            assert_eq!(
+                internal_disk_serial(EXTERNAL_FIRST).as_deref(),
+                Some("0ba0206164386025")
+            );
+        }
+
+        /// Attaching or detaching the enclosure must not move the fingerprint.
+        #[test]
+        fn serial_is_stable_across_hot_plug() {
+            assert_eq!(
+                internal_disk_serial(EXTERNAL_FIRST),
+                internal_disk_serial(INTERNAL_ONLY)
+            );
+        }
+
+        /// A lone unlabelled controller is the machine's own disk; only an
+        /// explicit `External` marking disqualifies one.
+        #[test]
+        fn unlabelled_controller_still_counts() {
+            let text = "+-o IONVMeController  <class IONVMeController>\n\
+                        \x20   {\n\
+                        \x20     \"Serial Number\" = \"S1234\"\n\
+                        \x20   }\n";
+            assert_eq!(internal_disk_serial(text).as_deref(), Some("S1234"));
+        }
+
+        /// Nothing but removable storage contributes no disk serial at all,
+        /// rather than an identity that walks away with the drive.
+        #[test]
+        fn external_only_yields_no_serial() {
+            let text = "+-o IONVMeController  <class IONVMeController>\n\
+                        \x20   {\n\
+                        \x20     \"Physical Interconnect Location\" = \"External\"\n\
+                        \x20     \"Serial Number\" = \"P300FBCA23101920021\"\n\
+                        \x20   }\n";
+            assert_eq!(internal_disk_serial(text), None);
+        }
     }
 }
 
@@ -216,7 +359,6 @@ mod imp {
 mod imp {
     use super::{MachineFacts, MachineIdError};
     use std::fs;
-    use std::path::Path;
 
     fn read_trim(path: &str) -> Option<String> {
         fs::read_to_string(path)
@@ -225,26 +367,43 @@ mod imp {
             .filter(|s| !s.is_empty())
     }
 
-    /// First non-removable block device's hardware serial under `/sys/block`.
+    /// Whether `dev` is removable storage rather than a disk built into the
+    /// machine.
+    ///
+    /// Two signals, because they catch different drives: `removable` covers
+    /// media the kernel knows is swappable (USB sticks, card readers), while a
+    /// plain SSD inside a USB or FireWire enclosure reports `removable = 0` and
+    /// is only recognisable from where it sits in the sysfs topology.
+    ///
+    /// Excluding these matters because the disk serial feeds the host
+    /// fingerprint: a drive that can be unplugged must never be part of the
+    /// machine's identity, or attaching one changes `H` and the host stops being
+    /// able to attest (see docs/features/F16 and the macOS backend).
+    fn is_removable(dev: &str) -> bool {
+        if read_trim(&format!("/sys/block/{dev}/removable")).as_deref() == Some("1") {
+            return true;
+        }
+        fs::canonicalize(format!("/sys/block/{dev}")).is_ok_and(|p| {
+            let path = p.to_string_lossy();
+            path.contains("/usb") || path.contains("/firewire")
+        })
+    }
+
+    /// First built-in block device's hardware serial under `/sys/block`.
     fn disk_serial() -> Option<String> {
         let entries = fs::read_dir("/sys/block").ok()?;
         let mut candidates: Vec<String> = entries
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            // skip virtual / removable devices
+            // skip virtual devices
             .filter(|n| !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("dm-"))
             .collect();
         candidates.sort();
         for dev in candidates {
-            let base = format!("/sys/block/{dev}/device");
-            if Path::new(&format!("/sys/block/{dev}/removable"))
-                .canonicalize()
-                .is_ok()
-            {
-                if let Some("1") = read_trim(&format!("/sys/block/{dev}/removable")).as_deref() {
-                    continue;
-                }
+            if is_removable(&dev) {
+                continue;
             }
+            let base = format!("/sys/block/{dev}/device");
             if let Some(s) = read_trim(&format!("{base}/serial")) {
                 return Some(s);
             }
@@ -300,12 +459,19 @@ mod imp {
     /// emitting `key=value` lines we parse below. These are the Windows
     /// analogues of the macOS `ioreg` / Linux DMI values: the SMBIOS system UUID
     /// and baseboard serial (`Win32_ComputerSystemProduct` / `Win32_BaseBoard`)
-    /// and the lowest-index physical disk's serial (`Win32_DiskDrive`).
+    /// and the lowest-index *fixed* physical disk's serial (`Win32_DiskDrive`).
+    ///
+    /// USB-attached and removable-media drives are filtered out before the sort:
+    /// they can be unplugged, and a fingerprint component that walks away with a
+    /// drive would break attestation the moment it does (see docs/features/F16
+    /// and the macOS backend).
     fn query() -> Result<String, MachineIdError> {
         const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue';\
             $p=Get-CimInstance Win32_ComputerSystemProduct;\
             $b=Get-CimInstance Win32_BaseBoard;\
-            $d=Get-CimInstance Win32_DiskDrive | Sort-Object Index | Select-Object -First 1;\
+            $d=Get-CimInstance Win32_DiskDrive | \
+                Where-Object { $_.InterfaceType -ne 'USB' -and $_.MediaType -notlike '*Removable*' } | \
+                Sort-Object Index | Select-Object -First 1;\
             Write-Output \"uuid=$($p.UUID)\";\
             Write-Output \"board=$($b.SerialNumber)\";\
             Write-Output \"product=$($p.IdentifyingNumber)\";\
@@ -364,12 +530,10 @@ mod imp {
         // product identifying number (both are burned-in SMBIOS fields).
         let board_serial = val(&text, "board")
             .or_else(|| val(&text, "product"))
-            .ok_or_else(|| {
-                MachineIdError::Unavailable("baseboard / product serial".to_string())
-            })?;
-        let disk_serial = val(&text, "disk").ok_or_else(|| {
-            MachineIdError::Unavailable("boot disk serial (Win32_DiskDrive.SerialNumber)".to_string())
-        })?;
+            .ok_or_else(|| MachineIdError::Unavailable("baseboard / product serial".to_string()))?;
+        // Best-effort: a host whose only drives are removable contributes none,
+        // exactly as on macOS and Linux (see `MachineFacts::is_complete`).
+        let disk_serial = val(&text, "disk").unwrap_or_default();
 
         Ok(MachineFacts {
             board_serial,
