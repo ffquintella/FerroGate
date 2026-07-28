@@ -8,6 +8,13 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.5] — 2026-07-28
+
+### Changed
+
+- **Version bump only.** No functional changes since [0.21.4]; this release
+  exists to publish a new workspace version and its artifacts.
+
 ## [0.21.4] — 2026-07-27
 
 ### Fixed
