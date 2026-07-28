@@ -33,7 +33,7 @@ ml-kem              = { version = "0.2", default-features = false, features = ["
 
 # AEAD + KDF used both for sealing (measurement-bound) and PSK-channel
 # transport.
-chacha20poly1305    = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305    = { version = "0.11", default-features = false, features = ["alloc"] }
 hkdf                = "0.13"
 
 [dev-dependencies]
