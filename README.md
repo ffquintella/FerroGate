@@ -27,6 +27,7 @@ The full system design lives under [`docs/`](docs/README.md):
 - [MIA — agent](docs/mia.md)
 - [Local helper API](docs/helper-api.md)
 - [Audit log](docs/audit.md)
+- [Integration SDK](docs/sdk.md)
 - [Operations](docs/operations.md)
 - [Testing and verification](docs/testing.md)
 - [Features](docs/features/README.md)

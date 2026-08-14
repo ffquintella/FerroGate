@@ -10,6 +10,12 @@ lcov.info
 .env
 .env.local
 
+# Cargo registry credentials. `.cargo/config.toml` (index URLs only) IS
+# committed; the token must never be. Supply it via
+# CARGO_REGISTRIES_<REGISTRY>_TOKEN instead of `cargo login`.
+.cargo/credentials
+.cargo/credentials.toml
+
 # macOS
 .DS_Store
 

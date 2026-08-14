@@ -1,0 +1,38 @@
+[package]
+name        = "ferrogate-sdk-rust"
+description = "FerroGate — Rust integration SDK: the relying-party / verifier-side crates behind a single dependency"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme      = "README.md"
+keywords    = ["ferrogate", "spiffe", "attestation", "tpm", "verifier"]
+categories  = ["authentication", "cryptography"]
+
+[lints]
+workspace = true
+
+# The SDK is a facade: every capability is an optional re-export so a relying
+# party pulls in only what it verifies. `ferro-crypto` is unconditional — it
+# carries the composite Ed25519 + ML-DSA-65 primitive every other crate needs.
+#
+# `proto` is off by default on purpose: `ferro-proto` compiles `.proto` files in
+# a build script, so enabling it adds a `protoc` (protobuf-compiler) build
+# requirement that a token-verifying consumer does not otherwise need.
+[features]
+default = ["verify"]
+verify  = ["dep:ferro-svid-verify", "dep:ferro-child-verify"]
+svid    = ["dep:ferro-svid"]
+attest  = ["dep:ferro-attest"]
+proto   = ["dep:ferro-proto"]
+full    = ["verify", "svid", "attest", "proto"]
+
+[dependencies]
+ferro-crypto       = { path = "../ferro-crypto" }
+ferro-svid-verify  = { path = "../ferro-svid-verify",  optional = true }
+ferro-child-verify = { path = "../ferro-child-verify", optional = true }
+ferro-svid         = { path = "../ferro-svid",         optional = true }
+ferro-attest       = { path = "../ferro-attest",       optional = true }
+ferro-proto        = { path = "../ferro-proto",        optional = true }

@@ -1,7 +1,8 @@
 .PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs container-image container-image-push \
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
-        pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk release deploy-release
+        pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk \
+        publish-sdk publish-sdk-dry-run release deploy-release
 
 # Default target: list available targets with their descriptions.
 .DEFAULT_GOAL := help
@@ -436,11 +437,18 @@ pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi+nupkg
 # self-contained Cargo workspace tarball (ferrogate-sdk-rust-<version>.tgz) that
 # a third party can drop in and `cargo build`. See scripts/pack-sdk.sh.
 #
+# `make publish-sdk` publishes the same crate set to the `ferrogate` Cargo
+# registry (Cloudsmith), so a third party can `cargo add ferrogate-sdk-rust`
+# instead of vendoring the tarball. It needs CARGO_REGISTRIES_FERROGATE_TOKEN in
+# the environment — never a committed file. `make publish-sdk-dry-run` packages
+# and verifies the same crates without uploading and without a token.
+#
 # `make release` produces the artifacts published to a GitHub Release: the mia
 # .deb, the mia .rpm, and the SDK .tgz. It is the entry point the release
 # workflow (.github/workflows/release.yml) runs on a `releases/*` tag. On Linux
 # it builds all three; off Linux it builds only the SDK (deb/rpm need a Linux
-# host) and says so.
+# host) and says so. The workflow publishes the SDK crates in a separate job
+# (`make publish-sdk`) once the release artifacts are up.
 #
 # `make deploy-release` cuts the release: it creates the annotated
 # `releases/v<workspace-version>` tag and pushes it to origin, which is what
@@ -449,6 +457,12 @@ pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi+nupkg
 # and commit first; this target only tags and pushes.
 pkg-sdk: ## Build the ferrogate-sdk-rust integration tarball (.tgz)
 	bash scripts/pack-sdk.sh
+
+publish-sdk: ## Publish the ferrogate-sdk-rust crates to the Cargo registry (needs CARGO_REGISTRIES_FERROGATE_TOKEN)
+	bash scripts/publish-sdk.sh
+
+publish-sdk-dry-run: ## Package and verify the SDK crates without uploading (no token needed)
+	bash scripts/publish-sdk.sh --dry-run
 
 release: ## Build the GitHub Release artifacts (mia .deb + .rpm + SDK .tgz)
 	@case "$(UNAME_S)" in \

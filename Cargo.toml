@@ -19,6 +19,7 @@ members = [
     "crates/ferro-machineid",
     "crates/ferro-sep",
     "crates/ferrogate-cli",
+    "crates/ferrogate-sdk-rust",
     "tools/fleet-manifest",
     "tools/offline-signer",
 ]

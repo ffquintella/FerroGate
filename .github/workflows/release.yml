@@ -3,7 +3,9 @@ name: Release
 # Fires when a release tag is pushed under the `releases/` namespace, e.g.
 #   git tag releases/v0.13.1 && git push origin releases/v0.13.1
 # Builds the mia .deb and .rpm packages and the ferrogate-sdk-rust .tgz, then
-# attaches them to the GitHub Release for the tag.
+# attaches them to the GitHub Release for the tag. Once that succeeds, the
+# `publish-sdk` job publishes the ferrogate-sdk-rust crates, at the workspace
+# version, to the `ferrogate` Cargo registry on Cloudsmith.
 on:
   push:
     tags:
@@ -54,3 +56,55 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  # Publish the SDK crates to the `ferrogate` Cargo registry (Cloudsmith), at
+  # the workspace version, so integrators can depend on `ferrogate-sdk-rust`
+  # instead of vendoring the tarball. Runs after the GitHub Release so a
+  # registry hiccup never blocks the downloadable artifacts.
+  #
+  # The registry INDEX lives in the committed .cargo/config.toml; the token
+  # never does. It is injected here from the `CLOUDSMITH_API_KEY` secret into
+  # CARGO_REGISTRIES_FERROGATE_TOKEN for the single step that needs it, in
+  # Cloudsmith's required `Token <api-key>` form. GitHub masks the secret in
+  # logs, and cargo neither echoes nor persists it.
+  publish-sdk:
+    name: publish ferrogate-sdk-rust to the Cargo registry
+    needs: release
+    runs-on: ubuntu-latest
+    # Scope the credential to a protected environment: the token is only
+    # readable by runs of this job, and can be gated on a required reviewer.
+    environment: cargo-registry
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ferro-proto compiles .proto files in its build script.
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Check that the registry credential is configured
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+        run: |
+          if [ -z "$CLOUDSMITH_API_KEY" ]; then
+            echo "::error::CLOUDSMITH_API_KEY is not set for the 'cargo-registry' environment." >&2
+            echo "Add it under Settings → Environments → cargo-registry → Environment secrets." >&2
+            exit 1
+          fi
+
+      # No token: proves the crates package and verify before anything is
+      # uploaded, so a broken manifest fails here rather than half way through.
+      - name: Verify the SDK crates package cleanly
+        run: make publish-sdk-dry-run
+
+      - name: Publish the SDK crates
+        env:
+          CARGO_REGISTRIES_FERROGATE_TOKEN: "Token ${{ secrets.CLOUDSMITH_API_KEY }}"
+        run: make publish-sdk

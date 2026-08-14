@@ -15,6 +15,7 @@
   - [Helper API](helper-api.md)
   - [Allowlist provisioning](allowlist-provisioning.md)
   - [Audit log](audit.md)
+  - [Integration SDK](sdk.md)
 
 - Operations
   - [Operations guide](operations.md)

@@ -27,6 +27,7 @@ The system is split into two components:
 | [mia.md](mia.md) | MIA agent design, hardening, TPM glue |
 | [helper-api.md](helper-api.md) | Local UDS/Named-Pipe API, caller authentication |
 | [audit.md](audit.md) | Merkle-chained immutable audit log |
+| [sdk.md](sdk.md) | `ferrogate-sdk-rust` integration SDK: contents, consumption, publishing |
 | [operations.md](operations.md) | Bootstrap, rotation, revocation, key ceremony |
 | [testing.md](testing.md) | Test plan, formal verification targets |
 | [features/](features/README.md) | Per-feature design notes and acceptance criteria |

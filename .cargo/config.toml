@@ -1,0 +1,17 @@
+# Alternative Cargo registries.
+#
+# INDEX URLS ONLY — never a token. This file is committed; the Cloudsmith API
+# key is a secret and is supplied out of band through the environment:
+#
+#     export CARGO_REGISTRIES_FERROGATE_TOKEN="Token $CLOUDSMITH_API_KEY"
+#
+# (the literal "Token " prefix is Cloudsmith's required scheme). In CI the same
+# variable is populated from the `CLOUDSMITH_API_KEY` GitHub Actions secret —
+# see .github/workflows/release.yml. `cargo login` would write the token to
+# .cargo/credentials.toml, which is git-ignored; prefer the environment.
+#
+# The `ferrogate` registry hosts the ferrogate-sdk-rust crates published by
+# `make publish-sdk` (scripts/publish-sdk.sh).
+[registries.ferrogate]
+index = "sparse+https://cargo.cloudsmith.io/uox/ferrogate/"
+credential-provider = "cargo:token"
