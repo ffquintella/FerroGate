@@ -504,8 +504,12 @@ mod self_signed_split_brain {
 
     /// Start a 2-node cluster in the zero-config `SelfSigned` peer-TLS mode
     /// (deterministic shared cert derived from the secret). Returns the data
-    /// root, the nodes, and the elected leader id.
-    async fn start_2_node_self_signed_tls(tag: &str) -> (std::path::PathBuf, Vec<Cluster>, u64) {
+    /// root, the nodes, the elected leader id, and the peer list — the caller
+    /// needs the API addresses to tell its own log lines from every other
+    /// cluster's (see the capture note on the test below).
+    async fn start_2_node_self_signed_tls(
+        tag: &str,
+    ) -> (std::path::PathBuf, Vec<Cluster>, u64, Vec<PeerNode>) {
         let root = temp_root(tag);
         let ports = free_ports(); // returns 3 pairs; we use the first 2
         let peers: Vec<PeerNode> = peers_for(&ports[..2]);
@@ -517,7 +521,7 @@ mod self_signed_split_brain {
         }
         let nodes = futures::future::try_join_all(starts).await.unwrap();
         let leader = wait_for_leader(&nodes).await;
-        (root, nodes, leader)
+        (root, nodes, leader, peers)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -538,7 +542,7 @@ mod self_signed_split_brain {
         // up. (edition 2021: `set_var` is safe; the test binary owns its env.)
         std::env::set_var("HQL_SPLIT_BRAIN_INTERVAL", "1");
 
-        let (root, nodes, leader_id) = start_2_node_self_signed_tls("tls-split-brain").await;
+        let (root, nodes, leader_id, peers) = start_2_node_self_signed_tls("tls-split-brain").await;
         assert!(leader_id == 1 || leader_id == 2);
 
         // Let several split-brain cycles run (it sleeps `interval` *before* the
@@ -560,8 +564,18 @@ mod self_signed_split_brain {
 
         // And it must have run cleanly: no platform-verify rejection of the
         // derived peer cert, and no failed membership comparison.
+        //
+        // The capture layer is the *process-global* subscriber, so `lines` also
+        // holds events from every other test in this binary — including the
+        // plain-HTTP clusters whose whole point is to kill nodes, and which
+        // therefore log `check_compare_membership` connect failures that say
+        // nothing about peer TLS. Keep only the lines that name one of OUR
+        // nodes: hiqlite builds the metrics URL from `addr_api`, and reqwest's
+        // error carries that URL through to the message.
+        let ours: Vec<&str> = peers.iter().map(|p| p.addr_api.as_str()).collect();
         let offending: Vec<&String> = lines
             .iter()
+            .filter(|l| ours.iter().any(|addr| l.contains(addr)))
             .filter(|l| {
                 l.contains("UnknownIssuer")
                     || l.contains("check_compare_membership")
