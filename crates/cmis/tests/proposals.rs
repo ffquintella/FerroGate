@@ -63,7 +63,13 @@ fn now_unix() -> i64 {
 /// SVID bound to it (issued at "now" so the validity check passes).
 async fn setup(
     policy: ProposalPolicy,
-) -> (MachineIdentitySvc, SoftwareMachineKey, String, String, TmpDirs) {
+) -> (
+    MachineIdentitySvc,
+    SoftwareMachineKey,
+    String,
+    String,
+    TmpDirs,
+) {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -71,7 +77,8 @@ async fn setup(
 
     // The host's machine key, and the SVID that binds it via cnf.jkt.
     let key = SoftwareMachineKey::generate().unwrap();
-    let jkt = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(key.public_spki_der()));
+    let jkt = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(key.public_spki_der()));
     let ek_sha = [0x42u8; 48];
     let host_uuid = host_uuid_from_ek_digest(&ek_sha).to_string();
     let minted = issuer
@@ -83,6 +90,7 @@ async fn setup(
                 dpop_jkt: jkt,
                 ttl_secs: 3600,
                 tee_evidence_id: None,
+                subject_pub: None,
             },
             now_unix(),
         )
@@ -99,8 +107,10 @@ async fn setup(
         allowlist_proposal_policy: policy,
         ..CmisConfig::default()
     };
-    let raft_dir =
-        std::env::temp_dir().join(format!("ferrogate-cmis-prop-raft-{}-{n}", std::process::id()));
+    let raft_dir = std::env::temp_dir().join(format!(
+        "ferrogate-cmis-prop-raft-{}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&raft_dir);
     let cluster = Arc::new(
         Cluster::start_single_node(raft_dir.to_string_lossy().into_owned())
@@ -253,7 +263,8 @@ async fn existing_allowlist_queues_proposal_for_review() {
         .await
         .unwrap()
         .into_inner();
-    let doc = allowlist::decode_body(&allowlist::decode(&got.signed_allowlist).unwrap().body).unwrap();
+    let doc =
+        allowlist::decode_body(&allowlist::decode(&got.signed_allowlist).unwrap().body).unwrap();
     assert_eq!(doc.entries[0].uid, Some(1));
 
     // Rejecting drops it.
@@ -350,6 +361,7 @@ async fn rejects_unissued_svid() {
                     .encode(Sha256::digest(key.public_spki_der())),
                 ttl_secs: 3600,
                 tee_evidence_id: None,
+                subject_pub: None,
             },
             now_unix(),
         )

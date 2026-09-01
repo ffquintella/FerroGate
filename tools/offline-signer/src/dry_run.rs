@@ -92,6 +92,9 @@ fn cmd_dry_run(opts: &Opts) -> Result<()> {
             ferro_svid::Jwk::from_public_key_at(old_kid, &old_pk_b64, bundle.window_start - 1),
         ],
         crl: None,
+        // See `emit_jwks`: the offline ceremony cannot build the certificate
+        // anchor, CMIS adds it when serving.
+        x509_bundle: None,
     };
     let preferred = jwks.preferred().ok_or_else(|| anyhow!("empty jwks"))?;
     if preferred.kid != new_kid {

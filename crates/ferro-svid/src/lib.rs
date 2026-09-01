@@ -16,6 +16,10 @@
 //! - [`issue`] — the [`issue::Issuer`] that produces signed SVIDs.
 //! - [`lifecycle`] — renewal-vs-re-attestation decisions and the 60%-TTL
 //!   rotation scheduler math.
+//! - [`x509`] — the **X.509-SVID profile**: a SPIFFE X509-SVID leaf, issued
+//!   from the same attestation and the same issuer key as the JWS, whose native
+//!   signature is standard Ed25519 (so any TLS stack validates it) and whose
+//!   ML-DSA-65 half rides in the ITU-T X.509 alternative-signature extensions.
 //!
 //! The independent reference verifier lives in the `ferro-svid-verify` crate.
 //! Both crates pin the same wire constants below; a divergence is a bug.
@@ -30,11 +34,12 @@ pub mod issue;
 pub mod jwks;
 pub mod lifecycle;
 pub mod spiffe;
+pub mod x509;
 
 /// JOSE `alg` carried in every SVID header.
 pub const SVID_ALG: &str = ferro_crypto::composite::COMPOSITE_JOSE_ALG;
 
-/// JOSE `typ` marking the FerroGate SVID profile.
+/// JOSE `typ` marking the FerroGate JWS SVID profile.
 pub const SVID_TYP: &str = "ferrogate-svid+jwt";
 
 /// Domain-separation context the composite signature covers. Distinct from
@@ -69,3 +74,4 @@ pub use lifecycle::{
     RenewalDecision, REATTEST_WINDOW_SECS, ROTATE_FRACTION,
 };
 pub use spiffe::{host_uuid_from_ek_digest, spiffe_host_id, spiffe_issuer_id, SpiffeError};
+pub use x509::{X509Error, X509Svid, ALT_SIGNATURE_CONTEXT as X509_ALT_SIGNATURE_CONTEXT};

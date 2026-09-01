@@ -59,7 +59,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// SPKI-pinning certificate verifier used on the transport.
 pub use ferro_crypto as crypto;
 
-/// Reference verifier for composite-signed JWS SVIDs (`ferro-svid-verify`).
+/// Reference verifier for FerroGate SVIDs (`ferro-svid-verify`).
+///
+/// Covers both profiles: the composite-signed compact JWS at the crate root,
+/// and the X.509-SVID certificate profile in its `x509` module. A certificate
+/// leaf also validates under any stock TLS stack on its native Ed25519
+/// signature alone; use `svid_verify::x509` when you want the ML-DSA-65 half
+/// checked too.
 ///
 /// Requires the `verify` feature (on by default).
 #[cfg(feature = "verify")]
@@ -73,7 +79,8 @@ pub use ferro_svid_verify as svid_verify;
 #[cfg(feature = "verify")]
 pub use ferro_child_verify as child_verify;
 
-/// SVID envelope, claims, SPIFFE derivation, JWKS, and lifecycle (`ferro-svid`).
+/// SVID envelope, claims, SPIFFE derivation, JWKS, X.509-SVID issuance, and
+/// lifecycle (`ferro-svid`).
 ///
 /// Requires the `svid` feature.
 #[cfg(feature = "svid")]

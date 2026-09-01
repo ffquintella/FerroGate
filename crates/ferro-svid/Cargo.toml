@@ -18,6 +18,7 @@ thiserror  = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 ciborium   = { workspace = true }
+der        = { workspace = true }
 base64     = { workspace = true }
 sha2       = { workspace = true }
 hex        = { workspace = true }
@@ -25,3 +26,8 @@ uuid       = { workspace = true }
 
 [dev-dependencies]
 ferro-svid-verify = { path = "../ferro-svid-verify" }
+# An independent X.509 parser, so the interop test proves the X.509-SVID leaf is
+# readable by a stack that knows nothing about how we encoded it.
+# `verify` brings in the parser's own signature checker, so the interop test
+# validates the chain with code that shares nothing with our encoder.
+x509-parser = { workspace = true, features = ["verify"] }

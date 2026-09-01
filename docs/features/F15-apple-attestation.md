@@ -255,6 +255,7 @@ Apple attestation, both of which prove genuine-Apple-hardware key residency:
 |-------|-------|
 | Hardware fingerprint `H` | `crates/ferro-machineid` (macOS `ioreg`, Linux sysfs/DMI) |
 | `MachineKey` trait, software + SEP backends, P-256 verify | `crates/ferro-sep` (SEP behind the off-by-default `secure-enclave` feature) |
+| Secure Enclave as a *sealing* root (not just signing) | `SecureEnclaveSealKey` in `crates/ferro-sep/src/enclave.rs`, used by the X.509-SVID store — see [F17](F17-x509-svid.md) |
 | Wire evidence | `AttestInit.host_key`, `HostKeyEvidence`, `MachineFacts` in `crates/ferro-proto/proto/machine_identity.proto` |
 | Server-side verification | `crates/ferro-attest/src/host_key.rs` |
 | Handshake branch + issuance | `run_attest_host_key` in `crates/cmis/src/service.rs` |

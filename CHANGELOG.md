@@ -8,6 +8,115 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.6] — 2026-09-01
+
+### Added
+
+- **X.509-SVID profile, issued beside the JWS one (F17).** CMIS now mints a
+  SPIFFE X509-SVID certificate from every attestation, alongside the compact-JWS
+  SVID it already issued — same SPIFFE ID, same validity window, same issuer
+  key, both returned in `SVIDBundle` (`x509_svid`, `x509_bundle`). The JWS
+  profile is unchanged; nothing has to migrate.
+
+  The certificate exists so a workload can do mTLS, which the JWS profile cannot
+  support, so its native signature is a **standard** RFC 8410 Ed25519 signature
+  over the `TBSCertificate`: rustls, OpenSSL, and Envoy validate the chain with
+  no FerroGate code in the loop. The post-quantum half is not given up — the
+  ML-DSA-65 signature over the same body travels in the ITU-T X.509 (2019) §9.8
+  alternative-signature extensions (`subjectAltPublicKeyInfo`,
+  `altSignatureAlgorithm`, `altSignatureValue`), all non-critical, and
+  `ferro-svid-verify`'s new `x509` module **requires** both halves. A stock stack
+  therefore gets classical assurance and an opted-in consumer gets the same
+  AND-combined assurance as the JWS profile; there is no PQ-only path and no way
+  to strip the classical half.
+
+  The leaf follows the SPIFFE X509-SVID shape (SPIFFE ID as the sole URI SAN,
+  `CA:FALSE`, `keyUsage = digitalSignature`) and binds the Ed25519 half of the
+  host's phase-4 composite CSR key, with the ML-DSA-65 half in
+  `subjectAltPublicKeyInfo` — so the key that mints child tokens is the key that
+  terminates mTLS. The trust anchor is a self-signed CMIS signing certificate,
+  published in the JWKS `x-ferrogate-x509-bundle` member so one fetch arms a
+  verifier for both profiles. It takes nothing from the clock and signs its PQ
+  half with FIPS-204's deterministic variant, so every replica sharing an issuer
+  seed publishes byte-identical anchor DER.
+
+  Revocation covers both profiles: `RevokeHost` already did, and `RevokeSvid` on
+  a JWS digest now also revokes the certificate issued with it, so an operator
+  cannot accidentally leave a live certificate behind. See
+  [docs/features/F17-x509-svid.md](docs/features/F17-x509-svid.md) for the shape,
+  the two-pass signing order, and the two known gaps: MIA does not yet write the
+  certificate anywhere (making it usable for local mTLS means putting private key
+  material on disk, which needs its own decisions), and an F14 cross-sign window
+  publishes only the live root's certificate anchor.
+
+- **The host stores its X.509-SVID under a machine-bound key (F17).** MIA now
+  persists the certificate it was issued — leaf, trust bundle, and the Ed25519
+  private key the certificate names — to `<state-dir>/x509-svid.sealed` (`0600`),
+  sealed so the file **only opens on the machine that wrote it**. Where the host
+  has a TPM the data-protection key is sealed by the chip to PCRs `{0,4,7,8}`,
+  so the credential is unreadable on other hardware *and* after a boot-state
+  change; elsewhere it is derived from the hardware fingerprint (F16), the same
+  clone resistance the machine key already has. A usable TPM always wins, even
+  on a host that attests through the software tier. A host with neither gets no
+  store at all, because writing the private key unsealed is worse than
+  re-attesting.
+
+  Loading is fail-closed: a stored credential is returned only if it unseals
+  here *and* still verifies — chains to its bundle under both signature halves,
+  is unexpired, and its key is the one the certificate names. A store that fails
+  any of that is logged and deleted rather than retried forever, which is what a
+  TPM host sees after a firmware update. The store never decides whether to
+  attest; the daemon attests on every start regardless.
+
+  New `mia x509-svid` prints what is held (SPIFFE ID, sealing backend, expiry)
+  and, with `--pem` / `--bundle-pem`, the certificates. It never prints the
+  private key — serving that to a local workload belongs to the helper API, and
+  is not implemented yet, so a workload still cannot do mTLS with the host's
+  X.509-SVID.
+
+- **The Secure Enclave seals the credential store on macOS.** The store gained a
+  third backend beside the TPM and the fingerprint-derived machine key: `mia`
+  generates a P-256 key *inside* the Apple Secure Enclave — non-exportable, root
+  included — and ECIES-encrypts the store's data-protection key to its public
+  half. Unwrapping happens inside the Enclave, so the file is inert on any other
+  Mac. A hardware root is preferred in the order TPM → Secure Enclave → machine
+  key, even on a host that attests through the software tier.
+
+  Behind the new `secure-enclave` feature (off by default; it links
+  Security.framework), which `make pkg-macos` now enables. Persisting the
+  Enclave key needs a **codesigned** binary carrying a keychain-access-group
+  entitlement — macOS answers `errSecMissingEntitlement` (-34018) otherwise, for
+  every keychain and for Apple's canonical recipe alike, and ad-hoc signing is
+  killed at launch by AMFI. `make pkg-macos CODESIGN_ID="Developer ID
+  Application: …"` signs with `crates/mia/dist/mia.entitlements`. Since a
+  non-persistent Enclave key would leave the next start unable to open its own
+  store, `with_sealer` selects this backend only when it can actually keep the
+  key, and otherwise falls through to the machine key with a logged reason.
+
+  The Enclave *cryptography* needs no entitlement, so it is covered by live
+  tests on real hardware: wrap/unwrap round trips, a blob refusing to open under
+  a different Enclave key, tamper rejection, and a full credential round-trip
+  through the store. Only cross-process persistence is `#[ignore]`d, since it
+  cannot run from an unsigned build.
+
+- `ferro_sep::seal_bytes` / `unseal_bytes` generalise the machine-key AEAD
+  envelope from a fixed 32-byte scalar to arbitrary payloads, with a purpose tag
+  mixed into both the HKDF `info` and the AEAD associated data so a blob sealed
+  for one use cannot be presented as another. The machine-key file is a
+  purpose-empty envelope, so existing `host-key.bin` files still open unchanged.
+
+- `CompositeSecretKey::to_ed25519_pkcs8_der` exports the classical half as
+  PKCS#8 v1 (RFC 8410 §7) — the form a TLS stack loads a private key from, and
+  the only way an X.509-SVID is usable. It is the one API that hands out private
+  key material; the ML-DSA-65 half is deliberately not exportable.
+
+- `ferro_crypto::composite` gained `sign_interop_ed25519` /
+  `sign_interop_mldsa65` (and their `verify_` counterparts, plus a deterministic
+  ML-DSA variant): standard-format signatures over a raw message, for artefacts
+  a third party must verify without FerroGate. They refuse a 48-byte message —
+  the length of a composite transcript hash — so the interop and composite
+  message spaces stay disjoint by construction.
+
 ## [0.21.5] — 2026-07-28
 
 ### Changed

@@ -1,4 +1,4 @@
-.PHONY: help build test run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
+.PHONY: help build test test-macos run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs container-image container-image-push \
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
         pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk \
@@ -19,6 +19,12 @@ build: ## Build the entire workspace
 
 test: ## Run all workspace tests
 	cargo test --workspace --all-targets
+
+test-macos: ## Run the macOS Secure Enclave tests (needs a Mac with a Secure Enclave)
+	@[ "$(UNAME_S)" = "Darwin" ] || { echo "ERROR: test-macos must run on macOS (host is $(UNAME_S))"; exit 1; }
+	@echo "==> Secure Enclave credential-store tests (live hardware)."
+	@echo "    Keychain persistence is skipped: it needs a codesigned binary."
+	cargo test -p ferro-sep -p mia --features mia/secure-enclave
 
 run: ## Run the ferrogate CLI (pass args with ARGS="...")
 	cargo run -p ferrogate-cli --bin ferrogate -- $(ARGS)
@@ -390,15 +396,33 @@ pkg-win: ## Build the mia Windows MSI + Chocolatey/NuGet package in a linux/amd6
 
 # macOS component+product package built with the platform's own tools (no extra
 # cargo plugin). Stages a payload root, then pkgbuild → productbuild. Set
-# PKG_SIGN_ID="Developer ID Installer: ..." to sign the product archive.
+# PKG_SIGN_ID="Developer ID Installer: ..." to sign the product archive, and
+# CODESIGN_ID="Developer ID Application: ..." to sign the mia binary itself —
+# required for the Secure Enclave credential store (see mia.entitlements).
 MACOS_PKG_ID   := com.ferrogate.mia
 MACOS_PKG_ROOT := target/macos/pkgroot
 MACOS_PKG_OUT  := target/macos/ferrogate-mia-$(CARGO_VERSION).pkg
 MACOS_DIST     := crates/mia/dist
 pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 	@[ "$(UNAME_S)" = "Darwin" ] || { echo "ERROR: pkg-macos must run on macOS (host is $(UNAME_S))"; exit 1; }
-	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE)
+	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE) --features secure-enclave
 	strip target/release/$(PKG_CRATE)
+	# Codesign the binary with the keychain entitlement, without which macOS
+	# refuses to persist the Secure Enclave key that seals the X.509-SVID store
+	# (mia then falls back to the fingerprint-derived machine key at runtime).
+	# The entitlement is restricted: only a real Developer ID works.
+	@if [ -n "$(CODESIGN_ID)" ]; then \
+		echo "==> codesigning $(PKG_CRATE) with $(CODESIGN_ID)"; \
+		codesign --force --options runtime --timestamp \
+			--sign "$(CODESIGN_ID)" \
+			--entitlements $(MACOS_DIST)/mia.entitlements \
+			target/release/$(PKG_CRATE); \
+	else \
+		echo "NOTE: CODESIGN_ID not set — shipping an unsigned mia. The Secure Enclave"; \
+		echo "      credential store will be unavailable and mia will seal its X.509-SVID"; \
+		echo "      under the machine key instead. Set CODESIGN_ID=\"Developer ID Application: ...\""; \
+		echo "      (and edit $(MACOS_DIST)/mia.entitlements with your team id) to enable it."; \
+	fi
 	rm -rf $(MACOS_PKG_ROOT)
 	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/bin
 	install -d -m 0755 $(MACOS_PKG_ROOT)/etc/ferrogate

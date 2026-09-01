@@ -38,6 +38,7 @@ use fips204::ml_dsa_65;
 use fips204::traits::{SerDes as _, Signer as _, Verifier as _};
 use rand_core::OsRng;
 use sha3::{Digest, Sha3_256, Sha3_384};
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -68,6 +69,10 @@ pub const COMPOSITE_PK_LEN: usize = ED25519_PK_LEN + MLDSA65_PK_LEN;
 /// Length of the concat composite signature on the wire.
 pub const COMPOSITE_SIG_LEN: usize = ED25519_SIG_LEN + MLDSA65_SIG_LEN;
 
+/// Length of the [`transcript_hash`] output — the *only* message a composite
+/// signature ever covers.
+pub const TRANSCRIPT_HASH_LEN: usize = 48;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -93,6 +98,15 @@ pub enum CompositeError {
     /// An encoder produced an error (extremely unusual).
     #[error("encoder failed: {0}")]
     Encode(String),
+    /// An interop (standard-format) sign or verify was attempted over a message
+    /// the length of a composite transcript hash. See
+    /// [`CompositeSecretKey::sign_interop_ed25519`] for why the two message
+    /// spaces are kept disjoint.
+    #[error("interop signing refused: message is {0} bytes, the composite transcript-hash length")]
+    InteropDomainCollision(usize),
+    /// A PKCS#8 blob was not the RFC 8410 Ed25519 v1 form this crate emits.
+    #[error("malformed Ed25519 PKCS#8: {0}")]
+    Pkcs8(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +141,67 @@ fn derive_subseed(seed: &[u8; 32], tag: &[u8]) -> [u8; 32] {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&out);
     arr
+}
+
+/// Reject a message that could be a composite transcript hash.
+///
+/// Composite signatures always cover exactly [`TRANSCRIPT_HASH_LEN`] bytes, so
+/// refusing that one length in the interop (raw) path makes the two message
+/// spaces disjoint by construction.
+fn reject_transcript_sized(msg: &[u8]) -> Result<(), CompositeError> {
+    if msg.len() == TRANSCRIPT_HASH_LEN {
+        return Err(CompositeError::InteropDomainCollision(msg.len()));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 PKCS#8 (RFC 8410 §7)
+// ---------------------------------------------------------------------------
+
+/// The fixed DER prefix of a PKCS#8 v1 `OneAsymmetricKey` wrapping an Ed25519
+/// seed, per RFC 8410 §7: `SEQUENCE { INTEGER 0, AlgorithmIdentifier
+/// { id-Ed25519 }, OCTET STRING { OCTET STRING seed } }`. Everything before the
+/// 32-byte seed is constant, so the whole encoding is this prefix plus the seed.
+const ED25519_PKCS8_PREFIX: [u8; 16] = [
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+
+/// Total length of the PKCS#8 v1 encoding of an Ed25519 private key.
+pub const ED25519_PKCS8_LEN: usize = ED25519_PKCS8_PREFIX.len() + ED25519_PK_LEN;
+
+/// Wrap a raw Ed25519 seed as PKCS#8 v1 DER.
+///
+/// This is the format TLS stacks load a private key from, so it is how an
+/// X.509-SVID's key reaches a workload.
+#[must_use]
+pub fn ed25519_pkcs8_from_seed(seed: &[u8; 32]) -> Zeroizing<Vec<u8>> {
+    let mut der = Vec::with_capacity(ED25519_PKCS8_LEN);
+    der.extend_from_slice(&ED25519_PKCS8_PREFIX);
+    der.extend_from_slice(seed);
+    Zeroizing::new(der)
+}
+
+/// Recover the public key of a PKCS#8 v1 Ed25519 private key, without exposing
+/// the private half.
+///
+/// A store that holds a certificate and its key uses this to prove the two
+/// belong together before trusting either.
+pub fn ed25519_public_from_pkcs8(der: &[u8]) -> Result<[u8; ED25519_PK_LEN], CompositeError> {
+    if der.len() != ED25519_PKCS8_LEN {
+        return Err(CompositeError::Pkcs8(format!(
+            "expected {ED25519_PKCS8_LEN} bytes, got {}",
+            der.len()
+        )));
+    }
+    if der[..ED25519_PKCS8_PREFIX.len()] != ED25519_PKCS8_PREFIX {
+        return Err(CompositeError::Pkcs8(
+            "not an RFC 8410 Ed25519 PKCS#8 v1 header".to_string(),
+        ));
+    }
+    let mut seed = Zeroizing::new([0u8; 32]);
+    seed.copy_from_slice(&der[ED25519_PKCS8_PREFIX.len()..]);
+    Ok(EdSk::from_bytes(&seed).verifying_key().to_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +304,45 @@ impl CompositePublicKey {
         }
         Ok(())
     }
+
+    /// Verify a **standard-format** RFC 8032 Ed25519 signature over `msg`.
+    ///
+    /// The counterpart to [`CompositeSecretKey::sign_interop_ed25519`]; see that
+    /// method for why interoperable artefacts sign the message directly rather
+    /// than the composite transcript hash.
+    pub fn verify_interop_ed25519(
+        &self,
+        msg: &[u8],
+        sig: &[u8; ED25519_SIG_LEN],
+    ) -> Result<(), CompositeError> {
+        reject_transcript_sized(msg)?;
+        let ed_sig = ed25519_dalek::Signature::from_bytes(sig);
+        self.ed25519
+            .verify_strict(msg, &ed_sig)
+            .map_err(|_| CompositeError::ClassicalFailed)
+    }
+
+    /// Verify a **standard-format** FIPS-204 ML-DSA-65 signature over `msg`
+    /// under the FIPS-204 context string `ctx`.
+    ///
+    /// The counterpart to [`CompositeSecretKey::sign_interop_mldsa65`].
+    pub fn verify_interop_mldsa65(
+        &self,
+        ctx: &[u8],
+        msg: &[u8],
+        sig: &[u8],
+    ) -> Result<(), CompositeError> {
+        reject_transcript_sized(msg)?;
+        if sig.len() != MLDSA65_SIG_LEN {
+            return Err(CompositeError::PqcFailed);
+        }
+        let mut arr = [0u8; MLDSA65_SIG_LEN];
+        arr.copy_from_slice(sig);
+        if !self.mldsa65.verify(msg, &arr, ctx) {
+            return Err(CompositeError::PqcFailed);
+        }
+        Ok(())
+    }
 }
 
 impl core::fmt::Debug for CompositePublicKey {
@@ -306,6 +420,88 @@ impl CompositeSecretKey {
             classical,
             pqc: pqc_arr.to_vec(),
         })
+    }
+
+    /// Export the **Ed25519 half** as PKCS#8 v1 DER (RFC 8410 §7).
+    ///
+    /// ## This hands out private key material
+    ///
+    /// Everything else in this type keeps the private key inside; this does not.
+    /// It exists for one reason: an X.509-SVID names the Ed25519 half as its
+    /// subject public key, and a TLS stack cannot use the certificate without
+    /// the matching private key in a format it understands. Anything that calls
+    /// this is responsible for what happens to the bytes — MIA seals them under
+    /// a TPM- or machine-bound key and never writes them out in the clear.
+    ///
+    /// The ML-DSA-65 half is **not** exported: it is not needed to use the
+    /// certificate, and leaving it here keeps the blast radius to the classical
+    /// key alone. The returned buffer zeroes itself on drop.
+    #[must_use]
+    pub fn to_ed25519_pkcs8_der(&self) -> Zeroizing<Vec<u8>> {
+        let seed = Zeroizing::new(self.ed25519.to_bytes());
+        ed25519_pkcs8_from_seed(&seed)
+    }
+
+    /// Sign `msg` as a **standard-format** RFC 8032 Ed25519 signature: the raw
+    /// message, with no FerroGate transcript hash and no context string.
+    ///
+    /// This exists for artefacts a third party must be able to verify with an
+    /// off-the-shelf stack. The hybrid X.509-SVID profile
+    /// (`ferro_svid::x509`) signs its `TBSCertificate` this way so rustls,
+    /// OpenSSL, or Envoy validate the chain unaided, and carries the ML-DSA-65
+    /// half of the same logical signature in a certificate extension.
+    ///
+    /// ## Domain separation
+    ///
+    /// Every *composite* signature this key produces covers exactly one thing:
+    /// the [`TRANSCRIPT_HASH_LEN`]-byte [`transcript_hash`] output. Interop
+    /// signing therefore refuses a message of that length, keeping the two
+    /// message spaces disjoint so an interop signature can never be replayed as
+    /// a composite one, or the reverse.
+    pub fn sign_interop_ed25519(
+        &self,
+        msg: &[u8],
+    ) -> Result<[u8; ED25519_SIG_LEN], CompositeError> {
+        reject_transcript_sized(msg)?;
+        Ok(self.ed25519.sign(msg).to_bytes())
+    }
+
+    /// Sign `msg` as a **standard-format** FIPS-204 ML-DSA-65 signature under
+    /// the FIPS-204 context string `ctx`.
+    ///
+    /// The PQ half of the hybrid X.509-SVID signature. `ctx` carries the domain
+    /// separation the composite transcript would otherwise provide, and the
+    /// same length guard as [`Self::sign_interop_ed25519`] applies.
+    pub fn sign_interop_mldsa65(&self, ctx: &[u8], msg: &[u8]) -> Result<Vec<u8>, CompositeError> {
+        reject_transcript_sized(msg)?;
+        let sig = self
+            .mldsa65
+            .try_sign(msg, ctx)
+            .map_err(CompositeError::Sign)?;
+        Ok(sig.to_vec())
+    }
+
+    /// As [`Self::sign_interop_mldsa65`], but using FIPS-204's **deterministic**
+    /// variant: the hedging value `rnd` is all-zero, so the same key and message
+    /// always produce the same signature.
+    ///
+    /// FIPS 204 §3.4 approves both the hedged (default, randomised) and the
+    /// deterministic variant. Hedged is the better default — it is more robust
+    /// against fault and side-channel attacks — so this is reserved for the one
+    /// artefact whose bytes must be reproducible: the X.509-SVID trust bundle,
+    /// which every CMIS replica sharing an issuer seed has to publish
+    /// identically. Never reach for it to make a *leaf* credential reproducible.
+    pub fn sign_interop_mldsa65_deterministic(
+        &self,
+        ctx: &[u8],
+        msg: &[u8],
+    ) -> Result<Vec<u8>, CompositeError> {
+        reject_transcript_sized(msg)?;
+        let sig = self
+            .mldsa65
+            .try_sign_with_seed(&[0u8; 32], msg, ctx)
+            .map_err(CompositeError::Sign)?;
+        Ok(sig.to_vec())
     }
 }
 
@@ -608,5 +804,127 @@ mod tests {
     #[test]
     fn jose_alg_matches_design_doc() {
         assert_eq!(COMPOSITE_JOSE_ALG, "MLDSA65+Ed25519");
+    }
+
+    // --- Ed25519 PKCS#8 export --------------------------------------------
+
+    #[test]
+    fn exported_pkcs8_matches_the_certificate_subject_key() {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let der = sk.to_ed25519_pkcs8_der();
+
+        assert_eq!(der.len(), ED25519_PKCS8_LEN);
+        // The public key recovered from the export is the one an X.509-SVID
+        // carries in its SubjectPublicKeyInfo.
+        assert_eq!(
+            ed25519_public_from_pkcs8(&der).unwrap(),
+            pk.ed25519().to_bytes(),
+        );
+    }
+
+    #[test]
+    fn exported_pkcs8_loads_in_a_stock_tls_stack() {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let der = sk.to_ed25519_pkcs8_der();
+
+        // ring is what rustls uses to load a private key; if it accepts this
+        // blob and its signature verifies under the certificate's subject key,
+        // the exported key is usable for mTLS.
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der)
+            .expect("a stock PKCS#8 loader accepts the export");
+        let msg = b"handshake transcript";
+        let sig = ring::signature::KeyPair::public_key(&pair);
+        assert_eq!(sig.as_ref(), pk.ed25519().as_bytes());
+
+        let signature = pair.sign(msg);
+        pk.verify_interop_ed25519(msg, &signature.as_ref().try_into().unwrap())
+            .expect("a signature from the exported key verifies under the subject key");
+    }
+
+    #[test]
+    fn malformed_pkcs8_is_rejected() {
+        let (sk, _) = CompositeSecretKey::generate().unwrap();
+        let der = sk.to_ed25519_pkcs8_der();
+
+        assert!(matches!(
+            ed25519_public_from_pkcs8(&der[..40]),
+            Err(CompositeError::Pkcs8(_))
+        ));
+        let mut wrong = der.to_vec();
+        wrong[5] ^= 0xff; // corrupt the AlgorithmIdentifier
+        assert!(matches!(
+            ed25519_public_from_pkcs8(&wrong),
+            Err(CompositeError::Pkcs8(_))
+        ));
+    }
+
+    // --- interop (standard-format) signatures ------------------------------
+
+    #[test]
+    fn interop_ed25519_verifies_under_a_stock_verifier() {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let msg = b"not a transcript hash, just some TBSCertificate-ish bytes";
+        let sig = sk.sign_interop_ed25519(msg).unwrap();
+
+        pk.verify_interop_ed25519(msg, &sig).unwrap();
+
+        // The point of the interop path: a verifier that knows nothing about
+        // FerroGate — here ed25519-dalek used directly, exactly as rustls or
+        // OpenSSL would — validates the same bytes.
+        let stock_sig = ed25519_dalek::Signature::from_bytes(&sig);
+        pk.ed25519()
+            .verify_strict(msg, &stock_sig)
+            .expect("a stock RFC 8032 verifier accepts the interop signature");
+    }
+
+    #[test]
+    fn interop_mldsa65_roundtrips_and_is_context_bound() {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let msg = b"some certificate body bytes";
+        let sig = sk.sign_interop_mldsa65(b"ctx-a", msg).unwrap();
+
+        pk.verify_interop_mldsa65(b"ctx-a", msg, &sig).unwrap();
+        assert!(pk.verify_interop_mldsa65(b"ctx-b", msg, &sig).is_err());
+        assert!(pk.verify_interop_mldsa65(b"ctx-a", b"other", &sig).is_err());
+    }
+
+    #[test]
+    fn deterministic_mldsa65_is_reproducible_and_hedged_is_not() {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let msg = b"a trust bundle body";
+
+        let a = sk.sign_interop_mldsa65_deterministic(b"ctx", msg).unwrap();
+        let b = sk.sign_interop_mldsa65_deterministic(b"ctx", msg).unwrap();
+        assert_eq!(a, b, "the deterministic variant must be byte-stable");
+        pk.verify_interop_mldsa65(b"ctx", msg, &a).unwrap();
+
+        let h1 = sk.sign_interop_mldsa65(b"ctx", msg).unwrap();
+        let h2 = sk.sign_interop_mldsa65(b"ctx", msg).unwrap();
+        assert_ne!(h1, h2, "the default variant is hedged, so it varies");
+        pk.verify_interop_mldsa65(b"ctx", msg, &h1).unwrap();
+    }
+
+    #[test]
+    fn interop_signing_refuses_transcript_sized_messages() {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        // A composite signature covers exactly this message space; the interop
+        // path must not overlap it, in either direction.
+        let h = transcript_hash(ctx(), b"payload");
+        assert!(matches!(
+            sk.sign_interop_ed25519(&h),
+            Err(CompositeError::InteropDomainCollision(48))
+        ));
+        assert!(matches!(
+            sk.sign_interop_mldsa65(b"any", &h),
+            Err(CompositeError::InteropDomainCollision(48))
+        ));
+
+        // And the classical half of a real composite signature cannot be
+        // re-presented as a valid interop signature over the transcript hash.
+        let composite = sk.sign(ctx(), b"payload").unwrap();
+        assert!(matches!(
+            pk.verify_interop_ed25519(&h, &composite.classical),
+            Err(CompositeError::InteropDomainCollision(48))
+        ));
     }
 }

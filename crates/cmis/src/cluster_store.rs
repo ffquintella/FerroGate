@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use ferro_svid::{IssueParams, IssuedSvid, LastAttestation};
+use ferro_svid::{IssueParams, IssuedSvid, LastAttestation, X509Svid};
 
 use crate::state::IssuedRecord;
 
@@ -77,6 +77,27 @@ pub struct WireIssuedRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
 
+    /// The host's composite CSR key, hex-encoded concat bytes — the subject key
+    /// the X.509-SVID profile binds its leaf to. Optional with a default so
+    /// records written before the profile existed still decode; such a record
+    /// renews with the JWS profile only, until the host next attests.
+    ///
+    /// This is the same key as [`Self::child_pub_hex`]; the two are kept
+    /// separate because they answer to different consumers (JWKS publication
+    /// versus certificate issuance) and either may be absent on an old record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_pub_hex: Option<String>,
+
+    /// The issued X.509-SVID leaf certificate, hex-encoded DER.
+    ///
+    /// Stored rather than re-derived: the leaf's ML-DSA-65 half is signed with
+    /// FIPS-204's hedged (randomised) variant, so re-issuing would produce a
+    /// *different* certificate for the same identity — and a replica must serve
+    /// the byte-exact certificate the host holds. The trust bundle is not stored
+    /// beside it because it *is* reproducible from the issuer key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x509_leaf_der_hex: Option<String>,
+
     /// The host's composite child-token signing key (F09), hex-encoded concat
     /// bytes. Persisting it here lets any replica — and any restarted
     /// instance — republish the key into the JWKS by `kid` on startup, so a
@@ -123,12 +144,21 @@ impl WireIssuedRecord {
             iat: r.bundle.iat,
             exp: r.bundle.exp,
             hostname: r.hostname.clone(),
+            subject_pub_hex: r.params.subject_pub.as_ref().map(hex::encode),
+            x509_leaf_der_hex: r.bundle.x509.as_ref().map(|x| hex::encode(&x.leaf_der)),
             child_pub_hex: r.child_pub.as_ref().map(hex::encode),
         }
     }
 
     /// Reverse [`Self::from_record`].
     pub fn into_record(self) -> Result<IssuedRecord, WireError> {
+        let subject_pub = match &self.subject_pub_hex {
+            Some(h) => Some(hex::decode(h).map_err(|e| WireError::Hex {
+                field: "subject_pub_hex",
+                reason: e.to_string(),
+            })?),
+            None => None,
+        };
         let params = IssueParams {
             ek_cert_sha384: hex_48("ek_cert_sha384_hex", &self.ek_cert_sha384_hex)?,
             pcr_digest: hex_48("pcr_digest_hex", &self.pcr_digest_hex)?,
@@ -136,14 +166,31 @@ impl WireIssuedRecord {
             dpop_jkt: self.dpop_jkt,
             ttl_secs: self.ttl_secs,
             tee_evidence_id: self.tee_evidence_id,
+            subject_pub,
         };
         let last_attestation = LastAttestation {
             at: self.last_attestation_at,
             pcr_digest: hex_48("last_pcr_digest_hex", &self.last_pcr_digest_hex)?,
             policy_epoch: self.last_policy_epoch,
         };
+        // The certificate's own metadata is not stored: it is exactly what the
+        // issuer derived from the JWS window (`ferro_svid::Issuer::issue`), so
+        // reproducing it here keeps the two profiles from drifting apart.
+        let x509 = match &self.x509_leaf_der_hex {
+            Some(h) => Some(X509Svid {
+                leaf_der: hex::decode(h).map_err(|e| WireError::Hex {
+                    field: "x509_leaf_der_hex",
+                    reason: e.to_string(),
+                })?,
+                spiffe_id: self.spiffe_id.clone(),
+                not_before: self.iat - ferro_svid::NBF_LOOKBACK_SECS,
+                not_after: self.exp,
+            }),
+            None => None,
+        };
         let bundle = IssuedSvid {
             jws: self.jws,
+            x509,
             spiffe_id: self.spiffe_id,
             iat: self.iat,
             exp: self.exp,
@@ -182,6 +229,9 @@ mod tests {
     use super::*;
 
     fn sample_record() -> IssuedRecord {
+        let subject_pub = ferro_crypto::composite::CompositeSecretKey::from_seed(&[0x5a; 32])
+            .1
+            .to_concat_bytes();
         IssuedRecord {
             params: IssueParams {
                 ek_cert_sha384: [0xABu8; 48],
@@ -190,6 +240,7 @@ mod tests {
                 dpop_jkt: "thumb".into(),
                 ttl_secs: 3600,
                 tee_evidence_id: Some("tee-1".into()),
+                subject_pub: Some(subject_pub),
             },
             last_attestation: LastAttestation {
                 at: 1_700_000_000,
@@ -198,6 +249,12 @@ mod tests {
             },
             bundle: IssuedSvid {
                 jws: "eyJ...".into(),
+                x509: Some(X509Svid {
+                    leaf_der: vec![0x30, 0x82, 0x01, 0x02],
+                    spiffe_id: "spiffe://td/host/x".into(),
+                    not_before: 1_700_000_000 - ferro_svid::NBF_LOOKBACK_SECS,
+                    not_after: 1_700_003_600,
+                }),
                 spiffe_id: "spiffe://td/host/x".into(),
                 iat: 1_700_000_000,
                 exp: 1_700_003_600,
@@ -225,6 +282,28 @@ mod tests {
         assert_eq!(back.bundle.spiffe_id, r.bundle.spiffe_id);
         assert_eq!(back.hostname, r.hostname);
         assert_eq!(back.child_pub, r.child_pub);
+
+        // Both profiles survive replication: the certificate byte-for-byte, and
+        // the subject key it is bound to so a rotation can re-issue it.
+        assert_eq!(back.bundle.x509, r.bundle.x509);
+        assert_eq!(back.params.subject_pub, r.params.subject_pub);
+    }
+
+    #[test]
+    fn a_record_written_before_the_x509_profile_still_decodes() {
+        // Forward compatibility in the replicated store: a row persisted by an
+        // older CMIS has neither field, and must decode to "JWS profile only"
+        // rather than failing the whole rehydrate.
+        let mut wire =
+            serde_json::to_value(WireIssuedRecord::from_record(&sample_record())).expect("encode");
+        let obj = wire.as_object_mut().unwrap();
+        obj.remove("subject_pub_hex");
+        obj.remove("x509_leaf_der_hex");
+
+        let back = decode(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert!(back.params.subject_pub.is_none());
+        assert!(back.bundle.x509.is_none());
+        assert_eq!(back.bundle.jws, "eyJ...");
     }
 
     #[test]
@@ -250,7 +329,8 @@ mod tests {
 
     #[test]
     fn decodes_record_written_before_hostname_existed() {
-        let mut wire = serde_json::to_value(WireIssuedRecord::from_record(&sample_record())).unwrap();
+        let mut wire =
+            serde_json::to_value(WireIssuedRecord::from_record(&sample_record())).unwrap();
         wire.as_object_mut().unwrap().remove("hostname");
         let bytes = serde_json::to_vec(&wire).unwrap();
         let back = decode(&bytes).unwrap();

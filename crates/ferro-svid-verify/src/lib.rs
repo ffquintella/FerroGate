@@ -11,8 +11,15 @@
 //! segments, a recognised `alg`/`typ`, a `kid` present in the supplied JWK
 //! set, a valid composite (Ed25519 **and** ML-DSA-65) signature over the
 //! signing input, and finally the `nbf`/`exp` time bounds.
+//!
+//! FerroGate issues a second, certificate-shaped profile beside the JWS one;
+//! [`x509`] verifies that. Its leaf is validated by any stock TLS stack on the
+//! native Ed25519 signature alone, so reach for [`x509`] only when you want the
+//! post-quantum half checked as well.
 
 #![forbid(unsafe_code)]
+
+pub mod x509;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -98,7 +105,7 @@ pub struct Jwk {
 
 impl Jwk {
     /// Reconstruct the composite public key carried by this JWK.
-    fn to_public_key(&self) -> Result<CompositePublicKey, VerifyError> {
+    pub(crate) fn to_public_key(&self) -> Result<CompositePublicKey, VerifyError> {
         let bytes = URL_SAFE_NO_PAD
             .decode(self.public.as_bytes())
             .map_err(|e| VerifyError::Malformed(format!("jwk pub: {e}")))?;
@@ -108,7 +115,8 @@ impl Jwk {
 }
 
 /// A JWK set, optionally carrying FerroGate's CRL (feature F11) in the
-/// `x-ferrogate-crl` extension member.
+/// `x-ferrogate-crl` extension member and the X.509-SVID trust bundle in
+/// `x-ferrogate-x509-bundle`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JwkSet {
     /// Keys.
@@ -116,6 +124,10 @@ pub struct JwkSet {
     /// The composite-signed revocation list, when published.
     #[serde(rename = "x-ferrogate-crl", default)]
     pub crl: Option<SignedCrl>,
+    /// base64url DER of the X.509-SVID signing certificate — the trust anchor
+    /// for the certificate profile. See [`x509`].
+    #[serde(rename = "x-ferrogate-x509-bundle", default)]
+    pub x509_bundle: Option<String>,
 }
 
 impl JwkSet {
@@ -124,7 +136,7 @@ impl JwkSet {
         serde_json::from_str(s).map_err(|e| VerifyError::Malformed(e.to_string()))
     }
 
-    fn find(&self, kid: &str) -> Option<&Jwk> {
+    pub(crate) fn find(&self, kid: &str) -> Option<&Jwk> {
         self.keys.iter().find(|k| k.kid == kid)
     }
 
@@ -199,17 +211,17 @@ pub struct CrlBody {
 }
 
 impl CrlBody {
-    fn revokes_svid(&self, cert_sha_hex: &str) -> bool {
+    pub(crate) fn revokes_svid(&self, cert_sha_hex: &str) -> bool {
         self.entries.iter().any(|e| {
             matches!(&e.target, RevocationTarget::Svid { cert_sha } if cert_sha.eq_ignore_ascii_case(cert_sha_hex))
         })
     }
-    fn revokes_host(&self, spiffe_id: &str) -> bool {
+    pub(crate) fn revokes_host(&self, spiffe_id: &str) -> bool {
         self.entries
             .iter()
             .any(|e| matches!(&e.target, RevocationTarget::Host { spiffe_id: s } if s == spiffe_id))
     }
-    fn is_fresh(&self, now: i64, leeway_secs: i64) -> bool {
+    pub(crate) fn is_fresh(&self, now: i64, leeway_secs: i64) -> bool {
         let age = now - self.issued_at;
         age <= CRL_MAX_AGE_SECS && age >= -leeway_secs
     }
@@ -228,7 +240,7 @@ pub struct SignedCrl {
 
 impl SignedCrl {
     /// Verify the CRL signature against the keys in `jwks`. Fail-closed.
-    fn verify<'a>(&'a self, jwks: &JwkSet) -> Result<&'a CrlBody, VerifyError> {
+    pub(crate) fn verify<'a>(&'a self, jwks: &JwkSet) -> Result<&'a CrlBody, VerifyError> {
         let jwk = jwks.find(&self.signer_kid).ok_or_else(|| {
             VerifyError::CrlInvalid(format!("unknown signer kid {}", self.signer_kid))
         })?;

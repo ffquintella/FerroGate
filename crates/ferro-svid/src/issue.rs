@@ -1,5 +1,7 @@
 //! SVID issuance: turn verified attestation evidence into a signed compact JWS.
 
+use std::sync::OnceLock;
+
 use ferro_crypto::composite::{CompositeError, CompositePublicKey, CompositeSecretKey};
 
 use crate::allowlist::{self, AllowEntry, AllowlistDoc, AllowlistError, SignedAllowlist};
@@ -8,6 +10,7 @@ use crate::crl::{CrlBody, CrlError, SignedCrl};
 use crate::envelope::{self, EnvelopeError, JwsHeader};
 use crate::jwks::{Jwk, JwkSet};
 use crate::spiffe::{self, SpiffeError};
+use crate::x509::{self, X509Error, X509Svid};
 
 /// Inputs CMIS supplies to mint one SVID. All hardware/boot fields come from a
 /// verified [`ferro_attest::VerifiedQuote`]; the DPoP thumbprint comes from the
@@ -27,13 +30,32 @@ pub struct IssueParams {
     pub ttl_secs: u64,
     /// Optional TEE evidence id (`None` in the M2 single-replica config).
     pub tee_evidence_id: Option<String>,
+    /// The host's composite CSR key (`Csr::composite_pub`) in **concat wire
+    /// form** — the key the X.509-SVID profile binds its leaf certificate to.
+    ///
+    /// Held as bytes rather than a parsed [`CompositePublicKey`] deliberately:
+    /// FIPS-204 keeps the expanded ML-DSA matrix in memory, so a parsed key is
+    /// tens of kilobytes, and these params are cloned per issuance and stored
+    /// per host. Issuance parses it once, next to work that dwarfs the cost.
+    ///
+    /// `None` suppresses the X.509 profile for this issuance; the JWS SVID is
+    /// still minted. That is the case for issued-SVID records written before the
+    /// profile existed, and for a malformed CSR key.
+    pub subject_pub: Option<Vec<u8>>,
 }
 
 /// A freshly issued SVID and its salient metadata.
+///
+/// One attestation yields **both** profiles: the compact JWS in [`Self::jws`]
+/// and, when the CSR key was recorded, the X.509-SVID in [`Self::x509`]. They
+/// carry the same SPIFFE ID, the same validity window, and the same issuer key;
+/// a consumer picks whichever its stack can verify.
 #[derive(Debug, Clone)]
 pub struct IssuedSvid {
     /// The compact JWS.
     pub jws: String,
+    /// The X.509-SVID leaf, when [`IssueParams::subject_pub`] was supplied.
+    pub x509: Option<X509Svid>,
     /// Subject SPIFFE ID.
     pub spiffe_id: String,
     /// Issued-at, Unix seconds.
@@ -60,6 +82,9 @@ pub enum IssueError {
     /// Allowlist signing/encoding failed.
     #[error("allowlist: {0}")]
     Allowlist(#[from] AllowlistError),
+    /// X.509-SVID issuance failed.
+    #[error("x509: {0}")]
+    X509(#[from] X509Error),
 }
 
 /// The CMIS issuance authority: a composite signing key plus the trust-domain
@@ -69,6 +94,9 @@ pub struct Issuer {
     public: CompositePublicKey,
     kid: String,
     trust_domain: String,
+    /// Memoised X.509-SVID trust bundle. Deterministic in the key and the trust
+    /// domain, so it is built once and handed out by reference thereafter.
+    x509_ca: OnceLock<Vec<u8>>,
 }
 
 impl Issuer {
@@ -85,6 +113,7 @@ impl Issuer {
             public,
             kid: kid.into(),
             trust_domain: trust_domain.into(),
+            x509_ca: OnceLock::new(),
         }
     }
 
@@ -126,10 +155,35 @@ impl Issuer {
         &self.public
     }
 
-    /// The JWK set this issuer publishes (currently a single key).
+    /// The X.509-SVID trust bundle: this issuer's self-signed signing
+    /// certificate, DER-encoded.
+    ///
+    /// Consumers install it as the trust anchor for the X.509 profile, exactly
+    /// as they install the JWK set for the JWS profile. It is deterministic in
+    /// `(issuer key, trust domain)` — see [`crate::x509::issue_ca`] — so every
+    /// replica of a cluster serves identical bytes, and it is built at most once
+    /// per process.
+    pub fn x509_ca(&self) -> Result<&[u8], IssueError> {
+        if let Some(der) = self.x509_ca.get() {
+            return Ok(der);
+        }
+        let der = x509::issue_ca(&self.secret, &self.public, &self.trust_domain)?;
+        Ok(self.x509_ca.get_or_init(|| der))
+    }
+
+    /// The JWK set this issuer publishes: its single composite key plus, in the
+    /// `x-ferrogate-x509-bundle` member, the X.509-SVID trust anchor — so one
+    /// fetch arms a verifier for both profiles.
     #[must_use]
     pub fn jwks(&self) -> JwkSet {
-        JwkSet::single(Jwk::from_public_key(self.kid.clone(), &self.public))
+        let set = JwkSet::single(Jwk::from_public_key(self.kid.clone(), &self.public));
+        match self.x509_ca() {
+            Ok(der) => set.with_x509_bundle(der),
+            // A trust bundle this issuer cannot build is a bug, not a runtime
+            // condition. Publishing the keys without it keeps the JWS profile
+            // serving rather than taking the whole JWKS down.
+            Err(_) => set,
+        }
     }
 
     /// Sign a [`CrlBody`] with the composite issuance key, stamping this
@@ -159,7 +213,13 @@ impl Issuer {
         Ok(allowlist::sign(&doc, &self.secret)?)
     }
 
-    /// Mint an SVID. `now` is the reference clock in Unix seconds.
+    /// Mint an SVID in **both** profiles. `now` is the reference clock in Unix
+    /// seconds.
+    ///
+    /// The X.509 leaf mirrors the JWS exactly: same subject SPIFFE ID, and a
+    /// validity window of `[nbf, exp]` so the two credentials expire together.
+    /// It is omitted when [`IssueParams::subject_pub`] is `None`, since there is
+    /// then no subject key to bind a certificate to.
     pub fn issue(&self, params: &IssueParams, now: i64) -> Result<IssuedSvid, IssueError> {
         let ttl = params.ttl_secs.min(crate::MAX_TTL_SECS);
         let iat = now;
@@ -193,8 +253,27 @@ impl Issuer {
             .sign(crate::SVID_SIGNING_CONTEXT, signing_input.as_bytes())?;
         let jws = envelope::compact(&signing_input, &sig.to_concat_bytes());
 
+        let x509 = match &params.subject_pub {
+            Some(bytes) => {
+                let subject_pub = CompositePublicKey::from_concat_bytes(bytes)?;
+                Some(x509::issue_leaf(
+                    &self.secret,
+                    &self.public,
+                    &self.trust_domain,
+                    &x509::LeafParams {
+                        subject_pub: &subject_pub,
+                        spiffe_id: &sub,
+                        not_before: nbf,
+                        not_after: exp,
+                    },
+                )?)
+            }
+            None => None,
+        };
+
         Ok(IssuedSvid {
             jws,
+            x509,
             spiffe_id: sub,
             iat,
             exp,
@@ -206,6 +285,12 @@ impl Issuer {
 mod tests {
     use super::*;
 
+    fn host_key() -> Vec<u8> {
+        CompositeSecretKey::from_seed(&[0x5a; 32])
+            .1
+            .to_concat_bytes()
+    }
+
     fn params() -> IssueParams {
         IssueParams {
             ek_cert_sha384: [0x11; 48],
@@ -214,6 +299,7 @@ mod tests {
             dpop_jkt: "abc123".to_string(),
             ttl_secs: 3600,
             tee_evidence_id: None,
+            subject_pub: Some(host_key()),
         }
     }
 
@@ -247,7 +333,7 @@ mod tests {
         let issuer = Issuer::generate("kid-1", "ferrogate.test").unwrap();
         let mut p = params();
         p.ttl_secs = crate::MAX_TTL_SECS + 999_999;
-        let svid = issuer.issue(&p, 0).unwrap();
+        let svid = issuer.issue(&p, 1_000_000).unwrap();
         assert_eq!(svid.exp - svid.iat, crate::MAX_TTL_SECS as i64);
     }
 
@@ -277,6 +363,48 @@ mod tests {
                 &sig,
             )
             .expect("signature from the same seed verifies after restart");
+    }
+
+    #[test]
+    fn issue_mints_both_profiles_over_the_same_identity_and_window() {
+        let issuer = Issuer::generate("kid-1", "ferrogate.test").unwrap();
+        let svid = issuer.issue(&params(), 1_000_000).unwrap();
+
+        let x509 = svid.x509.as_ref().expect("the X.509 profile is issued too");
+        assert_eq!(x509.spiffe_id, svid.spiffe_id, "same SPIFFE ID");
+        assert_eq!(
+            x509.not_after, svid.exp,
+            "the two credentials expire together"
+        );
+        assert_eq!(
+            x509.not_before,
+            svid.iat - crate::NBF_LOOKBACK_SECS,
+            "the certificate honours the same clock-skew lookback as `nbf`"
+        );
+
+        // The JWS profile is untouched by the addition.
+        let decoded = envelope::decode(&svid.jws).unwrap();
+        assert_eq!(decoded.claims.sub, svid.spiffe_id);
+        assert_eq!(decoded.header.typ, crate::SVID_TYP);
+    }
+
+    #[test]
+    fn x509_profile_is_skipped_without_a_subject_key() {
+        let issuer = Issuer::generate("kid-1", "ferrogate.test").unwrap();
+        let mut p = params();
+        p.subject_pub = None;
+        let svid = issuer.issue(&p, 1_000_000).unwrap();
+        assert!(svid.x509.is_none());
+        // The JWS is still minted, so an old record still renews.
+        assert!(envelope::decode(&svid.jws).is_ok());
+    }
+
+    #[test]
+    fn x509_ca_is_memoised_and_stable() {
+        let issuer = Issuer::generate("kid-1", "ferrogate.test").unwrap();
+        let a = issuer.x509_ca().unwrap().to_vec();
+        let b = issuer.x509_ca().unwrap().to_vec();
+        assert_eq!(a, b);
     }
 
     #[test]

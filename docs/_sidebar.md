@@ -46,6 +46,7 @@
   - [F12 — MIA hardening](features/F12-mia-hardening.md)
   - [F13 — Bootstrap & enrollment](features/F13-bootstrap-enrollment.md)
   - [F14 — Root key ceremony](features/F14-root-key-ceremony.md)
+  - [F17 — X.509-SVID profile](features/F17-x509-svid.md)
 
 - Decisions
   - [ADR index](adr/README.md)

@@ -14,8 +14,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use base64::Engine as _;
 use ferro_attest::{
-    credential_secret_matches, verify_aik_signature, verify_host_key_csr,
-    verify_host_key_evidence, PcrSet, QuoteVerification, RejectReason,
+    credential_secret_matches, verify_aik_signature, verify_host_key_csr, verify_host_key_evidence,
+    PcrSet, QuoteVerification, RejectReason,
 };
 use ferro_audit::{AuditEvent, Hash384};
 use ferro_crypto::composite::{CompositePublicKey, CompositeSignature};
@@ -73,6 +73,19 @@ impl MachineIdentitySvc {
             tracing::error!(error = %e, "CRL publish failed");
             Status::unavailable("issuer temporarily unavailable")
         })
+    }
+
+    /// The `cert_sha` of the X.509-SVID issued alongside the JWS whose digest is
+    /// `jws_cert_sha` — `None` if no such record exists or it carried no
+    /// certificate.
+    async fn paired_x509_cert_sha(&self, jws_cert_sha: &str) -> Option<String> {
+        self.state
+            .list_svids()
+            .await
+            .iter()
+            .find(|rec| hex::encode(sha384(rec.bundle.jws.as_bytes())) == jws_cert_sha)
+            .and_then(|rec| rec.bundle.x509.as_ref())
+            .map(|x| hex::encode(sha384(&x.leaf_der)))
     }
 }
 
@@ -464,10 +477,20 @@ async fn run_attest(
     // child tokens (F09) the MIA will mint with it. A malformed key here is the
     // host's problem, not the issuer's — log and continue rather than fail the
     // attestation, since the SVID itself does not depend on JWKS publication.
-    match CompositePublicKey::from_concat_bytes(&csr.composite_pub) {
-        Ok(pk) => state.register_child_key(&pk),
-        Err(e) => tracing::warn!(error = %e, "could not publish host child-token key"),
-    }
+    // The CSR key does double duty: it is published for child-token verification
+    // *and* becomes the subject key of the X.509-SVID leaf. A key that will not
+    // parse costs the host its certificate profile, not its attestation — the
+    // JWS SVID does not depend on it.
+    let subject_pub = match CompositePublicKey::from_concat_bytes(&csr.composite_pub) {
+        Ok(pk) => {
+            state.register_child_key(&pk);
+            Some(csr.composite_pub.clone())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not publish host child-token key");
+            None
+        }
+    };
 
     let params = IssueParams {
         ek_cert_sha384: sha384(&init.ek_cert),
@@ -476,6 +499,7 @@ async fn run_attest(
         dpop_jkt: csr.dpop_jkt,
         ttl_secs: state.config.svid_ttl_secs,
         tee_evidence_id: None,
+        subject_pub,
     };
     let issued = state.issuer.issue(&params, now).map_err(|e| {
         tracing::error!(error = %e, "SVID issuance failed");
@@ -508,7 +532,7 @@ async fn run_attest(
         .await;
 
     tracing::info!(spiffe_id = %issued.spiffe_id, "issued SVID via full attestation");
-    send(tx, RespPhase::Svid(to_bundle(&issued))).await?;
+    send(tx, RespPhase::Svid(to_bundle(&issued, &state))).await?;
     Ok(())
 }
 
@@ -635,10 +659,16 @@ async fn run_attest_host_key(
         return Err(Status::permission_denied("attestation failed"));
     }
 
-    match CompositePublicKey::from_concat_bytes(&csr.composite_pub) {
-        Ok(pk) => state.register_child_key(&pk),
-        Err(e) => tracing::warn!(error = %e, "could not publish host child-token key"),
-    }
+    let subject_pub = match CompositePublicKey::from_concat_bytes(&csr.composite_pub) {
+        Ok(pk) => {
+            state.register_child_key(&pk);
+            Some(csr.composite_pub.clone())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not publish host child-token key");
+            None
+        }
+    };
 
     // No PCRs exist on this profile; reuse the fingerprint as the stable
     // `pcr_digest` so the subject UUID and renewal-drift logic stay well-defined.
@@ -654,6 +684,7 @@ async fn run_attest_host_key(
             .host_key_svid_ttl_secs
             .unwrap_or(state.config.svid_ttl_secs),
         tee_evidence_id: None,
+        subject_pub,
     };
     let issued = state.issuer.issue(&params, now).map_err(|e| {
         tracing::error!(error = %e, "host-key SVID issuance failed");
@@ -685,16 +716,32 @@ async fn run_attest_host_key(
         .await;
 
     tracing::info!(spiffe_id = %issued.spiffe_id, "issued SVID via host-key attestation (F15)");
-    send(tx, RespPhase::Svid(to_bundle(&issued))).await?;
+    send(tx, RespPhase::Svid(to_bundle(&issued, &state))).await?;
     Ok(())
 }
 
-fn to_bundle(issued: &IssuedSvid) -> SvidBundle {
+/// Shape an issued SVID for the wire, carrying **both** profiles.
+///
+/// The X.509 fields are left empty when the issuance produced no certificate
+/// (an unparseable CSR key, or a record predating the profile) or when the trust
+/// bundle cannot be built — a client that only speaks the JWS profile is
+/// unaffected either way.
+fn to_bundle(issued: &IssuedSvid, state: &CmisState) -> SvidBundle {
+    let (x509_svid, x509_bundle) = match (&issued.x509, state.issuer.x509_ca()) {
+        (Some(leaf), Ok(ca)) => (leaf.leaf_der.clone(), ca.to_vec()),
+        (Some(_), Err(e)) => {
+            tracing::error!(error = %e, "issued an X.509-SVID but cannot publish its trust bundle");
+            (Vec::new(), Vec::new())
+        }
+        (None, _) => (Vec::new(), Vec::new()),
+    };
     SvidBundle {
         jws: issued.jws.clone(),
         issued_at: issued.iat,
         expires_at: issued.exp,
         spiffe_id: issued.spiffe_id.clone(),
+        x509_svid,
+        x509_bundle,
     }
 }
 
@@ -723,7 +770,7 @@ impl MachineIdentity for MachineIdentitySvc {
     ) -> Result<Response<SvidBundle>, Status> {
         let spiffe_id = request.into_inner().spiffe_id;
         match self.state.lookup(&spiffe_id).await {
-            Some(rec) => Ok(Response::new(to_bundle(&rec.bundle))),
+            Some(rec) => Ok(Response::new(to_bundle(&rec.bundle, &self.state))),
             None => Err(Status::not_found("no SVID for subject")),
         }
     }
@@ -768,7 +815,7 @@ impl MachineIdentity for MachineIdentitySvc {
                     .map_err(|_| Status::unavailable("issuer temporarily unavailable"))?;
                 self.state.update_bundle(&subject, issued.clone()).await;
                 tracing::info!(spiffe_id = %subject, "renewed SVID (short path)");
-                Ok(Response::new(to_bundle(&issued)))
+                Ok(Response::new(to_bundle(&issued, &self.state)))
             }
             RenewalDecision::FullReattest(reason) => {
                 tracing::info!(
@@ -968,10 +1015,12 @@ impl MachineIdentity for MachineIdentitySvc {
             verify_proposing_svid(&self.state, &req.svid_jws, now)?;
 
         // 2. The presented machine key must be the one the SVID is bound to.
-        let computed_jkt = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(Sha256::digest(&req.sep_pub));
+        let computed_jkt =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&req.sep_pub));
         if computed_jkt != cnf_jkt {
-            return Err(Status::unauthenticated("sep_pub does not match svid cnf.jkt"));
+            return Err(Status::unauthenticated(
+                "sep_pub does not match svid cnf.jkt",
+            ));
         }
 
         // 3. The proposal signature must verify under that key, over the
@@ -991,7 +1040,9 @@ impl MachineIdentity for MachineIdentitySvc {
         // Light replay guard; the SVID's own validity is the real freshness
         // anchor (it is short-lived and was checked above).
         if proposal.issued_at > now.saturating_add(300) {
-            return Err(Status::invalid_argument("proposal issued_at is in the future"));
+            return Err(Status::invalid_argument(
+                "proposal issued_at is in the future",
+            ));
         }
         // Validate entries exactly as `set_allowlist` does.
         let mut entries = Vec::with_capacity(proposal.entries.len());
@@ -1177,10 +1228,27 @@ impl MachineIdentity for MachineIdentitySvc {
             &self.state,
             AuditEvent::SvidRevoked {
                 cert_sha: Hash384(cert_bytes),
-                reason,
+                reason: reason.clone(),
             },
             now,
         );
+
+        // One attestation mints two credentials, so revoking one must revoke
+        // both: find the record this `cert_sha` names and add a second entry for
+        // its X.509 leaf, keyed the same way (SHA-384 of the DER). Without this
+        // an operator who revoked "the SVID" would leave a live certificate
+        // behind. The scan is over an admin RPC, not the issuance path.
+        if let Some(leaf_sha) = self.paired_x509_cert_sha(&cert_sha).await {
+            self.state.revoke(
+                RevocationTarget::Svid {
+                    cert_sha: leaf_sha.clone(),
+                },
+                reason,
+                now,
+            );
+            tracing::info!(%cert_sha, x509_cert_sha = %leaf_sha, "revoked the paired X.509-SVID");
+        }
+
         let number = self.publish_crl_now(now)?;
         tracing::info!(%cert_sha, crl_number = number, "SVID revoked");
         Ok(Response::new(RevokeResponse { crl_number: number }))
@@ -1402,7 +1470,10 @@ mod tests {
         let stored = sign_at(&issuer, 1_000_000, ttl);
         // now is only a third into the window — below half-life, so untouched.
         let served = refresh_served_allowlist(&issuer, stored.clone(), ttl, 1_000_000 + ttl / 3);
-        assert_eq!(served, stored, "a still-fresh allowlist must not be re-signed");
+        assert_eq!(
+            served, stored,
+            "a still-fresh allowlist must not be re-signed"
+        );
     }
 
     #[test]
@@ -1443,7 +1514,10 @@ mod tests {
         let issuer = test_issuer();
         let garbage = vec![0xde, 0xad, 0xbe, 0xef];
         let served = refresh_served_allowlist(&issuer, garbage.clone(), 72 * 3600, 9_999_999);
-        assert_eq!(served, garbage, "unparseable bytes fail safe (served as-is)");
+        assert_eq!(
+            served, garbage,
+            "unparseable bytes fail safe (served as-is)"
+        );
     }
 
     #[test]

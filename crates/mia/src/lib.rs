@@ -10,6 +10,9 @@
 //! - [`scheduler`] — computes when to rotate a live SVID (60% of TTL, jittered).
 //! - [`helper`] — the local helper API: a UDS server that mints DPoP-bound
 //!   child tokens for vetted local callers (features F08/F09).
+//! - [`credstore`] — machine-bound at-rest storage for the host's X.509-SVID
+//!   (features F04/F17): the certificate and its private key sealed under a
+//!   TPM- or fingerprint-derived key that only opens on this host.
 //! - [`hardening`] — the startup defence-in-depth profile (feature F12): the
 //!   fail-closed IMA check and the policy that drives the `ferro-harden`
 //!   syscall wrappers (mlockall, seccomp, privilege drop).
@@ -36,6 +39,9 @@ pub mod scheduler;
 /// `mia machine-id` — print this host's fingerprint-derived machine identity.
 pub mod machine_id;
 
+/// `mia x509-svid` — inspect the machine-bound X.509-SVID store.
+pub mod x509_svid;
+
 /// `mia resync-allowlist` on-demand allowlist re-fetch.
 pub mod resync;
 
@@ -53,6 +59,10 @@ pub mod tpm;
 /// PCR-bound sealing of the SVID cache (feature F04). Linux-only.
 #[cfg(target_os = "linux")]
 pub mod seal;
+
+/// Machine-bound storage for the host's X.509-SVID (features F04/F17):
+/// TPM-sealed where there is a TPM, machine-key sealed everywhere else.
+pub mod credstore;
 
 /// In-process software **virtual TPM** for TPM-less dev/test hosts (macOS,
 /// Windows, CI). INSECURE — never for production. Behind the off-by-default

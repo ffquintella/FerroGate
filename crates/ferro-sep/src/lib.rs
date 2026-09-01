@@ -158,13 +158,14 @@ impl SoftwareMachineKey {
         // are astronomically rare for P-256, but the loop keeps it correct.
         for _ in 0..16 {
             let mut bytes = [0u8; 32];
-            getrandom::fill(&mut bytes)
-                .map_err(|e| SepError::KeyGen(format!("getrandom: {e}")))?;
+            getrandom::fill(&mut bytes).map_err(|e| SepError::KeyGen(format!("getrandom: {e}")))?;
             if let Ok(signing) = SigningKey::from_bytes((&bytes).into()) {
                 return Ok(Self { signing });
             }
         }
-        Err(SepError::KeyGen("no valid scalar after 16 draws".to_string()))
+        Err(SepError::KeyGen(
+            "no valid scalar after 16 draws".to_string(),
+        ))
     }
 
     /// Reconstruct from a raw 32-byte scalar (as produced by [`Self::to_bytes`]).
@@ -289,7 +290,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// File magic identifying a sealed machine key.
 const SEAL_MAGIC: [u8; 4] = *b"FGMK";
@@ -303,36 +304,65 @@ const NONCE_LEN: usize = 12;
 /// `MAGIC ‖ VERSION ‖ salt ‖ nonce` — the fixed-size header before the ciphertext.
 const SEAL_HEADER_LEN: usize = 4 + 1 + SALT_LEN + NONCE_LEN;
 
-/// The additional authenticated data binding the header version to the ciphertext.
-fn seal_aad() -> [u8; 5] {
-    [SEAL_MAGIC[0], SEAL_MAGIC[1], SEAL_MAGIC[2], SEAL_MAGIC[3], SEAL_VERSION]
+/// The purpose tag of the machine-key file. Empty, because that format predates
+/// the parameter and its bytes must not change.
+const MACHINE_KEY_PURPOSE: &[u8] = b"";
+
+/// The additional authenticated data: the header, plus the purpose so a blob
+/// sealed for one use cannot be replayed as another.
+fn seal_aad(purpose: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(5 + purpose.len());
+    aad.extend_from_slice(&SEAL_MAGIC);
+    aad.push(SEAL_VERSION);
+    aad.extend_from_slice(purpose);
+    aad
 }
 
-/// Derive the AEAD key from `seal_secret` and the per-file `salt`.
-fn derive_seal_key(seal_secret: &[u8], salt: &[u8]) -> Result<[u8; 32], SepError> {
+/// Derive the AEAD key from `seal_secret`, the per-file `salt`, and `purpose`.
+fn derive_seal_key(seal_secret: &[u8], salt: &[u8], purpose: &[u8]) -> Result<[u8; 32], SepError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), seal_secret);
+    let mut info = Vec::with_capacity(SEAL_INFO.len() + purpose.len());
+    info.extend_from_slice(SEAL_INFO);
+    info.extend_from_slice(purpose);
     let mut key = [0u8; 32];
-    hk.expand(SEAL_INFO, &mut key)
+    hk.expand(&info, &mut key)
         .map_err(|e| SepError::KeyGen(format!("HKDF expand: {e}")))?;
     Ok(key)
 }
 
-/// Seal a raw 32-byte scalar under `seal_secret`, producing the on-disk blob
+/// Seal arbitrary bytes under `seal_secret`, producing the on-disk blob
 /// `MAGIC ‖ VERSION ‖ salt ‖ nonce ‖ ciphertext ‖ tag`.
-fn seal_scalar(scalar: &[u8; 32], seal_secret: &[u8]) -> Result<Vec<u8>, SepError> {
+///
+/// `purpose` domain-separates one kind of sealed file from another: it is mixed
+/// into both the HKDF `info` and the AEAD associated data, so a blob sealed for
+/// one purpose cannot be presented as another even under the same secret. Pass
+/// an empty slice for the machine-key format that predates the parameter.
+///
+/// The confidentiality of the result is exactly the secrecy of `seal_secret`.
+/// Callers derive it from something the host cannot carry elsewhere — the
+/// hardware fingerprint, or a value a TPM will only release on this machine.
+///
+/// # Errors
+/// Returns [`SepError::KeyGen`] if the RNG, the key derivation, or the AEAD
+/// fails.
+pub fn seal_bytes(
+    plaintext: &[u8],
+    seal_secret: &[u8],
+    purpose: &[u8],
+) -> Result<Vec<u8>, SepError> {
     let mut salt = [0u8; SALT_LEN];
     getrandom::fill(&mut salt).map_err(|e| SepError::KeyGen(format!("getrandom salt: {e}")))?;
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|e| SepError::KeyGen(format!("getrandom nonce: {e}")))?;
 
-    let mut key_bytes = derive_seal_key(seal_secret, &salt)?;
+    let mut key_bytes = derive_seal_key(seal_secret, &salt, purpose)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-    let aad = seal_aad();
+    let aad = seal_aad(purpose);
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: scalar,
+                msg: plaintext,
                 aad: &aad,
             },
         )
@@ -349,27 +379,36 @@ fn seal_scalar(scalar: &[u8; 32], seal_secret: &[u8]) -> Result<Vec<u8>, SepErro
     Ok(out)
 }
 
-/// Reverse [`seal_scalar`]. Returns [`SepError::Malformed`] if `blob` is not a
-/// sealed key or does not decrypt under `seal_secret` (wrong host or corruption).
-fn unseal_scalar(blob: &[u8], seal_secret: &[u8]) -> Result<[u8; 32], SepError> {
+/// Reverse [`seal_bytes`]. The plaintext zeroes itself on drop.
+///
+/// # Errors
+/// Returns [`SepError::Malformed`] if `blob` is not a sealed file of this
+/// format and purpose, or does not decrypt under `seal_secret` — the same
+/// answer for a wrong host, a wrong purpose, and a corrupt file, because a
+/// caller should treat all three identically: discard and re-provision.
+pub fn unseal_bytes(
+    blob: &[u8],
+    seal_secret: &[u8],
+    purpose: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, SepError> {
     if blob.len() <= SEAL_HEADER_LEN || blob[0..4] != SEAL_MAGIC {
         return Err(SepError::Malformed(
-            "not a sealed machine key (bad magic or truncated)".to_string(),
+            "not a sealed file (bad magic or truncated)".to_string(),
         ));
     }
     let version = blob[4];
     if version != SEAL_VERSION {
         return Err(SepError::Malformed(format!(
-            "unsupported sealed-key version {version}"
+            "unsupported seal version {version}"
         )));
     }
     let salt = &blob[5..5 + SALT_LEN];
     let nonce = &blob[5 + SALT_LEN..SEAL_HEADER_LEN];
     let ciphertext = &blob[SEAL_HEADER_LEN..];
 
-    let mut key_bytes = derive_seal_key(seal_secret, salt)?;
+    let mut key_bytes = derive_seal_key(seal_secret, salt, purpose)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-    let aad = seal_aad();
+    let aad = seal_aad(purpose);
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(nonce),
@@ -380,22 +419,39 @@ fn unseal_scalar(blob: &[u8], seal_secret: &[u8]) -> Result<[u8; 32], SepError> 
         )
         .map_err(|_| {
             SepError::Malformed(
-                "sealed machine key did not decrypt (wrong host or corrupt file)".to_string(),
+                "sealed file did not decrypt (wrong host or corrupt file)".to_string(),
             )
         });
     key_bytes.zeroize();
-    let mut plaintext = plaintext?;
+    Ok(Zeroizing::new(plaintext?))
+}
 
+/// Seal a raw 32-byte scalar under `seal_secret`.
+///
+/// The empty purpose keeps the encoding byte-identical to the pre-`seal_bytes`
+/// format, so machine-key files written by an earlier build still open.
+fn seal_scalar(scalar: &[u8; 32], seal_secret: &[u8]) -> Result<Vec<u8>, SepError> {
+    seal_bytes(scalar, seal_secret, MACHINE_KEY_PURPOSE)
+}
+
+/// Reverse [`seal_scalar`]. Returns [`SepError::Malformed`] if `blob` is not a
+/// sealed key or does not decrypt under `seal_secret` (wrong host or corruption).
+fn unseal_scalar(blob: &[u8], seal_secret: &[u8]) -> Result<[u8; 32], SepError> {
+    let plaintext = unseal_bytes(blob, seal_secret, MACHINE_KEY_PURPOSE).map_err(|e| match e {
+        // Keep the machine-key wording operators and runbooks already know.
+        SepError::Malformed(_) => SepError::Malformed(
+            "sealed machine key did not decrypt (wrong host or corrupt file)".to_string(),
+        ),
+        other => other,
+    })?;
     if plaintext.len() != 32 {
-        let len = plaintext.len();
-        plaintext.zeroize();
         return Err(SepError::Malformed(format!(
-            "sealed payload is {len} bytes, expected 32"
+            "sealed payload is {} bytes, expected 32",
+            plaintext.len()
         )));
     }
     let mut scalar = [0u8; 32];
     scalar.copy_from_slice(&plaintext);
-    plaintext.zeroize();
     Ok(scalar)
 }
 
@@ -478,6 +534,54 @@ mod tests {
     }
 
     #[test]
+    fn machine_key_file_is_a_purpose_empty_envelope() {
+        // The generic envelope did not change the machine-key format: a file
+        // written by `open_or_create_sealed` opens as a plain purpose-empty
+        // sealed blob, which is what an older build wrote.
+        let path = seal_scratch("compat");
+        let _ = std::fs::remove_file(&path);
+        let secret = b"machine-fingerprint-H-bytes";
+
+        let key = SoftwareMachineKey::open_or_create_sealed(&path, secret).unwrap();
+        let blob = std::fs::read(&path).unwrap();
+        let plaintext = unseal_bytes(&blob, secret, b"").unwrap();
+        assert_eq!(plaintext.as_slice(), key.to_bytes().as_slice());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_purpose_binds_the_blob_to_one_use() {
+        // Same secret, different purpose: the AEAD must refuse. Without this a
+        // sealed certificate store could be swapped in for a sealed key file.
+        let secret = b"same-host-secret";
+        let blob = seal_bytes(b"credential store contents", secret, b"x509-store").unwrap();
+
+        assert!(unseal_bytes(&blob, secret, b"x509-store").is_ok());
+        assert!(matches!(
+            unseal_bytes(&blob, secret, b"other-purpose"),
+            Err(SepError::Malformed(_))
+        ));
+        assert!(matches!(
+            unseal_bytes(&blob, secret, b""),
+            Err(SepError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn sealed_bytes_roundtrip_at_arbitrary_length() {
+        let secret = b"host-secret";
+        for len in [0usize, 1, 32, 5000] {
+            let msg = vec![0xa5; len];
+            let blob = seal_bytes(&msg, secret, b"p").unwrap();
+            assert_eq!(
+                unseal_bytes(&blob, secret, b"p").unwrap().as_slice(),
+                &msg[..]
+            );
+            assert!(unseal_bytes(&blob, b"other-host", b"p").is_err());
+        }
+    }
+
+    #[test]
     fn sealed_wrong_secret_is_rejected() {
         // Clone resistance: a key file moved to a host with a different
         // fingerprint (different seal secret) must not decrypt.
@@ -501,7 +605,10 @@ mod tests {
 
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(&on_disk[0..4], &SEAL_MAGIC, "sealed file starts with magic");
-        assert!(on_disk.len() > 32, "sealed blob is larger than a raw scalar");
+        assert!(
+            on_disk.len() > 32,
+            "sealed blob is larger than a raw scalar"
+        );
         assert_ne!(
             &on_disk[SEAL_HEADER_LEN..],
             &key.to_bytes()[..],
