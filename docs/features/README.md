@@ -20,7 +20,7 @@ reviewed in isolation, even though some have ordering dependencies.
 | F12 | [MIA process hardening](F12-mia-hardening.md) | MIA | Done (mlockall/seccomp/cap-drop/IMA via ferro-harden) |
 | F13 | [Zero-touch bootstrap and fleet enrollment](F13-bootstrap-enrollment.md) | CMIS, MIA | Done (fleet-manifest tool; pre-admission EK lookup) |
 | F14 | [Root key ceremony and rotation](F14-root-key-ceremony.md) | CMIS, offline | Done (offline-signer + ferro-ceremony; JWKS newer-preferred; staging dry-run) |
-| F17 | [X.509-SVID profile](F17-x509-svid.md) | CMIS | Issuance + reference verifier done; MIA-side delivery pending |
+| F17 | [X.509-SVID profile](F17-x509-svid.md) | CMIS, MIA | Done (issuance, reference verifier, machine-bound store: TPM / Secure Enclave / machine key); serving the credential to a workload pending |
 
 For the planned ordering and progress tracking see
 [../roadmap.md](../roadmap.md).
