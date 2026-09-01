@@ -8,6 +8,8 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.6] — 2026-09-01
+
 ### Added
 
 - **X.509-SVID profile, issued beside the JWS one (F17).** CMIS now mints a
