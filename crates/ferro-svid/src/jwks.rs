@@ -95,9 +95,10 @@ impl Jwk {
 /// A JWK set as served by the CMIS `JWKS` RPC.
 ///
 /// Besides the verification keys, the set may carry FerroGate's revocation list
-/// in the `x-ferrogate-crl` extension member (feature F11). The member is
-/// omitted entirely when no CRL has been published yet, keeping a stock JWKS
-/// parser happy; consumers that understand revocation pull it from here.
+/// in the `x-ferrogate-crl` extension member (feature F11) and the X.509-SVID
+/// trust bundle in `x-ferrogate-x509-bundle`. Both members are omitted entirely
+/// when unset, keeping a stock JWKS parser happy; consumers that understand
+/// revocation, or the certificate profile, pull them from here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JwkSet {
     /// The verification keys, newest-preferred ordering left to the caller.
@@ -109,16 +110,33 @@ pub struct JwkSet {
         skip_serializing_if = "Option::is_none"
     )]
     pub crl: Option<crate::crl::SignedCrl>,
+    /// base64url DER of the X.509-SVID signing certificate — the trust anchor
+    /// for the certificate profile, published alongside the JWS profile's keys
+    /// so one fetch arms a verifier for both. See [`crate::x509`].
+    #[serde(
+        rename = "x-ferrogate-x509-bundle",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x509_bundle: Option<String>,
 }
 
 impl JwkSet {
-    /// A set containing a single key and no CRL.
+    /// A set containing a single key, with no CRL and no X.509 trust bundle.
     #[must_use]
     pub fn single(jwk: Jwk) -> Self {
         Self {
             keys: vec![jwk],
             crl: None,
+            x509_bundle: None,
         }
+    }
+
+    /// Publish `bundle_der` as the X.509-SVID trust anchor of this set.
+    #[must_use]
+    pub fn with_x509_bundle(mut self, bundle_der: &[u8]) -> Self {
+        self.x509_bundle = Some(URL_SAFE_NO_PAD.encode(bundle_der));
+        self
     }
 
     /// Find a key by `kid`.

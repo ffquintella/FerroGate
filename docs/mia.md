@@ -102,6 +102,72 @@ a policy over PCRs `{0, 4, 7, 8}`. On reboot:
 - If the unseal fails (PCR drift, lid open, kernel update), the cached SVID
   is treated as gone and a full re-attestation runs.
 
+### The X.509-SVID store
+
+The certificate profile (feature [F17](features/F17-x509-svid.md)) is persisted
+the same way, by `mia::credstore`, in `<state-dir>/x509-svid.sealed` (`0600`;
+`/var/lib/ferrogate` on Linux). One file holds the leaf certificate, the trust
+bundle it chains to, and the Ed25519 private key the certificate names — the
+key a TLS stack needs to use the credential. The ML-DSA-65 half of the host's
+composite key is not stored: it is not needed to use the certificate, so the
+blast radius stays with the classical key.
+
+The data-protection key is bound to the machine, and how depends on what the
+host has:
+
+| Backend | Key protected by | Opens only |
+|---|---|---|
+| `tpm` | a random key sealed by the TPM to PCRs `{0,4,7,8}` | on this TPM, in this boot state |
+| `secure-enclave` | a random key ECIES-wrapped to a non-exportable macOS Secure Enclave key | on this Mac's Enclave |
+| `machine-key` | HKDF over the hardware fingerprint `H` (F16) | on a host with this fingerprint |
+
+The first two are hardware roots of trust and are preferred in that order, even
+on a host that attests through the software tier — a key the hardware releases
+beats one derived from a fingerprint, and there is no reason to protect the
+credential more weakly than the machine allows. A host with none of them gets
+**no** store: writing the private key unsealed is worse than re-attesting.
+
+#### The Secure Enclave backend (macOS)
+
+The Enclave is the Mac's answer to a TPM. `mia` generates a P-256 key *inside*
+it — the private half cannot be exported by anyone, root included — and
+encrypts the store's data-protection key to its public half. Unwrapping is a
+private-key operation the Enclave performs internally, so the file is inert on
+any other Mac.
+
+It needs two things:
+
+1. the `secure-enclave` cargo feature (off by default, since it links
+   Security.framework), which `make pkg-macos` enables; and
+2. a **codesigned** binary carrying a keychain-access-group entitlement. macOS
+   refuses to keep a Secure Enclave key in the keychain otherwise
+   (`errSecMissingEntitlement`, -34018), and a key that dies with the process
+   would leave the next start unable to open its own store. The entitlement is
+   restricted, so ad-hoc signing does not work — AMFI kills the process at
+   launch. Sign with a real Developer ID:
+
+```sh
+make pkg-macos CODESIGN_ID="Developer ID Application: Example (TEAMID)"
+```
+
+   after putting your team identifier into `crates/mia/dist/mia.entitlements`.
+
+A build without either simply falls through to `machine-key`, logging the
+reason at debug level. Nothing fails; the credential is just protected at the
+software tier.
+
+Loading is fail-closed. The daemon returns a stored credential only if it
+unseals here *and* still verifies — the certificate must chain to its bundle
+under both signature halves, must not have expired, and its stored key must be
+the one the certificate names. Anything else is logged and the file is deleted,
+so the next start does not retry a file that can never open again. This is what
+a TPM host sees after a firmware update, and it is the intended behaviour.
+
+The store does not decide whether to attest: the daemon attests on every start
+regardless, and a fresh issuance overwrites the file. What the store buys is a
+credential that survives a restart and can be inspected — and, critically, one
+that is worthless on any other machine.
+
 ## Configuration
 
 MIA reads an optional TOML **configuration file** and overlays **environment
@@ -474,6 +540,46 @@ the allowlist check works. Options:
   locations instead of `mia.toml`; mutually exclusive with `--config`.
 - `-a, --audience <aud>` — audience for the test token (default
   `https://selftest.ferrogate.invalid`).
+
+### `mia x509-svid` — inspect the machine-bound certificate store
+
+```console
+$ mia x509-svid
+spiffe-id:   spiffe://ferrogate.prod/host/0192b0d0-…
+sealed-with: tpm (opens only on this machine)
+store:       /var/lib/ferrogate/x509-svid.sealed
+not-after:   1774000000 (expires in 0h 47m)
+leaf:        5461 bytes DER
+bundle:      5502 bytes DER
+private-key: held, not printed
+```
+
+On a Mac the same command reports the Enclave tier and the macOS state
+directory:
+
+```console
+$ mia x509-svid
+spiffe-id:   spiffe://ferrogate.prod/host/0192b0d0-…
+sealed-with: secure-enclave (opens only on this machine)
+store:       /Library/Application Support/FerroGate/x509-svid.sealed
+not-after:   1774000000 (expires in 0h 47m)
+leaf:        5461 bytes DER
+bundle:      5502 bytes DER
+private-key: held, not printed
+```
+
+Read-only and offline: it opens the sealed store exactly as the daemon does and
+reports what is inside. Running it on another host — or on a TPM host after a
+boot-state change — fails, which is the practical demonstration that the file is
+machine-bound.
+
+- `--pem` — print the leaf certificate as PEM.
+- `--bundle-pem` — print the trust bundle as PEM.
+
+The private key is never printed. It is sealed so that this host can terminate
+mTLS with the credential; a copy on a terminal or in shell history would undo
+that. Serving the key to a local workload belongs to the helper API, not to this
+command.
 
 ## Configuration sketch (aspirational)
 

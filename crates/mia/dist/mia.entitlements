@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Entitlements the `mia` binary needs to keep a Secure Enclave key in the
+    keychain, which is what lets the X.509-SVID credential store survive a
+    restart on macOS (see docs/features/F17-x509-svid.md).
+
+    Both entries are *restricted*: they are only honoured on a binary signed by
+    a real Apple Developer team. Ad-hoc signing does not work — AMFI kills the
+    process at launch. Replace TEAMID with the team identifier of the signing
+    certificate, and keep the group in sync with the bundle identifier.
+
+    Without these, `mia` still runs: `credstore::with_sealer` finds it cannot
+    persist an Enclave key (errSecMissingEntitlement, -34018) and falls back to
+    the fingerprint-derived machine key.
+  -->
+  <key>com.apple.application-identifier</key>
+  <string>TEAMID.com.ferrogate.mia</string>
+  <key>keychain-access-groups</key>
+  <array>
+    <string>TEAMID.com.ferrogate.mia</string>
+  </array>
+</dict>
+</plist>

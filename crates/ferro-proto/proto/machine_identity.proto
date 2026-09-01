@@ -231,6 +231,16 @@ message SVIDBundle {
   int64 issued_at = 2;     // unix seconds (iat)
   int64 expires_at = 3;    // unix seconds (exp)
   string spiffe_id = 4;    // sub claim, for convenience
+
+  // The same identity in the X.509-SVID profile, issued from the same
+  // attestation and the same issuer key as the JWS above: `x509_svid` is the
+  // DER leaf certificate (SPIFFE ID in its URI SAN, subject key = the CSR's
+  // composite key), `x509_bundle` the DER signing certificate to trust it
+  // under. Both empty when the profile could not be issued — a CSR key that
+  // failed to parse, or a record predating the profile — in which case the JWS
+  // is still served. See `ferro_svid::x509`.
+  bytes x509_svid = 5;
+  bytes x509_bundle = 6;
 }
 
 // ---- Rotate / Fetch / JWKS ---------------------------------------------

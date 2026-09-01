@@ -22,7 +22,8 @@ In:
 
 Out:
 
-- X.509 SVIDs (JWS first; X.509 a follow-on).
+- X.509 SVIDs — delivered as a separate profile beside this one, see
+  [F17](F17-x509-svid.md).
 - Workload-attestation (per-app) SVIDs from CMIS; those are minted locally
   by MIA as child tokens (see F09).
 

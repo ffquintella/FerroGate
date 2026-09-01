@@ -73,6 +73,7 @@ fn record_with_child_key(spiffe_id: &str, child_pub: Vec<u8>) -> IssuedRecord {
             dpop_jkt: "dpop".to_string(),
             ttl_secs: 3600,
             tee_evidence_id: None,
+            subject_pub: None,
         },
         last_attestation: LastAttestation {
             at: 1_700_000_000,
@@ -81,6 +82,7 @@ fn record_with_child_key(spiffe_id: &str, child_pub: Vec<u8>) -> IssuedRecord {
         },
         bundle: IssuedSvid {
             jws: "eyJ...".to_string(),
+            x509: None,
             spiffe_id: spiffe_id.to_string(),
             iat: 1_700_000_000,
             exp: 1_700_003_600,
@@ -146,7 +148,11 @@ async fn ensure_child_key_published_rehydrates_on_miss() {
     // Already-published (the fast path) stays true; a kid in nobody's store
     // and a non-host kid both report absent without publishing anything.
     assert!(state.ensure_child_key_published(&kid).await);
-    assert!(!state.ensure_child_key_published("host-0000000000000000").await);
+    assert!(
+        !state
+            .ensure_child_key_published("host-0000000000000000")
+            .await
+    );
     assert!(!state.ensure_child_key_published("not-a-host-kid").await);
 }
 

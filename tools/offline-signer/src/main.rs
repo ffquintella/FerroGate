@@ -396,7 +396,14 @@ fn cmd_jwks(opts: &Opts) -> Result<()> {
         ferro_svid::Jwk::from_public_key_at(&bundle.new_kid, &new_pk, bundle.window_start),
         ferro_svid::Jwk::from_public_key_at(&bundle.old_kid, &old_pk, bundle.window_start - 1),
     ];
-    let set = ferro_svid::JwkSet { keys, crl: None };
+    // Keys only: the ceremony holds public halves, and an X.509-SVID trust
+    // bundle needs the signing key. CMIS stamps its own live bundle into the
+    // `x-ferrogate-x509-bundle` member when it serves the set.
+    let set = ferro_svid::JwkSet {
+        keys,
+        crl: None,
+        x509_bundle: None,
+    };
     let json = serde_json::to_vec_pretty(&set).context("encode jwks")?;
     emit(opts, &json)
 }

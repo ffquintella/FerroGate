@@ -86,7 +86,8 @@ The MIA generates a fresh composite keypair (Ed25519 + ML-DSA-65) and submits:
 - `aik_sig` — a TPM signature over `SHA-384(composite_pub)` using the AIK,
   proving the composite key is bound to this hardware.
 
-CMIS verifies `aik_sig` and issues a JWS SVID with:
+CMIS verifies `aik_sig` and issues **both SVID profiles** from this one
+attestation. The JWS SVID carries:
 
 - `iss = spiffe://ferrogate.<env>/cmis`
 - `sub = spiffe://ferrogate.<env>/host/<uuid>` where `uuid` is derived from
@@ -95,6 +96,18 @@ CMIS verifies `aik_sig` and issues a JWS SVID with:
 - `attest = { ek_cert_sha384, pcr_digest_sha384, policy_id, tee_evidence_id }`
 - Signature = composite (Ed25519 + ML-DSA-65), AND-combined.
 - `exp - iat ≤ 3600 s`.
+
+Alongside it, in the same `SVIDBundle`, comes the **X.509-SVID** (feature
+[F17](features/F17-x509-svid.md)): a certificate with the same `sub` as its sole
+URI SAN, the same validity window, `composite_pub`'s Ed25519 half as its subject
+key and the ML-DSA-65 half in `subjectAltPublicKeyInfo`. Its native signature is
+standard Ed25519, so a stock TLS stack can use the credential for mTLS; the
+ML-DSA-65 half travels in `altSignatureValue`. The trust bundle to validate it
+under is in `SVIDBundle.x509_bundle` and in the JWKS
+`x-ferrogate-x509-bundle` member.
+
+A client may use either profile or both; they name the same identity and expire
+together.
 
 ## Renewal vs re-attestation
 

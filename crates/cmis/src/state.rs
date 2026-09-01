@@ -314,6 +314,10 @@ impl CmisState {
 
     /// The JWK set published over the `JWKS` RPC.
     ///
+    /// The set also carries the X.509-SVID trust bundle in its
+    /// `x-ferrogate-x509-bundle` member, so a verifier arms both profiles from
+    /// one fetch.
+    ///
     /// Ordering is **roots first, newest-first, then child keys**: the issuer's
     /// own root key together with any cross-sign-window roots registered via
     /// [`register_root_key`] lead the set sorted by [`Jwk::created`] descending,
@@ -344,9 +348,21 @@ impl CmisState {
 
         let mut keys = roots;
         keys.extend(child_keys.iter().cloned());
-        JwkSet {
+        let set = JwkSet {
             keys,
             crl: self.published_crl.read().clone(),
+            x509_bundle: None,
+        };
+        // Publish the X.509-SVID trust anchor beside the JWS keys, so one JWKS
+        // fetch arms a verifier for both profiles. A bundle this issuer cannot
+        // build is a bug, not a runtime condition: log it and keep serving the
+        // JWS profile rather than failing the whole RPC.
+        match self.issuer.x509_ca() {
+            Ok(der) => set.with_x509_bundle(der),
+            Err(e) => {
+                tracing::error!(error = %e, "could not build the X.509-SVID trust bundle");
+                set
+            }
         }
     }
 
@@ -458,7 +474,10 @@ impl CmisState {
         if found {
             tracing::info!(kid, "on-miss rehydrate published the requested child key");
         } else {
-            tracing::warn!(kid, "kid requested via JWKS hint is not in the issued-SVID store");
+            tracing::warn!(
+                kid,
+                "kid requested via JWKS hint is not in the issued-SVID store"
+            );
         }
         found
     }
@@ -692,16 +711,18 @@ impl CmisState {
         match self.cluster.list_proposals().await {
             Ok(rows) => rows
                 .into_iter()
-                .map(|(host_uuid, entries_cbor, proposer_spiffe_id, proposed_at)| {
-                    (
-                        host_uuid,
-                        ProposalRecord {
-                            entries_cbor,
-                            proposer_spiffe_id,
-                            proposed_at,
-                        },
-                    )
-                })
+                .map(
+                    |(host_uuid, entries_cbor, proposer_spiffe_id, proposed_at)| {
+                        (
+                            host_uuid,
+                            ProposalRecord {
+                                entries_cbor,
+                                proposer_spiffe_id,
+                                proposed_at,
+                            },
+                        )
+                    },
+                )
                 .collect(),
             Err(e) => {
                 tracing::error!(error = %e, "cluster list_proposals failed");

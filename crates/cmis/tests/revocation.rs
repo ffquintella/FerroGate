@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
-use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
+use cmis::{CmisConfig, CmisState, IssuedRecord, MachineIdentitySvc};
 use ferro_attest::{RimStore, TpmQuoteVerifier, VendorTrustStore};
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore};
 use ferro_proto::v1::machine_identity_server::MachineIdentity;
 use ferro_proto::v1::{JwksRequest, RevokeHostRequest, RevokeSvidRequest};
 use ferro_raft::Cluster;
-use ferro_svid::{IssueParams, Issuer};
+use ferro_svid::{IssueParams, Issuer, LastAttestation};
 use sha2::{Digest, Sha384};
 
 /// A credential maker that is never exercised by these RPCs.
@@ -40,10 +40,7 @@ async fn svc() -> (MachineIdentitySvc, Arc<CmisState>) {
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), RimStore::new());
 
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!(
-        "ferrogate-cmis-rev-{}-{seq}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("ferrogate-cmis-rev-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&tmp).unwrap());
     let (signer, _pk) = InProcessSigner::generate("audit-test-1").unwrap();
@@ -79,6 +76,11 @@ fn params() -> IssueParams {
         dpop_jkt: "dpop".to_string(),
         ttl_secs: 3600,
         tee_evidence_id: None,
+        subject_pub: Some(
+            ferro_crypto::composite::CompositeSecretKey::from_seed(&[0x5a; 32])
+                .1
+                .to_concat_bytes(),
+        ),
     }
 }
 
@@ -189,6 +191,74 @@ async fn revoked_svid_is_rejected_by_reference_verifier_after_propagation() {
     let jwks = fetch_jwks(&svc).await;
     let err = ferro_svid_verify::verify_unrevoked(&issued.jws, &jwks, now + 60, 0).unwrap_err();
     assert_eq!(err, ferro_svid_verify::VerifyError::Revoked);
+}
+
+/// The admin RPCs stamp the CRL with the real wall clock, so tests that go
+/// through them must use it as their reference time too.
+fn wall_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn revoking_an_svid_also_revokes_the_x509_certificate_issued_with_it() {
+    let (svc, state) = svc().await;
+    let now = wall_now();
+
+    let issued = state.issuer.issue(&params(), now).unwrap();
+    let leaf = issued
+        .x509
+        .clone()
+        .expect("the X.509 profile is issued beside the JWS");
+    // The pairing is resolved through the issued-SVID store, so the record has
+    // to be there — as it is after a real attestation.
+    state
+        .record(IssuedRecord {
+            params: params(),
+            last_attestation: LastAttestation {
+                at: now,
+                pcr_digest: [0x22; 48],
+                policy_epoch: state.current_epoch(),
+            },
+            bundle: issued.clone(),
+            hostname: None,
+            child_pub: None,
+        })
+        .await;
+
+    // Both credentials verify before the revocation.
+    state.publish_crl(now).unwrap();
+    let jwks = fetch_jwks(&svc).await;
+    ferro_svid_verify::verify_unrevoked(&issued.jws, &jwks, now + 60, 0)
+        .expect("JWS accepted before revocation");
+    ferro_svid_verify::x509::verify_x509_unrevoked(&leaf.leaf_der, &jwks, now + 60, 0)
+        .expect("certificate accepted before revocation");
+
+    // Revoke by the JWS digest — the only handle the operator CLI offers.
+    svc.revoke_svid(tonic::Request::new(RevokeSvidRequest {
+        cert_sha: hex::encode(Sha384::digest(issued.jws.as_bytes())),
+        reason: "key-compromise".into(),
+    }))
+    .await
+    .unwrap();
+
+    // Neither credential survives it.
+    let jwks = fetch_jwks(&svc).await;
+    assert_eq!(
+        ferro_svid_verify::verify_unrevoked(&issued.jws, &jwks, now + 60, 0).unwrap_err(),
+        ferro_svid_verify::VerifyError::Revoked,
+    );
+    assert_eq!(
+        ferro_svid_verify::x509::verify_x509_unrevoked(&leaf.leaf_der, &jwks, now + 60, 0)
+            .unwrap_err(),
+        ferro_svid_verify::VerifyError::Revoked,
+        "revoking the SVID must not leave its certificate live"
+    );
 }
 
 #[tokio::test]

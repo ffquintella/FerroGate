@@ -85,6 +85,9 @@ fn main() -> anyhow::Result<()> {
         // `host/<uuid>` CMIS keys its allowlist and host SVID under). Read-only
         // and offline — no config, no CMIS, no daemon contact.
         Some("machine-id") => return mia::machine_id::run(&args[1..]),
+        // Inspect the sealed X.509-SVID (feature F17). Read-only and offline;
+        // opens the same machine-bound store the daemon writes.
+        Some("x509-svid") => return mia::x509_svid::run(&args[1..]),
         // `--reload` is a management flag, not a daemon option: it signals the
         // running agent (SIGHUP) to re-read its config + allowlist, then exits.
         Some("--reload") => return mia::resync::run_reload(&args[1..]),
@@ -155,16 +158,15 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
         .with(filter_layer)
         .with(fmt::layer().with_ansi(ansi).with_writer(writer))
         .init();
-    let log_reload: LogReload = Arc::new(move |directive: &str| {
-        match EnvFilter::try_new(directive) {
+    let log_reload: LogReload =
+        Arc::new(move |directive: &str| match EnvFilter::try_new(directive) {
             Ok(f) => {
                 let _ = filter_handle.reload(f);
             }
             Err(e) => {
                 tracing::warn!(directive, error = %e, "ignoring invalid log directive on reload");
             }
-        }
-    });
+        });
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -198,10 +200,16 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
                 source: mia::config::ConfigSource::default(),
             }]
         } else {
-            tracing::info!(count = discovered.len(), "serving all discovered environments");
+            tracing::info!(
+                count = discovered.len(),
+                "serving all discovered environments"
+            );
             let mut instances = Vec::new();
             for d in discovered {
-                let label = d.environment.clone().unwrap_or_else(|| "default".to_string());
+                let label = d
+                    .environment
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
                 // Load each by its concrete path (no env-name re-resolution).
                 // Named environments load shared-only, so a process-wide
                 // FERROGATE_HELPER_SOCKET (e.g. from a pre-0.19 launchd plist)
@@ -393,7 +401,9 @@ fn service_request_stop() {
 /// `mia service` manages the Windows service and is unavailable elsewhere.
 #[cfg(not(windows))]
 fn service_cmd(_args: &[String]) -> anyhow::Result<()> {
-    anyhow::bail!("the `service` command manages the Windows service and is only available on Windows")
+    anyhow::bail!(
+        "the `service` command manages the Windows service and is only available on Windows"
+    )
 }
 
 /// Top-level CLI usage banner.
@@ -412,6 +422,7 @@ fn print_usage() {
          \x20 refresh-key       re-fetch the CMIS enrollment key into allowlist.key\n\
          \x20 resync-allowlist  re-fetch this host's signed allowlist from CMIS\n\
          \x20 machine-id        print this host's fingerprint-derived machine identity\n\
+         \x20 x509-svid         inspect the machine-bound X.509-SVID store\n\
          \x20 test              check CMIS connectivity and helper-token issuance\n\
          \x20 service           manage the Windows service (install/uninstall/start/stop)\n\
          \n\
@@ -631,7 +642,14 @@ async fn start_helper_api(
         .helper_socket()
         .context("internal: start_helper_api called without a helper socket")?
         .to_path_buf();
-    serve(config, socket_path, build_auth(config), config_source, log_reload).await
+    serve(
+        config,
+        socket_path,
+        build_auth(config),
+        config_source,
+        log_reload,
+    )
+    .await
 }
 
 /// Directory for mia's writable runtime state — the persistent machine signing
@@ -644,16 +662,7 @@ async fn start_helper_api(
 /// and read-only. On macOS / Windows — where the daemon does not drop — state
 /// stays beside the system config, as it always has.
 fn state_dir() -> std::path::PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        std::path::PathBuf::from("/var/lib/ferrogate")
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        mia::config::system_config_path()
-            .parent()
-            .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
-    }
+    mia::credstore::state_dir()
 }
 
 /// Resolve where the persistent machine signing key lives — in the service
@@ -716,7 +725,11 @@ fn prepare_and_harden(instances: &[EnvInstance]) -> anyhow::Result<()> {
     {
         let mut dirs = vec![state_dir()];
         for inst in instances {
-            if let Some(parent) = inst.config.helper_socket().and_then(std::path::Path::parent) {
+            if let Some(parent) = inst
+                .config
+                .helper_socket()
+                .and_then(std::path::Path::parent)
+            {
                 dirs.push(parent.to_path_buf());
             }
         }
@@ -1076,6 +1089,11 @@ fn host_session_from_attested(attested: mia::client::AttestedSvid) -> HostSessio
     use mia::helper::{ChildTokenMinter, MinterConfig};
     use sha2::{Digest, Sha384};
 
+    // Put the X.509 half of the issuance somewhere it survives a restart —
+    // sealed so it only opens on this machine. Best-effort: a host that cannot
+    // seal keeps running with the in-memory credential.
+    persist_x509_credential(&attested);
+
     let mut parent = [0u8; 48];
     parent.copy_from_slice(&Sha384::digest(attested.bundle.jws.as_bytes()));
     let cfg = MinterConfig {
@@ -1087,6 +1105,101 @@ fn host_session_from_attested(attested: mia::client::AttestedSvid) -> HostSessio
         spiffe_id: attested.bundle.spiffe_id.clone(),
         jws: attested.bundle.jws.clone(),
         minter: ChildTokenMinter::new(attested.svid_secret, cfg),
+    }
+}
+
+/// Seal this attestation's X.509-SVID to disk, bound to this machine.
+///
+/// Stores the leaf, the trust bundle CMIS served with it, and the Ed25519
+/// private key the certificate names — the composite key's classical half, the
+/// one a TLS stack needs. The ML-DSA half stays in memory: it is not needed to
+/// use the certificate.
+///
+/// Every failure is logged and swallowed. The daemon has a working credential
+/// in memory either way; losing the *stored* copy costs a restart, not a
+/// session. A host with neither a TPM nor a fingerprint gets no store at all,
+/// because the alternative — writing the key in the clear — is worse than
+/// re-attesting.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn persist_x509_credential(attested: &mia::client::AttestedSvid) {
+    let leaf_der = attested.bundle.x509_svid.clone();
+    let bundle_der = attested.bundle.x509_bundle.clone();
+    if leaf_der.is_empty() || bundle_der.is_empty() {
+        tracing::debug!("CMIS issued no X.509-SVID with this attestation; nothing to seal");
+        return;
+    }
+
+    let credential = mia::credstore::X509Credential {
+        leaf_der,
+        bundle_der,
+        key_pkcs8: attested.svid_secret.to_ed25519_pkcs8_der(),
+    };
+    let path = mia::credstore::store_path();
+    let fingerprint = prefetched_facts().map(|f| f.fingerprint().as_bytes().to_vec());
+
+    let outcome = mia::credstore::with_sealer(fingerprint.as_deref(), |sealer| {
+        (
+            sealer.name(),
+            mia::credstore::store(&path, &credential, sealer),
+        )
+    });
+    match outcome {
+        Some((backend, Ok(()))) => tracing::info!(
+            path = %path.display(),
+            backend,
+            "sealed the X.509-SVID to disk (opens only on this machine)"
+        ),
+        Some((backend, Err(e))) => tracing::warn!(
+            error = %e, backend, path = %path.display(),
+            "could not seal the X.509-SVID; it stays in memory for this session only"
+        ),
+        None => tracing::warn!(
+            "no TPM and no hardware fingerprint on this host: the X.509-SVID will not be \
+             stored, since writing its private key unsealed is not an option"
+        ),
+    }
+}
+
+/// Report the sealed X.509-SVID left by a previous run, if it still opens here.
+///
+/// Purely informational at startup: the daemon re-attests regardless, and the
+/// fresh issuance overwrites the store. What this buys is an early, explicit
+/// signal — that a credential survived, or that it no longer opens (the TPM
+/// refusing after a firmware change looks exactly like this). A store that
+/// cannot be used is deleted so the next start does not retry a file that can
+/// never open again.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn report_stored_x509_credential() {
+    let path = mia::credstore::store_path();
+    let fingerprint = prefetched_facts().map(|f| f.fingerprint().as_bytes().to_vec());
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX);
+
+    let Some(result) = mia::credstore::with_sealer(fingerprint.as_deref(), |sealer| {
+        mia::credstore::load(&path, sealer, now)
+    }) else {
+        return;
+    };
+    match result {
+        Ok(None) => {}
+        Ok(Some(loaded)) => tracing::info!(
+            spiffe_id = %loaded.spiffe_id,
+            expires_in_secs = loaded.not_after - now,
+            backend = loaded.backend,
+            "recovered the sealed X.509-SVID from a previous run"
+        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %e, path = %path.display(),
+                "the stored X.509-SVID did not open on this host; discarding it and re-attesting"
+            );
+            mia::credstore::discard(&path);
+        }
     }
 }
 
@@ -1326,9 +1439,10 @@ fn maybe_spawn_propose_task(
     // a host with no fingerprint (e.g. the TPM backend) falls back to the plaintext key.
     let key_path = host_key_path();
     let key = match prefetched_facts() {
-        Some(facts) => {
-            ferro_sep::SoftwareMachineKey::open_or_create_sealed(&key_path, facts.fingerprint().as_bytes())
-        }
+        Some(facts) => ferro_sep::SoftwareMachineKey::open_or_create_sealed(
+            &key_path,
+            facts.fingerprint().as_bytes(),
+        ),
         None => ferro_sep::SoftwareMachineKey::open_or_create(&key_path),
     };
     let key = match key {
@@ -1718,6 +1832,12 @@ where
         }
     };
 
+    // Say up front whether the X.509-SVID sealed by a previous run still opens
+    // on this host. It does not change what happens next — the daemon attests
+    // regardless — but a store that stopped opening (a TPM refusing after a
+    // firmware change) is worth surfacing at startup rather than at first use.
+    report_stored_x509_credential();
+
     // Attest to CMIS first: a successful attestation yields the host SVID (and
     // thus the EK-derived identity that keys this host's allowlist) and the
     // token minter. When CMIS isn't configured or attestation fails, there is no
@@ -1794,7 +1914,12 @@ where
     // a reload can pick up a newly-added allowlist or a changed log directive;
     // reload mirrors startup's fail-closed semantics.
     #[cfg(unix)]
-    spawn_reload_task(server.allowlist_reloader(), config_source, log_reload, clock.clone());
+    spawn_reload_task(
+        server.allowlist_reloader(),
+        config_source,
+        log_reload,
+        clock.clone(),
+    );
     #[cfg(not(unix))]
     let _ = (&config_source, &log_reload, &clock);
 
@@ -1904,9 +2029,10 @@ fn spawn_reload_task<A>(
 
             // Allowlist: re-load from the (possibly changed) path/key/max-age.
             // Both must be configured to verify a body; otherwise fail closed.
-            if let (Some(path), Some(key_path)) =
-                (config.allowlist.path.as_deref(), config.allowlist.key.as_deref())
-            {
+            if let (Some(path), Some(key_path)) = (
+                config.allowlist.path.as_deref(),
+                config.allowlist.key.as_deref(),
+            ) {
                 match mia::helper::allowlist::load_at_startup(
                     path,
                     key_path,
@@ -1919,7 +2045,9 @@ fn spawn_reload_task<A>(
                         let loaded = al.is_some();
                         reloader.set(al).await;
                         if loaded {
-                            tracing::info!("configuration and signed allowlist reloaded and swapped in live");
+                            tracing::info!(
+                                "configuration and signed allowlist reloaded and swapped in live"
+                            );
                         } else {
                             tracing::warn!("reloaded allowlist absent or unverified; serving deny-all (fail closed)");
                         }
@@ -1929,7 +2057,9 @@ fn spawn_reload_task<A>(
                     }
                 }
             } else {
-                tracing::warn!("no allowlist configured after reload; serving deny-all (fail closed)");
+                tracing::warn!(
+                    "no allowlist configured after reload; serving deny-all (fail closed)"
+                );
                 reloader.set(None).await;
             }
         }

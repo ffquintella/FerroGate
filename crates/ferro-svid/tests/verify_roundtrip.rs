@@ -16,6 +16,11 @@ fn params() -> IssueParams {
         dpop_jkt: "dpop-thumb".to_string(),
         ttl_secs: 3600,
         tee_evidence_id: None,
+        subject_pub: Some(
+            ferro_crypto::composite::CompositeSecretKey::from_seed(&[0x5a; 32])
+                .1
+                .to_concat_bytes(),
+        ),
     }
 }
 

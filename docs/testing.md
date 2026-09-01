@@ -6,6 +6,8 @@
 |-------|------|---------|
 | Hybrid TLS handshake | Wycheproof vectors plus interop against BoringSSL PQ branch | `cargo test`, cross-impl harness |
 | Composite signature | NIST FIPS-204 KAT plus Ed25519 RFC 8032 vectors; AND-combiner conformance | KAT runner |
+| X.509-SVID profile | Leaf parsed and its chain verified by an independent X.509 stack; both signature halves required by the reference verifier; either half removed or corrupted must fail | `cargo test`, `x509-parser` with its own verifier |
+| X.509-SVID store sealing | Credential round-trips on the machine that sealed it and is unreadable elsewhere; TPM backend additionally fails after a PCR change; Secure Enclave backend fails under a different Enclave key | `cargo test` (machine key), `swtpm` (TPM, Linux), live Secure Enclave (macOS, `--features secure-enclave`) |
 | TPM quote verify | `swtpm` with scripted PCR sequences; positive and negative cases | integration tests |
 | Credential activation | `swtpm` with mismatched AIK/EK pairs to confirm rejection | integration tests |
 | Audit Merkle tree | Property tests on random insertions and inclusion/exclusion proofs | `proptest` |

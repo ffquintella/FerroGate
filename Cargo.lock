@@ -1654,6 +1654,7 @@ version = "0.21.5"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
+ "der 0.8.0",
  "ferro-crypto",
  "ferro-svid-verify",
  "hex",
@@ -1662,6 +1663,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1669,6 +1671,7 @@ name = "ferro-svid-verify"
 version = "0.21.5"
 dependencies = [
  "base64 0.22.1",
+ "der 0.8.0",
  "ferro-crypto",
  "hex",
  "serde",
@@ -3001,6 +3004,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tss-esapi",
+ "zeroize",
 ]
 
 [[package]]
