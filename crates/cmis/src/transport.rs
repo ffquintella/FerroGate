@@ -17,6 +17,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls_pki_types::pem::{self, PemObject};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::ServerConfig;
@@ -39,8 +40,7 @@ pub fn load_pem_identity(
 ) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_bytes = std::fs::read(cert_path)
         .map_err(|e| anyhow::anyhow!("reading TLS cert {}: {e}", cert_path.display()))?;
-    let mut cert_reader = io::BufReader::new(&cert_bytes[..]);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
+    let certs = CertificateDer::pem_slice_iter(&cert_bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("parsing TLS cert {}: {e}", cert_path.display()))?;
     if certs.is_empty() {
@@ -49,10 +49,12 @@ pub fn load_pem_identity(
 
     let key_bytes = std::fs::read(key_path)
         .map_err(|e| anyhow::anyhow!("reading TLS key {}: {e}", key_path.display()))?;
-    let mut key_reader = io::BufReader::new(&key_bytes[..]);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| anyhow::anyhow!("parsing TLS key {}: {e}", key_path.display()))?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| match e {
+        pem::Error::NoItemsFound => {
+            anyhow::anyhow!("no private key found in {}", key_path.display())
+        }
+        e => anyhow::anyhow!("parsing TLS key {}: {e}", key_path.display()),
+    })?;
 
     Ok((certs, key))
 }
@@ -123,4 +125,53 @@ pub fn tls_incoming(
     });
 
     ReceiverStream::new(rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write `cert` and `key` PEM into a fresh per-test temp dir.
+    fn write_pair(tag: &str, cert: &str, key: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cmis-transport-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert_path, key_path) = (dir.join("server.crt"), dir.join("server.key"));
+        std::fs::write(&cert_path, cert).unwrap();
+        std::fs::write(&key_path, key).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn loads_rcgen_identity() {
+        let ck =
+            rcgen::generate_simple_self_signed(vec!["cmis.test.ferrogate.invalid".into()]).unwrap();
+        let (cert, key) = write_pair("ok", &ck.cert.pem(), &ck.signing_key.serialize_pem());
+        let (certs, key) = load_pem_identity(&cert, &key).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), ck.cert.der().as_ref());
+        assert_eq!(key.secret_der(), ck.signing_key.serialize_der().as_slice());
+    }
+
+    #[test]
+    fn rejects_missing_cert_and_key() {
+        let ck =
+            rcgen::generate_simple_self_signed(vec!["cmis.test.ferrogate.invalid".into()]).unwrap();
+        let key_pem = ck.signing_key.serialize_pem();
+
+        let (cert, key) = write_pair("nocert", "not a pem file\n", &key_pem);
+        let err = load_pem_identity(&cert, &key).unwrap_err().to_string();
+        assert!(err.starts_with("no certificates found"), "{err}");
+
+        // A certificate where the key should be: no private key section.
+        let (cert, key) = write_pair("nokey", &ck.cert.pem(), &ck.cert.pem());
+        let err = load_pem_identity(&cert, &key).unwrap_err().to_string();
+        assert!(err.starts_with("no private key found"), "{err}");
+    }
 }

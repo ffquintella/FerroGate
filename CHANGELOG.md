@@ -31,6 +31,10 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   `SECURITY_IDENTIFICATION`; `mia test` uses it, and `mia status` and `mia-tray`
   request the same access. See
   [docs/helper-api.md](docs/helper-api.md#windows-pipe-clients).
+- **`rustls-pemfile` dropped (`cmis`, `ferrogate-cli`).** It is unmaintained
+  (RUSTSEC-2025-0134). PEM certificates and keys are now parsed with the
+  `rustls-pki-types` `PemObject` API. Error messages are unchanged, and
+  `cargo deny check` is clean again.
 - **hiqlite 0.13.2 → 0.15.0 (`ferro-raft`).** Same feature set (`sqlite`,
   `auto-heal`); openraft stays on 0.9. 0.14.0 was skipped: with TLS on both
   transports its `Client::shutdown` panics, so `Cluster::shutdown` did too

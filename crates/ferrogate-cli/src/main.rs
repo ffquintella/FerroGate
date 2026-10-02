@@ -35,6 +35,8 @@ use ferro_proto::v1::{
     BumpEpochRequest, HealthRequest, ListSvidsRequest, NodeRole, RevokeHostRequest,
     RevokeSvidRequest,
 };
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use tonic::transport::Channel;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8443";
@@ -285,8 +287,7 @@ fn resolve_pins(global: &GlobalArgs) -> anyhow::Result<Vec<SpkiPin>> {
 fn pin_from_cert(cert_path: &str) -> anyhow::Result<SpkiPin> {
     let cert_bytes = std::fs::read(cert_path)
         .map_err(|e| anyhow::anyhow!("reading TLS cert `{cert_path}`: {e}"))?;
-    let mut reader = std::io::BufReader::new(&cert_bytes[..]);
-    let cert = rustls_pemfile::certs(&mut reader)
+    let cert = CertificateDer::pem_slice_iter(&cert_bytes)
         .next()
         .ok_or_else(|| anyhow::anyhow!("no certificate found in `{cert_path}`"))?
         .map_err(|e| anyhow::anyhow!("parsing TLS cert `{cert_path}`: {e}"))?;

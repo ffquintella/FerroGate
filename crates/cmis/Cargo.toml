@@ -35,7 +35,6 @@ serde              = { workspace = true }
 tokio              = { workspace = true }
 tokio-stream       = { workspace = true }
 tokio-rustls       = { workspace = true }
-rustls-pemfile     = { workspace = true }
 rustls-pki-types   = { workspace = true }
 tonic              = { workspace = true }
 tracing            = { workspace = true }
@@ -54,3 +53,4 @@ base64             = { workspace = true }
 [dev-dependencies]
 futures           = { workspace = true }
 ferro-svid-verify = { path = "../ferro-svid-verify" }
+rcgen             = { workspace = true }

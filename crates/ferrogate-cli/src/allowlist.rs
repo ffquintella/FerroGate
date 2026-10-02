@@ -34,6 +34,8 @@ use ferro_proto::v1::{
 };
 use ferro_svid::allowlist::{self, AllowEntry, AllowlistDoc};
 use ferro_svid::host_uuid_from_ek_digest;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use sha2::{Digest, Sha384};
 use tonic::transport::Channel;
 
@@ -547,8 +549,7 @@ impl Flags {
             (None, Some(path), None) => {
                 let pem = std::fs::read(path)
                     .map_err(|e| anyhow::anyhow!("reading EK cert `{path}`: {e}"))?;
-                let mut reader = std::io::BufReader::new(&pem[..]);
-                let cert = rustls_pemfile::certs(&mut reader)
+                let cert = CertificateDer::pem_slice_iter(&pem)
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("no certificate found in `{path}`"))?
                     .map_err(|e| anyhow::anyhow!("parsing EK cert `{path}`: {e}"))?;
