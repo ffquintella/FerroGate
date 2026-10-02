@@ -207,6 +207,8 @@ Each replica needs the same view of the cluster and a shared secret pair:
   the wire.
 - `CMIS_RAFT_LISTEN` — the interface the Raft + management transports *bind*
   (default `0.0.0.0` for a multi-node cluster, so peers can reach this node).
+  Must be an IP literal (`0.0.0.0`, `10.0.0.5`, or bracketed IPv6 such as
+  `[::]`); a hostname fails startup.
 - `CMIS_PEER_TLS=1` — encrypt the inter-node transport with TLS (recommended
   whenever the peers are not on a trusted private network). Zero-config: every
   node derives the same peer certificate from the shared secret, so split-brain

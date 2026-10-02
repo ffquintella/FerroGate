@@ -39,7 +39,7 @@ mod tests {
     fn delay_is_about_sixty_percent_for_centered_jitter() {
         // iat=1000, ttl=3600 -> rotate at 1000+2160; from now=1000 that's 2160s.
         let d = delay_until_rotation(1000, 1000, 1000 + 3600, 0.5);
-        assert_eq!(d, Duration::from_secs(2160));
+        assert_eq!(d, Duration::from_mins(36));
     }
 
     #[test]
@@ -61,7 +61,7 @@ mod tests {
     fn jitter_keeps_delay_within_band() {
         let lo = delay_until_rotation(1000, 1000, 1000 + 3600, 0.0);
         let hi = delay_until_rotation(1000, 1000, 1000 + 3600, 1.0);
-        assert_eq!(lo, Duration::from_secs(1800)); // 50%
-        assert_eq!(hi, Duration::from_secs(2520)); // 70%
+        assert_eq!(lo, Duration::from_mins(30)); // 50%
+        assert_eq!(hi, Duration::from_mins(42)); // 70%
     }
 }

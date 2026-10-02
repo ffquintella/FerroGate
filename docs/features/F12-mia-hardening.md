@@ -84,7 +84,7 @@ toggles (`FERROGATE_SECCOMP=enforce|audit|off`, `FERROGATE_SKIP_HARDENING`,
 `FERROGATE_REQUIRE_IMA`, `FERROGATE_RUN_AS_UID/GID`) cover staged rollout and
 the dev "audit" mode. The Linux paths are verified by `cargo test -p
 ferro-harden` (including the live `SIGSYS` self-test) run in CI / the
-`rust:1.88-bookworm` container. A static-PIE musl build that statically links
+`rust:1.95-bookworm` container. A static-PIE musl build that statically links
 TSS2 is left as deployment packaging; the reproducibility gate runs on the
 default glibc build, which is PIE by default.
 

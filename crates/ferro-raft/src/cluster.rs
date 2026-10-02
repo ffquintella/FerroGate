@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use hiqlite::tls::{ServerTlsConfig, ServerTlsConfigCerts};
-use hiqlite::{Client, Node, NodeConfig, Param};
+use hiqlite::{Client, LogSync, Node, NodeConfig, Param};
 use tokio::time::timeout;
 
 /// TLS for the inter-node Raft + management transports.
@@ -67,7 +67,9 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// — an operator-set `SSL_CERT_FILE`, else the common system bundle — are
 /// preserved so ordinary outbound TLS in the process still works.
 fn install_trust_anchor(data_dir: &str, anchor_pem: &str) -> Result<(), ClusterError> {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let dir = std::path::Path::new(data_dir).join("peer-tls");
     std::fs::create_dir_all(&dir)?;
@@ -152,6 +154,58 @@ impl ClusterConfig {
             }
         };
         Ok(Some(ServerTlsConfig::Specific(specific)))
+    }
+
+    /// Build the hiqlite [`NodeConfig`] for this node.
+    ///
+    /// `peer_tls` is the output of [`Self::materialize_peer_tls`] and is applied
+    /// to *both* inter-node transports (Raft and management API), so neither
+    /// one is left in cleartext when peer TLS is on.
+    ///
+    /// `wal_sync` is set explicitly to [`LogSync::ImmediateAsync`], the default
+    /// up to hiqlite 0.14. hiqlite 0.15 changed the default to
+    /// `IntervalMillis(200)`; keeping the old value means a dependency bump does
+    /// not silently change how Raft log appends reach disk. Neither mode makes
+    /// an acknowledged write survive power loss (only `LogSync::Immediate`
+    /// does); moving to `Immediate` is a separate durability decision.
+    ///
+    /// Every other field not set here comes from `NodeConfig::default()`. Two
+    /// were added in hiqlite 0.14 and must keep their defaults, which the unit
+    /// tests below pin:
+    ///
+    /// - `learner_only = false`: every CMIS peer is a voter. A learner-only node
+    ///   never joins the quorum but still passes hiqlite's health check, so the
+    ///   cluster would look healthy while tolerating fewer failures.
+    /// - `rate_limit_db = None`: no client-side DB rate limit. With a limit set,
+    ///   hiqlite holds back excess writes and consistent reads, and fails them
+    ///   with `Error::RateLimit` once its wait queue is full, which would turn
+    ///   a burst of SVID issuance into client errors.
+    fn node_config(&self, peer_tls: Option<ServerTlsConfig>) -> NodeConfig {
+        let nodes: Vec<Node> = self
+            .peers
+            .iter()
+            .map(|p| Node {
+                id: p.id,
+                addr_raft: p.addr_raft.clone(),
+                addr_api: p.addr_api.clone(),
+            })
+            .collect();
+
+        NodeConfig {
+            node_id: self.node_id,
+            nodes,
+            listen_addr_api: Cow::Owned(self.listen_addr_api.clone()),
+            listen_addr_raft: Cow::Owned(self.listen_addr_raft.clone()),
+            data_dir: Cow::Owned(self.data_dir.clone()),
+            filename_db: Cow::Owned(self.filename_db.clone()),
+            secret_raft: self.secret_raft.clone(),
+            secret_api: self.secret_api.clone(),
+            tls_raft: peer_tls.clone(),
+            tls_api: peer_tls,
+            health_check_delay: Duration::ZERO,
+            wal_sync: LogSync::ImmediateAsync,
+            ..NodeConfig::default()
+        }
     }
 }
 
@@ -316,34 +370,14 @@ impl Cluster {
                 "single-node cluster: this node is the only peer and will not look for others"
             );
         }
-        let nodes: Vec<Node> = cfg
-            .peers
-            .iter()
-            .map(|p| Node {
-                id: p.id,
-                addr_raft: p.addr_raft.clone(),
-                addr_api: p.addr_api.clone(),
-            })
-            .collect();
-
         let peer_tls = cfg.materialize_peer_tls()?;
         if peer_tls.is_some() {
-            tracing::info!(node_id, "inter-node transport: rustls (secret-authenticated)");
+            tracing::info!(
+                node_id,
+                "inter-node transport: rustls (secret-authenticated)"
+            );
         }
-        let node_config = NodeConfig {
-            node_id,
-            nodes,
-            listen_addr_api: Cow::Owned(cfg.listen_addr_api.clone()),
-            listen_addr_raft: Cow::Owned(cfg.listen_addr_raft.clone()),
-            data_dir: Cow::Owned(cfg.data_dir.clone()),
-            filename_db: Cow::Owned(cfg.filename_db.clone()),
-            secret_raft: cfg.secret_raft.clone(),
-            secret_api: cfg.secret_api.clone(),
-            tls_raft: peer_tls.clone(),
-            tls_api: peer_tls,
-            health_check_delay_secs: 0,
-            ..NodeConfig::default()
-        };
+        let node_config = cfg.node_config(peer_tls);
 
         let client = hiqlite::start_node(node_config).await?;
 
@@ -852,6 +886,91 @@ impl<'r> From<&'r mut hiqlite::Row<'_>> for RimRow {
     fn from(row: &'r mut hiqlite::Row<'_>) -> Self {
         Self {
             version: row.get("version"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn three_peers() -> Vec<PeerNode> {
+        (1..=3)
+            .map(|id| PeerNode {
+                id,
+                addr_raft: format!("127.0.0.1:{}", 18_100 + id),
+                addr_api: format!("127.0.0.1:{}", 18_200 + id),
+            })
+            .collect()
+    }
+
+    fn specific_tls() -> ServerTlsConfig {
+        ServerTlsConfig::Specific(ServerTlsConfigCerts {
+            cert: Cow::Borrowed("/peer-tls/peer-chain.pem"),
+            key: Cow::Borrowed("/peer-tls/peer-key.pem"),
+            danger_tls_no_verify: true,
+        })
+    }
+
+    /// hiqlite 0.14 added `learner_only` and `rate_limit_db`; both reach us
+    /// through `..NodeConfig::default()`. Pin the defaults CMIS relies on so a
+    /// future upstream default change fails here rather than in production.
+    #[test]
+    fn node_config_keeps_every_peer_a_voter_with_no_rate_limit() {
+        let nc = ClusterConfig::for_node(2, three_peers(), "/data").node_config(None);
+        assert!(!nc.learner_only, "every CMIS peer must be a voting member");
+        assert!(
+            nc.rate_limit_db.is_none(),
+            "no client-side rate limit on the DB raft"
+        );
+    }
+
+    #[test]
+    fn node_config_passes_identity_and_secrets_through_and_is_valid() {
+        let mut cfg = ClusterConfig::for_node(2, three_peers(), "/data");
+        cfg.secret_raft = "raft-secret-for-unit-test".to_string();
+        cfg.secret_api = "api-secret-for-unit-test".to_string();
+        let nc = cfg.node_config(None);
+
+        assert_eq!(nc.node_id, 2);
+        assert_eq!(nc.nodes.len(), 3);
+        assert_eq!(nc.nodes[1].id, 2);
+        assert_eq!(nc.nodes[1].addr_raft, "127.0.0.1:18102");
+        assert_eq!(nc.nodes[1].addr_api, "127.0.0.1:18202");
+        assert_eq!(nc.secret_raft, "raft-secret-for-unit-test");
+        assert_eq!(nc.secret_api, "api-secret-for-unit-test");
+        assert_eq!(nc.data_dir, "/data");
+        assert_eq!(nc.filename_db, "hiqlite.db");
+        assert_eq!(nc.health_check_delay, Duration::ZERO);
+        nc.is_valid().expect("hiqlite accepts the generated config");
+    }
+
+    /// hiqlite 0.15 changed the `wal_sync` default from `ImmediateAsync` to
+    /// `IntervalMillis(200)`. We keep the pre-0.15 mode on purpose; see
+    /// `ClusterConfig::node_config`.
+    #[test]
+    fn node_config_keeps_the_pre_0_15_wal_sync_mode() {
+        let nc = ClusterConfig::for_node(1, three_peers(), "/data").node_config(None);
+        assert_eq!(nc.wal_sync, LogSync::ImmediateAsync);
+    }
+
+    #[test]
+    fn node_config_without_peer_tls_leaves_both_transports_plain() {
+        let nc = ClusterConfig::for_node(1, three_peers(), "/data").node_config(None);
+        assert!(nc.tls_raft.is_none());
+        assert!(nc.tls_api.is_none());
+    }
+
+    #[test]
+    fn node_config_applies_peer_tls_to_both_transports() {
+        let nc =
+            ClusterConfig::for_node(1, three_peers(), "/data").node_config(Some(specific_tls()));
+        for (transport, tls) in [("raft", &nc.tls_raft), ("api", &nc.tls_api)] {
+            let Some(ServerTlsConfig::Specific(certs)) = tls else {
+                panic!("{transport} transport lost its peer TLS config");
+            };
+            assert_eq!(certs.cert, "/peer-tls/peer-chain.pem", "{transport}");
+            assert_eq!(certs.key, "/peer-tls/peer-key.pem", "{transport}");
         }
     }
 }

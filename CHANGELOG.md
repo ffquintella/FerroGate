@@ -31,6 +31,31 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
   `SECURITY_IDENTIFICATION`; `mia test` uses it, and `mia status` and `mia-tray`
   request the same access. See
   [docs/helper-api.md](docs/helper-api.md#windows-pipe-clients).
+- **hiqlite 0.13.2 → 0.15.0 (`ferro-raft`).** Same feature set (`sqlite`,
+  `auto-heal`); openraft stays on 0.9. 0.14.0 was skipped: with TLS on both
+  transports its `Client::shutdown` panics, so `Cluster::shutdown` did too
+  under `PeerTls`. 0.15 fixes that and shuts the TLS listeners down
+  gracefully.
+  - **Upgrade a multi-node cluster with a full stop and start**, not a
+    rolling restart; upstream does not support mixing 0.15 with older nodes.
+    The database WAL, state machine and wire formats are unchanged, so data
+    directories carry over. Upstream's cache-WAL cleanup step does not apply
+    (we do not enable the `cache` feature).
+  - **Durability unchanged:** 0.15 moves the `wal_sync` default from
+    `ImmediateAsync` to `IntervalMillis(200)`; `ferro-raft` now sets
+    `ImmediateAsync` explicitly to keep the previous behaviour.
+    `health_check_delay_secs` became `health_check_delay: Duration` (still
+    zero). The `learner_only` and `rate_limit_db` fields added in 0.14 keep
+    their defaults (every peer votes, no client-side rate limit). Unit tests
+    in `ferro_raft::cluster` pin all of this.
+  - **Security:** hiqlite now compares the peer challenge-response and the
+    API secret header in constant time. It also adds an unauthenticated
+    `/version` route on the Raft and API ports (like the existing `/health`
+    and `/ping`) that returns the hiqlite version.
+  - **`CMIS_RAFT_LISTEN` must be an IP literal.** hiqlite now parses the bind
+    address strictly, so a hostname fails startup instead of being resolved.
+- **Workspace MSRV 1.88 → 1.95**, because hiqlite 0.15 declares
+  `rust-version = "1.95.0"`.
 
 ## [0.21.7] — 2026-10-02
 

@@ -112,11 +112,9 @@ async fn start_3_node(tag: &str) -> (std::path::PathBuf, Vec<Cluster>, u64) {
 /// (and is what the container test in `docs/operations.md` uses).
 fn write_test_certs(root: &std::path::Path) -> (String, String) {
     std::fs::create_dir_all(root).unwrap();
-    let cert = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .unwrap();
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .unwrap();
     let cert_path = root.join("peer.crt");
     let key_path = root.join("peer.key");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
@@ -266,9 +264,10 @@ async fn tls_cluster_elects_a_leader_and_replicates() {
 // The F05 acceptance text says "Killing the leader produces a new leader
 // within one election timeout and the cluster continues issuing SVIDs". The
 // strictest possible form — *graceful-shutdown of the current leader* — is
-// awkward to exercise against hiqlite 0.13 in-process because node `1` owns
-// cluster-bootstrap responsibilities and the initial leader is reliably
-// node `1`; an explicit leader-transfer RPC is not exposed. What we test
+// awkward to exercise against hiqlite (0.13, still so in 0.15) in-process
+// because node `1` owns cluster-bootstrap responsibilities and the initial
+// leader is reliably node `1`; an explicit leader-transfer RPC is not
+// exposed. What we test
 // here is the equivalent service-continuity property: kill a non-leader,
 // confirm quorum holds and the leader keeps issuing. The long-running
 // `ten_minute_chaos_run` (ignored by default) cycles kills across all roles

@@ -29,7 +29,7 @@ members = [
 [workspace.package]
 version      = "0.21.7"
 edition      = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 license      = "Apache-2.0"
 repository   = "https://github.com/ffquintella/FerroGate"
 authors      = ["FerroGate contributors"]
@@ -110,7 +110,7 @@ tss-esapi = "7.5"
 # Hiqlite bundles openraft + SQLite + replication transport; we wrap it in
 # `ferro-raft` to expose typed access to issued-SVID metadata and the RIM
 # version pointer without leaking the Raft library into the rest of the tree.
-hiqlite      = { version = "0.13", default-features = false, features = ["sqlite", "auto-heal"] }
+hiqlite      = { version = "0.15", default-features = false, features = ["sqlite", "auto-heal"] }
 async-trait  = "0.1"
 
 # gRPC / protobuf (F04 — MachineIdentity service surface)
