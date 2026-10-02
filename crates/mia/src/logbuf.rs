@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(resp.next_seq, 10);
         // Following from next_seq yields nothing new and no drops.
         let again = buf.tail(resp.next_seq, Level::Trace, 100, usize::MAX);
-        assert!(again.records.is_empty());
+        assert_eq!(again.records, [] as [LogRecord; 0]);
         assert_eq!(again.dropped, 0);
         assert_eq!(again.next_seq, 10);
         assert_eq!(again.buffer_id, resp.buffer_id);
@@ -695,9 +695,9 @@ mod tests {
     fn zero_capacity_disables_the_buffer() {
         let buf = buffered(0, 1 << 20, || tracing::error!("nope"));
         assert!(!buf.is_enabled());
-        assert!(all(&buf).is_empty());
+        assert_eq!(all(&buf), [] as [LogRecord; 0]);
         let buf = buffered(10, 0, || tracing::error!("nope"));
-        assert!(all(&buf).is_empty());
+        assert_eq!(all(&buf), [] as [LogRecord; 0]);
     }
 
     #[test]

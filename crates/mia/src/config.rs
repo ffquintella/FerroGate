@@ -1372,7 +1372,7 @@ mod tests {
         let reported = env_overridden(EnvOverrideScope::SharedOnly, |k| {
             (k == "FERROGATE_HELPER_SOCKET").then(|| "/x".to_string())
         });
-        assert!(reported.is_empty());
+        assert_eq!(reported, [] as [EnvOverride; 0]);
     }
 
     #[test]

@@ -281,7 +281,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
         .await
         .unwrap()
         .into_inner();
-    assert!(empty.items.is_empty());
+    assert_eq!(empty.items, [] as [ferro_proto::v1::PendingProposal; 0]);
 }
 
 #[tokio::test]
@@ -306,7 +306,7 @@ async fn off_policy_never_auto_adopts() {
         .await
         .unwrap()
         .into_inner();
-    assert!(got.signed_allowlist.is_empty());
+    assert_eq!(got.signed_allowlist, [] as [u8; 0]);
 }
 
 #[tokio::test]

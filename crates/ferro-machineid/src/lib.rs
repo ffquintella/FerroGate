@@ -308,7 +308,7 @@ mod imp {
         fn splits_one_block_per_controller() {
             assert_eq!(devices(EXTERNAL_FIRST).len(), 2);
             assert_eq!(devices(INTERNAL_ONLY).len(), 1);
-            assert!(devices("").is_empty());
+            assert_eq!(devices(""), [] as [&str; 0]);
         }
 
         #[test]
