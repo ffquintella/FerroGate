@@ -8,6 +8,43 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 ## [Unreleased]
 
+## [0.21.7] — 2026-10-02
+
+### Added
+
+- **`mia-tray`, a system-tray companion for the MIA agent (F18).** A small,
+  unprivileged desktop app (macOS menu bar, Windows notification area, Linux
+  StatusNotifierItem) that shows the agent's health per environment, raises
+  notifications when a human is needed, runs a graphical setup wizard, offers
+  guided recovery for each known failure state, and tails the daemon's
+  recent, redacted logs. It holds no key material, never sends `HelperReq`,
+  and runs every state-changing action as a fixed `mia` command behind the OS
+  consent prompt (pkexec / macOS admin prompt / UAC). The GUI sits behind the
+  default-off `gui` feature, so `make lint` / `make test` need no GTK; build it
+  with `make tray`. Shipped in `pkg-macos`, `pkg-win` and `pkg-tray` (deb/rpm).
+- **Read-only status endpoint in `mia`.** A separate listener
+  (`mia-status.sock` / `\\.\pipe\ferrogate-mia-status`, group
+  `ferrogate-status` / `FerroGateStatus`) answering only `StatusReq` and
+  `LogTailReq`, rate-limited per uid. Snapshots and log records carry no key,
+  token, SVID, pin or `jti` material; redaction happens before a record enters
+  the bounded in-memory log buffer. Wire types live in the new
+  `mia-status-proto` crate. Configured by the new `[status]` section.
+- **`mia status [--json]`**, **`mia test --json`**, and
+  **`mia setup --check / --apply / --dump`**. `--apply` validates the draft
+  as untrusted input, writes atomically with the TTY wizard's mode and
+  ownership, and appends a `ConfigChanged` audit event (key names only).
+
+### Changed
+
+- `mia setup` now also prompts for the attestation backend, refuses `'` and
+  control characters, refuses a symlinked target, and preserves keys it does
+  not edit.
+- Cryptographic dependencies upgraded: `ed25519-dalek` 3, `rand_core` 0.10
+  (randomness via `getrandom` 0.4 `SysRng`), `p256` 0.14, `chacha20poly1305`
+  0.11, `sha3` 0.12.
+- `AGENTS.md` documents the `agent-router` and `fgv-desenvolvimento-seguro`
+  skills as mandatory for AI assistants.
+
 ## [0.21.6] — 2026-09-01
 
 ### Added
