@@ -163,7 +163,7 @@ are held and counted).
 
 | Platform | Package | Autostart |
 |---|---|---|
-| macOS | inside `make pkg-macos` (`/usr/local/bin/mia-tray`) | LaunchAgent `/Library/LaunchAgents/com.ferrogate.mia-tray.plist` (login item; started for the console user at install) |
+| macOS | inside `make pkg-macos` (`/Applications/FerroGate MIA.app`, symlinked as `/usr/local/bin/mia-tray`) | LaunchAgent `/Library/LaunchAgents/com.ferrogate.mia-tray.plist` (login item; started for the console user at install) |
 | Windows | inside `make pkg-win` (`%ProgramFiles%\FerroGate\MIA\mia-tray.exe`) | `HKLM\…\CurrentVersion\Run\FerroGateMiaTray` |
 | Linux | separate, opt-in `ferrogate-mia-tray` package (`make pkg-deb-tray`, `make pkg-rpm-tray`) so servers never pull in GTK | XDG autostart `/etc/xdg/autostart/mia-tray.desktop` |
 

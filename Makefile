@@ -454,11 +454,14 @@ pkg-win: ## Build the mia Windows MSI + Chocolatey/NuGet package in a linux/amd6
 # cargo plugin). Stages a payload root, then pkgbuild → productbuild. Set
 # PKG_SIGN_ID="Developer ID Installer: ..." to sign the product archive, and
 # CODESIGN_ID="Developer ID Application: ..." to sign the mia binary itself —
-# required for the Secure Enclave credential store (see mia.entitlements).
+# required for the Secure Enclave credential store (see mia.entitlements) —
+# and the tray's "FerroGate MIA.app" (ad-hoc signed otherwise).
 MACOS_PKG_ID   := com.ferrogate.mia
 MACOS_PKG_ROOT := target/macos/pkgroot
 MACOS_PKG_OUT  := target/macos/ferrogate-mia-$(CARGO_VERSION).pkg
 MACOS_DIST     := crates/mia/dist
+# The tray's app bundle, relative to the payload root (and so to /).
+MACOS_TRAY_APP := Applications/FerroGate MIA.app
 pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 	@[ "$(UNAME_S)" = "Darwin" ] || { echo "ERROR: pkg-macos must run on macOS (host is $(UNAME_S))"; exit 1; }
 	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE) --features secure-enclave
@@ -481,11 +484,9 @@ pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 	fi
 ifneq ($(MIA_TRAY),0)
 	# The mia-tray companion (feature F18): unprivileged, no entitlements.
+	# Signed below, once it sits inside its .app bundle.
 	cargo build --release $(TRAY) --bin mia-tray
 	strip target/release/mia-tray
-	@if [ -n "$(CODESIGN_ID)" ]; then \
-		codesign --force --options runtime --timestamp --sign "$(CODESIGN_ID)" target/release/mia-tray; \
-	fi
 endif
 	rm -rf $(MACOS_PKG_ROOT)
 	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/bin
@@ -498,14 +499,39 @@ endif
 	install -m 0640 $(MACOS_DIST)/mia.toml "$(MACOS_PKG_ROOT)/Library/Application Support/FerroGate/mia.toml"
 	install -m 0644 $(MACOS_DIST)/com.ferrogate.mia.plist $(MACOS_PKG_ROOT)/Library/LaunchDaemons/$(MACOS_PKG_ID).plist
 ifneq ($(MIA_TRAY),0)
-	# The tray binary and its per-user login item; the postinstall script
-	# creates the ferrogate-status group, adds the console user and starts
-	# the tray in that user's session.
+	# The tray as an app bundle in /Applications (Finder, Launchpad, Login
+	# Items show it by name), a /usr/local/bin/mia-tray symlink for the shell,
+	# and its per-user login item; the postinstall script creates the
+	# ferrogate-status group, adds the console user and starts the tray in
+	# that user's session.
+	install -d -m 0755 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS"
+	install -m 0755 target/release/mia-tray "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray"
+	sed 's/@VERSION@/$(CARGO_VERSION)/g' $(TRAY_DIST)/macos/Info.plist > "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Info.plist"
+	chmod 0644 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Info.plist"
+	plutil -lint "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Info.plist"
+	printf 'APPL????' > "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/PkgInfo"
+	# Sign the whole bundle (seals Info.plist); without CODESIGN_ID sign it
+	# ad hoc so the bundle's signature still matches its contents.
+	codesign --force --options runtime \
+		$(if $(CODESIGN_ID),--timestamp --sign "$(CODESIGN_ID)",--sign -) \
+		"$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)"
+	codesign --verify --strict --verbose=1 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)"
+	ln -s "/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray" $(MACOS_PKG_ROOT)/usr/local/bin/mia-tray
 	install -d -m 0755 $(MACOS_PKG_ROOT)/Library/LaunchAgents
-	install -m 0755 target/release/mia-tray $(MACOS_PKG_ROOT)/usr/local/bin/mia-tray
 	install -m 0644 $(TRAY_DIST)/com.ferrogate.mia-tray.plist $(MACOS_PKG_ROOT)/Library/LaunchAgents/com.ferrogate.mia-tray.plist
 endif
+	# pkgbuild marks bundles relocatable by default: the installer would then
+	# "upgrade" a copy of the app found elsewhere instead of /Applications,
+	# leaving the LaunchAgent pointing at nothing. Pin every bundle in place
+	# (newer pkgbuild omits the key rather than writing true, hence Add || Set).
+	pkgbuild --analyze --root $(MACOS_PKG_ROOT) target/macos/components.plist
+	@set -e; i=0; while /usr/libexec/PlistBuddy -c "Print :$$i" target/macos/components.plist >/dev/null 2>&1; do \
+		/usr/libexec/PlistBuddy -c "Add :$$i:BundleIsRelocatable bool false" target/macos/components.plist 2>/dev/null \
+			|| /usr/libexec/PlistBuddy -c "Set :$$i:BundleIsRelocatable false" target/macos/components.plist; \
+		i=$$((i + 1)); \
+	done
 	pkgbuild --root $(MACOS_PKG_ROOT) \
+		--component-plist target/macos/components.plist \
 		--scripts $(MACOS_DIST)/macos-scripts \
 		--identifier $(MACOS_PKG_ID) \
 		--version $(CARGO_VERSION) \
@@ -514,7 +540,7 @@ endif
 	productbuild --package target/macos/$(PKG_CRATE)-component.pkg \
 		$(if $(PKG_SIGN_ID),--sign "$(PKG_SIGN_ID)",) \
 		$(MACOS_PKG_OUT)
-	@rm -f target/macos/$(PKG_CRATE)-component.pkg
+	@rm -f target/macos/$(PKG_CRATE)-component.pkg target/macos/components.plist
 	@echo "==> .pkg written to $(MACOS_PKG_OUT)"
 
 pkg: ## Build every client package valid for this host (deb+rpm/Linux, msi+nupkg/Windows, pkg/macOS)
