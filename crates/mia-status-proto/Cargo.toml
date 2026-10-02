@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
+publish                = false
 
 # Deliberately tiny: the `mia-tray` companion (and any other status client)
 # depends on this crate instead of on `mia` itself, so it never pulls in the

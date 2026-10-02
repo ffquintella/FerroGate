@@ -100,8 +100,13 @@ sdk_stage() {
     #
     # Only `../`-prefixed paths are touched, so `[lib] path = "src/lib.rs"` and
     # any other intra-crate path is left alone.
+    #
+    # Every workspace crate is `publish = false` in the repository (so a stray
+    # `cargo publish` cannot push anything, and cargo-deny may accept the bare
+    # path deps). Drop that line from the staged SDK crates only.
     for c in "${SDK_CRATES[@]}"; do
-      sed -E "s|(path = \"\.\./[A-Za-z0-9_-]+\")|\1, version = \"=${version}\", registry = \"${SDK_REGISTRY}\"|g" \
+      sed -E -e "s|(path = \"\.\./[A-Za-z0-9_-]+\")|\1, version = \"=${version}\", registry = \"${SDK_REGISTRY}\"|g" \
+        -e '/^publish[[:space:]]*=[[:space:]]*false[[:space:]]*$/d' \
         "$stage/crates/$c/Cargo.toml" > "$stage/crates/$c/Cargo.toml.tmp"
       mv "$stage/crates/$c/Cargo.toml.tmp" "$stage/crates/$c/Cargo.toml"
     done
