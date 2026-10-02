@@ -140,7 +140,7 @@ async fn get_unknown_host_returns_empty_not_error() {
         .await
         .expect("get ok")
         .into_inner();
-    assert!(got.signed_allowlist.is_empty());
+    assert_eq!(got.signed_allowlist, [] as [u8; 0]);
 }
 
 #[tokio::test]

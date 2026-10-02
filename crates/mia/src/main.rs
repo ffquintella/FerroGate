@@ -2353,7 +2353,7 @@ mod tests {
 
     #[test]
     fn no_self_sha_yields_only_observed_entries() {
-        assert!(proposal_entries(&[], None).is_empty());
+        assert_eq!(proposal_entries(&[], None), [] as [ferro_svid::AllowEntry; 0]);
         let entries = proposal_entries(&[(0, [0x11; 48])], None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].uid, Some(0));

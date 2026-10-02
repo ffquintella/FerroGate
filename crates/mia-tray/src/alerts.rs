@@ -168,12 +168,14 @@ mod tests {
     #[test]
     fn startup_state_never_alerts() {
         let mut a = Alerter::new(Policy::default());
-        assert!(a
-            .observe(0, &snaps(&[(None, AgentState::CrlStale)]))
-            .is_empty());
-        assert!(a
-            .observe(5, &snaps(&[(None, AgentState::CrlStale)]))
-            .is_empty());
+        assert_eq!(
+            a.observe(0, &snaps(&[(None, AgentState::CrlStale)])),
+            [] as [Alert; 0]
+        );
+        assert_eq!(
+            a.observe(5, &snaps(&[(None, AgentState::CrlStale)])),
+            [] as [Alert; 0]
+        );
     }
 
     #[test]
@@ -181,9 +183,10 @@ mod tests {
         let mut a = Alerter::new(Policy::default());
         a.observe(0, &snaps(&[(None, AgentState::Healthy)]));
         // Healthy → Attesting → CmisUnreachable still counts.
-        assert!(a
-            .observe(5, &snaps(&[(None, AgentState::Attesting)]))
-            .is_empty());
+        assert_eq!(
+            a.observe(5, &snaps(&[(None, AgentState::Attesting)])),
+            [] as [Alert; 0]
+        );
         let got = a.observe(10, &snaps(&[(None, AgentState::CmisUnreachable)]));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].kind, AlertKind::BecameUnhealthy);
@@ -191,9 +194,10 @@ mod tests {
         let got = a.observe(20, &snaps(&[(None, AgentState::SvidExpiring)]));
         assert_eq!(got[0].kind, AlertKind::SvidExpiring);
         // Back to healthy is silent.
-        assert!(a
-            .observe(30, &snaps(&[(None, AgentState::Healthy)]))
-            .is_empty());
+        assert_eq!(
+            a.observe(30, &snaps(&[(None, AgentState::Healthy)])),
+            [] as [Alert; 0]
+        );
         // Healthy → CrlStale is a CRL alert, not a generic one.
         let got = a.observe(40, &snaps(&[(None, AgentState::CrlStale)]));
         assert_eq!(got[0].kind, AlertKind::CrlStale);
@@ -208,9 +212,10 @@ mod tests {
             1
         );
         a.observe(2, &snaps(&[(None, AgentState::Healthy)]));
-        assert!(a
-            .observe(3, &snaps(&[(None, AgentState::CrlStale)]))
-            .is_empty());
+        assert_eq!(
+            a.observe(3, &snaps(&[(None, AgentState::CrlStale)])),
+            [] as [Alert; 0]
+        );
         // After the dedup window it may alert again.
         a.observe(4000, &snaps(&[(None, AgentState::Healthy)]));
         assert_eq!(
@@ -248,8 +253,9 @@ mod tests {
         a.observe(0, &snaps(&[(Some("p"), AgentState::Healthy)]));
         a.observe(1, &snaps(&[(None, AgentState::NotRunning)]));
         // "p" re-appears broken: a first sighting, not a transition.
-        assert!(a
-            .observe(2, &snaps(&[(Some("p"), AgentState::PinMismatch)]))
-            .is_empty());
+        assert_eq!(
+            a.observe(2, &snaps(&[(Some("p"), AgentState::PinMismatch)])),
+            [] as [Alert; 0]
+        );
     }
 }

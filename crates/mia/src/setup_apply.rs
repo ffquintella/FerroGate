@@ -1374,7 +1374,7 @@ mod tests {
             changed_keys(&old, &new),
             vec!["cmis.endpoint", "status.enable"]
         );
-        assert!(changed_keys(&old, &old).is_empty());
+        assert_eq!(changed_keys(&old, &old), [] as [String; 0]);
     }
 
     #[test]

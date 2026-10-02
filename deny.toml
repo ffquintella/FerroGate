@@ -36,6 +36,13 @@ name  = "ring"
 allow = ["OpenSSL"]
 name  = "aws-lc-sys"
 
+# Mozilla's root CA bundle as data (CDLA-Permissive-2.0, a permissive data
+# licence), reached via hiqlite → reqwest / quinn → rustls-platform-verifier.
+# Scoped to this crate only: the licence is not allowed workspace-wide.
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+name  = "webpki-root-certs"
+
 # mia-tray GUI (feature F18, optional `gui` cargo feature — checked by
 # `make deny-tray`, since the [graph] above covers default features only).
 # egui's bundled default fonts: Noto Emoji / emoji-icon-font (OFL-1.1) and
@@ -57,6 +64,11 @@ name  = "error-code"
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
+# Internal `path = "../<crate>"` deps carry no version. They are accepted only
+# because every workspace crate is `publish = false`; the SDK crates are
+# published solely through scripts/publish-sdk.sh, which pins an exact version
+# on those deps (and drops `publish = false`) in the staged copy.
+allow-wildcard-paths = true
 deny = [
     # Force the project to rely on `ring` / `aws-lc-rs` rather than `openssl`
     # bindings, in line with the design docs.

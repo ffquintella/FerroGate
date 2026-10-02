@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn version_is_the_package_version() {
         assert_eq!(super::VERSION, env!("CARGO_PKG_VERSION"));
-        assert!(!super::VERSION.is_empty());
+        assert_ne!(super::VERSION, "");
     }
 
     /// Smoke-test that the default feature set actually re-exports the
