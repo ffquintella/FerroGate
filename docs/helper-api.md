@@ -9,7 +9,12 @@ short-lived, sender-constrained tokens for a specific audience.
 - **Linux:** Unix Domain Socket at `/run/ferrogate/mia.sock`, mode `0660`,
   group `ferrogate-clients`.
 - **Windows:** Named pipe `\\.\pipe\ferrogate-mia`, ACL grants only members
-  of the `FerroGateClients` local group.
+  of the `FerroGateClients` local group — and only `FILE_GENERIC_READ |
+  FILE_WRITE_DATA` (`0x0012008B`), never `FILE_CREATE_PIPE_INSTANCE`, so a
+  group member cannot stand up a rogue server instance. Clients must open the
+  pipe with desired access `GENERIC_READ | FILE_WRITE_DATA` (requesting
+  `GENERIC_WRITE` is denied) and should set `SECURITY_SQOS_PRESENT |
+  SECURITY_IDENTIFICATION`. See [Windows pipe clients](#windows-pipe-clients).
 
 The wire encoding is CBOR (`ciborium`). The protocol is request/response, one
 exchange per connection.
@@ -71,6 +76,30 @@ primitives into the same `CallerIdentity` the Unix path produces.
 
 Any step failing terminates the request with `permission_denied` and
 appends a `LocalDenied` audit event.
+
+#### Windows pipe clients
+
+The pipe DACL grants SYSTEM, Administrators and the pipe's owner (the account
+running `mia`) `GENERIC_READ | GENERIC_WRITE`; the client group gets only
+`FILE_GENERIC_READ | FILE_WRITE_DATA`. On a named pipe `GENERIC_WRITE` maps to
+`FILE_GENERIC_WRITE`, which includes `FILE_APPEND_DATA` — the same bit as
+`FILE_CREATE_PIPE_INSTANCE` — so withholding it is what stops one client from
+creating an extra server instance and answering other users' connections.
+
+A client therefore opens the pipe with exactly:
+
+| `CreateFileW` argument | Value |
+|---|---|
+| `dwDesiredAccess` | `GENERIC_READ \| FILE_WRITE_DATA` (`0x80000002`) |
+| `dwFlagsAndAttributes` | `SECURITY_SQOS_PRESENT \| SECURITY_IDENTIFICATION` (plus `FILE_FLAG_OVERLAPPED` for async I/O) |
+
+`GENERIC_READ | GENERIC_WRITE` (e.g. tokio's `ClientOptions`, .NET
+`NamedPipeClientStream` with `PipeDirection.InOut`) fails with
+`ERROR_ACCESS_DENIED` for a non-administrator; .NET clients use the
+`PipeAccessRights.Read | PipeAccessRights.WriteData` constructor overload with
+`TokenImpersonationLevel.Identification` instead.
+`SECURITY_IDENTIFICATION` keeps a server squatting the name from impersonating
+the client. In Rust, `ferro_winauth::open_client_pipe` does all of this.
 
 ### `mia` self-trust
 

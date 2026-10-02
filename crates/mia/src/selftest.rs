@@ -848,8 +848,6 @@ fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
 /// Step 5 (Windows): connect the helper named pipe, then run the mint exchange.
 #[cfg(windows)]
 async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
-    use tokio::net::windows::named_pipe::ClientOptions;
-
     let label = "[5/5] helper token mint";
     let Some(socket) = config.helper_socket() else {
         report(label, "FAIL", "helper.socket is not configured");
@@ -862,7 +860,9 @@ async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> b
         return false;
     };
 
-    let stream = match ClientOptions::new().open(socket) {
+    // Not tokio's ClientOptions: it requests GENERIC_WRITE, which the pipe DACL
+    // denies to the client group (it includes FILE_CREATE_PIPE_INSTANCE).
+    let stream = match ferro_winauth::open_client_pipe(socket.as_os_str()) {
         Ok(s) => s,
         Err(e) => {
             report(
