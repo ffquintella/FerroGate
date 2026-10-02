@@ -633,7 +633,7 @@ separate listener, so status reads never touch the token-minting path:
 |----|------------------|--------|
 | Linux | `/run/ferrogate/mia-status.sock` | `0660`, group `status.socket_gid` (or `status.group`, default `ferrogate-status`, from `/etc/group`) |
 | macOS | `/var/run/ferrogate/mia-status.sock` | `0660`, group `status.socket_gid` (dscl groups are not in `/etc/group`) |
-| Windows | `\\.\pipe\ferrogate-mia-status` | DACL: SYSTEM, Administrators, `status.group` (default `FerroGateStatus`) |
+| Windows | `\\.\pipe\ferrogate-mia-status` | DACL: SYSTEM, Administrators, `status.group` (default `FerroGateStatus`; read + write-data only, no pipe-instance creation — see [helper-api.md](helper-api.md#windows-pipe-clients)) |
 
 Framing is the helper protocol's (4-byte big-endian length + one CBOR value,
 ≤ 64 KiB, one exchange per connection, 5 s read deadline). Two requests are

@@ -4526,6 +4526,7 @@ version = "0.21.7"
 dependencies = [
  "arboard",
  "eframe",
+ "ferro-winauth",
  "gtk",
  "mia-status-proto",
  "notify-rust",

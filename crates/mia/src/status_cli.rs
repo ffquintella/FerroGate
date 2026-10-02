@@ -238,17 +238,18 @@ fn connect(endpoint: &Path) -> Result<std::os::unix::net::UnixStream, QueryError
 
 #[cfg(windows)]
 fn connect(endpoint: &Path) -> Result<std::fs::File, QueryError> {
-    // A pipe client is an ordinary file handle opened read/write.
+    // A pipe client is an ordinary file handle, opened with exactly
+    // GENERIC_READ | FILE_WRITE_DATA: the pipe DACL denies the status group
+    // GENERIC_WRITE (it includes FILE_CREATE_PIPE_INSTANCE).
     // ERROR_FILE_NOT_FOUND (2): no pipe; ERROR_PIPE_BUSY (231): retry once.
     let _ = IO_TIMEOUT;
+    use ferro_winauth::pipe_acl::{PIPE_CLIENT_DESIRED_ACCESS, SECURITY_IDENTIFICATION};
     use std::os::windows::fs::OpenOptionsExt as _;
-    // SECURITY_IDENTIFICATION: a squatting pipe server may learn who we are
-    // but can never impersonate this (possibly privileged) client.
-    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
     for attempt in 0..2 {
         match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
+            .access_mode(PIPE_CLIENT_DESIRED_ACCESS)
+            // SECURITY_IDENTIFICATION: a squatting pipe server may learn who
+            // we are but can never impersonate this (possibly privileged) client.
             .security_qos_flags(SECURITY_IDENTIFICATION)
             .open(endpoint)
         {

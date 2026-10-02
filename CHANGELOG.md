@@ -12,21 +12,25 @@ reaches a tagged release. Until then, changes are grouped by delivery milestone
 
 - **Windows pipe clients can no longer create pipe instances.** The named-pipe
   DACL built by `ferro_winauth::create_server_pipe` (helper pipe
-  `\\.\pipe\ferrogate-mia`) granted the client group `GRGW`. On a pipe,
-  `GENERIC_WRITE` includes `FILE_APPEND_DATA` = `FILE_CREATE_PIPE_INSTANCE`, so
-  any `FerroGateClients` member could create an extra server instance and answer
-  other users' connections (forged helper responses; impersonation of clients
-  that did not restrict their SQOS level). The group now gets only
-  `FILE_GENERIC_READ | FILE_WRITE_DATA` (`0x0012008B`). SYSTEM, Administrators
-  and the pipe owner (`OW`, the account running `mia`) keep `GRGW`.
+  `\\.\pipe\ferrogate-mia`, status pipe `\\.\pipe\ferrogate-mia-status`)
+  granted the client group (`FerroGateClients` / `FerroGateStatus`) `GRGW`. On
+  a pipe, `GENERIC_WRITE` includes `FILE_APPEND_DATA` =
+  `FILE_CREATE_PIPE_INSTANCE`, so any group member could create an extra server
+  instance and answer other users' connections (forged helper tokens or status;
+  impersonation of clients that did not restrict their SQOS level). The group
+  now gets only `FILE_GENERIC_READ | FILE_WRITE_DATA` (`0x0012008B`). SYSTEM,
+  Administrators and the pipe owner (`OW`, the account running `mia`) keep
+  `GRGW`.
 
 ### Changed
 
 - **Breaking for Windows pipe clients:** open the pipe with desired access
   `GENERIC_READ | FILE_WRITE_DATA`. A non-administrator that requests
   `GENERIC_WRITE` now gets `ERROR_ACCESS_DENIED`. New
-  `ferro_winauth::open_client_pipe` does this and sets `SECURITY_IDENTIFICATION`;
-  `mia test` uses it. See [docs/helper-api.md](docs/helper-api.md#windows-pipe-clients).
+  `ferro_winauth::open_client_pipe` does this and sets
+  `SECURITY_IDENTIFICATION`; `mia test` uses it, and `mia status` and `mia-tray`
+  request the same access. See
+  [docs/helper-api.md](docs/helper-api.md#windows-pipe-clients).
 
 ## [0.21.7] — 2026-10-02
 

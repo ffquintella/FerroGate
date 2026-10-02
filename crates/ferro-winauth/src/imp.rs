@@ -283,7 +283,7 @@ fn map_first_instance_err(
     first: bool,
 ) -> io::Result<NamedPipeServer> {
     match res {
-        Err(e) if first && e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+        Err(e) if first && e.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed()) => {
             Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "the helper pipe already exists; another mia instance is already \

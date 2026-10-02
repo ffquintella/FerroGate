@@ -38,6 +38,14 @@ pub const ACCESS_DENIED_CODE: &str = "status_access_denied";
 /// Tray-side error code: no `mia` binary was found.
 pub const NOT_INSTALLED_CODE: &str = "not_installed";
 
+/// Desired access for opening the Windows status pipe: `GENERIC_READ |
+/// FILE_WRITE_DATA`. The pipe DACL grants the status group no more than that —
+/// `GENERIC_WRITE` would include `FILE_CREATE_PIPE_INSTANCE` and is denied.
+/// Mirrors `ferro_winauth::pipe_acl::PIPE_CLIENT_DESIRED_ACCESS` (pinned by a
+/// test) without pulling that FFI crate into the unprivileged tray.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PIPE_CLIENT_DESIRED_ACCESS: u32 = 0x8000_0002;
+
 /// Why talking to the endpoint failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClientError {
@@ -221,7 +229,7 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use super::{with_deadline, ClientError, IO_TIMEOUT};
+    use super::{with_deadline, ClientError, IO_TIMEOUT, PIPE_CLIENT_DESIRED_ACCESS};
     use mia_status_proto::{StatusRequest, StatusResponse};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::path::Path;
@@ -260,8 +268,7 @@ mod platform {
     fn open(path: &Path) -> Result<std::fs::File, ClientError> {
         for attempt in 0..2 {
             match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
+                .access_mode(PIPE_CLIENT_DESIRED_ACCESS)
                 .security_qos_flags(SECURITY_IDENTIFICATION)
                 .open(path)
             {
@@ -520,6 +527,14 @@ pub fn observe(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn pipe_access_matches_the_dacl_contract() {
+        assert_eq!(
+            PIPE_CLIENT_DESIRED_ACCESS,
+            ferro_winauth::pipe_acl::PIPE_CLIENT_DESIRED_ACCESS
+        );
+    }
 
     struct Fake(
         Mutex<Vec<Result<StatusResponse, ClientError>>>,
