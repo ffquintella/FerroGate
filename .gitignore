@@ -37,3 +37,6 @@ dist
 # plist, postinstall) live under crates/mia/dist and must be tracked.
 !crates/mia/dist/
 !crates/mia/dist/**
+
+# Claude Code local settings and worktrees
+.claude/
