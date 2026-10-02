@@ -40,7 +40,8 @@ use ferro_ceremony::{
     SealedShare, SealedShareSet, SignedMinutes,
 };
 use ferro_crypto::composite::{CompositePublicKey, CompositeSecretKey, COMPOSITE_PK_LEN};
-use rand_core::{OsRng, RngCore as _};
+use getrandom::SysRng;
+use rand_core::{Rng as _, UnwrapErr};
 use sha3::{Digest, Sha3_256};
 
 fn main() -> ExitCode {
@@ -223,7 +224,7 @@ fn cmd_keygen(opts: &Opts) -> Result<()> {
         resolve_seed(v)?
     } else {
         let mut s = [0u8; 32];
-        OsRng.fill_bytes(&mut s);
+        UnwrapErr(SysRng).fill_bytes(&mut s);
         s
     };
     let kid = opts.get("kid")?;

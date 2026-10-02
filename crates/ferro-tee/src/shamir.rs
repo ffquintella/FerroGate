@@ -18,7 +18,8 @@
 //! Below `t` shares the secret bytes are independently uniform random; a
 //! property test in this module asserts that fact statistically.
 
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use rand_core::{Rng as _, UnwrapErr};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::TeeError;
@@ -127,7 +128,7 @@ pub fn split(secret: &[u8], threshold: usize, total: usize) -> Result<ShareSet, 
         coeffs[0] = *s_byte;
         // Random coefficients for degrees 1..t-1.
         if threshold > 1 {
-            OsRng.fill_bytes(&mut coeffs[1..]);
+            UnwrapErr(SysRng).fill_bytes(&mut coeffs[1..]);
         }
         for share in &mut shares {
             share.y[i] = eval(&coeffs, share.x);

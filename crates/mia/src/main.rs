@@ -92,6 +92,9 @@ fn main() -> anyhow::Result<()> {
         // running agent (SIGHUP) to re-read its config + allowlist, then exits.
         Some("--reload") => return mia::resync::run_reload(&args[1..]),
         Some("test") => return mia::selftest::run(&args[1..]),
+        // Read the running agent's status endpoint (feature F18). Exits with a
+        // stable code: 0 healthy, 1 not all healthy, 3 agent not running, …
+        Some("status") => std::process::exit(mia::status_cli::run(&args[1..])),
         // Windows service management (install/uninstall/start/stop) and the
         // internal `service run` the SCM launches. Windows-only.
         Some("service") => return service_cmd(&args[1..]),
@@ -154,9 +157,20 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
     // the system config (%ProgramData%\FerroGate\logs\mia.log). Every other run
     // logs to stdout, where systemd/launchd or the operator's terminal sees it.
     let (writer, ansi) = log_writer(service_log)?;
+    // The status endpoint's redacting log ring buffer (feature F18) sits under
+    // the same global filter, so it only ever holds what the daemon's own
+    // directive enables.
+    // Nothing reads the buffer when the endpoint is off, so hold no records.
+    let (log_records, log_bytes) = if primary_config.status_enabled() {
+        primary_config.log_buffer_limits()
+    } else {
+        (0, 0)
+    };
+    let logbuf = mia::logbuf::LogBuffer::new(log_records, log_bytes);
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt::layer().with_ansi(ansi).with_writer(writer))
+        .with(mia::logbuf::LogBufferLayer::new(Arc::clone(&logbuf)))
         .init();
     let log_reload: LogReload =
         Arc::new(move |directive: &str| match EnvFilter::try_new(directive) {
@@ -174,6 +188,11 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
         "FerroGate Machine Identity Agent"
     );
 
+    // The status endpoint is per process, configured from the primary config.
+    let status_endpoint = status_endpoint_config(&primary_config);
+    let status_rate_limit = primary_config.status_rate_limit();
+    let started = unix_now();
+
     // Build the set of environment instances to serve.
     let instances = if explicit {
         let label = config_source
@@ -186,6 +205,7 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
             tracing::debug!(env = %label, "no configuration file; using environment and defaults");
         }
         vec![EnvInstance {
+            status: mia::status::StatusHandle::new(&label, started),
             label,
             config: primary_config,
             source: config_source,
@@ -198,6 +218,7 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
                 label: "default".to_string(),
                 config: primary_config,
                 source: mia::config::ConfigSource::default(),
+                status: mia::status::StatusHandle::new("default", started),
             }]
         } else {
             tracing::info!(
@@ -223,6 +244,7 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
                     Ok((config, _)) => {
                         tracing::info!(env = %label, config = %d.path.display(), "loaded environment configuration");
                         instances.push(EnvInstance {
+                            status: mia::status::StatusHandle::new(&label, started),
                             label,
                             config,
                             source,
@@ -248,7 +270,14 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
     // seccomp filter is inherited by every tokio worker and `mlockall(MCL_FUTURE)`
     // covers their allocations, and before any TPM or network I/O. Fatal on
     // failure: a MIA that cannot harden must not serve.
-    prepare_and_harden(&instances)?;
+    let status_listener = prepare_and_harden(&instances, status_endpoint)?;
+    let status = status_listener.map(|prepared| {
+        let registry =
+            mia::status::StatusRegistry::new(instances.iter().map(|i| i.status.clone()).collect());
+        let service =
+            mia::status_server::StatusService::new(registry, Some(logbuf), status_rate_limit);
+        (prepared, service)
+    });
 
     // Build the multi-threaded runtime by hand (rather than `#[tokio::main]`) so
     // hardening runs first. `enable_all` wires the I/O and time drivers the
@@ -256,16 +285,49 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run_all(instances, log_reload))
+    runtime.block_on(run_all(instances, log_reload, status))
 }
 
+/// The status endpoint's parameters (feature F18), or `None` when it is
+/// disabled (`status.enable = false`) or misconfigured (logged; the daemon
+/// still serves — the endpoint is diagnostics, not identity).
+fn status_endpoint_config(
+    config: &mia::config::Config,
+) -> Option<mia::status_server::StatusEndpointConfig> {
+    if !config.status_enabled() {
+        tracing::info!("status endpoint disabled (status.enable = false)");
+        return None;
+    }
+    match mia::status_server::StatusEndpointConfig::from_config(config) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::error!(error = %e, "status endpoint misconfigured; not serving it");
+            None
+        }
+    }
+}
+
+/// Current Unix time in seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// The status listener paired with the service that answers on it.
+type StatusEndpoint = (
+    mia::status_server::PreparedEndpoint,
+    mia::status_server::StatusService,
+);
+
 /// One environment the daemon serves: its display label (`"default"` or the
-/// environment name), its loaded configuration, and the [`ConfigSource`] to
-/// re-read on SIGHUP.
+/// environment name), its loaded configuration, the [`ConfigSource`] to
+/// re-read on SIGHUP, and the status handle the status endpoint reports from.
 struct EnvInstance {
     label: String,
     config: mia::config::Config,
     source: mia::config::ConfigSource,
+    status: mia::status::StatusHandle,
 }
 
 /// Parse the daemon's config-source flags from `args`: `--config`/`-c <path>`
@@ -424,6 +486,7 @@ fn print_usage() {
          \x20 machine-id        print this host's fingerprint-derived machine identity\n\
          \x20 x509-svid         inspect the machine-bound X.509-SVID store\n\
          \x20 test              check CMIS connectivity and helper-token issuance\n\
+         \x20 status            report each environment's state from the running agent\n\
          \x20 service           manage the Windows service (install/uninstall/start/stop)\n\
          \n\
          options:\n\
@@ -456,8 +519,24 @@ fn print_usage() {
 // The serve path holds a composite key (~4 KB ML-DSA) across awaits during
 // attestation; the large future is inherent, not a bug.
 #[allow(clippy::large_futures)]
-async fn run_all(instances: Vec<EnvInstance>, log_reload: LogReload) -> anyhow::Result<()> {
+async fn run_all(
+    instances: Vec<EnvInstance>,
+    log_reload: LogReload,
+    status: Option<StatusEndpoint>,
+) -> anyhow::Result<()> {
     use std::collections::HashSet;
+
+    // The read-only status endpoint (feature F18) runs beside the helper
+    // listeners for the life of the process.
+    if let Some((prepared, service)) = status {
+        tokio::spawn(async move {
+            if let Err(e) =
+                mia::status_server::serve(prepared, service, std::future::pending()).await
+            {
+                tracing::error!(error = %e, "status endpoint stopped");
+            }
+        });
+    }
 
     // Keep only environments that actually serve a socket, rejecting duplicates
     // so the second bind on a shared path can't crash-loop the first.
@@ -465,14 +544,20 @@ async fn run_all(instances: Vec<EnvInstance>, log_reload: LogReload) -> anyhow::
     let mut serveable: Vec<EnvInstance> = Vec::new();
     for inst in instances {
         match inst.config.helper_socket() {
-            None => tracing::info!(
-                env = %inst.label,
-                "no helper socket configured for this environment; not serving it"
-            ),
+            None => {
+                tracing::info!(
+                    env = %inst.label,
+                    "no helper socket configured for this environment; not serving it"
+                );
+                inst.status
+                    .set_not_configured(mia_status_proto::error_codes::HELPER_NOT_CONFIGURED);
+            }
             Some(socket) => {
                 if seen_sockets.insert(socket.to_path_buf()) {
                     serveable.push(inst);
                 } else {
+                    inst.status
+                        .set_not_configured(mia_status_proto::error_codes::HELPER_NOT_CONFIGURED);
                     // Name the likely culprit when the colliding path matches a
                     // process-wide FERROGATE_HELPER_SOCKET override.
                     let from_env_override = std::env::var_os("FERROGATE_HELPER_SOCKET")
@@ -532,10 +617,11 @@ async fn serve_one(instance: EnvInstance, log_reload: LogReload) -> anyhow::Resu
         label,
         config,
         source,
+        status,
     } = instance;
     let span = tracing::info_span!("env", environment = %label);
     async move {
-        if let Err(e) = start_helper_api(&config, source, log_reload).await {
+        if let Err(e) = start_helper_api(&config, source, log_reload, status).await {
             tracing::error!(error = %e, "environment helper API exited with error");
             return Err(e);
         }
@@ -548,8 +634,13 @@ async fn serve_one(instance: EnvInstance, log_reload: LogReload) -> anyhow::Resu
 /// Serve one environment (fallback for platforms with no helper transport).
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 async fn serve_one(instance: EnvInstance, log_reload: LogReload) -> anyhow::Result<()> {
-    let EnvInstance { config, source, .. } = instance;
-    start_helper_api(&config, source, log_reload).await
+    let EnvInstance {
+        config,
+        source,
+        status,
+        ..
+    } = instance;
+    start_helper_api(&config, source, log_reload, status).await
 }
 
 /// Build the platform's caller authenticator (Linux: SO_PEERCRED + IMA).
@@ -636,6 +727,7 @@ async fn start_helper_api(
     config: &mia::config::Config,
     config_source: mia::config::ConfigSource,
     log_reload: LogReload,
+    status: mia::status::StatusHandle,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let socket_path = config
@@ -648,6 +740,7 @@ async fn start_helper_api(
         build_auth(config),
         config_source,
         log_reload,
+        status,
     )
     .await
 }
@@ -716,10 +809,32 @@ fn prefetched_facts() -> Option<&'static ferro_machineid::MachineFacts> {
 /// SVID seed — are created and handed to the `_ferrogate` user. Only then does
 /// [`hardening::harden`] drop privileges. Fatal on failure: a MIA that cannot
 /// harden must not serve.
-fn prepare_and_harden(instances: &[EnvInstance]) -> anyhow::Result<()> {
+///
+/// The status socket (feature F18) is bound here too, before the runtime-path
+/// preparation and the hardening profile: it needs `chown`, which the seccomp
+/// filter forbids, and must be created while its directory is still
+/// root-owned. A status-endpoint failure is logged, never fatal.
+fn prepare_and_harden(
+    instances: &[EnvInstance],
+    status: Option<mia::status_server::StatusEndpointConfig>,
+) -> anyhow::Result<Option<mia::status_server::PreparedEndpoint>> {
     // Prefetch the fingerprint on every platform so attestation reads it the
     // same way; on Linux it is the only chance to read the root-only DMI files.
     prefetch_machine_facts();
+
+    let prepare_status = |cfg: mia::status_server::StatusEndpointConfig| {
+        let path = cfg.path.clone();
+        match mia::status_server::prepare(cfg) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => {
+                tracing::error!(
+                    error = %e, endpoint = %path.display(),
+                    "could not bind the status endpoint; serving without it"
+                );
+                None
+            }
+        }
+    };
 
     #[cfg(target_os = "linux")]
     {
@@ -733,8 +848,16 @@ fn prepare_and_harden(instances: &[EnvInstance]) -> anyhow::Result<()> {
                 dirs.push(parent.to_path_buf());
             }
         }
+        // Bind first, while the runtime directory is still root-owned (systemd
+        // recreates it per start); then hand the directories over and let the
+        // status group traverse to the socket.
+        let prepared = status.and_then(prepare_status);
         mia::hardening::prepare_runtime_paths(&dirs)?;
+        if let Some(p) = &prepared {
+            mia::status_server::grant_group_traverse(p);
+        }
         mia::hardening::harden()?;
+        Ok(prepared)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -742,8 +865,12 @@ fn prepare_and_harden(instances: &[EnvInstance]) -> anyhow::Result<()> {
         tracing::debug!(
             "hardening profile (seccomp/mlockall/privilege-drop) applies on Linux only"
         );
+        let prepared = status.and_then(prepare_status);
+        if let Some(p) = &prepared {
+            mia::status_server::grant_group_traverse(p);
+        }
+        Ok(prepared)
     }
-    Ok(())
 }
 
 /// Load the persistent 32-byte SVID seed, generating and persisting a fresh one
@@ -752,7 +879,8 @@ fn prepare_and_harden(instances: &[EnvInstance]) -> anyhow::Result<()> {
 /// stored with the same protection as `host-key.bin` rather than separately
 /// sealed.
 fn load_or_create_svid_seed(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
-    use rand_core::{OsRng, RngCore};
+    use getrandom::SysRng;
+    use rand_core::{Rng as _, UnwrapErr};
 
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -770,7 +898,7 @@ fn load_or_create_svid_seed(path: &std::path::Path) -> std::io::Result<[u8; 32]>
         Err(e) => return Err(e),
     }
     let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
+    UnwrapErr(SysRng).fill_bytes(&mut seed);
     write_secret_file(path, &seed)?;
     Ok(seed)
 }
@@ -818,14 +946,17 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
 #[allow(clippy::large_futures)] // holds a composite key (~4 KB ML-DSA) across awaits
 async fn bootstrap_host_svid_host_key(
     resolver: &mia::endpoint::CmisResolver,
+    status: &mia::status::StatusHandle,
 ) -> Option<HostSession> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use ferro_sep::MachineKey as _;
+    use mia::status::AttestFailure;
     use sha2::{Digest, Sha256};
 
     let Some(facts) = prefetched_facts() else {
         tracing::warn!("no hardware fingerprint available; host-key attestation skipped");
+        status.attest_failed(AttestFailure::Other);
         return None;
     };
     let key_path = host_key_path();
@@ -840,6 +971,7 @@ async fn bootstrap_host_svid_host_key(
         Ok(k) => k,
         Err(e) => {
             tracing::error!(error = %e, path = %key_path.display(), "cannot open machine signing key");
+            status.attest_failed(AttestFailure::Other);
             return None;
         }
     };
@@ -855,9 +987,11 @@ async fn bootstrap_host_svid_host_key(
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, cmis = %resolver.describe(), "could not connect to CMIS for attestation");
+            status.attest_failed(mia::status::AttestFailure::from_connect_error(&e));
             return None;
         }
     };
+    status.set_cmis_node(&endpoint);
     // Recover (or first-boot create) the persistent SVID seed so the composite
     // key — and therefore the child-signing kid and its JWKS entry — is stable
     // across restarts. If the seed cannot be persisted we fall back to an
@@ -881,6 +1015,7 @@ async fn bootstrap_host_svid_host_key(
             Ok(a) => a,
             Err(e) => {
                 tracing::error!(error = %e, "host-key attestation failed");
+                status.attest_failed(AttestFailure::from_attest_error(&e, false));
                 return None;
             }
         };
@@ -950,8 +1085,10 @@ fn tpm_available() -> bool {
 async fn bootstrap_host_svid(
     resolver: &mia::endpoint::CmisResolver,
     attest: &HostAttestConfig,
+    status: &mia::status::StatusHandle,
 ) -> Option<HostSession> {
     use mia::config::AttestBackend;
+    status.attest_started();
     let effective = match attest.backend {
         AttestBackend::Auto if tpm_available() && attest.tpm_ek_cert.is_some() => {
             tracing::info!(
@@ -974,12 +1111,20 @@ async fn bootstrap_host_svid(
         }
         other => other,
     };
-    match effective {
+    status.set_attest_backend(effective);
+    let session = match effective {
         AttestBackend::Auto => None, // unreachable: resolved above
-        AttestBackend::Tpm => bootstrap_host_svid_tpm(resolver, attest).await,
-        AttestBackend::HostKey => bootstrap_host_svid_host_key(resolver).await,
-        AttestBackend::VirtualTpm => bootstrap_host_svid_virtual_tpm(resolver).await,
+        AttestBackend::Tpm => bootstrap_host_svid_tpm(resolver, attest, status).await,
+        AttestBackend::HostKey => bootstrap_host_svid_host_key(resolver, status).await,
+        AttestBackend::VirtualTpm => bootstrap_host_svid_virtual_tpm(resolver, status).await,
+    };
+    if let Some(s) = &session {
+        status.attest_succeeded(&s.spiffe_id, s.issued_at, s.expires_at);
+        if let Some(backend) = s.x509_store {
+            status.set_x509_store(backend);
+        }
     }
+    session
 }
 
 /// Bootstrap the host SVID via the genuine **TPM 2.0** path (feature F02): drive
@@ -995,10 +1140,12 @@ async fn bootstrap_host_svid(
 async fn bootstrap_host_svid_tpm(
     resolver: &mia::endpoint::CmisResolver,
     attest: &HostAttestConfig,
+    status: &mia::status::StatusHandle,
 ) -> Option<HostSession> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use mia::client::AttestEvidence as _;
+    use mia::status::AttestFailure;
     use mia::tpm::{TpmEngine, TpmEvidence};
     use sha2::{Digest, Sha256};
 
@@ -1007,12 +1154,14 @@ async fn bootstrap_host_svid_tpm(
             "attestation.backend = \"tpm\" but attestation.tpm.ek_cert is not configured; \
              refusing to attest (fail closed)"
         );
+        status.attest_failed(AttestFailure::TpmUnavailable);
         return None;
     };
     let ek_cert = match std::fs::read(ek_cert_path) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, path = %ek_cert_path.display(), "cannot read attestation.tpm.ek_cert");
+            status.attest_failed(AttestFailure::TpmUnavailable);
             return None;
         }
     };
@@ -1022,6 +1171,7 @@ async fn bootstrap_host_svid_tpm(
             Ok(b) => ek_intermediates.push(b),
             Err(e) => {
                 tracing::error!(error = %e, path = %p.display(), "cannot read an attestation.tpm.ek_intermediates entry");
+                status.attest_failed(AttestFailure::TpmUnavailable);
                 return None;
             }
         }
@@ -1031,6 +1181,7 @@ async fn bootstrap_host_svid_tpm(
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "cannot open the TPM device (/dev/tpmrm0); refusing to attest (fail closed)");
+            status.attest_failed(AttestFailure::TpmUnavailable);
             return None;
         }
     };
@@ -1038,6 +1189,7 @@ async fn bootstrap_host_svid_tpm(
         Ok(ev) => ev,
         Err(e) => {
             tracing::error!(error = %e, "cannot initialize TPM attestation evidence (EK/AIK)");
+            status.attest_failed(AttestFailure::TpmUnavailable);
             return None;
         }
     };
@@ -1048,13 +1200,16 @@ async fn bootstrap_host_svid_tpm(
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, cmis = %resolver.describe(), "could not connect to CMIS for attestation");
+            status.attest_failed(mia::status::AttestFailure::from_connect_error(&e));
             return None;
         }
     };
+    status.set_cmis_node(&endpoint);
     let attested = match mia::client::run_attest(&mut client, &mut evidence, dpop_jkt).await {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(error = %e, "TPM attestation failed");
+            status.attest_failed(AttestFailure::from_attest_error(&e, true));
             return None;
         }
     };
@@ -1074,11 +1229,13 @@ async fn bootstrap_host_svid_tpm(
 async fn bootstrap_host_svid_tpm(
     _resolver: &mia::endpoint::CmisResolver,
     _attest: &HostAttestConfig,
+    status: &mia::status::StatusHandle,
 ) -> Option<HostSession> {
     tracing::error!(
         "attestation.backend = \"tpm\" is only supported on Linux (it needs a TSS2 stack); \
          refusing to attest (fail closed). Use \"host-key\" on this platform."
     );
+    status.attest_failed(mia::status::AttestFailure::TpmUnavailable);
     None
 }
 
@@ -1092,7 +1249,7 @@ fn host_session_from_attested(attested: mia::client::AttestedSvid) -> HostSessio
     // Put the X.509 half of the issuance somewhere it survives a restart —
     // sealed so it only opens on this machine. Best-effort: a host that cannot
     // seal keeps running with the in-memory credential.
-    persist_x509_credential(&attested);
+    let x509_store = persist_x509_credential(&attested);
 
     let mut parent = [0u8; 48];
     parent.copy_from_slice(&Sha384::digest(attested.bundle.jws.as_bytes()));
@@ -1104,6 +1261,9 @@ fn host_session_from_attested(attested: mia::client::AttestedSvid) -> HostSessio
     HostSession {
         spiffe_id: attested.bundle.spiffe_id.clone(),
         jws: attested.bundle.jws.clone(),
+        issued_at: attested.bundle.issued_at,
+        expires_at: attested.bundle.expires_at,
+        x509_store,
         minter: ChildTokenMinter::new(attested.svid_secret, cfg),
     }
 }
@@ -1120,13 +1280,16 @@ fn host_session_from_attested(attested: mia::client::AttestedSvid) -> HostSessio
 /// session. A host with neither a TPM nor a fingerprint gets no store at all,
 /// because the alternative — writing the key in the clear — is worse than
 /// re-attesting.
+///
+/// Returns the sealing backend's name when the credential was stored (for the
+/// status endpoint, feature F18).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn persist_x509_credential(attested: &mia::client::AttestedSvid) {
+fn persist_x509_credential(attested: &mia::client::AttestedSvid) -> Option<&'static str> {
     let leaf_der = attested.bundle.x509_svid.clone();
     let bundle_der = attested.bundle.x509_bundle.clone();
     if leaf_der.is_empty() || bundle_der.is_empty() {
         tracing::debug!("CMIS issued no X.509-SVID with this attestation; nothing to seal");
-        return;
+        return None;
     }
 
     let credential = mia::credstore::X509Credential {
@@ -1144,19 +1307,28 @@ fn persist_x509_credential(attested: &mia::client::AttestedSvid) {
         )
     });
     match outcome {
-        Some((backend, Ok(()))) => tracing::info!(
-            path = %path.display(),
-            backend,
-            "sealed the X.509-SVID to disk (opens only on this machine)"
-        ),
-        Some((backend, Err(e))) => tracing::warn!(
-            error = %e, backend, path = %path.display(),
-            "could not seal the X.509-SVID; it stays in memory for this session only"
-        ),
-        None => tracing::warn!(
-            "no TPM and no hardware fingerprint on this host: the X.509-SVID will not be \
-             stored, since writing its private key unsealed is not an option"
-        ),
+        Some((backend, Ok(()))) => {
+            tracing::info!(
+                path = %path.display(),
+                backend,
+                "sealed the X.509-SVID to disk (opens only on this machine)"
+            );
+            Some(backend)
+        }
+        Some((backend, Err(e))) => {
+            tracing::warn!(
+                error = %e, backend, path = %path.display(),
+                "could not seal the X.509-SVID; it stays in memory for this session only"
+            );
+            None
+        }
+        None => {
+            tracing::warn!(
+                "no TPM and no hardware fingerprint on this host: the X.509-SVID will not be \
+                 stored, since writing its private key unsealed is not an option"
+            );
+            None
+        }
     }
 }
 
@@ -1168,8 +1340,10 @@ fn persist_x509_credential(attested: &mia::client::AttestedSvid) {
 /// refusing after a firmware change looks exactly like this). A store that
 /// cannot be used is deleted so the next start does not retry a file that can
 /// never open again.
+///
+/// Returns the store's backend name when a credential opened (feature F18).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn report_stored_x509_credential() {
+fn report_stored_x509_credential() -> Option<&'static str> {
     let path = mia::credstore::store_path();
     let fingerprint = prefetched_facts().map(|f| f.fingerprint().as_bytes().to_vec());
     let now = i64::try_from(
@@ -1180,25 +1354,27 @@ fn report_stored_x509_credential() {
     )
     .unwrap_or(i64::MAX);
 
-    let Some(result) = mia::credstore::with_sealer(fingerprint.as_deref(), |sealer| {
+    let result = mia::credstore::with_sealer(fingerprint.as_deref(), |sealer| {
         mia::credstore::load(&path, sealer, now)
-    }) else {
-        return;
-    };
+    })?;
     match result {
-        Ok(None) => {}
-        Ok(Some(loaded)) => tracing::info!(
-            spiffe_id = %loaded.spiffe_id,
-            expires_in_secs = loaded.not_after - now,
-            backend = loaded.backend,
-            "recovered the sealed X.509-SVID from a previous run"
-        ),
+        Ok(None) => None,
+        Ok(Some(loaded)) => {
+            tracing::info!(
+                spiffe_id = %loaded.spiffe_id,
+                expires_in_secs = loaded.not_after - now,
+                backend = loaded.backend,
+                "recovered the sealed X.509-SVID from a previous run"
+            );
+            Some(loaded.backend)
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e, path = %path.display(),
                 "the stored X.509-SVID did not open on this host; discarding it and re-attesting"
             );
             mia::credstore::discard(&path);
+            None
         }
     }
 }
@@ -1220,6 +1396,7 @@ fn virtual_tpm_path() -> std::path::PathBuf {
 #[allow(clippy::large_futures)] // attestation future holds a composite key
 async fn bootstrap_host_svid_virtual_tpm(
     resolver: &mia::endpoint::CmisResolver,
+    status: &mia::status::StatusHandle,
 ) -> Option<HostSession> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
@@ -1236,6 +1413,7 @@ async fn bootstrap_host_svid_virtual_tpm(
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, path = %path.display(), "cannot open virtual-TPM state");
+            status.attest_failed(mia::status::AttestFailure::TpmUnavailable);
             return None;
         }
     };
@@ -1251,13 +1429,16 @@ async fn bootstrap_host_svid_virtual_tpm(
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, cmis = %resolver.describe(), "could not connect to CMIS for attestation");
+            status.attest_failed(mia::status::AttestFailure::from_connect_error(&e));
             return None;
         }
     };
+    status.set_cmis_node(&endpoint);
     let attested = match mia::client::run_attest(&mut client, &mut vtpm, dpop_jkt).await {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(error = %e, "virtual-TPM attestation failed");
+            status.attest_failed(mia::status::AttestFailure::from_attest_error(&e, true));
             return None;
         }
     };
@@ -1278,7 +1459,9 @@ async fn bootstrap_host_svid_virtual_tpm(
 ))]
 async fn bootstrap_host_svid_virtual_tpm(
     _resolver: &mia::endpoint::CmisResolver,
+    status: &mia::status::StatusHandle,
 ) -> Option<HostSession> {
+    status.attest_failed(mia::status::AttestFailure::TpmUnavailable);
     tracing::error!(
         "attestation.backend = \"virtual-tpm\" but mia was built without the `virtual-tpm` cargo \
          feature; refusing to attest (fail closed). Rebuild with `--features virtual-tpm` for \
@@ -1296,6 +1479,11 @@ struct HostSession {
     spiffe_id: String,
     /// The host's compact-JWS SVID, presented when proposing an allowlist.
     jws: String,
+    /// The SVID's issue and expiry times (Unix seconds), for status reporting.
+    issued_at: i64,
+    expires_at: i64,
+    /// The X.509-SVID store backend the credential was sealed under, if any.
+    x509_store: Option<&'static str>,
 }
 
 /// Extract the host UUID from a host SVID SPIFFE id (`spiffe://<td>/host/<uuid>`)
@@ -1694,6 +1882,7 @@ fn spawn_reattest_task<A>(
     ledger: mia::helper::CallerLedger,
     params: ReattestParams,
     clock: mia::helper::Clock,
+    status: mia::status::StatusHandle,
 ) where
     A: mia::helper::auth::CallerAuth,
 {
@@ -1709,7 +1898,8 @@ fn spawn_reattest_task<A>(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let Some(session) = bootstrap_host_svid(&resolver, &params.attest).await else {
+            let Some(session) = bootstrap_host_svid(&resolver, &params.attest, &status).await
+            else {
                 continue; // the failure is logged inside bootstrap; retry next tick
             };
             let spiffe_id = session.spiffe_id.clone();
@@ -1732,14 +1922,15 @@ fn spawn_reattest_task<A>(
             .await;
             match (params.allowlist_path.as_deref(), params.allowlist_key.as_deref()) {
                 (Some(path), Some(key)) => {
-                    match mia::helper::allowlist::load_at_startup(
+                    match mia::helper::allowlist::load_classified(
                         path,
                         key,
                         clock(),
                         params.allowlist_max_age_secs,
                     ) {
-                        Ok(al) => {
+                        Ok((al, outcome)) => {
                             let loaded = al.is_some();
+                            status.set_allowlist(outcome);
                             allowlist_reloader.set(al).await;
                             if loaded {
                                 tracing::info!("allowlist reloaded after re-attestation");
@@ -1789,6 +1980,7 @@ async fn serve<A>(
     auth: A,
     config_source: mia::config::ConfigSource,
     log_reload: LogReload,
+    status: mia::status::StatusHandle,
 ) -> anyhow::Result<()>
 where
     A: mia::helper::auth::CallerAuth,
@@ -1807,7 +1999,9 @@ where
     let (audit_tx, mut audit_rx) = mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(event) = audit_rx.recv().await {
-            tracing::info!(?event, "helper-api audit event");
+            // Own target: the status endpoint's log buffer never holds audit
+            // events (they carry caller pid/uid/binary hashes and token jtis).
+            tracing::info!(target: mia::logbuf::AUDIT_TARGET, ?event, "helper-api audit event");
         }
     });
 
@@ -1824,26 +2018,31 @@ where
         }
         Ok(None) => {
             tracing::warn!("CMIS not configured (no cmis.endpoint or cmis.srv); cannot attest");
+            status.set_not_configured(mia_status_proto::error_codes::CMIS_NOT_CONFIGURED);
             None
         }
         Err(e) => {
             tracing::error!(error = %e, "CMIS is misconfigured; cannot attest");
+            status.set_not_configured(mia_status_proto::error_codes::CMIS_MISCONFIGURED);
             None
         }
     };
+    status.set_attest_backend(config.attestation.backend);
 
     // Say up front whether the X.509-SVID sealed by a previous run still opens
     // on this host. It does not change what happens next — the daemon attests
     // regardless — but a store that stopped opening (a TPM refusing after a
     // firmware change) is worth surfacing at startup rather than at first use.
-    report_stored_x509_credential();
+    if let Some(backend) = report_stored_x509_credential() {
+        status.set_x509_store(backend);
+    }
 
     // Attest to CMIS first: a successful attestation yields the host SVID (and
     // thus the EK-derived identity that keys this host's allowlist) and the
     // token minter. When CMIS isn't configured or attestation fails, there is no
     // session — the helper API still serves but refuses to mint (`no_host_svid`).
     let session = match &resolver {
-        Some(r) => bootstrap_host_svid(r, &HostAttestConfig::from_config(config)).await,
+        Some(r) => bootstrap_host_svid(r, &HostAttestConfig::from_config(config), &status).await,
         None => None,
     };
     let host_spiffe_id = session.as_ref().map(|s| s.spiffe_id.clone());
@@ -1874,10 +2073,16 @@ where
         let key_path = config.allowlist.key.as_deref().context(
             "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing",
         )?;
-        mia::helper::allowlist::load_at_startup(path, key_path, clock(), max_age)
-            .with_context(|| format!("reading allowlist (allowlist.path) {}", path.display()))?
+        let (allowlist, outcome) =
+            mia::helper::allowlist::load_classified(path, key_path, clock(), max_age)
+                .with_context(|| {
+                    format!("reading allowlist (allowlist.path) {}", path.display())
+                })?;
+        status.set_allowlist(outcome);
+        allowlist
     } else {
         tracing::warn!("no allowlist configured; helper API denies all callers (fail closed)");
+        status.set_allowlist(mia::helper::allowlist::AllowlistLoad::Missing);
         None
     };
 
@@ -1895,6 +2100,7 @@ where
     // The CRL cache (feature F11) starts empty and the mint gate fails closed;
     // the puller's first verified pull (within seconds of startup) opens it.
     let crl = Arc::new(CrlCache::new());
+    status.set_crl_cache(Arc::clone(&crl));
     maybe_spawn_crl_puller(resolver.clone(), Arc::clone(&crl));
     let server = HelperServer::bind(
         helper_config,
@@ -1919,9 +2125,10 @@ where
         config_source,
         log_reload,
         clock.clone(),
+        status.clone(),
     );
     #[cfg(not(unix))]
-    let _ = (&config_source, &log_reload, &clock);
+    let _ = (&config_source, &log_reload, &clock, &status);
 
     // Optionally propose the callers the helper API observes back to CMIS, so a
     // host with no allowlist can bootstrap its own (subject to CMIS policy).
@@ -1958,6 +2165,7 @@ where
                     attest: HostAttestConfig::from_config(config),
                 },
                 clock.clone(),
+                status.clone(),
             );
         }
     }
@@ -1974,6 +2182,7 @@ async fn start_helper_api(
     _config: &mia::config::Config,
     _config_source: mia::config::ConfigSource,
     _log_reload: LogReload,
+    _status: mia::status::StatusHandle,
 ) -> anyhow::Result<()> {
     anyhow::bail!("unsupported platform: mia's helper API runs on Linux, macOS, and Windows")
 }
@@ -1999,6 +2208,7 @@ fn spawn_reload_task<A>(
     config_source: mia::config::ConfigSource,
     log_reload: LogReload,
     clock: mia::helper::Clock,
+    status: mia::status::StatusHandle,
 ) where
     A: mia::helper::auth::CallerAuth,
 {
@@ -2033,7 +2243,7 @@ fn spawn_reload_task<A>(
                 config.allowlist.path.as_deref(),
                 config.allowlist.key.as_deref(),
             ) {
-                match mia::helper::allowlist::load_at_startup(
+                match mia::helper::allowlist::load_classified(
                     path,
                     key_path,
                     clock(),
@@ -2041,8 +2251,9 @@ fn spawn_reload_task<A>(
                 ) {
                     // `load_at_startup` already logs loudly on a missing or
                     // non-verifying body; here we only note the swap outcome.
-                    Ok(al) => {
+                    Ok((al, outcome)) => {
                         let loaded = al.is_some();
+                        status.set_allowlist(outcome);
                         reloader.set(al).await;
                         if loaded {
                             tracing::info!(
@@ -2060,6 +2271,7 @@ fn spawn_reload_task<A>(
                 tracing::warn!(
                     "no allowlist configured after reload; serving deny-all (fail closed)"
                 );
+                status.set_allowlist(mia::helper::allowlist::AllowlistLoad::Missing);
                 reloader.set(None).await;
             }
         }

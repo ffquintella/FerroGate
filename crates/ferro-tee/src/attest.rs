@@ -29,7 +29,8 @@
 //! the verifier-supplied challenge.
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_384};
 
@@ -226,7 +227,7 @@ impl SoftwareAttestor {
     /// and TDX reports identically.
     #[must_use]
     pub fn generate_as(kind: AttestorKind, measurement: Measurement) -> Self {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let pk = sk.verifying_key().to_bytes();
 
         // Sealing root: HKDF-equivalent — SHA3-384(sk || measurement) truncated.

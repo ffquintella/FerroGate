@@ -26,6 +26,8 @@ $prevEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
     & (Join-Path $env:SystemRoot 'System32\net.exe') localgroup FerroGateClients /delete *> $null
+    # The status group (feature F18) created by the installer.
+    & (Join-Path $env:SystemRoot 'System32\net.exe') localgroup FerroGateStatus /delete *> $null
 } finally {
     $ErrorActionPreference = $prevEap
 }

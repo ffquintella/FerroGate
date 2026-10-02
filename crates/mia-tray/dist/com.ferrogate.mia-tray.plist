@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent (login item) for the FerroGate MIA tray companion (feature F18).
+
+  Installed by `make pkg-macos` to /Library/LaunchAgents, so it starts in
+  every user's GUI (Aqua) session at login, unprivileged. Quitting the tray
+  ends it for the session (no KeepAlive). To disable it for one user:
+      launchctl bootout gui/$(id -u)/com.ferrogate.mia-tray
+  and remove the login item in System Settings → General → Login Items.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ferrogate.mia-tray</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/mia-tray</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

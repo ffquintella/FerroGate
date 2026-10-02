@@ -7,7 +7,8 @@
 use std::time::Duration;
 
 use ferro_svid::rotation_at;
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use rand_core::{Rng as _, UnwrapErr};
 
 /// A uniform jitter sample in `[0, 1)` from the OS CSPRNG, suitable for
 /// [`ferro_svid::rotation_delay_secs`].
@@ -15,7 +16,7 @@ use rand_core::{OsRng, RngCore};
 #[allow(clippy::cast_precision_loss)] // 53-bit value into an f64 mantissa is exact.
 pub fn random_jitter() -> f64 {
     // 53-bit mantissa worth of randomness mapped into [0, 1).
-    let x = OsRng.next_u64() >> 11;
+    let x = UnwrapErr(SysRng).next_u64() >> 11;
     (x as f64) / ((1u64 << 53) as f64)
 }
 

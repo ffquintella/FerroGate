@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/cmis",
     "crates/mia",
+    "crates/mia-status-proto",
+    "crates/mia-tray",
     "crates/ferro-crypto",
     "crates/ferro-transport",
     "crates/ferro-attest",
@@ -70,20 +72,21 @@ ciborium   = "0.2"
 hostname = "0.4"
 
 # crypto (placeholders pinned now, used in later milestones)
-sha3          = "0.11"
+sha3          = "0.12"
 zeroize       = { version = "1.8", features = ["zeroize_derive"] }
-ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
-rand_core     = { version = "0.6", features = ["std"] }
+ed25519-dalek = { version = "3", features = ["rand_core", "zeroize"] }
+rand_core     = "0.10"
+getrandom     = { version = "0.4", features = ["sys_rng"] }
 ring          = "0.17"
 sha2          = "0.11"
 subtle        = "2.6"
 hex           = "0.4"
 hkdf          = "0.13"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 fips204       = "0.4"
 base64        = "0.22"
 der           = { version = "0.8", features = ["alloc", "derive", "oid"] }
-p256          = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p256          = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 
 # TLS stack (F01)
 rustls              = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"] }

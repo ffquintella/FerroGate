@@ -32,6 +32,36 @@ try {
     $ErrorActionPreference = $prevEap
 }
 
+# 1b. The status group (feature F18): members may read the agent's read-only
+#     status endpoint (the mia-tray companion, `mia status`); the daemon grants
+#     it on the status pipe DACL (status.group, default FerroGateStatus), so it
+#     must exist before the service starts. The installing user is added when
+#     it is a real account (not SYSTEM / a machine account, as under SCCM);
+#     the membership applies from that user's next logon.
+Write-Host 'Ensuring the FerroGateStatus local group exists...'
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $netExe localgroup FerroGateStatus *> $null
+    if ($LASTEXITCODE -ne 0) {
+        & $netExe localgroup FerroGateStatus /add /comment:"FerroGate MIA status readers (mia-tray)" *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create the FerroGateStatus local group (net.exe exit code $LASTEXITCODE)."
+        }
+        Write-Host 'Created local group FerroGateStatus.'
+    }
+    $installer = $env:USERNAME
+    if ($installer -and $installer -ne 'SYSTEM' -and -not $installer.EndsWith('$')) {
+        $member = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$installer" } else { $installer }
+        & $netExe localgroup FerroGateStatus $member /add *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Added $member to FerroGateStatus (applies from the next logon)."
+        }
+    }
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+
 # 2. Add the install dir to the system PATH (Chocolatey records it for clean
 #    removal on uninstall).
 Install-ChocolateyPath -PathToInstall $installDir -PathType 'Machine'

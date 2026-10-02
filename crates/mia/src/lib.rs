@@ -16,6 +16,9 @@
 //! - [`hardening`] — the startup defence-in-depth profile (feature F12): the
 //!   fail-closed IMA check and the policy that drives the `ferro-harden`
 //!   syscall wrappers (mlockall, seccomp, privilege drop).
+//! - [`status`], [`status_server`], [`logbuf`], [`status_cli`] — the
+//!   read-only status endpoint the `mia-tray` companion and `mia status` read
+//!   (feature F18); its wire types live in the `mia-status-proto` crate.
 //!
 //! `unsafe` is forbidden in this crate (see `docs/features/F12-mia-hardening.md`);
 //! every privileged syscall lives in the `ferro-harden` (Linux) and
@@ -50,6 +53,25 @@ pub mod selftest;
 
 /// Interactive `mia setup` configuration wizard (rich-terminal prompts).
 pub mod setup;
+
+/// Non-interactive `mia setup --check / --apply / --dump` (feature F18).
+pub mod setup_apply;
+
+/// Per-environment status model: what the status endpoint reports (F18).
+pub mod status;
+
+/// The status endpoint listener (UDS / named pipe) and request handling (F18).
+pub mod status_server;
+
+/// `mia status` — read the status endpoint from the command line (F18).
+pub mod status_cli;
+
+/// Redacting in-memory ring buffer of the daemon's log records (F18).
+pub mod logbuf;
+
+// The status endpoint promises the helper protocol's framing bound; keep the
+// two constants from drifting apart.
+const _: () = assert!(mia_status_proto::MAX_FRAME_LEN == helper::proto::MAX_FRAME_LEN);
 
 /// TPM 2.0 attestation glue and PCR sealing (features F02/F04). Linux-only:
 /// needs a TSS2 stack.

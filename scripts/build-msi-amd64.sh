@@ -12,7 +12,8 @@
 #   2. fedora       — build the MSI with wixl (Debian/Ubuntu msitools no longer
 #      ships wixl; Fedora's does) and assemble the Chocolatey/NuGet package.
 #
-# The MSI installs mia.exe and registers + starts the mia service. The nupkg
+# The MSI installs mia.exe and registers + starts the mia service, plus the
+# mia-tray.exe desktop companion with a Startup entry (MIA_TRAY=0 to omit). The nupkg
 # additionally creates the FerroGateClients group and adds the install dir to
 # PATH before invoking the MSI (see crates/mia/nuget/ and crates/mia/wix/).
 #
@@ -52,6 +53,7 @@ echo "==> [1/2] cross-compiling mia.exe in rust:bookworm…"
 docker run --rm --platform linux/amd64 \
   -v "$PWD":/work -w /work \
   -e CARGO_TERM_COLOR=always \
+  -e MIA_TRAY="${MIA_TRAY:-1}" \
   rust:bookworm bash -euo pipefail -c '
     echo "==> installing cross toolchain (clang/lld/nasm/cmake)…"
     apt-get update -qq
@@ -59,6 +61,13 @@ docker run --rm --platform linux/amd64 \
     rustup target add x86_64-pc-windows-msvc
     cargo install cargo-xwin --quiet
     cargo xwin build --release -p mia --bin mia --target x86_64-pc-windows-msvc
+    # The mia-tray desktop companion (feature F18). Optional: MIA_TRAY=0
+    # skips it, and a failed cross-compile only drops it from the MSI.
+    rm -f target/x86_64-pc-windows-msvc/release/mia-tray.exe
+    if [ "$MIA_TRAY" != 0 ]; then
+      cargo xwin build --release -p mia-tray --features gui --bin mia-tray --target x86_64-pc-windows-msvc \
+        || echo "WARNING: mia-tray.exe did not build; the MSI will ship without the tray"
+    fi
   '
 BINDIR=target/x86_64-pc-windows-msvc/release
 [ -f "$BINDIR/mia.exe" ] || { echo "ERROR: $BINDIR/mia.exe was not produced" >&2; exit 1; }
@@ -89,10 +98,21 @@ docker run --rm --platform linux/amd64 \
     # helper API'\''s default-on Authenticode caller check.
     [ -z "${WIN_SIGN:-}" ] || sign_file "$BINDIR/mia.exe"
 
+    # The tray (if it was built) is signed the same way, and shipped with a
+    # per-machine Startup entry; without it the TRAY block is stripped.
+    WXS=crates/mia/wix/mia.wxs
+    if [ -f "$BINDIR/mia-tray.exe" ]; then
+      [ -z "${WIN_SIGN:-}" ] || sign_file "$BINDIR/mia-tray.exe"
+    else
+      WXS="$(mktemp --suffix=.wxs)"
+      sed -e "/<!-- TRAY-BEGIN/,/<!-- TRAY-END -->/d" -e "/<!-- TRAY-REF -->/d" crates/mia/wix/mia.wxs > "$WXS"
+      echo "NOTE: building the MSI without mia-tray (mia-tray.exe not built)"
+    fi
+
     echo "==> building MSI with wixl…"
     mkdir -p target/wix
     MSI="target/wix/ferrogate-mia-${VERSION}-x64.msi"
-    wixl --arch x64 -D Version="$VERSION" -D BinDir="$BINDIR" -o "$MSI" crates/mia/wix/mia.wxs
+    wixl --arch x64 -D Version="$VERSION" -D BinDir="$BINDIR" -o "$MSI" "$WXS"
     [ -z "${WIN_SIGN:-}" ] || sign_file "$MSI"
 
     echo "==> assembling Chocolatey/NuGet package…"

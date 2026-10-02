@@ -152,6 +152,18 @@ pub enum AuditEvent {
         /// Short, stable opcode for the refusal.
         reason: String,
     },
+    /// A MIA configuration file was rewritten non-interactively by
+    /// `mia setup --apply` (feature F18) — typically on behalf of the tray
+    /// wizard, behind an OS consent prompt. Carries key *names* only, never
+    /// values.
+    ConfigChanged {
+        /// The configuration file that was written.
+        path: String,
+        /// The invoking (pre-elevation) user id (Windows: the user RID).
+        by_uid: u32,
+        /// Dotted names of the keys whose value changed (e.g. `cmis.endpoint`).
+        keys: Vec<String>,
+    },
 }
 
 /// Failure modes for event codec.

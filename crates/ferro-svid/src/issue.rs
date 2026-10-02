@@ -334,7 +334,7 @@ mod tests {
         let mut p = params();
         p.ttl_secs = crate::MAX_TTL_SECS + 999_999;
         let svid = issuer.issue(&p, 1_000_000).unwrap();
-        assert_eq!(svid.exp - svid.iat, crate::MAX_TTL_SECS as i64);
+        assert_eq!(svid.exp - svid.iat, crate::MAX_TTL_SECS.cast_signed());
     }
 
     #[test]

@@ -13,7 +13,8 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ferro_crypto::composite::{CompositeError, CompositeSecretKey, COMPOSITE_JOSE_ALG};
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use rand_core::{Rng as _, UnwrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::helper::auth::CallerIdentity;
@@ -150,7 +151,7 @@ impl ChildTokenMinter {
         let exp = now + i64::from(ttl);
 
         let mut jti = [0u8; 16];
-        OsRng.fill_bytes(&mut jti);
+        UnwrapErr(SysRng).fill_bytes(&mut jti);
 
         let actor_bin = hex::encode(actor.bin_sha);
         // `bin_sha[:16]` in the design note is the first 16 hex chars (8 bytes).

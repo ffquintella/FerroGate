@@ -96,3 +96,38 @@
 # closed). It only succeeds against a CMIS configured to trust the software
 # EK root and PCR digest logged at startup. Never use in production.
 #backend = "host-key"
+
+# --- Status endpoint (feature F18) -------------------------------------------
+# A read-only local endpoint, separate from the helper socket, that the
+# mia-tray companion and `mia status` read: per-environment state (SVID
+# validity, CMIS node, CRL age, allowlist state, attestation backend) and a
+# redacted tail of the daemon's own log. It never carries tokens, SVIDs, keys,
+# pins or caller identities, and accepts no write requests. Read from the
+# primary configuration only (a [status] table in mia-<env>.toml is ignored).
+[status]
+# Serve the endpoint. Default: true. Env: FERROGATE_STATUS_ENABLE.
+#enable = true
+# Listener: a Unix socket (Linux/macOS) or a named pipe (Windows). Defaults:
+#   Linux   /run/ferrogate/mia-status.sock
+#   macOS   /var/run/ferrogate/mia-status.sock
+#   Windows \\.\pipe\ferrogate-mia-status
+# Env: FERROGATE_STATUS_SOCKET.
+#socket = "/run/ferrogate/mia-status.sock"
+# Who may read status. Unix: the socket is 0660 and owned by this group —
+# give the numeric gid in `socket_gid`, or a group *name* in `group` that is
+# listed in /etc/group (default "ferrogate-status"; directory-service-only
+# groups, e.g. macOS dscl groups, need socket_gid). Windows: the local group
+# granted on the pipe DACL besides SYSTEM and Administrators (default
+# "FerroGateStatus"). Env: FERROGATE_STATUS_SOCKET_GID, FERROGATE_STATUS_GROUP.
+#socket_gid = "991"
+#group = "ferrogate-status"
+# Requests per second allowed per caller uid. Default: 10.
+# Env: FERROGATE_STATUS_RATE_LIMIT.
+#rate_limit_per_sec = 10
+# Log ring buffer served to the tray's log viewer: at most this many records
+# and about this many bytes (whichever is hit first); 0 disables it. Records
+# are redacted before they are buffered, and only levels the `log` directive
+# above already enables are kept. Defaults: 2000 records, 1048576 bytes.
+# Env: FERROGATE_STATUS_LOG_RECORDS, FERROGATE_STATUS_LOG_BYTES.
+#log_buffer_records = 2000
+#log_buffer_bytes = 1048576

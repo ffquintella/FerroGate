@@ -46,6 +46,9 @@ ferro-svid   = { path = "../ferro-svid" }
 ferro-svid-verify = { path = "../ferro-svid-verify" }
 ferro-sep       = { path = "../ferro-sep" }
 ferro-machineid = { path = "../ferro-machineid" }
+# Status-endpoint wire types (feature F18), shared with the `mia-tray`
+# companion so it never depends on the daemon crate itself.
+mia-status-proto = { path = "../mia-status-proto" }
 
 tokio              = { workspace = true }
 tokio-stream       = { workspace = true }
@@ -61,6 +64,7 @@ tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
 thiserror          = { workspace = true }
 rand_core          = { workspace = true }
+getrandom          = { workspace = true }
 sha2               = { workspace = true }
 hex                = { workspace = true }
 hostname           = { workspace = true }
@@ -97,6 +101,7 @@ p256              = { workspace = true }
 sha2              = { workspace = true }
 ed25519-dalek     = { workspace = true }
 rand_core         = { workspace = true }
+getrandom         = { workspace = true }
 serde_json        = { workspace = true }
 base64            = { workspace = true }
 
@@ -108,6 +113,12 @@ ring      = { workspace = true }
 # All hardening FFI (prctl / mlockall / seccomp / setuid / capset) lives in
 # `ferro-harden`, keeping `mia` itself `#![forbid(unsafe_code)]` (feature F12).
 ferro-harden = { path = "../ferro-harden" }
+
+# Unix: `open(2)` flag constants only (`O_NOFOLLOW`, `O_NONBLOCK`) for reading
+# untrusted `mia setup --apply` drafts — no libc *calls*, so `mia` stays
+# `#![forbid(unsafe_code)]`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # The Windows named-pipe helper transport delegates all FFI (client PID, image
 # attestation, ACL) to `ferro-winauth`, keeping `mia` itself `forbid(unsafe)`.

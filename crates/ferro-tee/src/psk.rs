@@ -29,13 +29,12 @@
 //! caller surfaces the verified peer measurement so callers can refuse to
 //! send a share to an attested-but-not-approved peer.
 
-use hkdf::Hkdf;
-use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
-use rand_core::OsRng;
+use getrandom::SysRng;
+use hkdf::SimpleHkdf;
+use ml_kem::ml_kem_768::{DecapsulationKey, EncapsulationKey};
+use ml_kem::{Ciphertext, Decapsulate, Encapsulate, Kem, KeyExport, MlKem768, TryKeyInit};
+use rand_core::UnwrapErr;
 use sha3::{Digest, Sha3_384};
-
-type EkSize = <<MlKem768 as KemCore>::EncapsulationKey as EncodedSizeUser>::EncodedSize;
 
 use crate::attest::{verify_report, Attestor, PeerRoots, Report};
 use crate::error::TeeError;
@@ -89,7 +88,7 @@ fn psk_bind(label: &[u8], parts: &[&[u8]]) -> Vec<u8> {
 }
 
 fn derive_psk(ss: &[u8], transcript: &[u8]) -> [u8; PSK_LEN] {
-    let hk = Hkdf::<Sha3_384>::new(Some(transcript), ss);
+    let hk = SimpleHkdf::<Sha3_384>::new(Some(transcript), ss);
     let mut out = [0u8; PSK_LEN];
     hk.expand(b"ferro-tee-psk-v1", &mut out)
         .expect("HKDF-Expand of 32 bytes from SHA3-384 always succeeds");
@@ -98,7 +97,7 @@ fn derive_psk(ss: &[u8], transcript: &[u8]) -> [u8; PSK_LEN] {
 
 /// Per-handshake state held by the initiator between `start` and `finish`.
 pub struct Initiator {
-    dk: <MlKem768 as KemCore>::DecapsulationKey,
+    dk: DecapsulationKey,
     ek_bytes: Vec<u8>,
     nonce_i: [u8; 32],
     nonce_r_offered: [u8; 32],
@@ -113,8 +112,8 @@ impl Initiator {
         nonce_i: [u8; 32],
         nonce_r_offered: [u8; 32],
     ) -> (Self, Msg1) {
-        let (dk, ek) = MlKem768::generate(&mut OsRng);
-        let ek_bytes = ek.as_bytes().to_vec();
+        let (dk, ek) = MlKem768::generate_keypair_from_rng(&mut UnwrapErr(SysRng));
+        let ek_bytes = ek.to_bytes().to_vec();
         let bound = psk_bind(b"initiator", &[&nonce_r_offered, &ek_bytes]);
         let report_i = attestor.produce(nonce_r_offered, &bound);
         let msg = Msg1 {
@@ -155,7 +154,7 @@ impl Initiator {
         }
         let ct = Ciphertext::<MlKem768>::try_from(msg2.ct_bytes.as_slice())
             .map_err(|_| TeeError::MlKem)?;
-        let ss = self.dk.decapsulate(&ct).map_err(|()| TeeError::MlKem)?;
+        let ss = self.dk.decapsulate(&ct);
         let transcript = {
             let mut h = Sha3_384::new();
             h.update(b"ferro-tee-psk-transcript-v1");
@@ -189,10 +188,8 @@ pub fn respond(
     if !allowlist.contains(&peer_measurement) {
         return Err(TeeError::MeasurementNotAllowed);
     }
-    let ek_array: ml_kem::array::Array<u8, EkSize> =
-        ml_kem::array::Array::try_from(msg1.ek_bytes.as_slice()).map_err(|_| TeeError::MlKem)?;
-    let ek = <<MlKem768 as KemCore>::EncapsulationKey as EncodedSizeUser>::from_bytes(&ek_array);
-    let (ct, ss) = ek.encapsulate(&mut OsRng).map_err(|()| TeeError::MlKem)?;
+    let ek = EncapsulationKey::new_from_slice(&msg1.ek_bytes).map_err(|_| TeeError::MlKem)?;
+    let (ct, ss) = ek.encapsulate_with_rng(&mut UnwrapErr(SysRng));
     let ct_bytes = ct.as_slice().to_vec();
     let bound_r = psk_bind(b"responder", &[&msg1.nonce_i, &msg1.ek_bytes, &ct_bytes]);
     let report_r = attestor.produce(msg1.nonce_i, &bound_r);

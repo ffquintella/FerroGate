@@ -273,6 +273,11 @@ mod tests {
     /// field entirely (a pre-field encoding shape) decodes to `None`.
     #[test]
     fn wildcard_uid_roundtrips_and_missing_field_defaults_to_none() {
+        #[derive(serde::Serialize)]
+        struct OnlySha {
+            bin_sha: String,
+        }
+
         let sha = hex::encode([0xCC; 48]);
         let mut buf = Vec::new();
         ciborium::into_writer(
@@ -287,10 +292,6 @@ mod tests {
         assert_eq!(back.uid, None);
 
         // A map carrying only `bin_sha` (no `uid` key) must default to None.
-        #[derive(serde::Serialize)]
-        struct OnlySha {
-            bin_sha: String,
-        }
         let mut buf = Vec::new();
         ciborium::into_writer(&OnlySha { bin_sha: sha }, &mut buf).unwrap();
         let back: AllowEntry = ciborium::from_reader(&buf[..]).unwrap();

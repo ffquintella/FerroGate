@@ -30,4 +30,3 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 rcgen     = { workspace = true }
-rand_core = { workspace = true }

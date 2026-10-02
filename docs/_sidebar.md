@@ -12,6 +12,7 @@
 - Components
   - [CMIS server](cmis.md)
   - [MIA agent](mia.md)
+  - [MIA tray companion](mia-tray.md)
   - [Helper API](helper-api.md)
   - [Allowlist provisioning](allowlist-provisioning.md)
   - [Audit log](audit.md)
@@ -47,6 +48,7 @@
   - [F13 — Bootstrap & enrollment](features/F13-bootstrap-enrollment.md)
   - [F14 — Root key ceremony](features/F14-root-key-ceremony.md)
   - [F17 — X.509-SVID profile](features/F17-x509-svid.md)
+  - [F18 — MIA tray companion](features/F18-mia-tray.md)
 
 - Decisions
   - [ADR index](adr/README.md)

@@ -37,7 +37,8 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use cmis::fleet_manifest::{FleetManifest, MachinePubkey, SignedFleetManifest};
 use ferro_attest::TrustedKeys;
 use ferro_crypto::composite::{CompositePublicKey, CompositeSecretKey};
-use rand_core::{OsRng, RngCore as _};
+use getrandom::SysRng;
+use rand_core::{Rng as _, UnwrapErr};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -216,7 +217,7 @@ fn cmd_keygen(opts: &Opts) -> Result<()> {
         resolve_seed(v)?
     } else {
         let mut s = [0u8; 32];
-        OsRng.fill_bytes(&mut s);
+        UnwrapErr(SysRng).fill_bytes(&mut s);
         s
     };
     let (_sk, pk) = CompositeSecretKey::from_seed(&seed);

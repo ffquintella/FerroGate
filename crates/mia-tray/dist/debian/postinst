@@ -1,0 +1,28 @@
+#!/bin/sh
+# postinst for the ferrogate-mia-tray package (feature F18); also used as the
+# RPM %post script (crates/mia-tray/Cargo.toml).
+#
+# Creates the `ferrogate-status` group whose members may read the MIA status
+# endpoint (mode 0660, group-owned by it), and adds the installing user when
+# the package manager tells us who that is (SUDO_USER under `sudo apt` /
+# `sudo dnf`). The tray itself needs no privilege.
+set -e
+
+GROUP=ferrogate-status
+
+if ! getent group "$GROUP" >/dev/null 2>&1; then
+    groupadd --system "$GROUP"
+    echo "ferrogate-mia-tray: created group $GROUP"
+fi
+
+INSTALLER="${SUDO_USER:-}"
+if [ -n "$INSTALLER" ] && [ "$INSTALLER" != "root" ] && id "$INSTALLER" >/dev/null 2>&1; then
+    usermod -aG "$GROUP" "$INSTALLER" || true
+    echo "ferrogate-mia-tray: added $INSTALLER to $GROUP (log out and back in for it to apply)"
+else
+    echo "ferrogate-mia-tray: add desktop users to $GROUP:  sudo usermod -aG $GROUP <user>"
+fi
+
+# The daemon resolves the group name when it binds the status socket.
+echo "ferrogate-mia-tray: restart the agent so its status socket uses the group:  sudo systemctl restart mia"
+exit 0

@@ -19,6 +19,7 @@
 use anyhow::Context as _;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use std::fmt::Write as _;
 
 const USAGE: &str = "usage: mia x509-svid [--pem] [--bundle-pem]";
 
@@ -133,7 +134,7 @@ fn pem(label: &str, der: &[u8]) -> String {
         out.push_str(core::str::from_utf8(chunk).unwrap_or_default());
         out.push('\n');
     }
-    out.push_str(&format!("-----END {label}-----\n"));
+    let _ = writeln!(out, "-----END {label}-----");
     out
 }
 

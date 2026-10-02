@@ -20,6 +20,7 @@ use ferro_attest::{PolicyId, RimStore, TpmQuoteVerifier, Vendor, VendorTrustStor
 
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{Signature, SigningKey};
+use p256::elliptic_curve::Generate as _;
 use sha2::{Digest, Sha256, Sha384};
 
 // --- wire-structure builders -------------------------------------------------
@@ -178,9 +179,9 @@ fn verifier_for(ek: &Ek, pcr_digest: [u8; 48]) -> TpmQuoteVerifier {
 #[test]
 fn full_quote_verifies_end_to_end() {
     let nonce = [0x5Au8; 32];
-    let aik = SigningKey::random(&mut rand_core::OsRng);
+    let aik = SigningKey::generate();
     let vk = aik.verifying_key();
-    let pt = vk.to_encoded_point(false);
+    let pt = vk.to_sec1_point(false);
 
     let aik_pub = marshal_aik_public(
         pt.x().unwrap(),
@@ -222,8 +223,8 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let nonce = [0x5Au8; 32];
-    let aik = SigningKey::random(&mut rand_core::OsRng);
-    let pt = aik.verifying_key().to_encoded_point(false);
+    let aik = SigningKey::generate();
+    let pt = aik.verifying_key().to_sec1_point(false);
     let aik_pub = marshal_aik_public(
         pt.x().unwrap(),
         pt.y().unwrap(),
@@ -315,7 +316,7 @@ fn missing_pcr_value_is_rejected() {
 fn non_restricted_aik_is_rejected() {
     let f = fixture();
     // Re-marshal the AIK pub with the restricted bit cleared.
-    let pt = f.aik.verifying_key().to_encoded_point(false);
+    let pt = f.aik.verifying_key().to_sec1_point(false);
     let attrs = GOOD_AIK_ATTRS & !TPMA_RESTRICTED;
     let aik_pub = marshal_aik_public(pt.x().unwrap(), pt.y().unwrap(), attrs, TPM_ALG_ECDSA);
     let sig = sign_quote(&f.aik, &f.quote.blob);
@@ -385,7 +386,7 @@ fn unknown_pcr_state_not_in_rim_is_rejected() {
 #[test]
 fn signature_from_wrong_key_is_rejected() {
     let f = fixture();
-    let attacker = SigningKey::random(&mut rand_core::OsRng);
+    let attacker = SigningKey::generate();
     let sig = sign_quote(&attacker, &f.quote.blob);
     let verifier = verifier_for(&f.ek, f.quote.pcr_digest);
     let v = QuoteVerification {

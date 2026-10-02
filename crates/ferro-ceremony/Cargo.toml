@@ -22,6 +22,3 @@ serde_json = { workspace = true }
 base64     = { workspace = true }
 hex        = { workspace = true }
 sha3       = { workspace = true }
-
-[dev-dependencies]
-rand_core = { workspace = true }

@@ -81,8 +81,27 @@
       </Component>
     </DirectoryRef>
 
+    <!-- TRAY-BEGIN: the mia-tray desktop companion (feature F18).
+         scripts/build-msi-amd64.sh strips this block (and the ComponentRef
+         below) when mia-tray.exe was not built (MIA_TRAY=0, or its
+         cross-compile failed), so the agent MSI never depends on it. -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="MiaTrayExe" Guid="5D1C7E3A-2B4F-4A8E-9C61-3F0B8E2D7A15">
+        <File Id="miaTrayExe" Name="mia-tray.exe" Source="$(var.BinDir)/mia-tray.exe" KeyPath="yes" />
+        <!-- Startup entry: start the (unprivileged) tray at every user's
+             logon. Removed with the component on uninstall. -->
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="FerroGateMiaTray"
+                       Type="string"
+                       Value="&quot;[INSTALLDIR]mia-tray.exe&quot;" />
+      </Component>
+    </DirectoryRef>
+    <!-- TRAY-END -->
+
     <Feature Id="Main" Title="FerroGate MIA" Level="1">
       <ComponentRef Id="MiaExe" />
+      <ComponentRef Id="MiaTrayExe" /><!-- TRAY-REF -->
     </Feature>
   </Product>
 </Wix>

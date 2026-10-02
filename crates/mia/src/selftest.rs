@@ -19,7 +19,9 @@
 //!
 //! Every failing step prints targeted remediation hints (mirroring the
 //! runbooks under `docs/operations/runbooks/`), and the command exits non-zero
-//! so provisioning scripts can gate on it. Like `mia setup`, this is a client
+//! so provisioning scripts can gate on it. `--json` (feature F18) prints the
+//! same results as one machine-readable JSON document instead (the tray's
+//! "run self-test" action and diagnostics bundle consume it). Like `mia setup`, this is a client
 //! command: it runs without the daemon's hardening profile and never *drives*
 //! the TPM — it only probes for one (a cheap, read-only device open) to report,
 //! informationally, whether a hardware root of trust is present and whether the
@@ -55,20 +57,128 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     };
 
     let (config, source) = Config::load(opts.config.as_deref(), opts.environment.as_deref())?;
-    println!(
-        "FerroGate MIA self-test (mia {})",
-        env!("CARGO_PKG_VERSION")
-    );
-    match &source {
-        Some(path) => println!("config: {}", path.display()),
-        None => println!("config: none found — using environment and defaults"),
+    if opts.json {
+        JSON_SINK.with(|sink| *sink.borrow_mut() = Some(JsonReport::default()));
+    } else {
+        println!(
+            "FerroGate MIA self-test (mia {})",
+            env!("CARGO_PKG_VERSION")
+        );
+        match &source {
+            Some(path) => println!("config: {}", path.display()),
+            None => println!("config: none found — using environment and defaults"),
+        }
+        println!();
     }
-    println!();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run_checks(&config, &opts.audience))
+    let failures = runtime.block_on(run_checks(&config, &opts.audience));
+
+    if opts.json {
+        let report = JSON_SINK
+            .with(|sink| sink.borrow_mut().take())
+            .unwrap_or_default();
+        let doc = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "config": source,
+            "environment": opts.environment,
+            "passed": failures.is_empty(),
+            "failures": failures,
+            "checks": report.checks,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+    } else {
+        println!();
+        if failures.is_empty() {
+            println!("all checks passed — the helper API is emitting tokens.");
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("self-test failed: {}", failures.join(", "));
+    }
+}
+
+/// One check's outcome in `--json` mode.
+#[derive(Debug, Clone, serde::Serialize)]
+struct CheckRecord {
+    /// Stable identifier (`configuration`, `cmis_connection`, …).
+    id: String,
+    /// The human label (`[2/5] CMIS connection`).
+    step: String,
+    /// `ok`, `FAIL`, `skip`, `info` or `warn`.
+    status: String,
+    /// One-line detail.
+    detail: String,
+    /// Remediation hints (failing checks).
+    hints: Vec<String>,
+    /// Extra per-check lines (e.g. SRV candidates tried).
+    notes: Vec<String>,
+}
+
+/// The `--json` collector: while set, [`report`] / [`hints`] / [`note`]
+/// record instead of printing.
+#[derive(Debug, Default)]
+struct JsonReport {
+    checks: Vec<CheckRecord>,
+    /// Notes printed before the check they belong to is reported.
+    pending_notes: Vec<String>,
+}
+
+thread_local! {
+    // The self-test runs on a current-thread runtime, so every check reports
+    // on this thread.
+    static JSON_SINK: std::cell::RefCell<Option<JsonReport>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A stable id from a step label: `[2/5] CMIS connection` → `cmis_connection`.
+fn check_id(step: &str) -> String {
+    let label = step.split_once("] ").map_or(step, |(_, rest)| rest);
+    label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Print (or, with `--json`, record) a detail line that precedes the check it
+/// belongs to.
+fn note(line: &str) {
+    let recorded = JSON_SINK.with(|sink| {
+        sink.borrow_mut()
+            .as_mut()
+            .map(|r| r.pending_notes.push(line.trim().to_string()))
+            .is_some()
+    });
+    if !recorded {
+        println!("{line}");
+    }
+}
+
+/// Print (or record against the last check) a detail line that follows it.
+fn note_after(line: &str) {
+    let recorded = JSON_SINK.with(|sink| {
+        sink.borrow_mut()
+            .as_mut()
+            .map(|r| {
+                if let Some(last) = r.checks.last_mut() {
+                    last.notes.push(line.trim().to_string());
+                }
+            })
+            .is_some()
+    });
+    if !recorded {
+        println!("{line}");
+    }
 }
 
 /// Parsed `mia test` command-line options.
@@ -80,6 +190,8 @@ struct Opts {
     environment: Option<String>,
     /// `--audience <aud>` for the test mint.
     audience: String,
+    /// `--json`: one machine-readable document instead of the human report.
+    json: bool,
 }
 
 impl Opts {
@@ -89,6 +201,7 @@ impl Opts {
         let mut config = None;
         let mut environment = None;
         let mut audience = DEFAULT_AUDIENCE.to_string();
+        let mut json = false;
         let mut it = args.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -108,6 +221,7 @@ impl Opts {
                     let aud = it.next().context("--audience requires a value")?;
                     audience.clone_from(aud);
                 }
+                "--json" => json = true,
                 other => anyhow::bail!("unknown argument: {other}\n\n{USAGE}"),
             }
         }
@@ -115,12 +229,13 @@ impl Opts {
             config,
             environment,
             audience,
+            json,
         }))
     }
 }
 
 const USAGE: &str =
-    "usage: mia test [--config <path> | --environment <env>] [--audience <aud>]";
+    "usage: mia test [--config <path> | --environment <env>] [--audience <aud>] [--json]";
 
 fn print_help() {
     println!(
@@ -139,6 +254,8 @@ fn print_help() {
          \x20 -e, --environment <env> select mia-<env>.toml from the standard config\n\
          \x20                         locations instead of mia.toml; excludes --config\n\
          \x20 -a, --audience <aud>    audience for the test token (default {DEFAULT_AUDIENCE})\n\
+         \x20     --json              print the results as one JSON document (same exit\n\
+         \x20                         status)\n\
          \x20 -h, --help              show this help"
     );
 }
@@ -155,9 +272,9 @@ enum ServerCrl {
     Unknown,
 }
 
-/// Execute the four checks in order, printing as it goes. Returns an error —
-/// and therefore a non-zero exit — if any check failed.
-async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
+/// Execute the checks in order, reporting as it goes. Returns the names of
+/// the checks that failed (empty ⇒ all passed).
+async fn run_checks(config: &Config, audience: &str) -> Vec<&'static str> {
     let mut failures: Vec<&str> = Vec::new();
 
     // 1. configuration ----------------------------------------------------
@@ -239,13 +356,7 @@ async fn run_checks(config: &Config, audience: &str) -> anyhow::Result<()> {
         failures.push("helper token mint");
     }
 
-    println!();
-    if failures.is_empty() {
-        println!("all checks passed — the helper API is emitting tokens.");
-        Ok(())
-    } else {
-        anyhow::bail!("self-test failed: {}", failures.join(", "));
-    }
+    failures
 }
 
 /// Step 1: build the CMIS resolver from `config` — a single static endpoint, or
@@ -300,11 +411,11 @@ async fn connect_best(
         .await
         .context("resolving CMIS candidates")?;
     if resolver.is_srv() {
-        println!(
+        note(&format!(
             "        SRV {} resolved to {} candidate(s):",
             resolver.describe(),
             candidates.len()
-        );
+        ));
     }
     let pins = resolver.pins().to_vec();
     let mut last_err: Option<String> = None;
@@ -314,19 +425,22 @@ async fn connect_best(
         {
             Ok(Ok(client)) => {
                 if resolver.is_srv() {
-                    println!("          ✓ {ep}");
+                    note(&format!("          ✓ {ep}"));
                 }
                 return Ok((ep.clone(), client));
             }
             Ok(Err(e)) => {
                 if resolver.is_srv() {
-                    println!("          ✗ {ep}: {e}");
+                    note(&format!("          ✗ {ep}: {e}"));
                 }
                 last_err = Some(format!("{ep}: {e}"));
             }
             Err(_) => {
                 if resolver.is_srv() {
-                    println!("          ✗ {ep}: timed out after {}s", STEP_TIMEOUT.as_secs());
+                    note(&format!(
+                        "          ✗ {ep}: timed out after {}s",
+                        STEP_TIMEOUT.as_secs()
+                    ));
                 }
                 last_err = Some(format!("{ep}: timed out"));
             }
@@ -379,7 +493,7 @@ async fn check_cluster_identity(resolver: &CmisResolver) -> bool {
             Ok(key) => probes.push((ep.clone(), key)),
             Err(e) => {
                 unreachable += 1;
-                println!("          ✗ {ep}: {e:#}");
+                note(&format!("          ✗ {ep}: {e:#}"));
             }
         }
     }
@@ -416,7 +530,11 @@ async fn check_cluster_identity(resolver: &CmisResolver) -> bool {
             ),
         );
         for (key, eps) in &groups {
-            println!("          key {} ⇐ {}", key_fp(key), eps.join(", "));
+            note_after(&format!(
+                "          key {} ⇐ {}",
+                key_fp(key),
+                eps.join(", ")
+            ));
         }
         hints(&[
             "Behind one SRV name a client fetches an allowlist signed by one node but verifies it \
@@ -1016,13 +1134,45 @@ fn report_attestation(config: &Config) {
     report("attestation", status, &detail);
 }
 
-/// Print one aligned check line.
+/// Print one aligned check line (or, with `--json`, record it).
 fn report(step: &str, status: &str, detail: &str) {
-    println!("{step:<28} {status:<5} {detail}");
+    let recorded = JSON_SINK.with(|sink| {
+        sink.borrow_mut()
+            .as_mut()
+            .map(|r| {
+                let notes = std::mem::take(&mut r.pending_notes);
+                r.checks.push(CheckRecord {
+                    id: check_id(step),
+                    step: step.to_string(),
+                    status: status.to_string(),
+                    detail: detail.to_string(),
+                    hints: Vec::new(),
+                    notes,
+                });
+            })
+            .is_some()
+    });
+    if !recorded {
+        println!("{step:<28} {status:<5} {detail}");
+    }
 }
 
-/// Print indented hint lines under a failing check.
+/// Print indented hint lines under a failing check (or, with `--json`,
+/// attach them to the last recorded check).
 fn hints(lines: &[String]) {
+    let recorded = JSON_SINK.with(|sink| {
+        sink.borrow_mut()
+            .as_mut()
+            .map(|r| {
+                if let Some(last) = r.checks.last_mut() {
+                    last.hints.extend(lines.iter().cloned());
+                }
+            })
+            .is_some()
+    });
+    if recorded {
+        return;
+    }
     for line in lines {
         println!("        - {line}");
     }
@@ -1058,6 +1208,45 @@ mod tests {
         let opts = Opts::parse(&args).unwrap().unwrap();
         assert_eq!(opts.environment.as_deref(), Some("staging"));
         assert!(opts.config.is_none());
+    }
+
+    #[test]
+    fn json_mode_collects_checks_instead_of_printing() {
+        assert!(Opts::parse(&["--json".to_string()]).unwrap().unwrap().json);
+        JSON_SINK.with(|sink| *sink.borrow_mut() = Some(JsonReport::default()));
+        note("        SRV x resolved to 2 candidate(s):");
+        report("[2/5] CMIS connection", "FAIL", "no reachable CMIS node");
+        hints(&["check DNS".to_string()]);
+        note_after("          key abc ⇐ a, b");
+        report("attestation", "info", "host-key");
+        let r = JSON_SINK.with(|sink| sink.borrow_mut().take()).unwrap();
+        assert_eq!(r.checks.len(), 2);
+        assert_eq!(r.checks[0].id, "cmis_connection");
+        assert_eq!(r.checks[0].status, "FAIL");
+        assert_eq!(r.checks[0].hints, vec!["check DNS".to_string()]);
+        assert_eq!(r.checks[0].notes.len(), 2);
+        assert_eq!(r.checks[1].id, "attestation");
+        let v = serde_json::to_value(&r.checks).unwrap();
+        assert_eq!(v[0]["detail"], "no reachable CMIS node");
+    }
+
+    #[test]
+    fn json_self_test_without_cmis_reports_failures() {
+        // No CMIS configured: the run fails, but `--json` still yields a
+        // complete document (exercised through the real check pipeline).
+        JSON_SINK.with(|sink| *sink.borrow_mut() = Some(JsonReport::default()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let failures = rt.block_on(run_checks(&Config::default(), DEFAULT_AUDIENCE));
+        let r = JSON_SINK.with(|sink| sink.borrow_mut().take()).unwrap();
+        assert!(failures.contains(&"configuration"));
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.id == "configuration" && c.status == "FAIL"));
+        assert!(r.checks.iter().any(|c| c.id == "helper_token_mint"));
     }
 
     #[test]

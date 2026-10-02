@@ -1,0 +1,26 @@
+[package]
+name        = "mia-status-proto"
+description = "FerroGate — MIA status-endpoint wire types (feature F18): read-only status and log-tail messages"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+# Deliberately tiny: the `mia-tray` companion (and any other status client)
+# depends on this crate instead of on `mia` itself, so it never pulls in the
+# TPM stack, the gRPC client, or any key-handling code. Keep it that way — no
+# runtime, no crypto, no I/O beyond `std::io::{Read, Write}` framing.
+
+[lints]
+workspace = true
+
+[dependencies]
+serde     = { workspace = true }
+ciborium  = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+proptest   = { workspace = true }

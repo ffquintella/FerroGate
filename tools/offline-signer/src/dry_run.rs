@@ -15,7 +15,7 @@ struct DryRunOperator {
 
 fn random_seed() -> [u8; 32] {
     let mut s = [0u8; 32];
-    OsRng.fill_bytes(&mut s);
+    UnwrapErr(SysRng).fill_bytes(&mut s);
     s
 }
 

@@ -18,8 +18,16 @@ enum AuditEvent {
     KeyShareUsed { share_idx: u8,    mrenclave: [u8;48] },
     LocalGrant   { pid: u32, uid: u32, bin_sha: [u8;48], jti: [u8;16] },
     LocalDenied  { pid: u32, uid: u32, bin_sha: [u8;48], reason: &'static str },
+    ConfigChanged { path: String, by_uid: u32, keys: Vec<String> },
 }
 ```
+
+`ConfigChanged` (feature F18) is written by `mia setup --apply` when it
+rewrites a MIA configuration file non-interactively. It carries the file path,
+the invoking user id and the dotted *names* of the changed keys — never their
+values. Today it is appended to a local, append-only JSON-lines journal beside
+the configuration file (`config-audit.jsonl`); forwarding that journal to CMIS
+through `AppendAuditEvent` is a follow-up.
 
 No personally identifiable information is recorded. EK certificates and
 binary contents are referenced only by SHA-384 hash.

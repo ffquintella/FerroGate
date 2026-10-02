@@ -242,7 +242,7 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
 /// printing the outcome. Falls back to the manual restart hint when the signal
 /// can't be sent (no signal-reload path on this platform, or the service
 /// manager command fails — e.g. the agent isn't running as a managed service).
-fn signal_reload() {
+pub(crate) fn signal_reload() {
     let Some(cmd) = crate::setup::reload_command() else {
         println!(
             "\n--reload is not supported on this platform; restart the agent to load it:  {}",
@@ -265,6 +265,31 @@ fn signal_reload() {
             println!("  Load it with a restart instead:  {}", crate::setup::restart_hint());
         }
     }
+}
+
+/// Signal the running agent to reload (SIGHUP via the service manager)
+/// without printing anything — for `mia setup --apply --json`, whose stdout
+/// must stay one JSON document. Errors when the platform has no live reload
+/// or the service manager command fails.
+pub(crate) fn send_reload() -> anyhow::Result<()> {
+    let cmd = crate::setup::reload_command().with_context(|| {
+        format!(
+            "live reload is not supported on this platform; restart the agent:  {}",
+            crate::setup::restart_hint()
+        )
+    })?;
+    let status = std::process::Command::new(cmd[0])
+        .args(&cmd[1..])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("running `{}`", cmd[0]))?;
+    anyhow::ensure!(
+        status.success(),
+        "the reload command exited with {status}; restart the agent:  {}",
+        crate::setup::restart_hint()
+    );
+    Ok(())
 }
 
 /// Fetch the CMIS enrollment key and write it to `allowlist.key`, then report

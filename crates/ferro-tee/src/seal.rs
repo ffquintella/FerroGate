@@ -24,9 +24,10 @@
 //!    bound into the tag.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key as ChachaKey, Nonce};
-use hkdf::Hkdf;
-use rand_core::{OsRng, RngCore};
+use chacha20poly1305::ChaCha20Poly1305;
+use getrandom::SysRng;
+use hkdf::SimpleHkdf;
+use rand_core::{Rng as _, UnwrapErr};
 use serde::{Deserialize, Serialize};
 use sha3::Sha3_384;
 
@@ -54,7 +55,7 @@ pub struct SealedEnvelope {
 }
 
 fn derive_key(sealing_root: &[u8; 32], measurement: &Measurement, aad: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha3_384>::new(Some(measurement.as_bytes()), sealing_root);
+    let hk = SimpleHkdf::<Sha3_384>::new(Some(measurement.as_bytes()), sealing_root);
     let mut info = Vec::with_capacity(SEAL_INFO.len() + 8 + aad.len());
     info.extend_from_slice(SEAL_INFO);
     info.extend_from_slice(&(aad.len() as u64).to_be_bytes());
@@ -76,12 +77,12 @@ pub fn seal(
     let measurement = attestor.measurement();
     let sealing_root = attestor.sealing_root();
     let key = derive_key(&sealing_root, &measurement, aad);
-    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new((&key).into());
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut nonce_bytes);
     let ct = cipher
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            (&nonce_bytes).into(),
             Payload {
                 msg: plaintext,
                 aad,
@@ -107,10 +108,10 @@ pub fn unseal(attestor: &dyn Attestor, env: &SealedEnvelope) -> Result<Vec<u8>, 
     }
     let sealing_root = attestor.sealing_root();
     let key = derive_key(&sealing_root, &env.measurement, &env.aad);
-    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new((&key).into());
     cipher
         .decrypt(
-            Nonce::from_slice(&env.nonce),
+            (&env.nonce).into(),
             Payload {
                 msg: &env.ciphertext,
                 aad: &env.aad,

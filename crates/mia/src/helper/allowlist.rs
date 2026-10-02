@@ -177,6 +177,61 @@ impl Allowlist {
     pub fn not_after(&self) -> i64 {
         self.not_after
     }
+
+    /// Number of distinct entries (binary hashes, plus one for a binary-side
+    /// wildcard) — a count for status reporting, never the entries themselves.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.members.len() + usize::from(self.any_bin.is_some())
+    }
+}
+
+/// How a startup/reload allowlist load ended, for the status endpoint
+/// (feature F18). Carries counts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowlistLoad {
+    /// No allowlist configured, or no body file present.
+    Missing,
+    /// A body (or its key) is present but unusable: missing/unparseable key,
+    /// bad signature, expired, or not yet valid.
+    Invalid,
+    /// A verified allowlist is in force.
+    Loaded {
+        /// Distinct entries ([`Allowlist::entry_count`]).
+        entries: usize,
+        /// Hard expiry, Unix seconds.
+        not_after: i64,
+    },
+}
+
+impl AllowlistLoad {
+    /// Classify an already-verified allowlist.
+    #[must_use]
+    pub fn of(allowlist: &Allowlist) -> Self {
+        Self::Loaded {
+            entries: allowlist.entry_count(),
+            not_after: allowlist.not_after(),
+        }
+    }
+}
+
+/// [`load_at_startup`], also reporting *why* no allowlist is in force so the
+/// status endpoint can tell a missing allowlist from an invalid one. Logging
+/// and fail-closed behaviour are identical.
+pub fn load_classified(
+    path: &std::path::Path,
+    key_path: &std::path::Path,
+    now: i64,
+    max_age_secs: i64,
+) -> std::io::Result<(Option<Allowlist>, AllowlistLoad)> {
+    let present = path.exists();
+    let loaded = load_at_startup(path, key_path, now, max_age_secs)?;
+    let outcome = match (&loaded, present) {
+        (Some(al), _) => AllowlistLoad::of(al),
+        (None, false) => AllowlistLoad::Missing,
+        (None, true) => AllowlistLoad::Invalid,
+    };
+    Ok((loaded, outcome))
 }
 
 /// Load the configured allowlist from disk at daemon startup, failing closed.
@@ -549,5 +604,44 @@ mod tests {
             Some(&[0x42; 7]),
         );
         assert!(load_startup(&dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn classified_load_distinguishes_missing_invalid_and_loaded() {
+        let (sk, pk) = keypair();
+        let (_sk2, pk2) = keypair();
+        let classify = |dir: &std::path::Path| {
+            load_classified(
+                &dir.join("allowlist.cbor"),
+                &dir.join("allowlist.pub"),
+                1000,
+                86_400,
+            )
+            .unwrap()
+            .1
+        };
+        let ok = startup_dir(
+            "class-ok",
+            Some(&signed_bytes(&doc(1000), &sk)),
+            Some(&pk.to_concat_bytes()),
+        );
+        assert_eq!(
+            classify(&ok),
+            AllowlistLoad::Loaded {
+                entries: 1,
+                not_after: 4600
+            }
+        );
+        let missing = startup_dir("class-missing", None, Some(&pk.to_concat_bytes()));
+        assert_eq!(classify(&missing), AllowlistLoad::Missing);
+        let invalid = startup_dir(
+            "class-invalid",
+            Some(&signed_bytes(&doc(1000), &sk)),
+            Some(&pk2.to_concat_bytes()),
+        );
+        assert_eq!(classify(&invalid), AllowlistLoad::Invalid);
+        for d in [ok, missing, invalid] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

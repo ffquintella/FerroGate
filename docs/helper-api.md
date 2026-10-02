@@ -14,6 +14,19 @@ short-lived, sender-constrained tokens for a specific audience.
 The wire encoding is CBOR (`ciborium`). The protocol is request/response, one
 exchange per connection.
 
+### Separate status endpoint (F18)
+
+Read-only status for the `mia-tray` companion and `mia status` is served on a
+**different** endpoint — `/run/ferrogate/mia-status.sock` (Linux),
+`/var/run/ferrogate/mia-status.sock` (macOS), `\\.\pipe\ferrogate-mia-status`
+(Windows) — with its own access group (`ferrogate-status` /
+`FerroGateStatus`). It reuses this API's framing and frame bound but none of
+its trust: no caller allowlist applies (the payload is non-sensitive by
+construction), only `StatusReq` / `LogTailReq` are accepted, and a `HelperReq`
+sent there is refused (`unsupported_request`). Conversely the helper socket
+never answers status requests, so status polling never touches the
+token-minting path. See [mia.md](mia.md#status-endpoint-and-mia-status).
+
 ## Caller authentication
 
 The MIA does not trust the caller's claimed identity. It establishes the

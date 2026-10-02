@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use getrandom::SysRng;
 use parking_lot::Mutex;
-use rand_core::{OsRng, RngCore};
+use rand_core::{Rng as _, UnwrapErr};
 
 use ferro_attest::TpmQuoteVerifier;
 use ferro_audit::AuditLog;
@@ -556,7 +557,7 @@ impl CmisState {
     #[must_use]
     pub fn random_bytes<const N: usize>(&self) -> [u8; N] {
         let mut buf = [0u8; N];
-        OsRng.fill_bytes(&mut buf);
+        UnwrapErr(SysRng).fill_bytes(&mut buf);
         buf
     }
 

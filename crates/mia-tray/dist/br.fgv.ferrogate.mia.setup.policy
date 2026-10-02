@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  polkit actions for the FerroGate MIA tray companion (feature F18).
+
+  mia-tray runs a FIXED, closed set of mia commands elevated through pkexec:
+  "setup" in apply mode (a draft the user wrote, optionally for one
+  environment, with reload / enrollment-key fetch), "resync-allowlist" with
+  reload, and "refresh-key". No other program or argument is ever built.
+  pkexec selects the action by the program path only, so there is one action
+  per packaged location of mia, and the message shows the exact command line
+  ($(command_line)) the administrator is approving, whoever asked for it. Every request needs an administrator's
+  credentials (auth_admin: never cached, never granted to inactive or remote
+  sessions). Service start / stop / restart use "pkexec systemctl", which is
+  polkit's generic org.freedesktop.policykit.exec action.
+
+  Installed to /usr/share/polkit-1/actions/ by the ferrogate-mia-tray package.
+-->
+<policyconfig>
+  <vendor>FerroGate</vendor>
+  <vendor_url>https://github.com/ffquintella/FerroGate</vendor_url>
+
+  <action id="br.fgv.ferrogate.mia.setup">
+    <description>Change the FerroGate machine identity agent</description>
+    <description xml:lang="pt_BR">Alterar o agente de identidade de máquina FerroGate</description>
+    <message>Authentication is required to run "$(command_line)" as the super user (FerroGate MIA configuration or maintenance).</message>
+    <message xml:lang="pt_BR">É necessária autenticação para executar "$(command_line)" como superusuário (configuração ou manutenção do FerroGate MIA).</message>
+    <icon_name>security-high</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/mia</annotate>
+  </action>
+
+  <!-- The same action for a `make mia-install` binary in /usr/local/bin. -->
+  <action id="br.fgv.ferrogate.mia.setup.local">
+    <description>Change the FerroGate machine identity agent</description>
+    <description xml:lang="pt_BR">Alterar o agente de identidade de máquina FerroGate</description>
+    <message>Authentication is required to run "$(command_line)" as the super user (FerroGate MIA configuration or maintenance).</message>
+    <message xml:lang="pt_BR">É necessária autenticação para executar "$(command_line)" como superusuário (configuração ou manutenção do FerroGate MIA).</message>
+    <icon_name>security-high</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/mia</annotate>
+  </action>
+</policyconfig>

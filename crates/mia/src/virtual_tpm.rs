@@ -42,6 +42,7 @@ use ferro_attest::tpm::{
 };
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::elliptic_curve::Generate as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384};
 
@@ -70,7 +71,7 @@ fn push_tpm2b(b: &mut Vec<u8>, data: &[u8]) {
 /// with the attribute mask [`ferro_attest`]'s verifier requires. The scheme hash
 /// is SHA-256 (matching the quote signature); the PCR bank quoted is SHA-384.
 fn marshal_aik_public(vk: &VerifyingKey) -> Vec<u8> {
-    let pt = vk.to_encoded_point(false);
+    let pt = vk.to_sec1_point(false);
     let (x, y) = (
         pt.x().expect("uncompressed point has X"),
         pt.y().expect("uncompressed point has Y"),
@@ -237,7 +238,7 @@ impl VirtualTpm {
     /// Create a fresh, in-memory-only virtual TPM. Its identity is lost on drop;
     /// use [`VirtualTpm::open_or_create`] to persist it across restarts.
     pub fn ephemeral() -> Result<Self> {
-        let aik = SigningKey::random(&mut rand_core::OsRng);
+        let aik = SigningKey::generate();
         let (ek_cert, ek_root) = build_ek_chain()?;
         Ok(Self::assemble(aik, ek_cert, ek_root))
     }

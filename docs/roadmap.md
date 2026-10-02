@@ -332,6 +332,35 @@ and will not be implemented (see "Dropped scope" above). Verified with the
 the bump, `FAILED_PRECONDITION` after, one `PolicyEpochBumped` leaf) plus
 `clippy -D warnings`.
 
+### F18 — MIA tray companion
+
+- [x] Read-only status endpoint (`StatusReq` / `LogTailReq`) in a dedicated
+      listener, `mia-status-proto` wire crate, `mia status [--json]`,
+      `mia test --json`, redacting log ring buffer. (Phase 1.)
+- [x] `mia setup --check / --apply / --dump` with the `ConfigChanged` audit
+      event. (Phase 1.)
+- [x] `crates/mia-tray`: tray icon + menu (worst state wins, per-environment
+      detail), endpoint → `mia status` → `NotRunning` fallback, transition
+      notifications with de-duplication and rate limiting. (Phase 2.)
+- [x] Windows (egui, no web view): status, guided recovery over a closed set of
+      fixed `mia` commands with OS-consent elevation (`pkexec` / macOS admin
+      prompt / UAC; cancel ⇒ "cancelled"), setup wizard on private `0600`
+      drafts, log viewer, diagnostics bundle; English and Portuguese. (Phase 2.)
+- [~] Packaging: wired into `pkg-macos` (LaunchAgent), `pkg-win` (Startup
+      entry) and the opt-in Linux `ferrogate-mia-tray` package (XDG autostart,
+      polkit policy, status group); the package builds have not been run yet.
+- [ ] Agent states driven from the e2e harness; per-platform OS-level test that
+      a peer outside the status group cannot connect; end-to-end wizard and
+      consent-prompt runs.
+
+**F18 status: in progress.** The daemon side and the tray are implemented and
+unit-tested (`cargo test -p mia-tray -p mia-status-proto`; the GUI build with
+`make lint-tray` / `make test-tray`, and on all three desktop platforms in
+`.github/workflows/mia-tray.yml`). Open: the criteria above that need real
+packages, a real consent prompt or the e2e harness, and the ESI decision on
+whether the OS administrator prompt satisfies NRM §5.3.1 for configuration
+changes on workstations.
+
 ## Milestone M6 — Ceremony, drills, and production readiness
 
 ### F01 — Hybrid PQC TLS transport (continued)

@@ -21,6 +21,7 @@ reviewed in isolation, even though some have ordering dependencies.
 | F13 | [Zero-touch bootstrap and fleet enrollment](F13-bootstrap-enrollment.md) | CMIS, MIA | Done (fleet-manifest tool; pre-admission EK lookup) |
 | F14 | [Root key ceremony and rotation](F14-root-key-ceremony.md) | CMIS, offline | Done (offline-signer + ferro-ceremony; JWKS newer-preferred; staging dry-run) |
 | F17 | [X.509-SVID profile](F17-x509-svid.md) | CMIS, MIA | Done (issuance, reference verifier, machine-bound store: TPM / Secure Enclave / machine key); serving the credential to a workload pending |
+| F18 | [MIA tray companion](F18-mia-tray.md) | MIA | In progress (daemon side and `mia-tray` done; e2e state coverage, real-prompt and package-build verification pending) |
 
 For the planned ordering and progress tracking see
 [../roadmap.md](../roadmap.md).

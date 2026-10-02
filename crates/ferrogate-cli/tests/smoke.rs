@@ -283,6 +283,7 @@ async fn https_without_pin_or_readable_cert_errors_clearly() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one CRUD walk-through against a live server.
 async fn allowlist_set_show_list_get_delete_roundtrip() {
     let addr = spawn_plaintext_cmis().await;
     let endpoint = format!("http://{addr}");

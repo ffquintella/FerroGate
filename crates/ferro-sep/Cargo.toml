@@ -28,7 +28,7 @@ p256      = { workspace = true }
 sha2      = { workspace = true }
 hex       = { workspace = true }
 thiserror = { workspace = true }
-getrandom = "0.4"
+getrandom = { workspace = true }
 # Clone-resistant at-rest sealing of the software machine key (F16): HKDF-SHA256
 # derives an AEAD key from a machine-bound seal secret; ChaCha20-Poly1305 seals
 # the P-256 scalar so a key file copied to another host cannot be decrypted.

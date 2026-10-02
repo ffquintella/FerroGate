@@ -1,0 +1,17 @@
+[Desktop Entry]
+# XDG autostart entry for the FerroGate MIA tray companion (feature F18).
+# Installed to /etc/xdg/autostart by the opt-in `ferrogate-mia-tray` package;
+# a user disables it with "Startup Applications" or by copying this file to
+# ~/.config/autostart/ with Hidden=true.
+Type=Application
+Name=FerroGate MIA
+Name[pt_BR]=FerroGate MIA
+Comment=Status of this machine's FerroGate identity agent
+Comment[pt_BR]=Status do agente de identidade FerroGate desta máquina
+Exec=/usr/bin/mia-tray
+Icon=security-high
+Terminal=false
+Categories=System;Monitor;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5

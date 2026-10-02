@@ -433,9 +433,10 @@ struct Protection {
     all(target_os = "macos", feature = "secure-enclave")
 ))]
 fn fresh_dpk() -> Zeroizing<Vec<u8>> {
-    use rand_core::{OsRng, RngCore};
+    use getrandom::SysRng;
+    use rand_core::{Rng as _, UnwrapErr};
     let mut dpk = Zeroizing::new(vec![0u8; 32]);
-    OsRng.fill_bytes(&mut dpk);
+    UnwrapErr(SysRng).fill_bytes(&mut dpk);
     dpk
 }
 

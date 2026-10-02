@@ -27,7 +27,7 @@
 
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use p256::EncodedPoint;
+use p256::Sec1Point;
 
 #[cfg(all(target_os = "macos", feature = "secure-enclave"))]
 pub mod enclave;
@@ -106,9 +106,9 @@ fn verifying_key_from_spki(spki: &[u8]) -> Result<VerifyingKey, SepError> {
             spki.len()
         )));
     };
-    let point = EncodedPoint::from_bytes(point_bytes)
+    let point = Sec1Point::from_bytes(point_bytes)
         .map_err(|e| SepError::Malformed(format!("EC point: {e}")))?;
-    VerifyingKey::from_encoded_point(&point)
+    VerifyingKey::from_sec1_point(&point)
         .map_err(|e| SepError::Malformed(format!("verifying key: {e}")))
 }
 
@@ -274,7 +274,7 @@ impl SoftwareMachineKey {
 
 impl MachineKey for SoftwareMachineKey {
     fn public_spki_der(&self) -> Vec<u8> {
-        let point = self.verifying_key().to_encoded_point(false);
+        let point = self.verifying_key().to_sec1_point(false);
         spki_from_sec1(point.as_bytes())
     }
 
@@ -287,7 +287,7 @@ impl MachineKey for SoftwareMachineKey {
 // ---- Clone-resistant at-rest sealing (F16) ------------------------------
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
@@ -356,11 +356,11 @@ pub fn seal_bytes(
     getrandom::fill(&mut nonce).map_err(|e| SepError::KeyGen(format!("getrandom nonce: {e}")))?;
 
     let mut key_bytes = derive_seal_key(seal_secret, &salt, purpose)?;
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    let cipher = ChaCha20Poly1305::new((&key_bytes).into());
     let aad = seal_aad(purpose);
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            (&nonce).into(),
             Payload {
                 msg: plaintext,
                 aad: &aad,
@@ -407,11 +407,12 @@ pub fn unseal_bytes(
     let ciphertext = &blob[SEAL_HEADER_LEN..];
 
     let mut key_bytes = derive_seal_key(seal_secret, salt, purpose)?;
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    let cipher = ChaCha20Poly1305::new((&key_bytes).into());
     let aad = seal_aad(purpose);
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            <&Nonce>::try_from(nonce)
+                .map_err(|_| SepError::Malformed("seal nonce length".into()))?,
             Payload {
                 msg: ciphertext,
                 aad: &aad,

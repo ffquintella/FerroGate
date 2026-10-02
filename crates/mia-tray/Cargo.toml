@@ -1,0 +1,138 @@
+[package]
+name        = "mia-tray"
+description = "FerroGate — MIA tray companion (feature F18): unprivileged status indicator, setup wizard, guided recovery and log viewer"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+# Build hygiene (F18 phase 2). The crate is split in two:
+#
+# - a **headless core** (the library without features): endpoint client,
+#   state → presentation mapping, notification policy, command builders and
+#   elevation specs, wizard draft handling, log follower, diagnostics bundle.
+#   It needs no GUI system libraries, so it is built, linted and tested by the
+#   ordinary `make lint` / `make test` on every host;
+# - the **GUI** (`gui` feature, off by default): tray icon + menu (`tray-icon`
+#   / `muda`), windows (`eframe` / `egui`), notifications, clipboard and file
+#   dialogs. On Linux it links GTK 3 (`libgtk-3-dev`, `libxdo-dev`, and
+#   `libayatana-appindicator3` at runtime), which servers and CI images often
+#   lack. The `mia-tray` binary requires it; build it with `make tray`, lint it
+#   with `make lint-tray`, test it with `make test-tray`.
+#
+# The tray never depends on the `mia` crate (no TPM stack, gRPC client or key
+# handling): it talks to the daemon through `mia-status-proto` and by running
+# fixed `mia` command lines.
+
+[lib]
+name = "mia_tray"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mia-tray"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The desktop front end. See the note above.
+gui = [
+    "dep:eframe",
+    "dep:tray-icon",
+    "dep:notify-rust",
+    "dep:arboard",
+    "dep:rfd",
+    "dep:winit",
+    "dep:gtk",
+]
+
+[dependencies]
+mia-status-proto   = { path = "../mia-status-proto" }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+toml               = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+# A private 0700 per-user directory for wizard drafts, removed on drop (so the
+# tray also cleans up after an elevated `mia setup --apply`, which leaves the
+# draft to its owner).
+tempfile   = "3"
+# The OS UI language (English / Portuguese string table).
+sys-locale = "0.3"
+
+# ── GUI (feature `gui`) ──────────────────────────────────────────────────────
+# Native rendering only — no embedded web view, so log text and config values
+# have no HTML/JS injection surface.
+eframe      = { version = "0.33", optional = true }
+tray-icon   = { version = "0.24", optional = true }
+notify-rust = { version = "4.17", optional = true }
+arboard     = { version = "3.6", optional = true }
+# GTK 3 file dialog on Linux (the tray already needs GTK there), native
+# dialogs on macOS / Windows.
+rfd         = { version = "0.15", optional = true, default-features = false, features = ["gtk3"] }
+
+# The tray process's event loop: winit on macOS / Windows; GTK on Linux, where
+# the StatusNotifierItem menu lives in a GTK main loop.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+winit = { version = "0.30", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
+# Windows: the Program Files and Windows directories for the elevation trust
+# rule come from HKLM, not from environment variables the user controls.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+# ── Linux packaging (opt-in package `ferrogate-mia-tray`) ─────────────────────
+# A separate package from `ferrogate-mia`, so servers never pull in GTK.
+# `make pkg-deb-tray` / `make pkg-rpm-tray`. Asset paths are relative to this
+# crate (deb) / the workspace root (rpm).
+[package.metadata.deb]
+name = "ferrogate-mia-tray"
+maintainer = "FerroGate contributors <https://github.com/ffquintella/FerroGate>"
+copyright = "FerroGate contributors"
+extended-description = """\
+Desktop companion for the FerroGate Machine Identity Agent: a tray icon that \
+shows whether the agent is healthy, a setup wizard, guided recovery and a \
+redacted log viewer. Unprivileged; holds no key material."""
+section = "admin"
+priority = "optional"
+features = ["gui"]
+depends = "ferrogate-mia, libgtk-3-0, libxdo3, libayatana-appindicator3-1, policykit-1 | polkitd, pkexec | policykit-1"
+maintainer-scripts = "dist/debian"
+assets = [
+    ["../../target/release/mia-tray", "usr/bin/", "755"],
+    ["dist/mia-tray.desktop", "etc/xdg/autostart/mia-tray.desktop", "644"],
+    ["dist/br.fgv.ferrogate.mia.setup.policy", "usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy", "644"],
+    ["../../docs/mia-tray.md", "usr/share/doc/ferrogate-mia-tray/mia-tray.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "ferrogate-mia-tray"
+summary = "FerroGate MIA tray companion (desktop)"
+license = "Apache-2.0"
+assets = [
+    { source = "target/release/mia-tray", dest = "/usr/bin/mia-tray", mode = "755" },
+    { source = "crates/mia-tray/dist/mia-tray.desktop", dest = "/etc/xdg/autostart/mia-tray.desktop", mode = "644" },
+    { source = "crates/mia-tray/dist/br.fgv.ferrogate.mia.setup.policy", dest = "/usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy", mode = "644" },
+    { source = "docs/mia-tray.md", dest = "/usr/share/doc/ferrogate-mia-tray/mia-tray.md", mode = "644", doc = true },
+]
+auto-req = "no"
+post_install_script = "crates/mia-tray/dist/debian/postinst"
+
+[package.metadata.generate-rpm.requires]
+ferrogate-mia = "*"
+gtk3 = "*"
+libxdo = "*"
+libayatana-appindicator-gtk3 = "*"
+polkit = "*"

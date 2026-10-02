@@ -15,7 +15,7 @@
 //! - Reconstructed key zeroizes when its holder is dropped.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key as ChachaKey, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ferro_tee::attest::{Attestor, PeerRoots, SoftwareAttestor};
 use ferro_tee::psk::{respond, Initiator};
 use ferro_tee::{
@@ -91,11 +91,11 @@ fn fetch_share(
     let share_bytes = seal::unseal(&holder.attestor, &holder.sealed).unwrap();
 
     // Encrypt under the PSK and send to leader; leader decrypts.
-    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&holder_sess.psk));
-    let nonce = Nonce::from_slice(b"share-xfer01");
+    let cipher = ChaCha20Poly1305::new((&holder_sess.psk).into());
+    let nonce = &Nonce::from(*b"share-xfer01");
     let ct = cipher.encrypt(nonce, share_bytes.as_slice()).unwrap();
 
-    let leader_cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&leader_sess.psk));
+    let leader_cipher = ChaCha20Poly1305::new((&leader_sess.psk).into());
     let pt = leader_cipher.decrypt(nonce, ct.as_slice()).unwrap();
     let share = decode_share(&pt);
     assert_eq!(share.x, holder.share_index);

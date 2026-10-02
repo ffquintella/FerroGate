@@ -2,6 +2,7 @@
         formal formal-tamarin formal-cryptoverif docs container-image container-image-push \
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
         pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk \
+        tray lint-tray test-tray deny-tray pkg-deb-tray pkg-rpm-tray pkg-tray \
         publish-sdk publish-sdk-dry-run release deploy-release
 
 # Default target: list available targets with their descriptions.
@@ -43,6 +44,29 @@ fmt-check: ## Check formatting without modifying files
 
 lint: ## Run clippy with warnings denied
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# ── mia-tray (feature F18) ────────────────────────────────────────────────────
+#
+# The tray's GUI (tray icon, menus, windows, notifications) sits behind the
+# off-by-default `gui` cargo feature of crates/mia-tray, so `make build`,
+# `make lint` and `make test` never need GUI system libraries: they build, lint
+# and test the tray's headless core (endpoint client, state mapping, command
+# builders, wizard drafts, log follower), which is where its logic lives. These
+# targets cover the GUI build. On Linux they need GTK 3 headers:
+#   sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+TRAY := -p mia-tray --features mia-tray/gui
+
+tray: ## Build the mia-tray desktop companion with its GUI (release)
+	cargo build --release $(TRAY) --bin mia-tray
+
+lint-tray: ## Clippy the mia-tray GUI build (and mia-status-proto) with warnings denied
+	cargo clippy $(TRAY) -p mia-status-proto --all-targets -- -D warnings
+
+test-tray: ## Test mia-tray with the GUI compiled in, plus mia-status-proto
+	cargo test $(TRAY) -p mia-status-proto
+
+deny-tray: ## cargo-deny over the GUI dependency graph (deny.toml's graph is default features only)
+	cargo deny --features mia-tray/gui check
 
 check: ## Type-check the workspace
 	cargo check --workspace --all-targets
@@ -355,6 +379,14 @@ RPM_ARCH  := x86_64
 MIA_FEATURES ?=
 CARGO_FEATURE_FLAG := $(if $(strip $(MIA_FEATURES)),--features $(MIA_FEATURES),)
 
+# The mia-tray desktop companion (feature F18) ships inside the macOS .pkg
+# (LaunchAgent login item) and the Windows MSI (Startup entry) by default;
+# MIA_TRAY=0 builds those packages without it. On Linux it is a separate,
+# opt-in package (ferrogate-mia-tray: pkg-deb-tray / pkg-rpm-tray), so servers
+# never pull in GTK.
+MIA_TRAY  ?= 1
+TRAY_DIST := crates/mia-tray/dist
+
 pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
 	cargo install cargo-deb cargo-generate-rpm
 	@echo "NOTE: the Windows MSI + NuGet package build in a linux/amd64 container ('make pkg-win'); only Docker is required."
@@ -364,6 +396,30 @@ pkg-deb: ## Build the mia .deb package (Linux; needs cargo-deb)
 	@command -v cargo-deb >/dev/null 2>&1 || { echo "ERROR: cargo-deb not found — run 'make pkg-tools'"; exit 1; }
 	cargo deb -p $(PKG_CRATE)
 	@echo "==> .deb written under target/debian/"
+
+pkg-deb-tray: ## Build the opt-in ferrogate-mia-tray .deb (Linux; cargo-deb + GTK 3 headers)
+	@command -v cargo-deb >/dev/null 2>&1 || { echo "ERROR: cargo-deb not found — run 'make pkg-tools'"; exit 1; }
+	cargo deb -p mia-tray
+	@echo "==> ferrogate-mia-tray .deb written under target/debian/"
+
+pkg-rpm-tray: ## Build the opt-in ferrogate-mia-tray .rpm (Linux/x86_64; cargo-generate-rpm + GTK 3 headers)
+ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
+	@command -v cargo-generate-rpm >/dev/null 2>&1 || { echo "ERROR: cargo-generate-rpm not found — run 'make pkg-tools'"; exit 1; }
+	cargo build --release $(TRAY) --bin mia-tray
+	strip target/release/mia-tray
+	cargo generate-rpm -p crates/mia-tray -a $(RPM_ARCH)
+	@echo "==> ferrogate-mia-tray $(RPM_ARCH) .rpm written under target/generate-rpm/"
+else
+	@echo "ERROR: pkg-rpm-tray needs a Linux/x86_64 host (host is $(UNAME_S)/$(HOST_ARCH)); the"
+	@echo "       containerised scripts/build-rpm-amd64.sh builds the agent only, without GTK."
+	@exit 1
+endif
+
+pkg-tray: ## Build the opt-in Linux tray packages (deb + rpm); macOS/Windows ship it in pkg-macos / pkg-win
+	@case "$(UNAME_S)" in \
+	  Linux) $(MAKE) --no-print-directory pkg-deb-tray pkg-rpm-tray ;; \
+	  *)     echo "Host is $(UNAME_S): the tray ships inside 'make pkg-macos' / 'make pkg-win' (MIA_TRAY=0 to omit)." ;; \
+	esac
 
 pkg-rpm: ## Build the mia .rpm package for x86_64/amd64 (Fedora/RHEL/SUSE)
 ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
@@ -392,7 +448,7 @@ WIN_MSI   := target/wix/ferrogate-$(PKG_CRATE)-$(CARGO_VERSION)-x64.msi
 WIN_NUPKG := target/nuget/ferrogate-$(PKG_CRATE).$(CARGO_VERSION).nupkg
 pkg-win: ## Build the mia Windows MSI + Chocolatey/NuGet package in a linux/amd64 container (needs Docker)
 	@command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found — the Windows MSI/nupkg build runs in a linux/amd64 container"; exit 1; }
-	./scripts/build-msi-amd64.sh $(CARGO_VERSION)
+	MIA_TRAY=$(MIA_TRAY) ./scripts/build-msi-amd64.sh $(CARGO_VERSION)
 
 # macOS component+product package built with the platform's own tools (no extra
 # cargo plugin). Stages a payload root, then pkgbuild → productbuild. Set
@@ -423,6 +479,14 @@ pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 		echo "      under the machine key instead. Set CODESIGN_ID=\"Developer ID Application: ...\""; \
 		echo "      (and edit $(MACOS_DIST)/mia.entitlements with your team id) to enable it."; \
 	fi
+ifneq ($(MIA_TRAY),0)
+	# The mia-tray companion (feature F18): unprivileged, no entitlements.
+	cargo build --release $(TRAY) --bin mia-tray
+	strip target/release/mia-tray
+	@if [ -n "$(CODESIGN_ID)" ]; then \
+		codesign --force --options runtime --timestamp --sign "$(CODESIGN_ID)" target/release/mia-tray; \
+	fi
+endif
 	rm -rf $(MACOS_PKG_ROOT)
 	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/bin
 	install -d -m 0755 $(MACOS_PKG_ROOT)/etc/ferrogate
@@ -433,6 +497,14 @@ pkg-macos: ## Build the mia .pkg installer (macOS; uses pkgbuild/productbuild)
 	# The TOML config goes to the macOS system config path (where mia discovers it).
 	install -m 0640 $(MACOS_DIST)/mia.toml "$(MACOS_PKG_ROOT)/Library/Application Support/FerroGate/mia.toml"
 	install -m 0644 $(MACOS_DIST)/com.ferrogate.mia.plist $(MACOS_PKG_ROOT)/Library/LaunchDaemons/$(MACOS_PKG_ID).plist
+ifneq ($(MIA_TRAY),0)
+	# The tray binary and its per-user login item; the postinstall script
+	# creates the ferrogate-status group, adds the console user and starts
+	# the tray in that user's session.
+	install -d -m 0755 $(MACOS_PKG_ROOT)/Library/LaunchAgents
+	install -m 0755 target/release/mia-tray $(MACOS_PKG_ROOT)/usr/local/bin/mia-tray
+	install -m 0644 $(TRAY_DIST)/com.ferrogate.mia-tray.plist $(MACOS_PKG_ROOT)/Library/LaunchAgents/com.ferrogate.mia-tray.plist
+endif
 	pkgbuild --root $(MACOS_PKG_ROOT) \
 		--scripts $(MACOS_DIST)/macos-scripts \
 		--identifier $(MACOS_PKG_ID) \

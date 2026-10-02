@@ -32,7 +32,16 @@ use crate::config::{
 
 /// Run the `mia setup` subcommand. `args` is everything after `setup` on the
 /// command line.
+#[allow(clippy::too_many_lines)] // linear flag parsing then one write step.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
+    // The non-interactive modes (feature F18) — `--check`, `--apply`, `--dump`
+    // — need no TTY and share this wizard's validators and renderer.
+    if args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--check" | "--apply" | "--dump"))
+    {
+        return crate::setup_apply::run(args);
+    }
     let mut explicit_output: Option<PathBuf> = None;
     let mut environment: Option<String> = None;
     let mut user_scope = false;
@@ -73,14 +82,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     }
     let env = environment.as_deref();
 
-    let output = if let Some(path) = explicit_output {
-        path
-    } else if user_scope {
-        user_config_path_for(env)
-            .context("no per-user config path available (HOME/APPDATA is unset)")?
-    } else {
-        system_config_path_for(env)
-    };
+    let output = target_path(explicit_output, user_scope, env)?;
 
     // `--clean` removes the stored config instead of writing one. It shares the
     // same path resolution (--user / --output), so it deletes whatever the
@@ -157,29 +159,103 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    write_file(&output, &rendered)?;
+    let changed = crate::setup_apply::write_config(&output, &rendered, &existing)?;
     println!("\n✓ Wrote {}", output.display());
+    if !changed.is_empty() {
+        println!("  Changed: {}", changed.join(", "));
+    }
     println!("  Review it, then (re)start the agent:  {}", restart_hint());
     Ok(())
 }
 
+/// Resolve the file `mia setup` writes: `--output` verbatim, else the per-user
+/// (`--user`) or system path for the `--environment` selector. Shared with
+/// `mia setup --apply / --dump`.
+pub(crate) fn target_path(
+    explicit_output: Option<PathBuf>,
+    user_scope: bool,
+    environment: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    Ok(if let Some(path) = explicit_output {
+        path
+    } else if user_scope {
+        user_config_path_for(environment)
+            .context("no per-user config path available (HOME/APPDATA is unset)")?
+    } else {
+        system_config_path_for(environment)
+    })
+}
+
 /// The collected configuration. `None` ⇒ the key is left as a commented
 /// template placeholder rather than an active assignment.
-#[derive(Default)]
-struct Settings {
-    log: Option<String>,
-    cmis_endpoint: Option<String>,
-    cmis_srv: Option<String>,
-    cmis_spki_pin: Option<String>,
-    helper_socket: Option<String>,
-    helper_socket_mode: Option<String>,
-    helper_windows_group: Option<String>,
-    allowlist: Option<String>,
-    allowlist_key: Option<String>,
-    allowlist_max_age: Option<String>,
-    allowlist_fetch: bool,
-    allowlist_propose: bool,
-    ima_log: Option<String>,
+///
+/// Shared with the non-interactive `mia setup --apply` (feature F18), which
+/// fills it from a draft file instead of prompts and renders it with the same
+/// [`render`], so both front ends write byte-identical files for the same
+/// answers.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Settings {
+    pub(crate) log: Option<String>,
+    pub(crate) cmis_endpoint: Option<String>,
+    pub(crate) cmis_srv: Option<String>,
+    pub(crate) cmis_spki_pin: Option<String>,
+    pub(crate) helper_socket: Option<String>,
+    pub(crate) helper_socket_mode: Option<String>,
+    pub(crate) helper_windows_group: Option<String>,
+    pub(crate) allowlist: Option<String>,
+    pub(crate) allowlist_key: Option<String>,
+    pub(crate) allowlist_max_age: Option<String>,
+    pub(crate) allowlist_fetch: bool,
+    pub(crate) allowlist_propose: bool,
+    pub(crate) ima_log: Option<String>,
+    /// `attestation.backend`; `None` ⇒ the default `auto` (see
+    /// [`backend_setting`]).
+    pub(crate) attestation_backend: Option<String>,
+    /// Keys the wizard does not prompt for, carried over unchanged from the
+    /// file being edited so a rewrite does not drop them.
+    pub(crate) carried: Carried,
+}
+
+/// Configuration the wizard does not edit but must not lose on a rewrite:
+/// copied from the existing file and re-emitted verbatim by [`render`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Carried {
+    helper_socket_gid: Option<String>,
+    helper_require_authenticode: Option<bool>,
+    allowlist_propose_interval_secs: Option<u64>,
+    tpm_ek_cert: Option<String>,
+    tpm_ek_intermediates: Vec<String>,
+    status: crate::config::StatusConfig,
+}
+
+impl Carried {
+    /// The non-wizard keys of `existing`.
+    pub(crate) fn from_existing(existing: &Config) -> Self {
+        let path = |p: &Path| p.display().to_string();
+        Self {
+            helper_socket_gid: existing.helper.socket_gid.clone(),
+            helper_require_authenticode: existing.helper.require_authenticode,
+            allowlist_propose_interval_secs: existing.allowlist.propose_interval_secs,
+            tpm_ek_cert: existing.attestation.tpm.ek_cert.as_deref().map(path),
+            tpm_ek_intermediates: existing
+                .attestation
+                .tpm
+                .ek_intermediates
+                .iter()
+                .map(|p| path(p))
+                .collect(),
+            status: existing.status.clone(),
+        }
+    }
+}
+
+/// The attestation backends the wizard offers, in prompt order.
+pub(crate) const BACKEND_CHOICES: [&str; 4] = ["auto", "tpm", "host-key", "virtual-tpm"];
+
+/// Map a backend answer onto [`Settings::attestation_backend`]: `auto` (the
+/// default) stays a commented placeholder; anything else is written.
+pub(crate) fn backend_setting(choice: &str) -> Option<String> {
+    (choice != "auto").then(|| choice.to_string())
 }
 
 /// Internal error type so an Esc/Ctrl-C cancellation can short-circuit the
@@ -217,6 +293,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
     let log = Text::new("Log verbosity (tracing EnvFilter syntax):")
         .with_default(existing.log.as_deref().unwrap_or("info"))
         .with_help_message("e.g. info, debug, mia=debug,info")
+        .with_validator(literal_validator)
         .prompt()?;
     s.log = non_empty(log);
 
@@ -243,32 +320,14 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
             .with_help_message(
                 "e.g. _cmis._tcp.example.com  (records dialed best-first over hybrid-PQC TLS)",
             )
-            .with_validator(|input: &str| {
-                let t = input.trim();
-                if t.is_empty() || t.contains('.') {
-                    Ok(Validation::Valid)
-                } else {
-                    Ok(Validation::Invalid(
-                        "an SRV owner name, e.g. _cmis._tcp.example.com".into(),
-                    ))
-                }
-            })
+            .with_validator(|input: &str| to_validation(check_srv(input)))
             .prompt()?;
         s.cmis_srv = non_empty(srv);
     } else {
         let endpoint = Text::new("CMIS endpoint URL:")
             .with_default(existing.cmis.endpoint.as_deref().unwrap_or_default())
             .with_help_message("https://cmis.example.com:8443  (https ⇒ hybrid-PQC TLS, pinned)")
-            .with_validator(|input: &str| {
-                let t = input.trim();
-                if t.is_empty() || t.starts_with("https://") || t.starts_with("http://") {
-                    Ok(Validation::Valid)
-                } else {
-                    Ok(Validation::Invalid(
-                        "must start with https:// or http:// (or be left blank)".into(),
-                    ))
-                }
-            })
+            .with_validator(|input: &str| to_validation(check_endpoint(input)))
             .prompt()?;
         s.cmis_endpoint = non_empty(endpoint);
     }
@@ -294,16 +353,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
         let pin = Text::new("CMIS SPKI pin (lowercase-hex SHA-384):")
             .with_default(existing.cmis.spki_pin.as_deref().unwrap_or_default())
             .with_help_message("96 hex chars; pins the CMIS TLS cert by public key, not by CA")
-            .with_validator(|input: &str| {
-                let t = input.trim();
-                if t.is_empty() || SpkiPin::from_hex(t).is_ok() {
-                    Ok(Validation::Valid)
-                } else {
-                    Ok(Validation::Invalid(
-                        "must be a lowercase-hex SHA-384 (96 hex chars), or blank".into(),
-                    ))
-                }
-            })
+            .with_validator(|input: &str| to_validation(check_pin(input)))
             .prompt()?;
         s.cmis_spki_pin = non_empty(pin);
     }
@@ -320,6 +370,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
                 existing.helper.socket.as_deref(),
                 default_socket(environment),
             ))
+            .with_validator(literal_validator)
             .prompt()?;
         s.helper_socket = non_empty(socket);
 
@@ -348,6 +399,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
             let group = Text::new("Windows group allowed to open the pipe (blank ⇒ default DACL):")
                 .with_default(existing.helper.windows_group.as_deref().unwrap_or_default())
                 .with_help_message("e.g. FerroGateClients")
+                .with_validator(literal_validator)
                 .prompt()?;
             s.helper_windows_group = non_empty(group);
         }
@@ -384,6 +436,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
                 dist_sibling(&env_filename("allowlist.cbor", environment)),
             ))
             .with_help_message("the signed list CMIS issued for this host (place it here)")
+            .with_validator(literal_validator)
             .prompt()?;
         s.allowlist = non_empty(path);
 
@@ -393,6 +446,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
                 dist_sibling(&env_filename("allowlist.pub", environment)),
             ))
             .with_help_message("public key that verifies the allowlist signature")
+            .with_validator(literal_validator)
             .prompt()?;
         s.allowlist_key = non_empty(key);
 
@@ -465,11 +519,28 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
         }
     }
 
+    // ── Attestation backend ─────────────────────────────────────────────────
+    println!("\n— Attestation —");
+    let current = serde_json::to_value(existing.attestation.backend)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "auto".to_string());
+    let cursor = BACKEND_CHOICES
+        .iter()
+        .position(|c| *c == current)
+        .unwrap_or(0);
+    let backend = Select::new("Attestation backend:", BACKEND_CHOICES.to_vec())
+        .with_starting_cursor(cursor)
+        .with_help_message(
+            "auto = TPM when usable, else host-key; virtual-tpm is INSECURE (dev/test builds only)",
+        )
+        .prompt()?;
+    s.attestation_backend = backend_setting(backend);
+
     // ── Attestation (Linux IMA) ──────────────────────────────────────────────
     // IMA is a Linux concept; only offer the override there.
     #[cfg(target_os = "linux")]
     {
-        println!("\n— Attestation —");
         let override_ima = Confirm::new("Override the IMA runtime-measurement log path?")
             .with_default(existing.attestation.ima_log.is_some())
             .with_help_message("only needed if your kernel exposes IMA at a non-standard path")
@@ -480,6 +551,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
                     existing.attestation.ima_log.as_deref(),
                     DEFAULT_IMA_LOG.to_string(),
                 ))
+                .with_validator(literal_validator)
                 .prompt()?;
             s.ima_log = non_empty(ima);
         }
@@ -494,6 +566,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
             .map(|p| p.display().to_string());
     }
 
+    s.carried = Carried::from_existing(existing);
     Ok(s)
 }
 
@@ -647,31 +720,107 @@ pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
     None
 }
 
+// ── Field validators ────────────────────────────────────────────────────────
+//
+// One implementation per field, shared by the interactive prompts (wrapped as
+// `inquire` validators below) and by `mia setup --check/--apply` (feature
+// F18), so the two front ends accept exactly the same values with the same
+// error text. Each takes the raw answer; blank means "unset" and is valid.
+
+/// Longest free-text answer accepted (paths, names, URLs).
+pub(crate) const MAX_ANSWER_LEN: usize = 4096;
+
+/// Every answer is written as a TOML *literal* string (`'…'`), which cannot
+/// contain a `'` or a line break — so reject those (and other control
+/// characters) instead of emitting a broken or key-injecting file.
+pub(crate) fn check_literal(input: &str) -> Result<(), String> {
+    if input.len() > MAX_ANSWER_LEN {
+        return Err(format!("too long (at most {MAX_ANSWER_LEN} bytes)"));
+    }
+    if input.contains('\'') || input.chars().any(char::is_control) {
+        return Err("must not contain a single quote (') or control characters".into());
+    }
+    Ok(())
+}
+
+/// A DNS SRV owner name (contains a dot), or blank.
+pub(crate) fn check_srv(input: &str) -> Result<(), String> {
+    check_literal(input)?;
+    let t = input.trim();
+    if t.is_empty() || t.contains('.') {
+        Ok(())
+    } else {
+        Err("an SRV owner name, e.g. _cmis._tcp.example.com".into())
+    }
+}
+
+/// An `https://` / `http://` endpoint URL, or blank.
+pub(crate) fn check_endpoint(input: &str) -> Result<(), String> {
+    check_literal(input)?;
+    let t = input.trim();
+    if t.is_empty() || t.starts_with("https://") || t.starts_with("http://") {
+        Ok(())
+    } else {
+        Err("must start with https:// or http:// (or be left blank)".into())
+    }
+}
+
+/// A lowercase-hex SHA-384 SPKI pin, or blank.
+pub(crate) fn check_pin(input: &str) -> Result<(), String> {
+    let t = input.trim();
+    if t.is_empty() || SpkiPin::from_hex(t).is_ok() {
+        Ok(())
+    } else {
+        Err("must be a lowercase-hex SHA-384 (96 hex chars), or blank".into())
+    }
+}
+
+/// An octal file mode (e.g. `660`, `0o640`), or blank.
+pub(crate) fn check_octal(input: &str) -> Result<(), String> {
+    let raw = input.trim();
+    let t = raw.trim_start_matches("0o");
+    if raw.is_empty() || (!t.is_empty() && u32::from_str_radix(t, 8).is_ok()) {
+        Ok(())
+    } else {
+        Err("not an octal mode (e.g. 660)".into())
+    }
+}
+
+/// A whole number of seconds that fits the config's signed 64-bit field, or
+/// blank.
+pub(crate) fn check_uint(input: &str) -> Result<(), String> {
+    let t = input.trim();
+    if t.is_empty() || t.parse::<u64>().is_ok_and(|n| i64::try_from(n).is_ok()) {
+        Ok(())
+    } else {
+        Err("must be a whole number of seconds".into())
+    }
+}
+
+/// Adapt a shared check into an `inquire` validation result.
+fn to_validation(r: Result<(), String>) -> Result<Validation, inquire::CustomUserError> {
+    Ok(match r {
+        Ok(()) => Validation::Valid,
+        Err(msg) => Validation::Invalid(msg.into()),
+    })
+}
+
 /// An octal-mode validator (e.g. `660`, `0o640`).
 // Only the non-Windows socket-mode prompt uses this; `test` keeps it compiled
 // for the platform-independent validator tests below.
 #[cfg(any(not(windows), test))]
 fn octal_validator(input: &str) -> Result<Validation, inquire::CustomUserError> {
-    let t = input.trim().trim_start_matches("0o");
-    if t.is_empty() {
-        return Ok(Validation::Valid);
-    }
-    match u32::from_str_radix(t, 8) {
-        Ok(_) => Ok(Validation::Valid),
-        Err(_) => Ok(Validation::Invalid("not an octal mode (e.g. 660)".into())),
-    }
+    to_validation(check_octal(input))
 }
 
 /// An unsigned-integer validator (seconds).
 fn uint_validator(input: &str) -> Result<Validation, inquire::CustomUserError> {
-    let t = input.trim();
-    if t.is_empty() || t.parse::<u64>().is_ok() {
-        Ok(Validation::Valid)
-    } else {
-        Ok(Validation::Invalid(
-            "must be a whole number of seconds".into(),
-        ))
-    }
+    to_validation(check_uint(input))
+}
+
+/// A free-text validator (paths, names): see [`check_literal`].
+fn literal_validator(input: &str) -> Result<Validation, inquire::CustomUserError> {
+    to_validation(check_literal(input))
 }
 
 /// Trim and treat the empty string as "unset".
@@ -686,7 +835,7 @@ fn non_empty(s: String) -> Option<String> {
 
 /// Parse an existing TOML config file for prompt pre-fill. A missing or
 /// unparseable file yields defaults (the wizard then starts fresh).
-fn load_existing(path: &Path) -> Config {
+pub(crate) fn load_existing(path: &Path) -> Config {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|t| Config::from_toml(&t).ok())
@@ -697,7 +846,9 @@ fn load_existing(path: &Path) -> Config {
 /// set are active assignments; everything else stays as a commented template
 /// line so the file remains a reference.
 #[allow(clippy::too_many_lines)] // a flat sequence of TOML-emitting blocks.
-fn render(s: &Settings, environment: Option<&str>) -> String {
+pub(crate) fn render(s: &Settings, environment: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
     // A quoted (TOML literal-string) value line, or a commented placeholder.
     fn str_line(set: Option<&str>, key: &str, placeholder: &str) -> String {
         match set {
@@ -767,6 +918,16 @@ fn render(s: &Settings, environment: Option<&str>) -> String {
         "windows_group",
         "FerroGateClients",
     ));
+    let c = &s.carried;
+    if c.helper_socket_gid.is_some() || c.helper_require_authenticode.is_some() {
+        out.push_str("# Kept from the previous file (not edited by `mia setup`).\n");
+        if let Some(gid) = &c.helper_socket_gid {
+            let _ = writeln!(out, "socket_gid = {}", basic_str(gid));
+        }
+        if let Some(b) = c.helper_require_authenticode {
+            let _ = writeln!(out, "require_authenticode = {b}");
+        }
+    }
     out.push('\n');
 
     out.push_str("[allowlist]\n");
@@ -810,12 +971,98 @@ fn render(s: &Settings, environment: Option<&str>) -> String {
     } else {
         out.push_str("#propose = false\n");
     }
+    if let Some(n) = c.allowlist_propose_interval_secs {
+        out.push_str("# Kept from the previous file (not edited by `mia setup`).\n");
+        let _ = writeln!(out, "propose_interval_secs = {n}");
+    }
     out.push('\n');
 
     out.push_str("[attestation]\n");
     out.push_str("# Linux only. Override the IMA runtime-measurement log path.\n");
     out.push_str(&str_line(s.ima_log.as_deref(), "ima_log", DEFAULT_IMA_LOG));
+    out.push_str(
+        "# Attestation backend: auto (default: TPM when usable, else host-key), tpm,\n\
+         # host-key, or virtual-tpm (INSECURE, dev/test builds only).\n",
+    );
+    out.push_str(&str_line(
+        s.attestation_backend.as_deref(),
+        "backend",
+        "auto",
+    ));
+    render_carried_tail(&mut out, c);
 
+    out
+}
+
+/// Emit the carried-over `[attestation.tpm]` and `[status]` tables, if the
+/// edited file had them. Nothing is emitted otherwise, so files without them
+/// render exactly as before.
+fn render_carried_tail(out: &mut String, c: &Carried) {
+    use std::fmt::Write as _;
+    if c.tpm_ek_cert.is_some() || !c.tpm_ek_intermediates.is_empty() {
+        out.push_str("\n# Kept from the previous file (not edited by `mia setup`).\n");
+        out.push_str("[attestation.tpm]\n");
+        if let Some(cert) = &c.tpm_ek_cert {
+            let _ = writeln!(out, "ek_cert = {}", basic_str(cert));
+        }
+        if !c.tpm_ek_intermediates.is_empty() {
+            let list: Vec<String> = c
+                .tpm_ek_intermediates
+                .iter()
+                .map(|p| basic_str(p))
+                .collect();
+            let _ = writeln!(out, "ek_intermediates = [{}]", list.join(", "));
+        }
+    }
+    let st = &c.status;
+    if *st != crate::config::StatusConfig::default() {
+        out.push_str("\n# Kept from the previous file (not edited by `mia setup`).\n");
+        out.push_str("[status]\n");
+        if let Some(v) = st.enable {
+            let _ = writeln!(out, "enable = {v}");
+        }
+        if let Some(v) = &st.socket {
+            let _ = writeln!(out, "socket = {}", basic_str(&v.display().to_string()));
+        }
+        if let Some(v) = &st.socket_gid {
+            let _ = writeln!(out, "socket_gid = {}", basic_str(v));
+        }
+        if let Some(v) = &st.group {
+            let _ = writeln!(out, "group = {}", basic_str(v));
+        }
+        if let Some(v) = st.rate_limit_per_sec {
+            let _ = writeln!(out, "rate_limit_per_sec = {v}");
+        }
+        if let Some(v) = st.log_buffer_records {
+            let _ = writeln!(out, "log_buffer_records = {v}");
+        }
+        if let Some(v) = st.log_buffer_bytes {
+            let _ = writeln!(out, "log_buffer_bytes = {v}");
+        }
+    }
+}
+
+/// A TOML *basic* string (`"…"`) with the required escapes — used for values
+/// carried over from an existing file, which (unlike wizard answers) may hold
+/// any character.
+fn basic_str(v: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for ch in v.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04X}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
     out
 }
 
@@ -859,31 +1106,6 @@ fn dir_is_writable(dir: &Path) -> bool {
         }
         Err(_) => false,
     }
-}
-
-/// Write `content` to `path`, creating parent directories. The caller already
-/// obtained consent (the write prompt names this exact path), so this
-/// overwrites unconditionally. On Unix the file is created with mode `0640`.
-fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-    }
-    std::fs::write(path, content).with_context(|| {
-        format!(
-            "writing {} (the system path needs elevation — re-run with `sudo`/as admin, \
-             use --user for a per-user file, or --output to write elsewhere)",
-            path.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640));
-    }
-    Ok(())
 }
 
 /// Remove the stored configuration file at `path`. Prompts for confirmation
@@ -933,7 +1155,8 @@ fn clean_config(path: &Path, force: bool) -> anyhow::Result<()> {
 }
 
 const USAGE: &str =
-    "usage: mia setup [--user] [--environment <env>] [--output <path>] [--force] [--clean]";
+    "usage: mia setup [--user] [--environment <env>] [--output <path>] [--force] [--clean]\n\
+     \x20      mia setup --check <draft> | --apply <draft> [--reload] [--fetch-enrollment-key] | --dump [--json]";
 
 fn print_help() {
     println!(
@@ -959,7 +1182,20 @@ fn print_help() {
          \x20 -o, --output <path>   target a specific path\n\
          \x20 -c, --clean           delete the stored configuration\n\
          \x20 -f, --force           skip the confirmation prompt (write or clean)\n\
-         \x20 -h, --help            show this help\n",
+         \x20 -h, --help            show this help\n\
+         \n\
+         non-interactive modes (no TTY needed; used by the mia-tray wizard):\n\
+         \x20 --check <draft>       validate a draft (the wizard's keys only) and exit\n\
+         \x20 --apply <draft>       validate, then write the config atomically (same\n\
+         \x20                       file the wizard would write), audit a ConfigChanged\n\
+         \x20                       event and delete the draft; honours --user /\n\
+         \x20                       --output / --environment\n\
+         \x20   --reload            then signal the running agent to reload\n\
+         \x20   --fetch-enrollment-key  then fetch the CMIS enrollment key into\n\
+         \x20                       allowlist.key over the pinned channel\n\
+         \x20 --dump                print the effective values, the file path and which\n\
+         \x20                       keys come from environment variables\n\
+         \x20 --json                machine-readable output for --check/--apply/--dump\n",
         system_config_path().display(),
     );
 }
@@ -1058,6 +1294,49 @@ mod tests {
         // carries the env-suffixed default.
         let out = render(&Settings::default(), Some("staging"));
         assert!(out.contains("staging"), "{out}");
+    }
+
+    #[test]
+    fn render_carries_keys_the_wizard_does_not_edit() {
+        // A rewrite must not drop keys the wizard never asks about — in
+        // particular the [status] section (feature F18) — and must quote
+        // carried values safely, whatever characters they hold.
+        let existing = Config::from_toml(
+            "[helper]\nsocket_gid = '991'\nrequire_authenticode = false\n\
+             [allowlist]\npropose_interval_secs = 60\n\
+             [attestation.tpm]\nek_cert = \"/etc/ek \\\"q\\\".der\"\nek_intermediates = ['/a', '/b']\n\
+             [status]\nsocket_gid = '992'\nrate_limit_per_sec = 3\nlog_buffer_records = 0\n",
+        )
+        .unwrap();
+        let s = Settings {
+            attestation_backend: backend_setting("tpm"),
+            carried: Carried::from_existing(&existing),
+            ..Settings::default()
+        };
+        let out = render(&s, None);
+        let back = Config::from_toml(&out).expect("rendered TOML parses");
+        assert_eq!(back.helper.socket_gid.as_deref(), Some("991"));
+        assert_eq!(back.helper.require_authenticode, Some(false));
+        assert_eq!(back.allowlist.propose_interval_secs, Some(60));
+        assert_eq!(back.attestation.tpm, existing.attestation.tpm);
+        assert_eq!(back.status, existing.status);
+        assert_eq!(back.attestation.backend, crate::config::AttestBackend::Tpm);
+        // Nothing carried ⇒ none of the extra tables appear.
+        let plain = render(&Settings::default(), None);
+        assert!(!plain.contains("[status]") && !plain.contains("[attestation.tpm]"));
+        assert!(plain.contains("#backend = 'auto'"));
+    }
+
+    #[test]
+    fn literal_check_rejects_quote_and_control_injection() {
+        assert!(check_literal("/run/ferrogate/mia.sock").is_ok());
+        assert!(check_literal("info'\n[cmis]").is_err());
+        assert!(check_literal("a\u{7}b").is_err());
+        assert!(check_literal(&"x".repeat(MAX_ANSWER_LEN + 1)).is_err());
+        assert!(check_endpoint("https://x\n").is_err());
+        assert!(check_octal("0o").is_err());
+        assert!(check_octal("").is_ok());
+        assert!(check_octal("0o640").is_ok());
     }
 
     #[test]

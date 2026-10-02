@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
-use p256::EncodedPoint;
+use p256::Sec1Point;
 use sha2::{Digest, Sha256, Sha384};
 use subtle::ConstantTimeEq;
 
@@ -264,9 +264,8 @@ fn verify_quote_signature(
         other => return Err(RejectReason::UnsupportedSigHash(other)),
     };
 
-    let point = EncodedPoint::from_affine_coordinates(&pad32(&aik.x), &pad32(&aik.y), false);
-    let vk =
-        VerifyingKey::from_encoded_point(&point).map_err(|_| RejectReason::SignatureInvalid)?;
+    let point = Sec1Point::from_affine_coordinates(&pad32(&aik.x), &pad32(&aik.y), false);
+    let vk = VerifyingKey::from_sec1_point(&point).map_err(|_| RejectReason::SignatureInvalid)?;
     let ecdsa_sig = Signature::from_scalars(pad32(&sig.r), pad32(&sig.s))
         .map_err(|_| RejectReason::SignatureInvalid)?;
 

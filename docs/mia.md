@@ -501,8 +501,84 @@ denials are exactly the entries a first proposal carries. The presented SVID is
 the one obtained at startup, so proposals stop being accepted once it expires
 until mia restarts.
 
-It requires a TTY; for unattended provisioning (configuration management),
-write the TOML file directly from the template in `crates/mia/dist/mia.toml`.
+The interactive wizard requires a TTY; for unattended provisioning
+(configuration management), write the TOML file directly from the template in
+`crates/mia/dist/mia.toml`, or use the non-interactive modes below.
+
+The wizard also asks for the **attestation backend** (`auto`, `tpm`, `host-key`,
+`virtual-tpm`). Keys it does not ask about — `helper.socket_gid`,
+`helper.require_authenticode`, `allowlist.propose_interval_secs`,
+`[attestation.tpm]` and `[status]` — are carried over unchanged from the file
+being edited. Values containing a single quote or control characters are
+rejected (every answer is written as a TOML literal string). The file is
+written atomically (temp file, `fsync`, rename) with mode `0640` and the
+previous file's owner and group; a symbolic link at the target is refused.
+Every write appends a `ConfigChanged { path, by_uid, keys }` event — key
+*names* only — to the local audit journal `config-audit.jsonl` beside the file
+([audit.md](audit.md)); if that record cannot be written the configuration is
+not changed.
+
+#### Non-interactive modes (`--check`, `--apply`, `--dump`)
+
+These back the `mia-tray` graphical wizard (feature F18) and need no TTY:
+
+- `mia setup --check <draft> [--json]` — validate a *draft* and exit (non-zero
+  on any problem). Error text is the wizard's own; `--json` prints
+  `{"ok": …, "errors": [{"key": …, "message": …}]}`.
+- `mia setup --apply <draft> [--user | --output <path> | -e <env>] [--reload]
+  [--fetch-enrollment-key] [--json]` — validate the draft, then write the same
+  file the interactive wizard would write for the same answers (byte for
+  byte), audit `ConfigChanged`, and delete the draft (unprivileged runs only —
+  an elevated run leaves it for its owner to remove, since deleting by path as
+  root could be redirected). `--reload` then signals the running agent
+  (SIGHUP; restart hint on Windows); `--fetch-enrollment-key` then fetches the
+  CMIS enrollment key into `allowlist.key` over the pinned channel the new
+  configuration describes, inside this (possibly elevated) process — only over
+  pinned TLS (never `http://`), only into an absolute path without `..` (when
+  elevated: beside the configuration file), only if the reply parses as a
+  composite public key, written atomically and audited. `--json` prints one
+  object: `ok`, `path`, `changed_keys`, `draft_deleted`, `enrollment_key`,
+  `reloaded`, `error`.
+- `mia setup --dump [--json] [--user | --output <path> | -e <env>]` — the
+  effective values (file + environment overlay), the file path and whether it
+  exists, and which keys come from environment variables (`env_overridden`,
+  e.g. `{"key": "cmis.endpoint", "var": "FERROGATE_CMIS_ENDPOINT"}`) — a wizard
+  shows those read-only, since writing the file would not change them.
+
+A **draft** is laid out like `mia.toml` but holds only the wizard's keys:
+
+```toml
+log = "info"
+[cmis]
+endpoint = "https://cmis.example.com:8443"   # or: srv = "_cmis._tcp.example.com"
+spki_pin = "<hex-sha384>"
+[helper]
+socket = "/run/ferrogate/mia.sock"
+socket_mode = "660"                          # windows_group = "FerroGateClients"
+[allowlist]
+path = "/etc/ferrogate/allowlist.cbor"
+key = "/etc/ferrogate/allowlist.pub"
+max_age_secs = 259200
+fetch = true
+propose = false
+[attestation]
+backend = "auto"                             # ima_log = "…" (Linux)
+```
+
+`--apply` treats the draft as untrusted input (it may be written by an
+unprivileged process and applied by an elevated one): at most 64 KiB, a
+regular file opened without following symlinks, not hard-linked, on Unix not
+writable by group/others and owned by the caller — or, when elevated (root,
+behind the OS consent prompt), by the `PKEXEC_UID` / `SUDO_UID` user, else by
+any user but root (macOS `osascript` sets neither variable); that user is
+recorded as `ConfigChanged.by_uid`. An elevated run (and every run on Windows,
+where elevation cannot be ruled out) refuses `--output` and reports parser
+errors by line number only, so it cannot be aimed at, or made to echo, an
+arbitrary file. Unknown keys are rejected; every value goes through the wizard's
+validators plus the cross-field rules the daemon enforces at startup
+(`endpoint` xor `srv`; `spki_pin` required with `https://` or SRV;
+`allowlist.key` required with `allowlist.path`; a valid `log` directive). A
+rejected draft is left in place and nothing is written.
 
 ### `mia test` — connectivity and token-issuance self-test
 
@@ -540,6 +616,100 @@ the allowlist check works. Options:
   locations instead of `mia.toml`; mutually exclusive with `--config`.
 - `-a, --audience <aud>` — audience for the test token (default
   `https://selftest.ferrogate.invalid`).
+- `--json` — print the results as one JSON document instead (same exit status):
+  `{"version", "config", "environment", "passed", "failures": [...],
+  "checks": [{"id", "step", "status", "detail", "hints": [...], "notes": [...]}]}`,
+  where `id` is a stable slug (`configuration`, `cmis_connection`,
+  `cluster_identity`, `cmis_crl_publishing`, `helper_token_mint`,
+  `attestation`) and `status` is `ok` / `FAIL` / `skip` / `info` / `warn`.
+
+### Status endpoint and `mia status`
+
+Besides the helper socket, the daemon serves a **read-only status endpoint**
+(feature F18) that the `mia-tray` companion and `mia status` read. It is a
+separate listener, so status reads never touch the token-minting path:
+
+| OS | default endpoint | access |
+|----|------------------|--------|
+| Linux | `/run/ferrogate/mia-status.sock` | `0660`, group `status.socket_gid` (or `status.group`, default `ferrogate-status`, from `/etc/group`) |
+| macOS | `/var/run/ferrogate/mia-status.sock` | `0660`, group `status.socket_gid` (dscl groups are not in `/etc/group`) |
+| Windows | `\\.\pipe\ferrogate-mia-status` | DACL: SYSTEM, Administrators, `status.group` (default `FerroGateStatus`) |
+
+Framing is the helper protocol's (4-byte big-endian length + one CBOR value,
+≤ 64 KiB, one exchange per connection, 5 s read deadline). Two requests are
+accepted — `StatusReq { environment }` → one `StatusSnapshot` per environment,
+and `LogTailReq { since_seq, min_level, max }` → redacted log records — and
+everything else, including a helper `HelperReq`, is answered with
+`unsupported_request`. Each peer uid gets `status.rate_limit_per_sec` requests
+per second (default 10); at most 16 connections are served at once. The wire
+types live in the small `mia-status-proto` crate so clients need not depend on
+the daemon.
+
+A snapshot carries the environment, its **state** (`healthy`, `attesting`,
+`cmis_unreachable`, `not_enrolled`, `pin_mismatch`, `tpm_unavailable`,
+`crl_stale`, `allowlist_missing`, `allowlist_invalid`, `svid_expiring`,
+`not_configured`; `not_running` / `ima_disabled` are reported client-side when
+there is no endpoint), when it entered it, the SVID's SPIFFE ID / expiry /
+renewal point, the attestation backend, the CMIS node in use, the CRL age, the
+allowlist state (entry *count* and expiry only), the X.509-SVID store backend,
+a stable error code with a fixed message, and the agent version. It never
+carries SVID or token bytes, signatures, key material, SPKI pins, `jti`s,
+helper-audit caller identities or allowlist contents.
+
+The log tail comes from an in-memory ring buffer (`status.log_buffer_records`,
+default 2000, and `status.log_buffer_bytes`, default 1 MiB; `0` disables it).
+Records are **redacted before they are buffered**: fields named like
+`token`/`svid`/`key`/`secret`/`pin`/`jwk`/`dpop`/`authorization` (and `jti`,
+`sig`, `seed`, `bin_sha`, `pid`, `uid`, …) and byte blobs are masked, JWS /
+long-hex / long-base64 runs in free text are replaced with `[redacted]`,
+control characters are escaped and values are cut at 512 bytes. Helper-API
+audit events (target `mia::audit`) are never buffered, and only levels the
+`log` directive already enables are kept — a client cannot raise verbosity.
+
+On Linux the status socket is bound, `chmod`ed and `chown`ed as root *before*
+the runtime directories are handed to the service user and before the
+hardening profile is applied, so the seccomp filter (which forbids `chown`) is
+unaffected and no other user can interfere with those path operations; a
+socket directory writable by anyone but root at that point (e.g. one left by a
+run outside systemd) is refused. When the directory is then not searchable by
+the status group (`/run/ferrogate` is `0750` for the service user), the daemon
+adds search-only `o+x` to it and logs that — each socket inside keeps its own
+`0660` mode. `[status]` is read from
+the primary configuration only and is not re-applied on SIGHUP.
+
+```console
+$ mia status
+[default] healthy (for 3h12m)
+  svid:         spiffe://ferrogate.prod/host/0192b0d0-… (expires in 47m, renews in 11m)
+  attestation:  host-key
+  cmis node:    cmis-a.example.com:8443
+  crl age:      42s
+  allowlist:    loaded (12 entries, expires in 2d4h)
+  x509 store:   machine-key
+  agent:        mia 0.21.6
+```
+
+`mia status [--json] [-e <env>] [-c <config>]` takes `status.socket` from
+`--config` (or the default configuration); `-e` filters the reply (`default`
+names `mia.toml`). `--json` prints the snapshot array. Exit status: `0` every
+reported environment is healthy, `1` not all healthy (or the environment is not
+served), `2` usage/config/protocol error, `3` the endpoint is absent (agent not
+running — the JSON still lists `not_running` snapshots, or `ima_disabled` on a
+Linux host whose kernel does not enforce IMA appraisal), `4` permission denied
+(not a member of the status group).
+
+### `mia-tray` — desktop companion
+
+On workstations, the unprivileged [`mia-tray`](mia-tray.md) companion (feature
+F18) shows the state above as a tray icon (worst state across environments),
+notifies on transitions that need a human, and offers a graphical setup wizard
+(`mia setup --dump` / `--check` / `--apply`, the system file through the OS
+consent prompt), guided recovery from a closed set of fixed `mia` commands, and
+a viewer for the redacted log tail. It reads only the status endpoint and the
+output of `mia` commands; it holds no key material and never talks to the
+helper socket. It ships inside `make pkg-macos` and `make pkg-win`, and as the
+separate, opt-in `ferrogate-mia-tray` package on Linux. See
+[mia-tray](mia-tray.md).
 
 ### `mia x509-svid` — inspect the machine-bound certificate store
 

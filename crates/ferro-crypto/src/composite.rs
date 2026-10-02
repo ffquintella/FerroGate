@@ -36,7 +36,8 @@ use ed25519_dalek::Signer as _;
 use ed25519_dalek::{SigningKey as EdSk, VerifyingKey as EdVk};
 use fips204::ml_dsa_65;
 use fips204::traits::{SerDes as _, Signer as _, Verifier as _};
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use sha3::{Digest, Sha3_256, Sha3_384};
 use zeroize::Zeroizing;
 
@@ -358,7 +359,7 @@ impl CompositeSecretKey {
     /// Generate a fresh composite keypair using the OS RNG.
     #[allow(clippy::similar_names)] // sk/vk is the established Ed25519 convention.
     pub fn generate() -> Result<(Self, CompositePublicKey), CompositeError> {
-        let classical_sk = EdSk::generate(&mut OsRng);
+        let classical_sk = EdSk::generate(&mut UnwrapErr(SysRng));
         let classical_vk = classical_sk.verifying_key();
         let (pqc_public, pqc_secret) = ml_dsa_65::try_keygen().map_err(CompositeError::KeyGen)?;
         let sk = Self {

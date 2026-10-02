@@ -135,7 +135,8 @@ async fn resolve_cluster_seed(
     cluster: &Cluster,
     path: &std::path::Path,
 ) -> anyhow::Result<[u8; 32]> {
-    use rand_core::{OsRng, RngCore};
+    use getrandom::SysRng;
+    use rand_core::{Rng as _, UnwrapErr};
 
     let started = tokio::time::Instant::now();
     loop {
@@ -153,7 +154,7 @@ async fn resolve_cluster_seed(
                 seed
             } else {
                 let mut seed = [0u8; 32];
-                OsRng.fill_bytes(&mut seed);
+                UnwrapErr(SysRng).fill_bytes(&mut seed);
                 tracing::warn!("no issuer seed on disk or in the cluster — minting a fresh one");
                 seed
             };

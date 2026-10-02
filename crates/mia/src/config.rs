@@ -41,7 +41,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Environment variable naming an explicit configuration file.
 pub const ENV_CONFIG: &str = "FERROGATE_CONFIG";
@@ -142,22 +142,24 @@ pub fn user_config_path_for(environment: Option<&str>) -> Option<PathBuf> {
 /// non-empty, neither `.` nor `..`, and limited to ASCII letters, digits, `.`,
 /// `-`, and `_` — so it can neither inject a path separator nor traverse out of
 /// the config directory.
+///
+/// The rule itself lives in [`mia_status_proto::validate_environment`] so the
+/// `mia-tray` companion applies exactly the same check before it passes
+/// `-e <env>` to a `mia` command; this wrapper only adds the CLI wording.
 pub fn validate_environment(name: &str) -> anyhow::Result<()> {
-    if name.is_empty() {
-        anyhow::bail!("--environment name must not be empty");
-    }
-    if name == "." || name == ".." {
-        anyhow::bail!("--environment name `{name}` is not a valid environment");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-    {
-        anyhow::bail!(
+    use mia_status_proto::EnvironmentNameError;
+    match mia_status_proto::validate_environment(name) {
+        Ok(()) => Ok(()),
+        Err(EnvironmentNameError::Empty) => {
+            anyhow::bail!("--environment name must not be empty")
+        }
+        Err(EnvironmentNameError::DotName) => {
+            anyhow::bail!("--environment name `{name}` is not a valid environment")
+        }
+        Err(EnvironmentNameError::InvalidCharacter) => anyhow::bail!(
             "--environment name `{name}` is invalid: use only letters, digits, '.', '-', '_'"
-        );
+        ),
     }
-    Ok(())
 }
 
 /// A configuration file discovered for the daemon's "serve every environment"
@@ -260,7 +262,7 @@ pub const DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS: u64 = 300;
 
 /// The fully parsed configuration. Every value is optional: an absent value
 /// falls back to its built-in default at the point of use.
-#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Tracing verbosity (tracing `EnvFilter` syntax); maps to `RUST_LOG`.
@@ -273,10 +275,12 @@ pub struct Config {
     pub allowlist: AllowlistConfig,
     /// Attestation inputs.
     pub attestation: AttestationConfig,
+    /// The read-only status endpoint and log ring buffer (feature F18).
+    pub status: StatusConfig,
 }
 
 /// `[cmis]` — the Central Machine Identity Service to attest to.
-#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CmisConfig {
     /// A single `https://host:port` endpoint (`https` ⇒ hybrid-PQC TLS,
@@ -296,7 +300,7 @@ pub struct CmisConfig {
 }
 
 /// `[helper]` — the local helper-API listening surface (feature F08).
-#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HelperConfig {
     /// Helper listener address — the Unix-socket path (Linux/macOS) or the
@@ -326,7 +330,7 @@ pub struct HelperConfig {
 }
 
 /// `[allowlist]` — the signed CBOR allowlist of vetted local callers.
-#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AllowlistConfig {
     /// Path to the signed CBOR allowlist. Absent ⇒ deny every caller.
@@ -360,7 +364,7 @@ pub struct AllowlistConfig {
 }
 
 /// `[attestation]` — attestation inputs.
-#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttestationConfig {
     /// Override the IMA runtime-measurement log path.
@@ -382,7 +386,7 @@ pub struct AttestationConfig {
 /// here: extract it once from the (v)TPM's EK-CA and point `ek_cert` at the DER.
 /// Without it the `tpm` backend cannot attest (and `auto` falls back to the
 /// software host-key tier).
-#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TpmConfig {
     /// Path to the EK certificate (DER) presented to CMIS.
@@ -392,8 +396,165 @@ pub struct TpmConfig {
     pub ek_intermediates: Vec<PathBuf>,
 }
 
+/// `[status]` — the read-only status endpoint (feature F18) and the redacting
+/// log ring buffer it serves.
+///
+/// The endpoint is per *process*, not per environment: in the daemon's
+/// serve-all mode it is configured from the primary configuration (`mia.toml`,
+/// or the file selected by `--config` / `--environment`), and a `[status]`
+/// section in a discovered `mia-<env>.toml` is ignored.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatusConfig {
+    /// Serve the status endpoint. `None` ⇒ enabled.
+    pub enable: Option<bool>,
+    /// Listener address: a Unix-socket path (Linux/macOS) or a named-pipe name
+    /// (Windows). `None` ⇒ [`mia_status_proto::DEFAULT_ENDPOINT`].
+    pub socket: Option<PathBuf>,
+    /// **Unix only.** Numeric gid that owns the socket (mode `0660`), so its
+    /// members may read status. Takes precedence over [`group`](Self::group).
+    pub socket_gid: Option<String>,
+    /// The group allowed to read status. Windows: the local group granted on
+    /// the pipe DACL (plus SYSTEM and Administrators), default
+    /// `FerroGateStatus`. Unix: a group *name* resolved from `/etc/group` when
+    /// `socket_gid` is unset, default `ferrogate-status` (groups that live
+    /// only in a directory service — e.g. macOS `dscl` groups — need
+    /// `socket_gid`).
+    pub group: Option<String>,
+    /// Requests per second allowed per caller uid. `None` ⇒
+    /// [`DEFAULT_STATUS_RATE_LIMIT`]; clamped to `1..=`[`MAX_STATUS_RATE_LIMIT`].
+    pub rate_limit_per_sec: Option<u32>,
+    /// Log ring-buffer capacity in records. `None` ⇒
+    /// [`DEFAULT_LOG_BUFFER_RECORDS`]; `0` disables the buffer.
+    pub log_buffer_records: Option<usize>,
+    /// Log ring-buffer capacity in bytes. `None` ⇒
+    /// [`DEFAULT_LOG_BUFFER_BYTES`]; `0` disables the buffer.
+    pub log_buffer_bytes: Option<usize>,
+}
+
+/// Default group allowed to read the status endpoint (Windows local group).
+#[cfg(windows)]
+pub const DEFAULT_STATUS_GROUP: &str = "FerroGateStatus";
+
+/// Default group allowed to read the status endpoint (Unix group name).
+#[cfg(not(windows))]
+pub const DEFAULT_STATUS_GROUP: &str = "ferrogate-status";
+
+/// Default per-uid status request budget, requests per second.
+pub const DEFAULT_STATUS_RATE_LIMIT: u32 = 10;
+
+/// Upper bound on the per-uid status request budget.
+pub const MAX_STATUS_RATE_LIMIT: u32 = 1000;
+
+/// Default log ring-buffer capacity in records.
+pub const DEFAULT_LOG_BUFFER_RECORDS: usize = 2000;
+
+/// Default log ring-buffer capacity in bytes (1 MiB).
+pub const DEFAULT_LOG_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Hard ceiling on the log ring buffer's record capacity, whatever is
+/// configured (the daemon may run under `mlockall`).
+pub const MAX_LOG_BUFFER_RECORDS: usize = 100_000;
+
+/// Hard ceiling on the log ring buffer's byte capacity (64 MiB).
+pub const MAX_LOG_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
+/// One environment variable that overrides a configuration key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvOverride {
+    /// The environment variable.
+    pub var: &'static str,
+    /// The dotted configuration key it overrides (e.g. `cmis.endpoint`).
+    pub key: &'static str,
+    /// `true` for per-environment keys that [`EnvOverrideScope::SharedOnly`]
+    /// does not apply (the helper-socket path).
+    pub per_environment: bool,
+}
+
+/// Table-row constructor for [`ENV_OVERRIDES`].
+const fn env_override(var: &'static str, key: &'static str, per_environment: bool) -> EnvOverride {
+    EnvOverride {
+        var,
+        key,
+        per_environment,
+    }
+}
+
+/// Every environment override [`Config::apply_env`] honours, in one table so
+/// `mia setup --dump` can say which keys are env-controlled (a test keeps the
+/// table and the overlay in sync).
+pub const ENV_OVERRIDES: &[EnvOverride] = &[
+    env_override("RUST_LOG", "log", false),
+    env_override("FERROGATE_CMIS_ENDPOINT", "cmis.endpoint", false),
+    env_override("FERROGATE_CMIS_SRV", "cmis.srv", false),
+    env_override("FERROGATE_CMIS_SPKI_PIN", "cmis.spki_pin", false),
+    env_override("FERROGATE_HELPER_SOCKET", "helper.socket", true),
+    env_override("FERROGATE_HELPER_SOCKET_MODE", "helper.socket_mode", false),
+    env_override("FERROGATE_HELPER_SOCKET_GID", "helper.socket_gid", false),
+    env_override(
+        "FERROGATE_HELPER_WINDOWS_GROUP",
+        "helper.windows_group",
+        false,
+    ),
+    env_override(
+        "FERROGATE_HELPER_REQUIRE_AUTHENTICODE",
+        "helper.require_authenticode",
+        false,
+    ),
+    env_override("FERROGATE_ALLOWLIST", "allowlist.path", false),
+    env_override("FERROGATE_ALLOWLIST_KEY", "allowlist.key", false),
+    env_override(
+        "FERROGATE_ALLOWLIST_MAX_AGE_SECS",
+        "allowlist.max_age_secs",
+        false,
+    ),
+    env_override("FERROGATE_ALLOWLIST_FETCH", "allowlist.fetch", false),
+    env_override("FERROGATE_ALLOWLIST_PROPOSE", "allowlist.propose", false),
+    env_override(
+        "FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS",
+        "allowlist.propose_interval_secs",
+        false,
+    ),
+    env_override("FERROGATE_IMA_LOG", "attestation.ima_log", false),
+    env_override("FERROGATE_ATTEST_BACKEND", "attestation.backend", false),
+    env_override("FERROGATE_TPM_EK_CERT", "attestation.tpm.ek_cert", false),
+    env_override("FERROGATE_STATUS_ENABLE", "status.enable", false),
+    env_override("FERROGATE_STATUS_SOCKET", "status.socket", false),
+    env_override("FERROGATE_STATUS_SOCKET_GID", "status.socket_gid", false),
+    env_override("FERROGATE_STATUS_GROUP", "status.group", false),
+    env_override(
+        "FERROGATE_STATUS_RATE_LIMIT",
+        "status.rate_limit_per_sec",
+        false,
+    ),
+    env_override(
+        "FERROGATE_STATUS_LOG_RECORDS",
+        "status.log_buffer_records",
+        false,
+    ),
+    env_override(
+        "FERROGATE_STATUS_LOG_BYTES",
+        "status.log_buffer_bytes",
+        false,
+    ),
+];
+
+/// The overrides in [`ENV_OVERRIDES`] that are set (per `get`) and apply in
+/// `scope` — i.e. the keys whose effective value comes from the environment.
+pub fn env_overridden(
+    scope: EnvOverrideScope,
+    get: impl Fn(&str) -> Option<String>,
+) -> Vec<EnvOverride> {
+    ENV_OVERRIDES
+        .iter()
+        .filter(|o| !(o.per_environment && scope == EnvOverrideScope::SharedOnly))
+        .filter(|o| get(o.var).is_some())
+        .copied()
+        .collect()
+}
+
 /// Which backend `mia` attests with to obtain its host SVID.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AttestBackend {
     /// **Capability-aware selection** (the production default): use a real
@@ -609,6 +770,48 @@ impl Config {
         if let Some(v) = get("FERROGATE_TPM_EK_CERT") {
             self.attestation.tpm.ek_cert = Some(PathBuf::from(v));
         }
+        self.apply_status_overrides(&get)?;
+        Ok(())
+    }
+
+    /// The `[status]` slice of [`Self::apply_overrides`].
+    fn apply_status_overrides(
+        &mut self,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(v) = get("FERROGATE_STATUS_ENABLE") {
+            self.status.enable = Some(parse_bool_env("FERROGATE_STATUS_ENABLE", &v)?);
+        }
+        if let Some(v) = get("FERROGATE_STATUS_SOCKET") {
+            self.status.socket = Some(PathBuf::from(v));
+        }
+        if let Some(v) = get("FERROGATE_STATUS_SOCKET_GID") {
+            self.status.socket_gid = Some(v);
+        }
+        if let Some(v) = get("FERROGATE_STATUS_GROUP") {
+            self.status.group = Some(v);
+        }
+        if let Some(v) = get("FERROGATE_STATUS_RATE_LIMIT") {
+            let n: u32 = v
+                .trim()
+                .parse()
+                .context("FERROGATE_STATUS_RATE_LIMIT is not an integer")?;
+            self.status.rate_limit_per_sec = Some(n);
+        }
+        if let Some(v) = get("FERROGATE_STATUS_LOG_RECORDS") {
+            let n: usize = v
+                .trim()
+                .parse()
+                .context("FERROGATE_STATUS_LOG_RECORDS is not an integer")?;
+            self.status.log_buffer_records = Some(n);
+        }
+        if let Some(v) = get("FERROGATE_STATUS_LOG_BYTES") {
+            let n: usize = v
+                .trim()
+                .parse()
+                .context("FERROGATE_STATUS_LOG_BYTES is not an integer")?;
+            self.status.log_buffer_bytes = Some(n);
+        }
         Ok(())
     }
 
@@ -655,6 +858,71 @@ impl Config {
         self.allowlist
             .max_age_secs
             .unwrap_or(DEFAULT_ALLOWLIST_MAX_AGE_SECS)
+    }
+
+    /// Whether the status endpoint is served (`status.enable`, default on).
+    #[must_use]
+    pub fn status_enabled(&self) -> bool {
+        self.status.enable.unwrap_or(true)
+    }
+
+    /// The status endpoint address; default
+    /// [`mia_status_proto::DEFAULT_ENDPOINT`].
+    #[must_use]
+    pub fn status_socket(&self) -> PathBuf {
+        self.status
+            .socket
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(mia_status_proto::DEFAULT_ENDPOINT))
+    }
+
+    /// The numeric gid to own the status socket, parsed from
+    /// `status.socket_gid`. A blank value is treated as unset.
+    pub fn status_socket_gid(&self) -> anyhow::Result<Option<u32>> {
+        match self.status.socket_gid.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(s) => s
+                .parse::<u32>()
+                .map(Some)
+                .with_context(|| format!("status.socket_gid {s:?} is not a numeric gid")),
+        }
+    }
+
+    /// The group allowed to read status; default [`DEFAULT_STATUS_GROUP`].
+    #[must_use]
+    pub fn status_group(&self) -> &str {
+        self.status
+            .group
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .unwrap_or(DEFAULT_STATUS_GROUP)
+    }
+
+    /// Requests per second per caller uid on the status endpoint, clamped to
+    /// `1..=`[`MAX_STATUS_RATE_LIMIT`].
+    #[must_use]
+    pub fn status_rate_limit(&self) -> u32 {
+        self.status
+            .rate_limit_per_sec
+            .unwrap_or(DEFAULT_STATUS_RATE_LIMIT)
+            .clamp(1, MAX_STATUS_RATE_LIMIT)
+    }
+
+    /// The log ring buffer's `(records, bytes)` capacity, each clamped to its
+    /// hard ceiling. Either being `0` disables the buffer.
+    #[must_use]
+    pub fn log_buffer_limits(&self) -> (usize, usize) {
+        (
+            self.status
+                .log_buffer_records
+                .unwrap_or(DEFAULT_LOG_BUFFER_RECORDS)
+                .min(MAX_LOG_BUFFER_RECORDS),
+            self.status
+                .log_buffer_bytes
+                .unwrap_or(DEFAULT_LOG_BUFFER_BYTES)
+                .min(MAX_LOG_BUFFER_BYTES),
+        )
     }
 
     /// The allowlist-propose interval; default
@@ -738,7 +1006,7 @@ mod tests {
     #[test]
     fn environment_selects_named_config_filename() {
         // Default ⇒ mia.toml; a selector ⇒ mia-<env>.toml, in the same dir.
-        assert!(config_filename(None) == "mia.toml");
+        assert_eq!(config_filename(None), "mia.toml");
         assert_eq!(config_filename(Some("staging")), "mia-staging.toml");
         let default = system_config_path_for(None);
         let staging = system_config_path_for(Some("staging"));
@@ -1009,6 +1277,102 @@ mod tests {
         })
         .unwrap();
         assert_eq!(c.socket_gid().unwrap(), Some(777));
+    }
+
+    #[test]
+    fn status_section_parses_and_defaults() {
+        let c = Config::default();
+        assert!(c.status_enabled());
+        assert_eq!(
+            c.status_socket(),
+            PathBuf::from(mia_status_proto::DEFAULT_ENDPOINT)
+        );
+        assert_eq!(c.status_socket_gid().unwrap(), None);
+        assert_eq!(c.status_group(), DEFAULT_STATUS_GROUP);
+        assert_eq!(c.status_rate_limit(), DEFAULT_STATUS_RATE_LIMIT);
+        assert_eq!(
+            c.log_buffer_limits(),
+            (DEFAULT_LOG_BUFFER_RECORDS, DEFAULT_LOG_BUFFER_BYTES)
+        );
+
+        let c = Config::from_toml(
+            "[status]\nenable = false\nsocket = '/tmp/s.sock'\nsocket_gid = '42'\n\
+             group = 'ops'\nrate_limit_per_sec = 0\nlog_buffer_records = 0\n\
+             log_buffer_bytes = 999999999999",
+        )
+        .unwrap();
+        assert!(!c.status_enabled());
+        assert_eq!(c.status_socket(), PathBuf::from("/tmp/s.sock"));
+        assert_eq!(c.status_socket_gid().unwrap(), Some(42));
+        assert_eq!(c.status_group(), "ops");
+        // Clamped: a zero budget becomes 1 req/s, the byte cap hits its ceiling.
+        assert_eq!(c.status_rate_limit(), 1);
+        assert_eq!(c.log_buffer_limits(), (0, MAX_LOG_BUFFER_BYTES));
+        // Unknown keys in [status] are rejected like everywhere else.
+        assert!(Config::from_toml("[status]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn status_env_overrides_apply() {
+        let mut c = Config::default();
+        let env: HashMap<&str, &str> = HashMap::from([
+            ("FERROGATE_STATUS_ENABLE", "0"),
+            ("FERROGATE_STATUS_SOCKET", "/run/x-status.sock"),
+            ("FERROGATE_STATUS_SOCKET_GID", "77"),
+            ("FERROGATE_STATUS_GROUP", "staff"),
+            ("FERROGATE_STATUS_RATE_LIMIT", "5"),
+            ("FERROGATE_STATUS_LOG_RECORDS", "10"),
+            ("FERROGATE_STATUS_LOG_BYTES", "4096"),
+        ]);
+        c.apply_overrides(EnvOverrideScope::Full, |k| {
+            env.get(k).map(|s| (*s).to_string())
+        })
+        .unwrap();
+        assert!(!c.status_enabled());
+        assert_eq!(c.status_socket(), PathBuf::from("/run/x-status.sock"));
+        assert_eq!(c.status_socket_gid().unwrap(), Some(77));
+        assert_eq!(c.status_group(), "staff");
+        assert_eq!(c.status_rate_limit(), 5);
+        assert_eq!(c.log_buffer_limits(), (10, 4096));
+    }
+
+    #[test]
+    fn env_override_table_matches_the_overlay() {
+        // Every variable in ENV_OVERRIDES must actually change the config when
+        // set (so `mia setup --dump` never claims an override that isn't one),
+        // and `env_overridden` must report exactly the variables that are set.
+        for o in ENV_OVERRIDES {
+            let value = match o.var {
+                "FERROGATE_HELPER_REQUIRE_AUTHENTICODE"
+                | "FERROGATE_ALLOWLIST_FETCH"
+                | "FERROGATE_ALLOWLIST_PROPOSE"
+                | "FERROGATE_STATUS_ENABLE" => "1",
+                "FERROGATE_ALLOWLIST_MAX_AGE_SECS"
+                | "FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS"
+                | "FERROGATE_STATUS_RATE_LIMIT"
+                | "FERROGATE_STATUS_LOG_RECORDS"
+                | "FERROGATE_STATUS_LOG_BYTES"
+                | "FERROGATE_HELPER_SOCKET_GID"
+                | "FERROGATE_STATUS_SOCKET_GID" => "7",
+                "FERROGATE_ATTEST_BACKEND" => "tpm",
+                _ => "x",
+            };
+            let mut c = Config::default();
+            c.apply_overrides(EnvOverrideScope::Full, |k| {
+                (k == o.var).then(|| value.to_string())
+            })
+            .unwrap();
+            assert_ne!(c, Config::default(), "{} did not change the config", o.var);
+            let reported = env_overridden(EnvOverrideScope::Full, |k| {
+                (k == o.var).then(|| value.to_string())
+            });
+            assert_eq!(reported, vec![*o]);
+        }
+        // SharedOnly never reports the per-environment socket path.
+        let reported = env_overridden(EnvOverrideScope::SharedOnly, |k| {
+            (k == "FERROGATE_HELPER_SOCKET").then(|| "/x".to_string())
+        });
+        assert!(reported.is_empty());
     }
 
     #[test]

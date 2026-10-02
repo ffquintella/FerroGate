@@ -72,6 +72,12 @@ impl CrlCache {
         self.inner.read().await.as_ref().map(|b| b.number)
     }
 
+    /// When the cached body was produced (Unix seconds), if any — the input to
+    /// the status endpoint's CRL-age report (feature F18).
+    pub async fn issued_at(&self) -> Option<i64> {
+        self.inner.read().await.as_ref().map(|b| b.issued_at)
+    }
+
     /// Decide whether a mint may proceed for the host identified by
     /// `parent_cert_sha_hex` (lowercase hex SHA-384 of the host SVID) and
     /// `host_spiffe_id`, at reference time `now`.
