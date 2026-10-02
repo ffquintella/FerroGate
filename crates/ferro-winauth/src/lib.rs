@@ -13,10 +13,14 @@
 //! - [`verify_authenticode`] — an Authenticode trust check on the image
 //!   (`WinVerifyTrust`), the Code-Integrity analogue of the IMA cross-check;
 //! - [`create_server_pipe`] — create a named-pipe server instance, optionally
-//!   with a DACL restricting access to one local group.
+//!   with a DACL restricting access to one local group (which may connect but
+//!   not create pipe instances — see [`pipe_acl`]);
+//! - [`open_client_pipe`] — open a pipe client with exactly the access that
+//!   DACL grants and `SECURITY_IDENTIFICATION`.
 //!
-//! Everything is `#[cfg(windows)]`; on other platforms the crate is empty so
-//! it can sit in the workspace and be a `cfg(windows)` dependency of `mia`.
+//! Everything except the pure [`pipe_acl`] constants is `#[cfg(windows)]`; on
+//! other platforms the crate is otherwise empty so it can sit in the workspace
+//! and be a `cfg(windows)` dependency of `mia`.
 
 #![allow(unsafe_code)]
 // this crate is the Windows FFI boundary by design
@@ -28,9 +32,11 @@
 mod imp;
 #[cfg(windows)]
 pub use imp::{
-    client_process_id, create_server_pipe, process_image_path, process_user_rid,
+    client_process_id, create_server_pipe, open_client_pipe, process_image_path, process_user_rid,
     verify_authenticode,
 };
+
+pub mod pipe_acl;
 
 // Windows Service Control Manager integration for the `mia` daemon. Lives here
 // because `windows-service`'s service-main macro expands to `unsafe` glue and

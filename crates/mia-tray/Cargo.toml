@@ -92,6 +92,8 @@ winreg = "0.56"
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Only to pin the pipe access mask to the DACL contract in a test.
+ferro-winauth = { path = "../ferro-winauth" }
 
 # ── Linux packaging (opt-in package `ferrogate-mia-tray`) ─────────────────────
 # A separate package from `ferrogate-mia`, so servers never pull in GTK.

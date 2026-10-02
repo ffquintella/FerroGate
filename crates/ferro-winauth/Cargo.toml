@@ -35,3 +35,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_Security_WinTrust",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { workspace = true }

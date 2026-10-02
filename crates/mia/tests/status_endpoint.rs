@@ -154,6 +154,16 @@ fn mia_status_reports_not_running_when_the_endpoint_is_absent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A fake compact JWS assembled at runtime from its decoded segments, so the
+/// source holds no literal `eyJ…` token for secret scanners to flag.
+fn fake_jws(header: &str, payload: &str, signature: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    [header, payload, signature]
+        .map(|segment| URL_SAFE_NO_PAD.encode(segment))
+        .join(".")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn log_tail_is_redacted_and_helper_requests_are_rejected() {
     let dir = scratch("logs");
@@ -161,7 +171,12 @@ async fn log_tail_is_redacted_and_helper_requests_are_rejected() {
     let subscriber = tracing_subscriber::registry()
         .with(tracing_subscriber::filter::LevelFilter::INFO)
         .with(LogBufferLayer::new(Arc::clone(&buf)));
-    let jws = "eyJhbGciOiJFZERTQSIsImtpZCI6ImNtaXMtMSJ9.eyJzdWIiOiJzcGlmZmU6Ly94In0.c2lnbmF0dXJlLWJ5dGVzLXRoYXQtYXJlLWxvbmctZW5vdWdo";
+    let jws = fake_jws(
+        r#"{"alg":"EdDSA","kid":"cmis-1"}"#,
+        r#"{"sub":"spiffe://x"}"#,
+        "signature-bytes-that-are-long-enough",
+    );
+    let jws = jws.as_str();
     tracing::subscriber::with_default(subscriber, || {
         tracing::info!(token = jws, "minted a child token");
         tracing::debug!("not enabled by the directive");

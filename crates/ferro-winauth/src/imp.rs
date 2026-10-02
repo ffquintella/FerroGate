@@ -4,11 +4,12 @@ use std::ffi::{c_void, OsStr, OsString};
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::io::RawHandle;
+use std::os::windows::fs::OpenOptionsExt as _;
+use std::os::windows::io::{IntoRawHandle as _, RawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -28,10 +29,10 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-/// SDDL DACL template: grant generic read/write to SYSTEM (`SY`), the local
-/// Administrators group (`BA`), and the caller-supplied group SID. No other
-/// principal is granted access.
-const SDDL_TEMPLATE: &str = "D:(A;;GRGW;;;SY)(A;;GRGW;;;BA)(A;;GRGW;;;{SID})";
+use crate::pipe_acl::{pipe_sddl, PIPE_CLIENT_DESIRED_ACCESS, SECURITY_IDENTIFICATION};
+
+/// `FILE_FLAG_OVERLAPPED`: tokio drives the pipe handle with overlapped I/O.
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 
 /// The PID of the process connected to `handle`, a named-pipe **server**
 /// instance with a client attached.
@@ -188,8 +189,10 @@ pub fn verify_authenticode(path: &Path) -> io::Result<bool> {
 }
 
 /// Create a named-pipe server instance at `addr`. When `group` is `Some`, the
-/// pipe is created with a DACL granting access only to that local group (plus
-/// SYSTEM and Administrators); otherwise the default pipe security applies.
+/// pipe is created with the DACL from [`pipe_sddl`]: that local group may
+/// connect (read/write data) but **not** create pipe instances; SYSTEM,
+/// Administrators and the pipe's owner keep full read/write. Otherwise the
+/// default pipe security applies.
 ///
 /// `first` must be `true` for the first instance of a pipe name and `false`
 /// for every subsequent instance.
@@ -206,7 +209,7 @@ pub fn create_server_pipe(
     };
 
     let sid = lookup_group_sid_string(group)?;
-    let sddl = SDDL_TEMPLATE.replace("{SID}", &sid);
+    let sddl = pipe_sddl(&sid);
     let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
 
     let mut psd: *mut c_void = ptr::null_mut();
@@ -239,6 +242,36 @@ pub fn create_server_pipe(
     map_first_instance_err(pipe, first)
 }
 
+/// Open a client end of the named pipe at `addr` for use with tokio.
+///
+/// Unlike tokio's `ClientOptions` (which always requests `GENERIC_WRITE`,
+/// including `FILE_APPEND_DATA` / `FILE_CREATE_PIPE_INSTANCE`), this asks for
+/// exactly [`PIPE_CLIENT_DESIRED_ACCESS`] (`GENERIC_READ | FILE_WRITE_DATA`)
+/// — the most a client group member is granted by [`create_server_pipe`] —
+/// and sets `SECURITY_IDENTIFICATION`, so a server squatting the name can
+/// identify but never impersonate this client.
+///
+/// Must be called from within a tokio runtime with I/O enabled.
+///
+/// # Errors
+///
+/// The `CreateFileW` error (e.g. `ERROR_FILE_NOT_FOUND`, `ERROR_PIPE_BUSY`,
+/// `ERROR_ACCESS_DENIED`), or a tokio registration error.
+pub fn open_client_pipe(addr: &OsStr) -> io::Result<NamedPipeClient> {
+    let file = std::fs::OpenOptions::new()
+        .access_mode(PIPE_CLIENT_DESIRED_ACCESS)
+        // std ORs in SECURITY_SQOS_PRESENT.
+        .security_qos_flags(SECURITY_IDENTIFICATION)
+        .custom_flags(FILE_FLAG_OVERLAPPED)
+        .open(addr)?;
+    let handle = file.into_raw_handle();
+    // SAFETY: `handle` is a freshly opened, uniquely owned named-pipe client
+    // handle (ownership released by `into_raw_handle`, so nothing else closes
+    // it), opened with FILE_FLAG_OVERLAPPED as tokio requires. On error tokio
+    // drops the mio wrapper, which closes the handle.
+    unsafe { NamedPipeClient::from_raw_handle(handle) }
+}
+
 /// `ERROR_ACCESS_DENIED` (os error 5) when creating the *first* pipe instance
 /// almost always means a pipe of that name already exists — i.e. another `mia`
 /// (typically the Windows service) is already running and owns it. Windows
@@ -250,7 +283,7 @@ fn map_first_instance_err(
     first: bool,
 ) -> io::Result<NamedPipeServer> {
     match res {
-        Err(e) if first && e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+        Err(e) if first && e.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed()) => {
             Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "the helper pipe already exists; another mia instance is already \
