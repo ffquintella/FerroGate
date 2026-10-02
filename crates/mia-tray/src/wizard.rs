@@ -713,7 +713,7 @@ mod tests {
         assert!(!d.values.flag(Field::AllowlistPropose));
         assert_eq!(d.values.get(Field::AttestationBackend), "host-key");
         assert_eq!(d.values.get(Field::CmisSrv), "");
-        assert!(validate(&d.values).is_empty());
+        assert_eq!(validate(&d.values), [] as [(Field, Msg); 0]);
     }
 
     #[test]

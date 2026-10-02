@@ -718,7 +718,7 @@ mod tests {
             assert_eq!(p.badge, badge, "{state:?}");
             assert_eq!(p.animated, state == AgentState::Attesting);
             assert_eq!(recoveries(&snap(state, None, None)), recs, "{state:?}");
-            assert!(!title(state).text(Lang::Pt).is_empty());
+            assert_ne!(title(state).text(Lang::Pt), "", "{state:?}");
         }
     }
 
