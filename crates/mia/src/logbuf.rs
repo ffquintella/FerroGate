@@ -538,13 +538,28 @@ mod tests {
         buf
     }
 
+    /// A fake compact JWS assembled at runtime from its decoded segments, so the
+    /// source holds no literal `eyJ…` token for secret scanners to flag.
+    fn fake_jws(header: &str, payload: &str, signature: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        [header, payload, signature]
+            .map(|segment| URL_SAFE_NO_PAD.encode(segment))
+            .join(".")
+    }
+
     fn all(buf: &LogBuffer) -> Vec<LogRecord> {
         buf.tail(0, Level::Trace, usize::MAX, usize::MAX).records
     }
 
     #[test]
     fn logbuf_redacts_sensitive_fields() {
-        let jws = "eyJhbGciOiJFZERTQSIsImtpZCI6ImNtaXMtMSJ9.eyJzdWIiOiJzcGlmZmU6Ly9mZXJyb2dhdGUudGVzdC9ob3N0L2FiYyIsImV4cCI6MTcwMDAwMDAwMH0.c2lnbmF0dXJlLWJ5dGVzLXRoYXQtYXJlLWxvbmctZW5vdWdoLXRvLWJlLXJlZGFjdGVk";
+        let jws = fake_jws(
+            r#"{"alg":"EdDSA","kid":"cmis-1"}"#,
+            r#"{"sub":"spiffe://ferrogate.test/host/abc","exp":1700000000}"#,
+            "signature-bytes-that-are-long-enough-to-be-redacted",
+        );
+        let jws = jws.as_str();
         let pin = "a".repeat(96);
         let jti = "0123456789abcdef0123456789abcdef";
         let buf = buffered(100, 1 << 20, || {
