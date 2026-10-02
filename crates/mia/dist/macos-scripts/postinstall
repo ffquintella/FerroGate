@@ -39,10 +39,12 @@ if [ -f "$DAEMON_PLIST" ] && [ -n "$STATUS_GID" ]; then
     || /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:FERROGATE_STATUS_SOCKET_GID $STATUS_GID" "$DAEMON_PLIST"
 fi
 # Start the tray (a per-user LaunchAgent) in the console user's session now;
-# it starts by itself at every later login.
+# it starts by itself at every later login. On an upgrade the running tray is
+# booted out first, so the new app bundle (not the replaced binary) runs.
 if [ -f "$TRAY_AGENT" ] && [ -n "$CONSOLE_USER" ]; then
   CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
   if [ -n "$CONSOLE_UID" ]; then
+    launchctl bootout "gui/$CONSOLE_UID/com.ferrogate.mia-tray" 2>/dev/null || true
     launchctl bootstrap "gui/$CONSOLE_UID" "$TRAY_AGENT" 2>/dev/null || true
   fi
 fi

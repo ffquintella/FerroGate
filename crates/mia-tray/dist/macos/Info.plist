@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist of "FerroGate MIA.app", the macOS bundle of the mia-tray
+  companion (feature F18). `make pkg-macos` substitutes @VERSION@ with the
+  workspace version and installs the bundle to /Applications.
+
+  LSUIElement keeps the tray out of the Dock and the app switcher; the tray
+  also sets the Accessory activation policy itself (gui/tray_loop.rs).
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>mia-tray</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.ferrogate.mia-tray</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>FerroGate MIA</string>
+    <key>CFBundleDisplayName</key>
+    <string>FerroGate MIA</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
