@@ -258,7 +258,7 @@ messages! {
     FieldCmisSpkiPin => "CMIS SPKI pin", "Pin SPKI do CMIS";
     HelpCmisSpkiPin => "Hex SHA-384 of the CMIS public key (96 characters), from your operator.", "SHA-384 em hexadecimal da chave pública do CMIS (96 caracteres), fornecido pelo operador.";
     FieldHelperSocket => "Helper socket / pipe", "Socket / pipe do helper";
-    HelpHelperSocket => "Where local applications request tokens; setting it enables the helper API.", "Onde as aplicações locais solicitam tokens; defini-lo ativa a API do helper.";
+    HelpHelperSocket => "Where local applications request tokens; leave blank for the platform default.", "Onde as aplicações locais solicitam tokens; deixe em branco para usar o padrão da plataforma.";
     FieldHelperSocketMode => "Socket mode (Unix)", "Modo do socket (Unix)";
     HelpHelperSocketMode => "Octal file mode of the helper socket, e.g. 660.", "Modo octal do socket do helper, por exemplo 660.";
     FieldHelperWindowsGroup => "Pipe group (Windows)", "Grupo do pipe (Windows)";

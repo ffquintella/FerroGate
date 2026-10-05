@@ -781,22 +781,39 @@ where
     }
 }
 
+/// Where step 5 connects: the helper listener the daemon serves for this
+/// configuration — the explicit `helper.socket` or, when unset, the platform's
+/// per-environment default (the same [`Config::helper_socket`] resolution the
+/// daemon binds with). `Err` carries the failure detail and hints to report
+/// when the helper API is switched off (`helper.enable = false`).
+fn mint_target(config: &Config) -> Result<std::path::PathBuf, (String, Vec<String>)> {
+    config.helper_socket().ok_or_else(|| {
+        (
+            "the helper API is disabled (helper.enable = false)".to_string(),
+            vec![
+                "No tokens can be served to local applications while the helper API is off. \
+                 Remove `enable = false` from the [helper] section (or unset \
+                 FERROGATE_HELPER_ENABLE), then restart the agent."
+                    .to_string(),
+            ],
+        )
+    })
+}
+
 /// Step 5 (Unix): connect the helper UDS, then run the mint exchange.
 #[cfg(unix)]
 async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
     let label = "[5/5] helper token mint";
-    let Some(socket) = config.helper_socket() else {
-        report(label, "FAIL", "helper.socket is not configured");
-        hints(&[
-            "The helper API is enabled by configuring a socket path (helper.socket / \
-                 FERROGATE_HELPER_SOCKET); without it no tokens can be served to local \
-                 applications. Run `mia setup` to configure one."
-                .to_string(),
-        ]);
-        return false;
+    let socket = match mint_target(config) {
+        Ok(socket) => socket,
+        Err((detail, advice)) => {
+            report(label, "FAIL", &detail);
+            hints(&advice);
+            return false;
+        }
     };
 
-    let stream = match tokio::net::UnixStream::connect(socket).await {
+    let stream = match tokio::net::UnixStream::connect(&socket).await {
         Ok(s) => s,
         Err(e) => {
             report(
@@ -849,15 +866,13 @@ fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
 #[cfg(windows)]
 async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
     let label = "[5/5] helper token mint";
-    let Some(socket) = config.helper_socket() else {
-        report(label, "FAIL", "helper.socket is not configured");
-        hints(&[
-            "The helper API is enabled by configuring a pipe name (helper.socket / \
-                 FERROGATE_HELPER_SOCKET, e.g. \\\\.\\pipe\\ferrogate-mia); without it no \
-                 tokens can be served to local applications. Run `mia setup` to configure one."
-                .to_string(),
-        ]);
-        return false;
+    let socket = match mint_target(config) {
+        Ok(socket) => socket,
+        Err((detail, advice)) => {
+            report(label, "FAIL", &detail);
+            hints(&advice);
+            return false;
+        }
     };
 
     // Not tokio's ClientOptions: it requests GENERIC_WRITE, which the pipe DACL
@@ -1181,6 +1196,31 @@ fn hints(lines: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mint_target_defaults_when_socket_is_unset() {
+        // No helper.socket anywhere is no longer a failure: step 5 dials the
+        // platform default the daemon binds.
+        let config = Config::from_toml("").unwrap();
+        assert_eq!(
+            mint_target(&config).unwrap(),
+            crate::config::default_helper_socket(None)
+        );
+        // An explicit socket is dialed verbatim.
+        let config = Config::from_toml("[helper]\nsocket = '/tmp/mia-explicit.sock'").unwrap();
+        assert_eq!(
+            mint_target(&config).unwrap(),
+            std::path::PathBuf::from("/tmp/mia-explicit.sock")
+        );
+    }
+
+    #[test]
+    fn mint_target_fails_only_when_disabled() {
+        let config = Config::from_toml("[helper]\nenable = false").unwrap();
+        let (detail, advice) = mint_target(&config).unwrap_err();
+        assert!(detail.contains("disabled"), "{detail}");
+        assert!(advice.iter().any(|h| h.contains("enable = false")));
+    }
 
     #[test]
     fn parse_defaults_and_overrides() {

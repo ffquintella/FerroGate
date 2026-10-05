@@ -199,6 +199,10 @@ pub(crate) struct Settings {
     pub(crate) cmis_endpoint: Option<String>,
     pub(crate) cmis_srv: Option<String>,
     pub(crate) cmis_spki_pin: Option<String>,
+    /// `helper.enable`: `Some(false)` writes `enable = false` (helper API
+    /// off); `None` or `Some(true)` leave the default (on) as a commented
+    /// placeholder.
+    pub(crate) helper_enable: Option<bool>,
     pub(crate) helper_socket: Option<String>,
     pub(crate) helper_socket_mode: Option<String>,
     pub(crate) helper_windows_group: Option<String>,
@@ -361,8 +365,11 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
     // ── Helper API (the daemon's local serving surface) ──────────────────────
     println!("\n— Helper API (local listener the daemon serves) —");
     let enable_helper = Confirm::new("Enable the local helper API?")
-        .with_default(existing.helper.socket.is_some())
-        .with_help_message("the agent serves DPoP-bound child tokens to vetted local callers")
+        .with_default(existing.helper_enabled())
+        .with_help_message(
+            "on by default: the agent serves DPoP-bound child tokens to vetted local callers; \
+             No writes `enable = false`",
+        )
         .prompt()?;
     if enable_helper {
         let socket = Text::new("Helper listener (Unix socket path / Windows pipe name):")
@@ -370,6 +377,7 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
                 existing.helper.socket.as_deref(),
                 default_socket(environment),
             ))
+            .with_help_message("blank ⇒ the platform default for this environment")
             .with_validator(literal_validator)
             .prompt()?;
         s.helper_socket = non_empty(socket);
@@ -404,6 +412,8 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
             s.helper_windows_group = non_empty(group);
         }
     } else {
+        // An unset socket no longer disables the helper API; say so explicitly.
+        s.helper_enable = Some(false);
         // Keep any platform fields from the existing file rather than dropping
         // them just because the helper section was skipped this run.
         s.helper_socket_mode
@@ -587,36 +597,14 @@ fn env_filename(name: &str, environment: Option<&str>) -> String {
     }
 }
 
-/// The platform's default helper listener address (Windows named pipe). With an
-/// `--environment` selector the pipe name is suffixed so two deployments'
-/// daemons don't try to bind the same pipe.
-#[cfg(windows)]
+/// The default helper listener address for `environment`, as the prompt and
+/// placeholder text. The address itself comes from
+/// [`crate::config::default_helper_socket`] — the one the daemon binds when
+/// `helper.socket` is unset — so the wizard never suggests a different path.
 fn default_socket(environment: Option<&str>) -> String {
-    match environment {
-        Some(env) => format!(r"\\.\pipe\ferrogate-mia-{env}"),
-        None => r"\\.\pipe\ferrogate-mia".to_string(),
-    }
-}
-
-/// The platform's default helper listener address (macOS Unix socket). macOS
-/// has no `/run`, and `/var/run` is a boot-cleared tmpfs — a socket parented
-/// there vanishes on every reboot and the daemon crash-loops on bind. Use the
-/// persistent system Application Support tree instead (the same place the
-/// config and allowlist live), in a dedicated `run/` subdirectory the daemon
-/// owns. For the default environment this must match the launchd plist's
-/// `FERROGATE_HELPER_SOCKET` (`crates/mia/dist/com.ferrogate.mia.plist`); an
-/// `--environment` deployment runs its own service and gets a suffixed socket.
-#[cfg(target_os = "macos")]
-fn default_socket(environment: Option<&str>) -> String {
-    let name = env_filename("mia.sock", environment);
-    format!("/Library/Application Support/FerroGate/run/{name}")
-}
-
-/// The platform's default helper listener address (Linux/other Unix socket),
-/// suffixed by the `--environment` selector when one is given.
-#[cfg(not(any(target_os = "macos", windows)))]
-fn default_socket(environment: Option<&str>) -> String {
-    format!("/run/ferrogate/{}", env_filename("mia.sock", environment))
+    crate::config::default_helper_socket(environment)
+        .display()
+        .to_string()
 }
 
 /// A file alongside the system config directory (e.g. the allowlist), as a
@@ -899,8 +887,15 @@ pub(crate) fn render(s: &Settings, environment: Option<&str>) -> String {
     out.push('\n');
 
     out.push_str("[helper]\n");
+    out.push_str("# Serve the local helper API. Default: true. Set false to switch it off\n");
+    out.push_str("# (leaving `socket` unset does not disable it).\n");
+    out.push_str(if s.helper_enable == Some(false) {
+        "enable = false\n"
+    } else {
+        "#enable = true\n"
+    });
     out.push_str("# Listener address: a Unix socket path (Linux/macOS) or a named-pipe name\n");
-    out.push_str("# (Windows). Its presence ENABLES the helper API.\n");
+    out.push_str("# (Windows). Default: the platform path for this environment, shown here.\n");
     out.push_str(&str_line(
         s.helper_socket.as_deref(),
         "socket",
@@ -1275,7 +1270,10 @@ mod tests {
         );
         assert_eq!(env_filename("mia.sock", Some("prod")), "mia-prod.sock");
         // No extension ⇒ appended.
-        assert_eq!(env_filename("ferrogate-mia", Some("qa")), "ferrogate-mia-qa");
+        assert_eq!(
+            env_filename("ferrogate-mia", Some("qa")),
+            "ferrogate-mia-qa"
+        );
     }
 
     #[test]
@@ -1286,6 +1284,41 @@ mod tests {
         let staging = default_socket(Some("staging"));
         assert_ne!(default, staging);
         assert!(staging.contains("staging"));
+        // The wizard suggests exactly what the daemon binds when unset.
+        assert_eq!(
+            Path::new(&staging),
+            crate::config::default_helper_socket(Some("staging"))
+        );
+    }
+
+    #[test]
+    fn render_writes_the_helper_switch_only_when_off() {
+        // Default (on): a commented placeholder; the file parses as enabled
+        // and serves the default socket.
+        let on = render(&Settings::default(), None);
+        assert!(on.contains("\n#enable = true\n"), "{on}");
+        let parsed = Config::from_toml(&on).unwrap();
+        assert!(parsed.helper_enabled());
+        assert_eq!(
+            parsed.helper_socket(),
+            Some(crate::config::default_helper_socket(None))
+        );
+        // An explicit true is the default too.
+        let s = Settings {
+            helper_enable: Some(true),
+            ..Settings::default()
+        };
+        assert_eq!(render(&s, None), on);
+        // Off: written as an active key, and the file parses as disabled.
+        let s = Settings {
+            helper_enable: Some(false),
+            ..Settings::default()
+        };
+        let off = render(&s, None);
+        assert!(off.contains("\nenable = false\n"), "{off}");
+        let parsed = Config::from_toml(&off).unwrap();
+        assert!(!parsed.helper_enabled());
+        assert_eq!(parsed.helper_socket(), None);
     }
 
     #[test]

@@ -149,8 +149,10 @@ Section "FerroGate MIA" SecMia
     DetailPrint "WARNING: 'mia service install' exited with code $0 (the service may already exist)."
   ${EndIf}
 
-  ; Start it now. mia exits cleanly (idle) until a helper socket is configured,
-  ; so a fresh install may show the service as Stopped — that is expected.
+  ; Start it now. The helper API is on by default (\\.\pipe\ferrogate-mia), so
+  ; the service keeps running; until CMIS and the allowlist are configured it
+  ; refuses every token request (fail closed). helper.enable = false in
+  ; mia.toml switches the helper API off (the service then exits idle).
   DetailPrint "Starting the mia service..."
   nsExec::ExecToLog '"$INSTDIR\mia.exe" service start'
   Pop $0

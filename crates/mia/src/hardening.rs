@@ -45,6 +45,90 @@ pub fn ima_cmdline_enforced(cmdline: &str) -> bool {
     })
 }
 
+/// A directory the daemon writes to after it drops privileges, prepared as
+/// root by `prepare_runtime_paths` (Linux).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeDir {
+    /// The directory.
+    pub path: std::path::PathBuf,
+    /// For a helper-socket directory, the gid the sockets inside must carry
+    /// (`helper.socket_gid`). The directory is then group-owned by it with the
+    /// setgid bit set (`02750`), so a socket the unprivileged daemon binds
+    /// there inherits the group from the directory — no `chown` after the
+    /// drop, which the seccomp allow-list forbids (it would kill the daemon
+    /// with `SIGSYS`). `None` ⇒ the service user's own group, mode `0750`.
+    pub socket_gid: Option<u32>,
+}
+
+/// Plan the post-drop runtime directories: `state_dir` plus the parent of every
+/// helper socket, each listed once.
+///
+/// `sockets` pairs each served helper socket with its `helper.socket_gid`.
+/// Environments whose sockets share a directory share its group; when they
+/// disagree the first gid wins and the conflict is logged — the later
+/// environment's bind then needs a `chown` the hardened daemon cannot make, so
+/// give such environments distinct socket directories (or one gid). The state
+/// directory (machine key, SVID seed) is never handed to a socket group: a
+/// socket placed there keeps the service user's group.
+#[must_use]
+pub fn plan_runtime_dirs(
+    state_dir: std::path::PathBuf,
+    sockets: impl IntoIterator<Item = (std::path::PathBuf, Option<u32>)>,
+) -> Vec<RuntimeDir> {
+    let mut dirs = vec![RuntimeDir {
+        path: state_dir,
+        socket_gid: None,
+    }];
+    for (socket, gid) in sockets {
+        let Some(parent) = socket.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            continue;
+        };
+        if parent == dirs[0].path {
+            if gid.is_some() {
+                tracing::warn!(
+                    dir = %parent.display(),
+                    "a helper socket in the state directory cannot take helper.socket_gid; \
+                     the state directory stays private to the service user — move the socket"
+                );
+            }
+            continue;
+        }
+        match dirs.iter_mut().find(|d| d.path == parent) {
+            None => dirs.push(RuntimeDir {
+                path: parent.to_path_buf(),
+                socket_gid: gid,
+            }),
+            Some(dir) => match (dir.socket_gid, gid) {
+                (None, Some(_)) => dir.socket_gid = gid,
+                (Some(have), Some(want)) if have != want => tracing::warn!(
+                    dir = %dir.path.display(), kept = have, ignored = want,
+                    "helper sockets sharing a directory ask for different socket_gid \
+                     values; the directory keeps the first"
+                ),
+                _ => {}
+            },
+        }
+    }
+    dirs
+}
+
+/// Create `dir` if needed and hand it to `uid:gid` — mode `02750` (setgid, so
+/// new entries inherit `gid`) when `setgid`, else `0750`. Ownership is set
+/// before the mode so the setgid bit is applied last.
+#[cfg(unix)]
+pub fn hand_over_dir(
+    dir: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    setgid: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(dir)?;
+    std::os::unix::fs::chown(dir, Some(uid), Some(gid))?;
+    let mode = if setgid { 0o2750 } else { 0o750 };
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::{harden, ima_enforced, prepare_runtime_paths};
 
@@ -53,7 +137,7 @@ mod linux {
     use anyhow::{bail, Context as _};
     use ferro_harden::{HardenProfile, RunAs, SeccompMode};
 
-    use super::{ima_cmdline_enforced, SERVICE_USER};
+    use super::{hand_over_dir, ima_cmdline_enforced, RuntimeDir, SERVICE_USER};
 
     /// Default path to the kernel command line.
     const DEFAULT_CMDLINE: &str = "/proc/cmdline";
@@ -102,9 +186,12 @@ mod linux {
     }
 
     /// Prepare, as root, the directories the daemon will write to *after* it
-    /// drops to the service user: create each one (mode `0750`) if missing and
-    /// hand ownership to the privilege-drop target. Must be called before
-    /// [`harden`]; the two resolve the same target via [`resolve_run_as`].
+    /// drops to the service user: create each one if missing and hand it to the
+    /// privilege-drop target — `uid:gid 0750`, or, for a helper-socket
+    /// directory with a [`RuntimeDir::socket_gid`], `uid:socket_gid 02750` so
+    /// the sockets bound there after the drop inherit that group without a
+    /// (seccomp-forbidden) `chown`. Must be called before [`harden`]; the two
+    /// resolve the same target via [`resolve_run_as`].
     ///
     /// This is what lets a MIA that starts as root, then drops to `_ferrogate`,
     /// still bind its helper socket under `/run/ferrogate` and persist its key
@@ -114,24 +201,26 @@ mod linux {
     /// A no-op when hardening is skipped or we are not root (no drop follows, so
     /// ownership is already correct). `mia` stays `#![forbid(unsafe_code)]`:
     /// `std::os::unix::fs::chown` is a safe wrapper over the syscall.
-    pub fn prepare_runtime_paths(dirs: &[std::path::PathBuf]) -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
-
+    pub fn prepare_runtime_paths(dirs: &[RuntimeDir]) -> anyhow::Result<()> {
         if env_flag_set("FERROGATE_SKIP_HARDENING") || !ferro_harden::is_root() {
             return Ok(());
         }
         let run_as = resolve_run_as()?;
         for dir in dirs {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("create runtime directory {}", dir.display()))?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))
-                .with_context(|| format!("set mode on {}", dir.display()))?;
-            std::os::unix::fs::chown(dir, Some(run_as.uid), Some(run_as.gid))
-                .with_context(|| format!("chown {} to the service user", dir.display()))?;
+            let gid = dir.socket_gid.unwrap_or(run_as.gid);
+            hand_over_dir(&dir.path, run_as.uid, gid, dir.socket_gid.is_some()).with_context(
+                || {
+                    format!(
+                        "hand runtime directory {} to the service user",
+                        dir.path.display()
+                    )
+                },
+            )?;
             tracing::info!(
-                dir = %dir.display(),
+                dir = %dir.path.display(),
                 uid = run_as.uid,
-                gid = run_as.gid,
+                gid,
+                setgid = dir.socket_gid.is_some(),
                 "handed runtime directory to the privilege-drop user"
             );
         }
@@ -250,5 +339,68 @@ mod tests {
         // A substring that merely contains the value must not match.
         assert!(!ima_cmdline_enforced("xima_appraise=enforce"));
         assert!(!ima_cmdline_enforced("not_ima_appraise=enforce"));
+    }
+
+    #[test]
+    fn runtime_dir_plan_dedups_and_carries_the_socket_group() {
+        use std::path::PathBuf;
+        let state = PathBuf::from("/var/lib/ferrogate");
+        let plan = plan_runtime_dirs(
+            state.clone(),
+            [
+                // Default env with no gid, then a named env asking for one:
+                // the shared /run/ferrogate takes the gid.
+                (PathBuf::from("/run/ferrogate/mia.sock"), None),
+                (PathBuf::from("/run/ferrogate/mia-qa.sock"), Some(555)),
+                // A conflicting gid for the same directory: the first wins.
+                (PathBuf::from("/run/ferrogate/mia-prod.sock"), Some(777)),
+                // Its own directory, its own gid.
+                (PathBuf::from("/srv/sock/mia-x.sock"), Some(42)),
+                // The state directory never takes a socket group.
+                (state.join("mia-odd.sock"), Some(9)),
+            ],
+        );
+        assert_eq!(
+            plan,
+            vec![
+                RuntimeDir {
+                    path: state,
+                    socket_gid: None
+                },
+                RuntimeDir {
+                    path: PathBuf::from("/run/ferrogate"),
+                    socket_gid: Some(555)
+                },
+                RuntimeDir {
+                    path: PathBuf::from("/srv/sock"),
+                    socket_gid: Some(42)
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hand_over_dir_sets_owner_then_setgid_mode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let base = std::env::temp_dir().join(format!("mia-handover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("run");
+        // Our own uid/gid: a chown any user may make, so this runs unprivileged.
+        let meta = {
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::metadata(&base).unwrap()
+        };
+        hand_over_dir(&dir, meta.uid(), meta.gid(), true).unwrap();
+        let got = std::fs::metadata(&dir).unwrap();
+        assert_eq!(got.permissions().mode() & 0o7777, 0o2750);
+        assert_eq!(got.gid(), meta.gid());
+        // Without a socket group: plain 0750, and re-running is idempotent.
+        hand_over_dir(&dir, meta.uid(), meta.gid(), false).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+            0o750
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

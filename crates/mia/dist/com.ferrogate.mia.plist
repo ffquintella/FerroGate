@@ -29,12 +29,12 @@
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
-        <!-- /var/run is a boot-cleared tmpfs on macOS; a socket parented there
-             vanishes on reboot and the daemon crash-loops on bind. Use the
-             persistent Application Support tree (where config/allowlist live);
-             the daemon creates the run/ subdir, owned root:<helper gid> 0750. -->
-        <key>FERROGATE_HELPER_SOCKET</key>
-        <string>/Library/Application Support/FerroGate/run/mia.sock</string>
+        <!-- No FERROGATE_HELPER_SOCKET here: the helper API is on by default at
+             /Library/Application Support/FerroGate/run/mia.sock (mia-<env>.sock
+             per environment). That persistent tree is used because /var/run is
+             a boot-cleared tmpfs on macOS; the daemon creates the run/ subdir
+             (mode 0750, group helper.socket_gid when set). Leaving the variable
+             out lets helper.socket / helper.enable in mia.toml take effect. -->
     </dict>
 
     <key>RunAtLoad</key>

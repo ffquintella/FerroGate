@@ -71,8 +71,9 @@ MIA serves child-token minting to co-located applications over a local IPC
 channel, never the network:
 
 - **Linux:** Unix domain socket, default `/run/ferrogate/mia.sock`, mode `0660`,
-  owned by group `ferrogate-clients`. Enabled via `FERROGATE_HELPER_SOCKET`;
-  mode overridable via `FERROGATE_HELPER_SOCKET_MODE`.
+  owned by group `ferrogate-clients`. On by default (path overridable via
+  `FERROGATE_HELPER_SOCKET`, switched off with `FERROGATE_HELPER_ENABLE=0` /
+  `helper.enable = false`); mode overridable via `FERROGATE_HELPER_SOCKET_MODE`.
 - **Windows:** named pipe `\\.\pipe\ferrogate-mia`, ACL'd to the
   `FerroGateClients` local group.
 

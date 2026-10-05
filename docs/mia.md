@@ -213,10 +213,12 @@ Restart-Service mia      # once installed
 The service runs as `LocalSystem`, reads its configuration from the system path
 (`%ProgramData%\FerroGate\mia.toml`), and — because it has no console — writes
 its logs to `%ProgramData%\FerroGate\logs\mia.log`. `mia service run` is the
-internal entry point the SCM launches and is not meant to be run by hand. Like
-every platform, the daemon exits cleanly (idle) when no helper socket is
-configured, so a freshly installed service shows as *Stopped* until you
-configure a helper pipe; it stays running once configured.
+internal entry point the SCM launches and is not meant to be run by hand. The
+helper API is on by default, so a freshly installed service starts and stays
+*Running*, serving `\\.\pipe\ferrogate-mia` and refusing every token request
+until CMIS and the allowlist are configured (fail closed). Set
+`helper.enable = false` to switch the helper API off; the daemon then exits
+cleanly (idle) and the service shows as *Stopped*.
 
 The pipe's DACL restricts access to the local group named by
 `helper.windows_group` (default `FerroGateClients`). The installer creates this
@@ -303,11 +305,12 @@ that won't bind) is logged and isolated; the others keep serving.
 
 Notes and constraints:
 
-- **Each environment needs a distinct `helper.socket`.** `mia setup` already
-  suggests env-suffixed socket defaults (e.g. `mia-staging.sock`); a duplicate
-  socket across environments is skipped with an error rather than crash-looping
-  the one that bound first.
-- An environment with no `helper.socket` configured is left idle (not served).
+- **Each environment needs a distinct `helper.socket`.** An unset
+  `helper.socket` already resolves to an env-suffixed default (e.g.
+  `mia-staging.sock`, see [Helper listener](#helper-listener-default-and-off-switch));
+  a duplicate socket across environments is skipped with an error rather than
+  crash-looping the one that bound first.
+- An environment with `helper.enable = false` is left idle (not served).
 - `--config`, `--environment`, or `$FERROGATE_CONFIG` pins the daemon to **one**
   environment (the all-environments scan is bypassed). To serve only the default
   `mia.toml` when named environments also exist, pass its path with `--config`.
@@ -330,7 +333,8 @@ endpoint = "https://cmis.example.com:8443"
 spki_pin = "<hex-sha384>"
 
 [helper]
-socket = "/run/ferrogate/mia.sock"   # presence enables the helper API
+enable = true                        # the default; false switches the helper API off
+socket = "/run/ferrogate/mia.sock"   # optional; this is the Linux default
 socket_mode = "660"
 
 [allowlist]
@@ -353,6 +357,7 @@ Each key has an environment-variable equivalent that overrides it:
 | `cmis.endpoint` | `FERROGATE_CMIS_ENDPOINT` |
 | `cmis.srv` | `FERROGATE_CMIS_SRV` |
 | `cmis.spki_pin` | `FERROGATE_CMIS_SPKI_PIN` |
+| `helper.enable` | `FERROGATE_HELPER_ENABLE` |
 | `helper.socket` | `FERROGATE_HELPER_SOCKET` |
 | `helper.socket_mode` | `FERROGATE_HELPER_SOCKET_MODE` |
 | `helper.windows_group` | `FERROGATE_HELPER_WINDOWS_GROUP` |
@@ -365,6 +370,43 @@ Each key has an environment-variable equivalent that overrides it:
 | `allowlist.propose_interval_secs` | `FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS` |
 | `attestation.ima_log` | `FERROGATE_IMA_LOG` |
 | `attestation.backend` | `FERROGATE_ATTEST_BACKEND` |
+
+#### Helper listener: default and off switch
+
+The helper API is **on by default**. When neither `helper.socket` nor
+`FERROGATE_HELPER_SOCKET` is set (a blank value counts as unset), the daemon,
+`mia test` and `mia setup` all resolve the same per-platform, per-environment
+default:
+
+| OS | default environment (`mia.toml`) | named environment (`mia-<env>.toml`) |
+|----|----------------------------------|--------------------------------------|
+| Linux | `/run/ferrogate/mia.sock` | `/run/ferrogate/mia-<env>.sock` |
+| macOS | `/Library/Application Support/FerroGate/run/mia.sock` | `…/FerroGate/run/mia-<env>.sock` |
+| Windows | `\\.\pipe\ferrogate-mia` | `\\.\pipe\ferrogate-mia-<env>` |
+
+The environment is the `--environment` selector or, for a file loaded by path
+(`--config`, `$FERROGATE_CONFIG`, serve-all discovery), the `<env>` in its
+`mia-<env>.toml` name; any other file name is the default environment. An
+explicit value still wins (precedence: default < `helper.socket` <
+`FERROGATE_HELPER_SOCKET`).
+
+To switch the helper API **off**, set `helper.enable = false` (or
+`FERROGATE_HELPER_ENABLE=0`, which also overrides the file and, being
+process-wide, applies to every environment the daemon serves). It wins over any
+socket value. An unset `helper.socket` **no longer** disables the helper API:
+configurations that relied on that must add `enable = false`. Being on is not
+being open — callers still need a signed allowlist entry, and with no allowlist
+every request is refused (fail closed).
+
+Directories and permissions: on Linux, systemd creates `/run/ferrogate`
+(`RuntimeDirectory=`) and the daemon, still root, hands each socket directory to
+`_ferrogate` before dropping privileges — `0750`, or `02750` group-owned by
+`helper.socket_gid` (the Debian package and `make mia-install` set
+`FERROGATE_HELPER_SOCKET_GID` to `ferrogate-clients` / `ferrogate`), so the
+socket bound after the drop inherits that group without a `chown` (forbidden by
+the seccomp profile). On macOS the root daemon creates `run/` (`0750`, group
+`helper.socket_gid` when set) on first bind. Sockets are `0660` (`socket_mode`)
+and a pre-existing non-socket file at the path is refused, never deleted.
 
 #### Attestation backend
 
@@ -553,7 +595,9 @@ log = "info"
 endpoint = "https://cmis.example.com:8443"   # or: srv = "_cmis._tcp.example.com"
 spki_pin = "<hex-sha384>"
 [helper]
-socket = "/run/ferrogate/mia.sock"
+enable = true                                # false ⇒ `enable = false` (helper API off);
+                                             # omitted ⇒ the file's current value is kept
+socket = "/run/ferrogate/mia.sock"           # optional; blank ⇒ the platform default
 socket_mode = "660"                          # windows_group = "FerroGateClients"
 [allowlist]
 path = "/etc/ferrogate/allowlist.cbor"
@@ -600,8 +644,10 @@ scripts. It runs four checks in order:
    readout;
 3. **CMIS CRL publishing** — the `JWKS` RPC returns a signature-valid, fresh
    CRL (the freshness the helper API fail-closed gates minting on, F11);
-4. **helper token mint** — a real `HelperReq` over the local helper socket,
-   reporting the minted token or interpreting the refusal.
+4. **helper token mint** — a real `HelperReq` over the local helper socket
+   (`helper.socket`, else the platform default above), reporting the minted
+   token or interpreting the refusal. It fails only if the helper API is
+   switched off (`helper.enable = false`) or the daemon cannot be reached.
 
 Each failing step prints targeted remediation hints (mirroring the
 [operations runbooks](operations/runbooks/README.md)); a `crl_stale` refusal in

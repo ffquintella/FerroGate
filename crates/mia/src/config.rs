@@ -226,6 +226,84 @@ fn scan_config_dirs(dirs: &[PathBuf]) -> Vec<DiscoveredConfig> {
         .collect()
 }
 
+/// The environment a configuration file belongs to, judged by its file name:
+/// `mia-<env>.toml` (with a valid `<env>`, see [`validate_environment`]) ⇒
+/// `Some(env)`; `mia.toml` or any other name ⇒ `None` (the default
+/// environment). The serve-all discovery uses the same rule, so a file loaded
+/// by path (`--config`, `$FERROGATE_CONFIG`, a discovered `mia-<env>.toml`)
+/// resolves to the same per-environment defaults — notably the helper socket —
+/// however it was selected.
+#[must_use]
+pub fn environment_for_path(path: &Path) -> Option<String> {
+    match classify_config_filename(path.file_name()?.to_str()?)? {
+        ConfigFile::Named(env) if validate_environment(&env).is_ok() => Some(env),
+        _ => None,
+    }
+}
+
+/// The helper socket's file name for an environment: `mia.sock` or
+/// `mia-<env>.sock`.
+#[cfg(not(windows))]
+fn helper_socket_name(environment: Option<&str>) -> String {
+    match environment {
+        Some(env) => format!("mia-{env}.sock"),
+        None => "mia.sock".to_string(),
+    }
+}
+
+/// The platform's default helper listener address (Windows named pipe):
+/// `\\.\pipe\ferrogate-mia`, or `\\.\pipe\ferrogate-mia-<env>` for a named
+/// environment, so side-by-side environments never contend for one pipe.
+///
+/// This is what [`Config::helper_socket`] resolves to when neither
+/// `helper.socket` nor `FERROGATE_HELPER_SOCKET` is set. `environment` must
+/// already have passed [`validate_environment`].
+#[cfg(windows)]
+#[must_use]
+pub fn default_helper_socket(environment: Option<&str>) -> PathBuf {
+    debug_assert!(environment.is_none_or(|e| validate_environment(e).is_ok()));
+    PathBuf::from(match environment {
+        Some(env) => format!(r"\\.\pipe\ferrogate-mia-{env}"),
+        None => r"\\.\pipe\ferrogate-mia".to_string(),
+    })
+}
+
+/// The platform's default helper listener address (macOS Unix socket):
+/// `/Library/Application Support/FerroGate/run/mia[-<env>].sock`.
+///
+/// macOS has no `/run`, and `/var/run` is a boot-cleared tmpfs — a socket
+/// parented there vanishes on every reboot and the daemon crash-loops on bind.
+/// The persistent, root-owned system Application Support tree (where the config
+/// and allowlist live) is used instead, in a dedicated `run/` subdirectory the
+/// daemon creates (mode `0750`) on first bind.
+///
+/// This is what [`Config::helper_socket`] resolves to when neither
+/// `helper.socket` nor `FERROGATE_HELPER_SOCKET` is set. `environment` must
+/// already have passed [`validate_environment`].
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn default_helper_socket(environment: Option<&str>) -> PathBuf {
+    debug_assert!(environment.is_none_or(|e| validate_environment(e).is_ok()));
+    system_config_dir()
+        .join("run")
+        .join(helper_socket_name(environment))
+}
+
+/// The platform's default helper listener address (Linux/other Unix socket):
+/// `/run/ferrogate/mia[-<env>].sock`. `/run/ferrogate` is the systemd
+/// `RuntimeDirectory=` of `mia.service`, recreated root-owned on every start
+/// and handed to the service user before the privilege drop.
+///
+/// This is what [`Config::helper_socket`] resolves to when neither
+/// `helper.socket` nor `FERROGATE_HELPER_SOCKET` is set. `environment` must
+/// already have passed [`validate_environment`].
+#[cfg(not(any(target_os = "macos", windows)))]
+#[must_use]
+pub fn default_helper_socket(environment: Option<&str>) -> PathBuf {
+    debug_assert!(environment.is_none_or(|e| validate_environment(e).is_ok()));
+    PathBuf::from("/run/ferrogate").join(helper_socket_name(environment))
+}
+
 /// The classification of a config filename for environment discovery.
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigFile {
@@ -277,6 +355,14 @@ pub struct Config {
     pub attestation: AttestationConfig,
     /// The read-only status endpoint and log ring buffer (feature F18).
     pub status: StatusConfig,
+    /// The environment this configuration belongs to (`None` ⇒ the default
+    /// environment). Not a TOML key — a file cannot claim another
+    /// environment's identity: the loader sets it from the `--environment`
+    /// selector or, failing that, from the `mia-<env>.toml` file name (see
+    /// [`environment_for_path`]). It selects the per-environment
+    /// [`default_helper_socket`].
+    #[serde(skip)]
+    environment: Option<String>,
 }
 
 /// `[cmis]` — the Central Machine Identity Service to attest to.
@@ -303,9 +389,16 @@ pub struct CmisConfig {
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HelperConfig {
+    /// Serve the helper API. `None` ⇒ enabled (the default). Set `false` to
+    /// switch the helper API off: an unset `socket` no longer disables it (it
+    /// falls back to [`default_helper_socket`]), so this is the one explicit
+    /// off switch. It also wins over a `socket` value (from the file or
+    /// `FERROGATE_HELPER_SOCKET`).
+    pub enable: Option<bool>,
     /// Helper listener address — the Unix-socket path (Linux/macOS) or the
-    /// named-pipe name (Windows, e.g. `\\.\pipe\ferrogate-mia`). Its presence
-    /// ENABLES the helper API.
+    /// named-pipe name (Windows, e.g. `\\.\pipe\ferrogate-mia`). `None` or
+    /// blank ⇒ the platform default for this configuration's environment,
+    /// [`default_helper_socket`].
     pub socket: Option<PathBuf>,
     /// **Unix only.** Octal socket mode as a string (e.g. `"660"`); default
     /// [`DEFAULT_SOCKET_MODE`].
@@ -488,6 +581,7 @@ pub const ENV_OVERRIDES: &[EnvOverride] = &[
     env_override("FERROGATE_CMIS_ENDPOINT", "cmis.endpoint", false),
     env_override("FERROGATE_CMIS_SRV", "cmis.srv", false),
     env_override("FERROGATE_CMIS_SPKI_PIN", "cmis.spki_pin", false),
+    env_override("FERROGATE_HELPER_ENABLE", "helper.enable", false),
     env_override("FERROGATE_HELPER_SOCKET", "helper.socket", true),
     env_override("FERROGATE_HELPER_SOCKET_MODE", "helper.socket_mode", false),
     env_override("FERROGATE_HELPER_SOCKET_GID", "helper.socket_gid", false),
@@ -619,9 +713,23 @@ impl Config {
         Ok((config, source))
     }
 
-    /// Resolve and parse the file portion only (no env overlay). Exposed for
-    /// testing; [`Config::load`] is the real entry point.
+    /// Resolve and parse the file portion only (no env overlay), and record the
+    /// environment the result belongs to: the `--environment` selector, else
+    /// the one named by the loaded file ([`environment_for_path`]), else the
+    /// default. Exposed for testing; [`Config::load`] is the real entry point.
     fn load_file(
+        explicit: Option<&Path>,
+        environment: Option<&str>,
+    ) -> anyhow::Result<(Self, Option<PathBuf>)> {
+        let (mut config, path) = Self::resolve_file(explicit, environment)?;
+        config.environment = environment
+            .map(str::to_owned)
+            .or_else(|| path.as_deref().and_then(environment_for_path));
+        Ok((config, path))
+    }
+
+    /// The file-resolution core of [`Self::load_file`].
+    fn resolve_file(
         explicit: Option<&Path>,
         environment: Option<&str>,
     ) -> anyhow::Result<(Self, Option<PathBuf>)> {
@@ -704,6 +812,12 @@ impl Config {
         }
         if let Some(v) = get("FERROGATE_CMIS_SPKI_PIN") {
             self.cmis.spki_pin = Some(v);
+        }
+        // The on/off switch applies in both scopes: a process-wide
+        // FERROGATE_HELPER_ENABLE=0 is a host-wide kill switch for every
+        // environment the daemon serves.
+        if let Some(v) = get("FERROGATE_HELPER_ENABLE") {
+            self.helper.enable = Some(parse_bool_env("FERROGATE_HELPER_ENABLE", &v)?);
         }
         // The socket *path* is per-environment: in serve-all mode a single
         // process-wide FERROGATE_HELPER_SOCKET would force every environment
@@ -823,10 +937,41 @@ impl Config {
         self.log.as_deref().unwrap_or("info")
     }
 
-    /// The helper socket path, if the helper API is enabled.
+    /// The environment this configuration belongs to (`None` ⇒ the default
+    /// environment), as recorded by the loader.
     #[must_use]
-    pub fn helper_socket(&self) -> Option<&Path> {
-        self.helper.socket.as_deref()
+    pub fn environment(&self) -> Option<&str> {
+        self.environment.as_deref()
+    }
+
+    /// Whether the helper API is served (`helper.enable`, default on).
+    #[must_use]
+    pub fn helper_enabled(&self) -> bool {
+        self.helper.enable.unwrap_or(true)
+    }
+
+    /// The helper listener address, or `None` when the helper API is switched
+    /// off (`helper.enable = false` / `FERROGATE_HELPER_ENABLE=0`).
+    ///
+    /// An explicit `helper.socket` (file or `FERROGATE_HELPER_SOCKET`) is used
+    /// verbatim; an unset or blank one resolves to the platform default for
+    /// this configuration's [`environment`](Self::environment), see
+    /// [`default_helper_socket`]. The daemon, `mia test` and `mia setup` all
+    /// resolve the address through here, so they always agree.
+    #[must_use]
+    pub fn helper_socket(&self) -> Option<PathBuf> {
+        if !self.helper_enabled() {
+            return None;
+        }
+        let explicit = self
+            .helper
+            .socket
+            .as_deref()
+            .filter(|p| !p.to_string_lossy().trim().is_empty());
+        Some(explicit.map_or_else(
+            || default_helper_socket(self.environment()),
+            Path::to_path_buf,
+        ))
     }
 
     /// The helper socket mode, parsed as octal; default [`DEFAULT_SOCKET_MODE`].
@@ -1106,7 +1251,9 @@ mod tests {
         assert_eq!(c.log_directive(), "info");
         assert_eq!(c.socket_mode().unwrap(), 0o660);
         assert_eq!(c.allowlist_max_age(), 72 * 3600);
-        assert!(c.helper_socket().is_none());
+        // No socket configured ⇒ the helper API is still on, at the default.
+        assert!(c.helper_enabled());
+        assert_eq!(c.helper_socket(), Some(default_helper_socket(None)));
     }
 
     #[test]
@@ -1138,7 +1285,7 @@ mod tests {
             Some("https://cmis.example.com:8443")
         );
         assert_eq!(
-            c.helper_socket(),
+            c.helper_socket().as_deref(),
             Some(Path::new("/run/ferrogate/mia.sock"))
         );
         assert_eq!(c.socket_mode().unwrap(), 0o640);
@@ -1197,7 +1344,10 @@ mod tests {
 
         // Overridden by env.
         assert_eq!(c.log_directive(), "debug");
-        assert_eq!(c.helper_socket(), Some(Path::new("/from/env.sock")));
+        assert_eq!(
+            c.helper_socket().as_deref(),
+            Some(Path::new("/from/env.sock"))
+        );
         assert_eq!(c.allowlist_max_age(), 120);
         // Untouched by env ⇒ keeps the file value.
         assert_eq!(c.socket_mode().unwrap(), 0o660);
@@ -1211,7 +1361,7 @@ mod tests {
             env.get(k).map(|s| (*s).to_string())
         })
         .unwrap();
-        assert_eq!(c.helper_socket(), Some(Path::new("/run/x.sock")));
+        assert_eq!(c.helper_socket().as_deref(), Some(Path::new("/run/x.sock")));
     }
 
     #[test]
@@ -1228,22 +1378,33 @@ mod tests {
             env.get(k).map(|s| (*s).to_string())
         })
         .unwrap();
-        assert_eq!(c.helper_socket(), Some(Path::new("/from/file.sock")));
+        assert_eq!(
+            c.helper_socket().as_deref(),
+            Some(Path::new("/from/file.sock"))
+        );
         assert_eq!(c.socket_mode().unwrap(), 0o600);
         assert_eq!(c.socket_gid().unwrap(), Some(777));
     }
 
     #[test]
-    fn shared_only_scope_leaves_unset_socket_unset() {
+    fn shared_only_scope_keeps_the_environment_default_socket() {
         // Without a file value, SharedOnly must not fill the socket from the
-        // env either — the environment simply has no helper socket.
-        let mut c = Config::default();
+        // process-wide env var either: the named environment gets its own
+        // per-environment default, never the default environment's path.
+        let mut c = Config {
+            environment: Some("staging".into()),
+            ..Config::default()
+        };
         let env: HashMap<&str, &str> = HashMap::from([("FERROGATE_HELPER_SOCKET", "/run/x.sock")]);
         c.apply_overrides(EnvOverrideScope::SharedOnly, |k| {
             env.get(k).map(|s| (*s).to_string())
         })
         .unwrap();
-        assert_eq!(c.helper_socket(), None);
+        assert_eq!(c.helper.socket, None);
+        assert_eq!(
+            c.helper_socket(),
+            Some(default_helper_socket(Some("staging")))
+        );
     }
 
     #[test]
@@ -1344,6 +1505,7 @@ mod tests {
         for o in ENV_OVERRIDES {
             let value = match o.var {
                 "FERROGATE_HELPER_REQUIRE_AUTHENTICODE"
+                | "FERROGATE_HELPER_ENABLE"
                 | "FERROGATE_ALLOWLIST_FETCH"
                 | "FERROGATE_ALLOWLIST_PROPOSE"
                 | "FERROGATE_STATUS_ENABLE" => "1",
@@ -1386,5 +1548,160 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("MAX_AGE"));
+    }
+
+    #[test]
+    fn default_helper_socket_is_platform_and_environment_scoped() {
+        let default = default_helper_socket(None);
+        let staging = default_helper_socket(Some("staging"));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                default,
+                Path::new("/Library/Application Support/FerroGate/run/mia.sock")
+            );
+            assert_eq!(
+                staging,
+                Path::new("/Library/Application Support/FerroGate/run/mia-staging.sock")
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(default, Path::new(r"\\.\pipe\ferrogate-mia"));
+            assert_eq!(staging, Path::new(r"\\.\pipe\ferrogate-mia-staging"));
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            assert_eq!(default, Path::new("/run/ferrogate/mia.sock"));
+            assert_eq!(staging, Path::new("/run/ferrogate/mia-staging.sock"));
+        }
+        // Side-by-side environments never share a listener.
+        assert_ne!(default, staging);
+    }
+
+    #[test]
+    fn environment_for_path_follows_the_discovery_naming() {
+        assert_eq!(
+            environment_for_path(Path::new("/etc/ferrogate/mia.toml")),
+            None
+        );
+        assert_eq!(
+            environment_for_path(Path::new("/etc/ferrogate/mia-prod.toml")),
+            Some("prod".to_string())
+        );
+        // Not a config name, or an invalid embedded environment ⇒ default.
+        assert_eq!(environment_for_path(Path::new("/tmp/custom.toml")), None);
+        assert_eq!(environment_for_path(Path::new("/tmp/mia-a b.toml")), None);
+        assert_eq!(environment_for_path(Path::new("/")), None);
+    }
+
+    #[test]
+    fn loader_records_the_environment_for_the_default_socket() {
+        let dir = std::env::temp_dir().join(format!("mia-env-socket-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A file named mia-<env>.toml loaded by path takes that environment's
+        // default socket — the same one serve-all discovery would give it.
+        let named = dir.join("mia-qa.toml");
+        std::fs::write(&named, "").unwrap();
+        let (c, _) = Config::load_file(Some(&named), None).unwrap();
+        assert_eq!(c.environment(), Some("qa"));
+        assert_eq!(c.helper_socket(), Some(default_helper_socket(Some("qa"))));
+
+        // Any other file name is the default environment.
+        let plain = dir.join("custom.toml");
+        std::fs::write(&plain, "").unwrap();
+        let (c, _) = Config::load_file(Some(&plain), None).unwrap();
+        assert_eq!(c.environment(), None);
+        assert_eq!(c.helper_socket(), Some(default_helper_socket(None)));
+
+        // An --environment selector wins even when no file is found.
+        let (c, path) = Config::load_file(None, Some("zz-mia-unit-test-absent")).unwrap();
+        assert!(path.is_none());
+        assert_eq!(c.environment(), Some("zz-mia-unit-test-absent"));
+        assert_eq!(
+            c.helper_socket(),
+            Some(default_helper_socket(Some("zz-mia-unit-test-absent")))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn helper_socket_precedence_default_then_toml_then_env() {
+        let get = |env: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                env.iter()
+                    .find(|(var, _)| *var == k)
+                    .map(|(_, v)| (*v).to_string())
+            }
+        };
+        // 1. built-in default.
+        let mut c = Config::from_toml("").unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, get(&[])).unwrap();
+        assert_eq!(c.helper_socket(), Some(default_helper_socket(None)));
+        // 2. the TOML value beats the default.
+        let mut c = Config::from_toml("[helper]\nsocket = '/from/file.sock'").unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, get(&[])).unwrap();
+        assert_eq!(
+            c.helper_socket().as_deref(),
+            Some(Path::new("/from/file.sock"))
+        );
+        // 3. the env var beats the TOML value.
+        c.apply_overrides(
+            EnvOverrideScope::Full,
+            get(&[("FERROGATE_HELPER_SOCKET", "/from/env.sock")]),
+        )
+        .unwrap();
+        assert_eq!(
+            c.helper_socket().as_deref(),
+            Some(Path::new("/from/env.sock"))
+        );
+        // A blank value (TOML or env) means "unset": the default applies.
+        let c = Config::from_toml("[helper]\nsocket = '  '").unwrap();
+        assert_eq!(c.helper_socket(), Some(default_helper_socket(None)));
+    }
+
+    #[test]
+    fn helper_api_can_be_disabled_explicitly() {
+        // `enable = false` switches the helper API off, even with a socket set.
+        let c = Config::from_toml("[helper]\nenable = false\nsocket = '/run/x.sock'").unwrap();
+        assert!(!c.helper_enabled());
+        assert_eq!(c.helper_socket(), None);
+        // `enable = true` is the default made explicit.
+        let c = Config::from_toml("[helper]\nenable = true").unwrap();
+        assert_eq!(c.helper_socket(), Some(default_helper_socket(None)));
+
+        // The env var overrides the file in both directions, in both scopes
+        // (a host-wide kill switch reaches every served environment).
+        for scope in [EnvOverrideScope::Full, EnvOverrideScope::SharedOnly] {
+            let mut c = Config::from_toml("[helper]\nenable = true").unwrap();
+            c.apply_overrides(scope, |k| {
+                (k == "FERROGATE_HELPER_ENABLE").then(|| "0".to_string())
+            })
+            .unwrap();
+            assert_eq!(c.helper_socket(), None, "{scope:?}");
+
+            let mut c = Config::from_toml("[helper]\nenable = false").unwrap();
+            c.apply_overrides(scope, |k| {
+                (k == "FERROGATE_HELPER_ENABLE").then(|| "yes".to_string())
+            })
+            .unwrap();
+            assert!(c.helper_enabled(), "{scope:?}");
+        }
+        // A non-boolean is a loud error, not a silent default.
+        let mut c = Config::default();
+        assert!(c
+            .apply_overrides(EnvOverrideScope::Full, |k| {
+                (k == "FERROGATE_HELPER_ENABLE").then(|| "maybe".to_string())
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn environment_is_not_a_toml_key() {
+        // Only the loader decides which environment a file belongs to.
+        assert!(Config::from_toml("environment = 'prod'").is_err());
+        assert_eq!(Config::from_toml("").unwrap().environment(), None);
     }
 }

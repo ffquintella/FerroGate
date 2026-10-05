@@ -25,6 +25,58 @@ record them.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-05
+
+### Added
+
+- Add `helper.enable` / `FERROGATE_HELPER_ENABLE` as the explicit off switch for the MIA helper API (S8, S29, S31)
+  `helper.enable = false` (or `FERROGATE_HELPER_ENABLE=0`) switches the helper
+  API off and wins over any `helper.socket` value. The variable overrides the
+  file and, being process-wide, reaches every environment the daemon serves.
+  `mia setup` writes `enable = false` when the helper API is declined, and
+  `mia setup --apply` accepts `helper.enable` in drafts; a draft that omits it
+  keeps the file's current value, so an older front end cannot switch the
+  helper API back on by leaving the key out.
+
+### Changed
+
+- Breaking: serve the MIA helper API by default on a per-platform, per-environment socket (S8, S29, S31)
+  **An unset `helper.socket` no longer disables the helper API.** When neither
+  `helper.socket` nor `FERROGATE_HELPER_SOCKET` is set (blank counts as unset),
+  the daemon, `mia test` and `mia setup` all resolve the same default through
+  `mia::config::default_helper_socket`: `/run/ferrogate/mia[-<env>].sock`
+  (Linux), `/Library/Application Support/FerroGate/run/mia[-<env>].sock`
+  (macOS), `\\.\pipe\ferrogate-mia[-<env>]` (Windows). The environment is the
+  `--environment` selector or the `<env>` in a `mia-<env>.toml` file name.
+  Precedence is unchanged: default < `helper.socket` < `FERROGATE_HELPER_SOCKET`.
+  Callers still need a signed allowlist entry; with no allowlist every request is
+  refused. `mia test` no longer fails with "helper.socket is not configured".
+  - **Migration:** hosts that relied on an unset socket to keep the helper API
+    off must add `helper.enable = false`. A Windows service now stays running
+    after install instead of exiting idle.
+  - **macOS:** the launchd plist no longer sets `FERROGATE_HELPER_SOCKET`. Its
+    value was the new default. A `helper.socket` in `mia.toml` now takes effect
+    for the default environment; before, the plist variable overrode it.
+
+### Fixed
+
+- Bind the Linux helper socket with `helper.socket_gid` without a `chown` that the seccomp profile forbids (S8, S12)
+  On Linux the hardened daemon binds the helper socket after dropping to
+  `_ferrogate`, and the seccomp allow-list has no `chown`. With
+  `FERROGATE_HELPER_SOCKET_GID` set, as the Debian package and
+  `make mia-install` do, the daemon was killed with `SIGSYS` at bind. Now, while
+  still root, it hands each helper-socket directory to `_ferrogate` group-owned
+  by `helper.socket_gid` with the setgid bit (`02750`). The socket inherits the
+  group, and the bind calls `chown` only if the group is still wrong.
+
+### Security
+
+- Refuse to replace a non-socket file at the helper socket path (S8)
+  The helper listener used to unlink whatever was at `helper.socket` before
+  binding. It now removes only a stale socket and refuses any other file type,
+  symlinks included, as the status endpoint already did. A mistyped path can no
+  longer make the daemon delete data.
+
 ## [0.21.9] - 2026-10-05
 
 ### Fixed
@@ -2303,7 +2355,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.21.9...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.22.0...HEAD
+[0.22.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.22.0
 [0.21.9]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.9
 [0.21.8]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.8
 [0.21.7]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.7

@@ -34,8 +34,13 @@
 //!
 //! The environment variables (each also a TOML key — see `dist/mia.toml`):
 //!
-//! - `FERROGATE_HELPER_SOCKET` (`helper.socket`) — socket path; its presence
-//!   enables the helper API. Absent ⇒ the daemon logs a banner and exits.
+//! - `FERROGATE_HELPER_ENABLE` (`helper.enable`) — serve the helper API
+//!   (default on); `0`/`false` switches it off.
+//! - `FERROGATE_HELPER_SOCKET` (`helper.socket`) — socket path. Absent ⇒ the
+//!   platform default for the environment
+//!   ([`mia::config::default_helper_socket`]: `/run/ferrogate/mia[-<env>].sock`
+//!   on Linux, `/Library/Application Support/FerroGate/run/mia[-<env>].sock`
+//!   on macOS, `\\.\pipe\ferrogate-mia[-<env>]` on Windows).
 //! - `FERROGATE_HELPER_SOCKET_MODE` (`helper.socket_mode`) — octal socket mode
 //!   (default `660`).
 //! - `FERROGATE_HELPER_SOCKET_GID` (`helper.socket_gid`) — numeric gid to own
@@ -510,12 +515,13 @@ fn print_usage() {
     );
 }
 
-/// Daemon entry point. Serves every environment instance that has a helper
-/// socket configured, concurrently, in this one process — each attesting to its
-/// own CMIS and exposing its own helper socket. Environments without a helper
-/// socket are idle (logged, not served); a duplicate socket across environments
-/// is skipped (each needs a distinct `helper.socket`). With nothing to serve it
-/// prints the idle banner and exits.
+/// Daemon entry point. Serves every environment instance whose helper API is
+/// on (the default), concurrently, in this one process — each attesting to its
+/// own CMIS and exposing its own helper socket (the configured `helper.socket`,
+/// else the per-environment platform default). Environments with
+/// `helper.enable = false` are idle (logged, not served); a duplicate socket
+/// across environments is skipped (each needs a distinct `helper.socket`).
+/// With nothing to serve it prints the idle banner and exits.
 // The serve path holds a composite key (~4 KB ML-DSA) across awaits during
 // attestation; the large future is inherent, not a bug.
 #[allow(clippy::large_futures)]
@@ -547,13 +553,14 @@ async fn run_all(
             None => {
                 tracing::info!(
                     env = %inst.label,
-                    "no helper socket configured for this environment; not serving it"
+                    "helper API disabled for this environment (helper.enable = false); \
+                     not serving it"
                 );
                 inst.status
                     .set_not_configured(mia_status_proto::error_codes::HELPER_NOT_CONFIGURED);
             }
             Some(socket) => {
-                if seen_sockets.insert(socket.to_path_buf()) {
+                if seen_sockets.insert(socket.clone()) {
                     serveable.push(inst);
                 } else {
                     inst.status
@@ -561,7 +568,7 @@ async fn run_all(
                     // Name the likely culprit when the colliding path matches a
                     // process-wide FERROGATE_HELPER_SOCKET override.
                     let from_env_override = std::env::var_os("FERROGATE_HELPER_SOCKET")
-                        .is_some_and(|v| std::path::Path::new(&v) == socket);
+                        .is_some_and(|v| std::path::Path::new(&v) == socket.as_path());
                     tracing::error!(
                         env = %inst.label, socket = %socket.display(),
                         from_env_override,
@@ -583,8 +590,8 @@ async fn run_all(
     match serveable.len() {
         0 => {
             println!(
-                "mia v{} — daemon idle; no environment has a helper socket configured \
-                 (helper.socket / FERROGATE_HELPER_SOCKET) to start the helper API.",
+                "mia v{} — daemon idle; every environment has the helper API switched off \
+                 (helper.enable = false / FERROGATE_HELPER_ENABLE=0).",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
@@ -732,8 +739,7 @@ async fn start_helper_api(
     use anyhow::Context as _;
     let socket_path = config
         .helper_socket()
-        .context("internal: start_helper_api called without a helper socket")?
-        .to_path_buf();
+        .context("internal: start_helper_api called with the helper API disabled")?;
     serve(
         config,
         socket_path,
@@ -838,16 +844,15 @@ fn prepare_and_harden(
 
     #[cfg(target_os = "linux")]
     {
-        let mut dirs = vec![state_dir()];
-        for inst in instances {
-            if let Some(parent) = inst
-                .config
-                .helper_socket()
-                .and_then(std::path::Path::parent)
-            {
-                dirs.push(parent.to_path_buf());
-            }
-        }
+        // Each served socket's directory, carrying the socket's group so the
+        // post-drop bind inherits it (setgid) instead of calling the
+        // seccomp-forbidden chown. A malformed gid is left to fail loudly at
+        // bind time, where it is reported against its environment.
+        let sockets = instances.iter().filter_map(|inst| {
+            let socket = inst.config.helper_socket()?;
+            Some((socket, inst.config.socket_gid().ok().flatten()))
+        });
+        let dirs = mia::hardening::plan_runtime_dirs(state_dir(), sockets);
         // Bind first, while the runtime directory is still root-owned (systemd
         // recreates it per start); then hand the directories over and let the
         // status group traverse to the socket.
@@ -2110,7 +2115,14 @@ where
         crl,
         audit_tx,
         Arc::clone(&clock),
-    )?;
+    )
+    .with_context(|| {
+        format!(
+            "binding the helper API listener {} (set helper.socket to move it, or \
+             helper.enable = false to switch the helper API off)",
+            socket_path.display()
+        )
+    })?;
     tracing::info!(listener = %socket_path.display(), "helper API listening");
 
     // Live config + allowlist reload on SIGHUP: `mia --reload` /

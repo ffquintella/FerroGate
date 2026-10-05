@@ -26,9 +26,16 @@ pub struct HelperServer<A: CallerAuth> {
 impl<A: CallerAuth> HelperServer<A> {
     /// Bind the socket with the configured permissions and prepare to serve.
     ///
-    /// Any existing file at `socket_path` is removed first (a stale socket from
-    /// a previous run). The socket is created, then its mode (and optionally
-    /// its group owner) is set before any client can connect.
+    /// A stale socket from a previous run at `socket_path` is removed first;
+    /// any other kind of file there is an error, never deleted (a mistyped path
+    /// must not unlink data). The socket is created, then its mode (and
+    /// optionally its group owner) is set before any client can connect.
+    ///
+    /// The group is only `chown`ed when the socket did not already inherit it:
+    /// on Linux the hardened daemon binds after dropping privileges, inside a
+    /// runtime directory prepared setgid to `socket_gid`
+    /// (`hardening::prepare_runtime_paths`), and its seccomp allow-list has no
+    /// `chown` — calling it there would kill the process.
     #[allow(clippy::too_many_arguments)] // each handle is a distinct collaborator.
     pub fn bind(
         config: HelperServerConfig,
@@ -51,27 +58,22 @@ impl<A: CallerAuth> HelperServer<A> {
         // parent (a shared system dir like `/tmp`, or a run/ dir from a prior
         // start) is left as the operator set it.
         if let Some(parent) = config.socket_path.parent() {
-            if !parent.exists() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
                 std::fs::create_dir_all(parent).map_err(ServerError::Socket)?;
                 std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750))
                     .map_err(ServerError::Socket)?;
                 if let Some(gid) = config.socket_gid {
-                    std::os::unix::fs::chown(parent, None, Some(gid))
-                        .map_err(ServerError::Socket)?;
+                    ensure_gid(parent, gid)?;
                 }
             }
         }
-        match std::fs::remove_file(&config.socket_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(ServerError::Socket(e)),
-        }
+        remove_stale_socket(&config.socket_path)?;
         let listener = UnixListener::bind(&config.socket_path)?;
 
         let perms = std::fs::Permissions::from_mode(config.socket_mode);
         std::fs::set_permissions(&config.socket_path, perms)?;
         if let Some(gid) = config.socket_gid {
-            std::os::unix::fs::chown(&config.socket_path, None, Some(gid))?;
+            ensure_gid(&config.socket_path, gid)?;
         }
 
         Ok(Self {
@@ -158,5 +160,89 @@ impl<A: CallerAuth> HelperServer<A> {
                 }
             }
         }
+    }
+}
+
+/// Remove a stale socket left at `path` by a previous run. Anything that is not
+/// a socket (a regular file, a directory, a symlink — never followed) is
+/// refused rather than deleted, so a misconfigured `helper.socket` cannot make
+/// the daemon unlink arbitrary data.
+fn remove_stale_socket(path: &std::path::Path) -> Result<(), ServerError> {
+    use std::os::unix::fs::FileTypeExt as _;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)?,
+        Ok(_) => {
+            return Err(ServerError::Socket(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists and is not a socket; refusing to replace it",
+                    path.display()
+                ),
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ServerError::Socket(e)),
+    }
+    Ok(())
+}
+
+/// Give `path` the group `gid`, issuing `chown` only when it does not already
+/// carry it (e.g. inherited from a setgid directory). A `stat` is always
+/// permitted by the hardened seccomp profile; a `chown` is not.
+fn ensure_gid(path: &std::path::Path, gid: u32) -> Result<(), ServerError> {
+    use std::os::unix::fs::MetadataExt as _;
+    if std::fs::metadata(path)?.gid() != gid {
+        std::os::unix::fs::chown(path, None, Some(gid))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mia-uds-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn stale_sockets_are_replaced_other_files_are_not() {
+        let dir = scratch("stale");
+        // Absent: nothing to do.
+        remove_stale_socket(&dir.join("absent.sock")).unwrap();
+        // A socket from a previous run is removed.
+        let sock = dir.join("old.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        drop(listener);
+        remove_stale_socket(&sock).unwrap();
+        assert!(!sock.exists());
+        // A regular file is refused and left intact.
+        let file = dir.join("data.sock");
+        std::fs::write(&file, b"keep me").unwrap();
+        let err = remove_stale_socket(&file).unwrap_err();
+        assert!(err.to_string().contains("not a socket"), "{err}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+        // A symlink is refused, and its target untouched.
+        let link = dir.join("link.sock");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(remove_stale_socket(&link).is_err());
+        assert!(file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_gid_skips_chown_when_the_group_already_matches() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = scratch("gid");
+        let file = dir.join("f");
+        std::fs::write(&file, b"").unwrap();
+        let gid = std::fs::metadata(&file).unwrap().gid();
+        // Already the right group ⇒ Ok without a chown (works for any user).
+        ensure_gid(&file, gid).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().gid(), gid);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

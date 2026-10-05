@@ -182,6 +182,10 @@ struct DraftCmis {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct DraftHelper {
+    /// `helper.enable`. Absent ⇒ keep the target file's current value, so a
+    /// draft from a front end that predates the key cannot silently re-enable
+    /// a helper API the operator switched off.
+    enable: Option<bool>,
     socket: Option<String>,
     socket_mode: Option<String>,
     windows_group: Option<String>,
@@ -339,6 +343,7 @@ fn validate(draft: Draft) -> Result<Settings, Vec<DraftError>> {
         cmis_endpoint: answer("cmis.endpoint", draft.cmis.endpoint, check_endpoint, &mut e),
         cmis_srv: answer("cmis.srv", draft.cmis.srv, check_srv, &mut e),
         cmis_spki_pin: answer("cmis.spki_pin", draft.cmis.spki_pin, pin_check, &mut e),
+        helper_enable: draft.helper.enable,
         helper_socket: answer("helper.socket", draft.helper.socket, check_literal, &mut e),
         helper_socket_mode: answer(
             "helper.socket_mode",
@@ -426,6 +431,15 @@ fn validate(draft: Draft) -> Result<Settings, Vec<DraftError>> {
     }
 }
 
+/// A draft that does not mention `helper.enable` keeps the target file's
+/// value: the switch is fail-safe in the "off" direction, so it is never
+/// flipped back on by omission.
+fn keep_helper_switch(settings: &mut Settings, existing: &Config) {
+    if settings.helper_enable.is_none() {
+        settings.helper_enable = existing.helper.enable;
+    }
+}
+
 /// Read, parse and validate a draft (see [`parse_draft`] for `detailed`).
 fn load_draft(
     path: &Path,
@@ -503,6 +517,7 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
     let by_uid = check_draft_owner(&draft_meta, who)?;
     let existing = setup::load_existing(&target);
     settings.carried = Carried::from_existing(&existing);
+    keep_helper_switch(&mut settings, &existing);
     let rendered = setup::render(&settings, opts.environment.as_deref());
 
     let staged = stage(&target, rendered.as_bytes(), CONFIG_MODE)?;
@@ -1396,6 +1411,36 @@ mod tests {
         .unwrap();
         assert_eq!(o.mode, Mode::Apply(PathBuf::from("d.toml")));
         assert!(o.user && o.reload && o.fetch_key);
+    }
+
+    #[test]
+    fn apply_keeps_or_sets_the_helper_switch() {
+        let dir = scratch("helper-switch");
+        let target = dir.join("mia.toml");
+        std::fs::write(&target, "[helper]\nenable = false\n").unwrap();
+
+        // A draft that omits `enable` must not re-enable the helper API.
+        let draft = write_draft(&dir, "log = 'info'\n");
+        apply(&draft, &apply_opts(&target)).unwrap();
+        let cfg = setup::load_existing(&target);
+        assert!(!cfg.helper_enabled());
+        assert_eq!(cfg.helper_socket(), None);
+
+        // An explicit `enable = true` turns it back on (at the default socket).
+        let draft = write_draft(&dir, "[helper]\nenable = true\n");
+        apply(&draft, &apply_opts(&target)).unwrap();
+        let cfg = setup::load_existing(&target);
+        assert!(cfg.helper_enabled());
+        assert_eq!(
+            cfg.helper_socket(),
+            Some(crate::config::default_helper_socket(None))
+        );
+
+        // And `enable = false` switches it off again.
+        let draft = write_draft(&dir, "[helper]\nenable = false\n");
+        apply(&draft, &apply_opts(&target)).unwrap();
+        assert!(!setup::load_existing(&target).helper_enabled());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

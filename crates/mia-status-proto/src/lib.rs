@@ -220,7 +220,9 @@ pub enum AgentState {
     NotInstalled,
     /// The status endpoint is absent: the service is stopped (client-side).
     NotRunning,
-    /// No CMIS source or no helper socket is configured.
+    /// No CMIS source is configured, or the helper API is not served (switched
+    /// off with `helper.enable = false`, or a socket duplicating another
+    /// environment's).
     NotConfigured,
     /// Startup or re-attestation is in progress.
     Attesting,
@@ -399,7 +401,10 @@ pub mod error_codes {
     pub const CMIS_NOT_CONFIGURED: &str = "cmis_not_configured";
     /// The CMIS configuration is unusable (both sources, or a bad pin).
     pub const CMIS_MISCONFIGURED: &str = "cmis_misconfigured";
-    /// No helper socket is configured for this environment.
+    /// The helper API is not served for this environment: switched off
+    /// (`helper.enable = false`), or its socket duplicates another
+    /// environment's. (An unset `helper.socket` no longer causes this — it
+    /// falls back to the platform default.) The wire value is unchanged.
     pub const HELPER_NOT_CONFIGURED: &str = "helper_not_configured";
     /// CMIS could not be reached.
     pub const CMIS_UNREACHABLE: &str = "cmis_unreachable";

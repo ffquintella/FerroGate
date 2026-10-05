@@ -6,8 +6,16 @@ short-lived, sender-constrained tokens for a specific audience.
 
 ## Transport
 
+The helper API is on by default; the addresses below are the defaults the agent
+uses when `helper.socket` is unset (a named environment `mia-<env>.toml` gets an
+`-<env>` suffix), and `helper.enable = false` switches it off — see
+[mia.md](mia.md#helper-listener-default-and-off-switch).
+
 - **Linux:** Unix Domain Socket at `/run/ferrogate/mia.sock`, mode `0660`,
   group `ferrogate-clients`.
+- **macOS:** Unix Domain Socket at
+  `/Library/Application Support/FerroGate/run/mia.sock`, mode `0660`, group
+  `helper.socket_gid` when set.
 - **Windows:** Named pipe `\\.\pipe\ferrogate-mia`, ACL grants only members
   of the `FerroGateClients` local group — and only `FILE_GENERIC_READ |
   FILE_WRITE_DATA` (`0x0012008B`), never `FILE_CREATE_PIPE_INSTANCE`, so a

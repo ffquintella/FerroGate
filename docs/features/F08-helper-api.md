@@ -95,8 +95,11 @@ Unix integration tests.
 
 ### Daemon bring-up
 
-The `mia` binary starts the helper API when `FERROGATE_HELPER_SOCKET` is set
-(Linux only — it needs `SO_PEERCRED` + IMA). It loads and verifies the signed
+The `mia` binary starts the helper API by default — on `FERROGATE_HELPER_SOCKET`
+/ `helper.socket` when set, else the per-environment platform default
+(`/run/ferrogate/mia[-<env>].sock` on Linux); `helper.enable = false` switches
+it off. (This section predates the macOS and Windows transports; see
+[mia.md](../mia.md#helper-listener-default-and-off-switch).) It loads and verifies the signed
 allowlist from `FERROGATE_ALLOWLIST` (key in `FERROGATE_ALLOWLIST_KEY`), binds
 the socket with `FERROGATE_HELPER_SOCKET_MODE` (default `660`), drains audit
 events to the log, and serves until `SIGINT`/`SIGTERM`. Until the attestation

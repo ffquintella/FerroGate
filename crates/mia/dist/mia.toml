@@ -36,10 +36,19 @@
 #spki_pin = "<hex-sha384>"
 
 # --- Helper API (feature F08) -----------------------------------------------
-# The local helper listener: a Unix socket path (Linux/macOS) or a named-pipe
-# name (Windows, e.g. \\.\pipe\ferrogate-mia). Setting `socket` ENABLES the
-# helper API; with none configured the daemon logs a banner and exits.
+# The local helper API is ON by default. Set `enable = false` (or
+# FERROGATE_HELPER_ENABLE=0) to switch it off; leaving `socket` unset no longer
+# does — it just selects the platform default below. Callers are still refused
+# unless they are on the signed allowlist ([allowlist], fail closed).
 [helper]
+#enable = true
+# The local helper listener: a Unix socket path (Linux/macOS) or a named-pipe
+# name (Windows). Unset => the platform default for this environment
+# (mia-<env>.toml gets an `-<env>` suffix, so environments never collide):
+#   Linux    /run/ferrogate/mia.sock          (mia-<env>.sock)
+#   macOS    /Library/Application Support/FerroGate/run/mia.sock
+#   Windows  \\.\pipe\ferrogate-mia           (\\.\pipe\ferrogate-mia-<env>)
+# Set it only to move the listener.
 #socket = "/run/ferrogate/mia.sock"
 # Unix only. Octal socket mode (as a string). Default: "660".
 #socket_mode = "660"
