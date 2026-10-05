@@ -1,0 +1,57 @@
+#!/bin/sh
+# Reload the FerroGate MIA launchd daemon after a package upgrade — if, and
+# only if, it was loaded before the upgrade. Called by postinstall.
+#
+# `launchctl kickstart -k` is not enough. It restarts the process but keeps the
+# job definition launchd parsed when the job was first bootstrapped, so a plist
+# change shipped by the new package never reaches the daemon (0.23.0 removed
+# FERROGATE_HELPER_SOCKET from the plist; a kickstarted daemon kept it, claimed
+# the well-known helper address for the wrong environment and crash-looped).
+# And without any restart the old image keeps running: its self-trust digest no
+# longer matches the replaced /usr/local/bin/mia, so even `mia test` is refused
+# as not-allowlisted. Booting the job out and bootstrapping it again re-reads
+# the plist and starts the new binary.
+#
+# A daemon that was not loaded (a fresh install, or one an operator unloaded)
+# is left alone: it must be configured before it is started.
+#
+# Usage: restart-daemon [PLIST]
+# Prints exactly one status word on stdout: not-loaded | restarted | failed.
+# Always exits 0: the payload is already laid down, so a failed reload must not
+# fail the install — postinstall reports it with the commands to finish by hand.
+set -u
+
+LABEL=com.ferrogate.mia
+SERVICE="system/$LABEL"
+PLIST=${1:-/Library/LaunchDaemons/$LABEL.plist}
+
+if ! launchctl print "$SERVICE" >/dev/null 2>&1; then
+  echo not-loaded
+  exit 0
+fi
+# Never tear down a running daemon that could not be brought back.
+if [ ! -f "$PLIST" ] || [ -L "$PLIST" ]; then
+  echo failed
+  exit 0
+fi
+
+launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
+# bootout can return before launchd has finished removing the job; a bootstrap
+# issued meanwhile fails (EIO / "service already loaded"). Wait up to 10 s.
+i=0
+while [ "$i" -lt 20 ] && launchctl print "$SERVICE" >/dev/null 2>&1; do
+  sleep 0.5
+  i=$((i + 1))
+done
+
+i=0
+while [ "$i" -lt 3 ]; do
+  if launchctl bootstrap system "$PLIST" >/dev/null 2>&1; then
+    echo restarted
+    exit 0
+  fi
+  i=$((i + 1))
+  [ "$i" -lt 3 ] && sleep 1
+done
+echo failed
+exit 0

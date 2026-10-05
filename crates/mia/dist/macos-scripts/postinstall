@@ -1,9 +1,11 @@
 #!/bin/sh
 # postinstall for the FerroGate MIA macOS package.
 #
-# Creates the runtime/log directories the launchd daemon expects. The daemon is
-# intentionally left UNLOADED — the operator must configure /etc/ferrogate/mia.env
-# and then `sudo launchctl load -w /Library/LaunchDaemons/com.ferrogate.mia.plist`.
+# Creates the runtime/log directories the launchd daemon expects. On a fresh
+# install the daemon is intentionally left UNLOADED — the operator must configure
+# /etc/ferrogate/mia.env and then
+# `sudo launchctl load -w /Library/LaunchDaemons/com.ferrogate.mia.plist`.
+# On an upgrade of a loaded daemon it is reloaded (see restart-daemon).
 set -eu
 
 install -d -m 0750 /var/run/ferrogate
@@ -93,6 +95,13 @@ if [ -f "$DAEMON_PLIST" ] && [ -n "$STATUS_GID" ]; then
   /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:FERROGATE_STATUS_SOCKET_GID string $STATUS_GID" "$DAEMON_PLIST" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:FERROGATE_STATUS_SOCKET_GID $STATUS_GID" "$DAEMON_PLIST"
 fi
+
+# ── Daemon upgrade ───────────────────────────────────────────────────────────
+# On an upgrade of a loaded daemon, boot it out and bootstrap it again so the
+# new binary and the new plist (including the gid set just above) take effect;
+# a daemon that was not loaded stays unloaded. See restart-daemon for why
+# `kickstart -k` is not enough.
+DAEMON_STATE="$("$(dirname "$0")/restart-daemon" "$DAEMON_PLIST")"
 # Start the tray (a per-user LaunchAgent) in the console user's session now;
 # it starts by itself at every later login. On an upgrade the running tray is
 # booted out first, so the new app bundle (not the replaced binary) runs.
@@ -106,7 +115,19 @@ fi
 
 echo "FerroGate MIA installed."
 echo "  Status readers (mia-tray, mia status): group $STATUS_GROUP (gid $STATUS_GID)${CONSOLE_USER:+, including $CONSOLE_USER from their next login}."
-echo "  1. Edit /etc/ferrogate/mia.env"
-echo "  2. sudo launchctl load -w /Library/LaunchDaemons/com.ferrogate.mia.plist"
+case "$DAEMON_STATE" in
+  restarted)
+    echo "  Daemon: reloaded with the new binary and launchd plist."
+    ;;
+  failed)
+    echo "  WARNING: the daemon could not be reloaded. Finish by hand:"
+    echo "    sudo launchctl bootout system/com.ferrogate.mia"
+    echo "    sudo launchctl bootstrap system $DAEMON_PLIST"
+    ;;
+  *)
+    echo "  1. Edit /etc/ferrogate/mia.env"
+    echo "  2. sudo launchctl load -w $DAEMON_PLIST"
+    ;;
+esac
 
 exit 0

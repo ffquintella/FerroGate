@@ -25,6 +25,22 @@ record them.
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-10-05
+
+### Fixed
+
+- Reload the macOS MIA daemon on package upgrade (T171)
+  The pkg `postinstall` restarted the tray but left a loaded daemon running
+  the replaced binary, so its self-trust digest no longer matched
+  `/usr/local/bin/mia` and `mia test` was refused (`not-allowlisted`).
+  `launchctl kickstart -k` was no cure: it keeps the job definition launchd
+  parsed at first bootstrap, so a daemon kickstarted after 0.23.0 still saw
+  the removed `FERROGATE_HELPER_SOCKET`, claimed the well-known helper
+  address for `mia.toml` while another environment was the default, and
+  crash-looped. The new `macos-scripts/restart-daemon` boots a loaded daemon
+  out and bootstraps it from the new plist; an unloaded daemon (fresh
+  install) is still left for the operator to configure and load.
+
 ## [0.23.0] - 2026-10-05
 
 ### Added
@@ -2443,7 +2459,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.23.0...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.23.1...HEAD
+[0.23.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.23.1
 [0.23.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.23.0
 [0.22.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.22.0
 [0.21.9]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.9
