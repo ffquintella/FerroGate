@@ -25,6 +25,12 @@ record them.
 
 ## [Unreleased]
 
+## [0.21.9] - 2026-10-05
+
+### Fixed
+
+- macOS package: the postinstall now gives `/Library/Application Support/FerroGate` and its `mia*.toml` files to the `ferrogate-status` group (mode 0640), so status-group members can read configs such as `mia-homolog.toml`
+
 ## [0.21.8] - 2026-10-05
 
 ### Added
@@ -2297,7 +2303,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.21.8...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.21.9...HEAD
+[0.21.9]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.9
 [0.21.8]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.8
 [0.21.7]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.7
 [0.21.5]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.5

@@ -29,6 +29,24 @@ if ! dscl . -read "/Groups/$STATUS_GROUP" >/dev/null 2>&1; then
   dscl . -create "/Groups/$STATUS_GROUP" Password "*"
 fi
 STATUS_GID="$(dscl . -read "/Groups/$STATUS_GROUP" PrimaryGroupID | awk '{print $2}')"
+
+# ── Config group ─────────────────────────────────────────────────────────────
+# The TOML configs are 0640 and would otherwise be root:wheel, unreadable by
+# the status-group members (`mia status`, mia-tray). Hand the directory and
+# every existing mia*.toml to the group; BSD semantics make files created later
+# in the directory (e.g. `mia setup --environment homolog` writing
+# mia-homolog.toml) inherit the directory's group. The files stay 0640, so
+# only root and group members can read them; the directory stays 0755.
+CONFIG_DIR="/Library/Application Support/FerroGate"
+if [ -d "$CONFIG_DIR" ] && [ -n "$STATUS_GID" ]; then
+  chgrp "$STATUS_GID" "$CONFIG_DIR"
+  for f in "$CONFIG_DIR"/mia*.toml; do
+    [ -f "$f" ] || continue
+    chgrp "$STATUS_GID" "$f"
+    chmod 0640 "$f"
+  done
+fi
+
 CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
 case "$CONSOLE_USER" in
   ""|root|loginwindow) CONSOLE_USER="" ;;
