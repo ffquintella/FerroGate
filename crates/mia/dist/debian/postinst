@@ -1,0 +1,149 @@
+#!/bin/sh
+# Debian post-install lifecycle for the combined FerroGate MIA workstation
+# package. Account and group creation is deliberately idempotent: upgrades may
+# execute this script repeatedly, and Debian does not remove system identities
+# on uninstall because files in /var/lib/ferrogate can retain their numeric ids.
+set -eu
+
+SERVICE_USER=_ferrogate
+CLIENT_GROUP=ferrogate-clients
+STATUS_GROUP=ferrogate-status
+DROPIN_DIR=/etc/systemd/system/mia.service.d
+DROPIN_FILE="$DROPIN_DIR/10-ferrogate-groups.conf"
+
+create_system_group() {
+    group_name=$1
+    if ! getent group "$group_name" >/dev/null 2>&1; then
+        groupadd --system "$group_name"
+        echo "ferrogate-mia: created system group $group_name"
+    fi
+}
+
+create_service_user() {
+    if getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+        return
+    fi
+
+    create_system_group "$SERVICE_USER"
+    nologin=/usr/sbin/nologin
+    if [ ! -x "$nologin" ]; then
+        nologin=/sbin/nologin
+    fi
+    useradd --system \
+        --gid "$SERVICE_USER" \
+        --home-dir /var/lib/ferrogate \
+        --no-create-home \
+        --shell "$nologin" \
+        --comment "FerroGate MIA service account" \
+        "$SERVICE_USER"
+    echo "ferrogate-mia: created system user $SERVICE_USER"
+}
+
+# Print local desktop/installing users as "uid:name". Values from loginctl are
+# checked against the account database before they reach usermod or runuser.
+candidate_users() {
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        sudo_uid=$(id -u "$SUDO_USER" 2>/dev/null || true)
+        case "$sudo_uid" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ "$sudo_uid" -ge 1000 ] &&
+                   awk -F: -v user="$SUDO_USER" '$1 == user { found=1 } END { exit !found }' /etc/passwd; then
+                    printf '%s:%s\n' "$sudo_uid" "$SUDO_USER"
+                fi
+                ;;
+        esac
+    fi
+
+    if command -v loginctl >/dev/null 2>&1; then
+        loginctl list-sessions --no-legend 2>/dev/null |
+        while read -r session uid user _rest; do
+            case "$session:$uid" in
+                *[!A-Za-z0-9_.:-]*) continue ;;
+            esac
+            case "$uid" in ''|*[!0-9]*) continue ;; esac
+            [ "$uid" -ge 1000 ] || continue
+            [ "$(loginctl show-session "$session" -p Active --value 2>/dev/null || true)" = yes ] || continue
+            session_type=$(loginctl show-session "$session" -p Type --value 2>/dev/null || true)
+            case "$session_type" in x11|wayland) ;; *) continue ;; esac
+            [ "$(id -u "$user" 2>/dev/null || true)" = "$uid" ] || continue
+            awk -F: -v user="$user" '$1 == user { found=1 } END { exit !found }' /etc/passwd || continue
+            printf '%s:%s\n' "$uid" "$user"
+        done
+    fi
+}
+
+configure_desktop_user() {
+    uid=$1
+    user=$2
+
+    # Every local graphical user may read the deliberately redacted status
+    # endpoint. Only the explicit sudo installer is enrolled in the more
+    # privileged helper transport group; its allowlist still gates token minting.
+    usermod -aG "$STATUS_GROUP" -- "$user"
+    if [ "${SUDO_USER:-}" = "$user" ]; then
+        usermod -aG "$CLIENT_GROUP" -- "$user"
+        echo "ferrogate-mia: added $user to $CLIENT_GROUP and $STATUS_GROUP (effective at next login)"
+    else
+        echo "ferrogate-mia: added $user to $STATUS_GROUP (effective at next login)"
+    fi
+
+    # Start the tray immediately when this user has a live desktop bus. Its XDG
+    # autostart entry starts the same user unit on subsequent graphical logins.
+    runtime_dir=/run/user/$uid
+    if command -v runuser >/dev/null 2>&1 && [ -S "$runtime_dir/bus" ]; then
+        if runuser -u "$user" -- env \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
+            systemctl --user daemon-reload >/dev/null 2>&1 &&
+           runuser -u "$user" -- env \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
+            systemctl --user restart mia-tray.service >/dev/null 2>&1; then
+            echo "ferrogate-mia: started mia-tray for $user"
+        else
+            echo "ferrogate-mia: warning: could not start mia-tray for $user; it will start at the next graphical login" >&2
+        fi
+    fi
+}
+
+if [ "${1:-}" = configure ]; then
+    create_service_user
+    create_system_group "$CLIENT_GROUP"
+    create_system_group "$STATUS_GROUP"
+
+    helper_gid=$(getent group "$CLIENT_GROUP" | cut -d: -f3)
+    case "$helper_gid" in
+        ''|*[!0-9]*)
+            echo "ferrogate-mia: invalid gid for $CLIENT_GROUP" >&2
+            exit 1
+            ;;
+    esac
+
+    install -d -m 0755 "$DROPIN_DIR"
+    umask 022
+    dropin_tmp=$(mktemp "$DROPIN_FILE.XXXXXX")
+    trap 'rm -f "$dropin_tmp"' EXIT HUP INT TERM
+    {
+        printf '%s\n' '[Service]'
+        printf 'Environment=FERROGATE_HELPER_SOCKET_GID=%s\n' "$helper_gid"
+        printf '%s\n' '# Socket client groups must be able to traverse /run/ferrogate.'
+        printf '%s\n' 'RuntimeDirectoryMode=0755'
+    } >"$dropin_tmp"
+    chmod 0644 "$dropin_tmp"
+    mv -f "$dropin_tmp" "$DROPIN_FILE"
+    trap - EXIT HUP INT TERM
+
+    candidate_users | sort -u |
+    while IFS=: read -r uid user; do
+        [ -n "$user" ] || continue
+        configure_desktop_user "$uid" "$user"
+    done
+fi
+
+# cargo-deb replaces this marker with the generated systemd daemon lifecycle.
+# It stays after account/drop-in creation so any future daemon start sees the
+# service account and helper socket gid first.
+#DEBHELPER#
+
+exit 0

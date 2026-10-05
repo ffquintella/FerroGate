@@ -379,11 +379,10 @@ RPM_ARCH  := x86_64
 MIA_FEATURES ?=
 CARGO_FEATURE_FLAG := $(if $(strip $(MIA_FEATURES)),--features $(MIA_FEATURES),)
 
-# The mia-tray desktop companion (feature F18) ships inside the macOS .pkg
-# (LaunchAgent login item) and the Windows MSI (Startup entry) by default;
-# MIA_TRAY=0 builds those packages without it. On Linux it is a separate,
-# opt-in package (ferrogate-mia-tray: pkg-deb-tray / pkg-rpm-tray), so servers
-# never pull in GTK.
+# The mia-tray desktop companion (feature F18) ships inside the Debian .deb,
+# macOS .pkg (LaunchAgent login item), and Windows MSI (Startup entry). The RPM
+# remains split because it is also used on headless server distributions.
+# MIA_TRAY=0 builds the macOS and Windows packages without it.
 MIA_TRAY  ?= 1
 TRAY_DIST := crates/mia-tray/dist
 
@@ -392,15 +391,18 @@ pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
 	@echo "NOTE: the Windows MSI + NuGet package build in a linux/amd64 container ('make pkg-win'); only Docker is required."
 	@echo "NOTE: the macOS .pkg builds on macOS ('make pkg-macos')."
 
-pkg-deb: ## Build the mia .deb package (Linux; needs cargo-deb)
+pkg-deb: ## Build the mia + system tray .deb package (Linux; needs cargo-deb + GTK 3 headers)
 	@command -v cargo-deb >/dev/null 2>&1 || { echo "ERROR: cargo-deb not found — run 'make pkg-tools'"; exit 1; }
-	cargo deb -p $(PKG_CRATE)
+	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE) $(CARGO_FEATURE_FLAG)
+	cargo build --release $(TRAY) --bin mia-tray
+	strip target/release/$(PKG_CRATE) target/release/mia-tray
+	cargo deb -p $(PKG_CRATE) --no-build --no-strip
+	./scripts/check-deb-package.sh target/debian/ferrogate-mia_$(CARGO_VERSION)-1_amd64.deb
 	@echo "==> .deb written under target/debian/"
 
-pkg-deb-tray: ## Build the opt-in ferrogate-mia-tray .deb (Linux; cargo-deb + GTK 3 headers)
-	@command -v cargo-deb >/dev/null 2>&1 || { echo "ERROR: cargo-deb not found — run 'make pkg-tools'"; exit 1; }
-	cargo deb -p mia-tray
-	@echo "==> ferrogate-mia-tray .deb written under target/debian/"
+pkg-deb-tray: ## Compatibility alias: the tray is included in the ferrogate-mia .deb
+	@echo "NOTE: the Debian tray is now included in ferrogate-mia; building the combined package."
+	$(MAKE) --no-print-directory pkg-deb
 
 pkg-rpm-tray: ## Build the opt-in ferrogate-mia-tray .rpm (Linux/x86_64; cargo-generate-rpm + GTK 3 headers)
 ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
@@ -415,9 +417,9 @@ else
 	@exit 1
 endif
 
-pkg-tray: ## Build the opt-in Linux tray packages (deb + rpm); macOS/Windows ship it in pkg-macos / pkg-win
+pkg-tray: ## Build Linux packages containing the tray (combined deb + opt-in rpm)
 	@case "$(UNAME_S)" in \
-	  Linux) $(MAKE) --no-print-directory pkg-deb-tray pkg-rpm-tray ;; \
+	  Linux) $(MAKE) --no-print-directory pkg-deb pkg-rpm-tray ;; \
 	  *)     echo "Host is $(UNAME_S): the tray ships inside 'make pkg-macos' / 'make pkg-win' (MIA_TRAY=0 to omit)." ;; \
 	esac
 

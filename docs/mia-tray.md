@@ -50,10 +50,11 @@ not.
 The status endpoint is readable by members of the status group —
 `ferrogate-status` on Linux and macOS, `FerroGateStatus` on Windows. The
 installers create it and add the installing user (macOS `.pkg`: the console
-user; Chocolatey package: the installing account; Linux `ferrogate-mia-tray`
-package: `$SUDO_USER`). Group membership applies from the next login. A user
-outside the group sees "Status not readable by this user" and a link to this
-page; add them with `sudo usermod -aG ferrogate-status <user>` (Linux),
+user; Chocolatey package: the installing account; Linux `ferrogate-mia`:
+`$SUDO_USER` plus active local graphical users). Group membership applies from
+the next login. A user outside the group sees "Status not readable by this
+user" and a link to this page; add them with
+`sudo usermod -aG ferrogate-status <user>` (Linux),
 `sudo dscl . -append /Groups/ferrogate-status GroupMembership <user>` (macOS) or
 `net localgroup FerroGateStatus <user> /add` (Windows), then restart the agent
 once on Linux so its socket picks the group up.
@@ -165,7 +166,8 @@ are held and counted).
 |---|---|---|
 | macOS | inside `make pkg-macos` (`/Applications/FerroGate MIA.app`, symlinked as `/usr/local/bin/mia-tray`) | LaunchAgent `/Library/LaunchAgents/com.ferrogate.mia-tray.plist` (login item; started for the console user at install) |
 | Windows | inside `make pkg-win` (`%ProgramFiles%\FerroGate\MIA\mia-tray.exe`) | `HKLM\…\CurrentVersion\Run\FerroGateMiaTray` |
-| Linux | separate, opt-in `ferrogate-mia-tray` package (`make pkg-deb-tray`, `make pkg-rpm-tray`) so servers never pull in GTK | XDG autostart `/etc/xdg/autostart/mia-tray.desktop` |
+| Linux (Debian/Ubuntu) | inside `ferrogate-mia` (`make pkg-deb`) | started for active graphical users during install; XDG autostart `/etc/xdg/autostart/mia-tray.desktop` on later logins |
+| Linux (RPM) | separate, opt-in `ferrogate-mia-tray` package (`make pkg-rpm-tray`) | XDG autostart `/etc/xdg/autostart/mia-tray.desktop` |
 
 `MIA_TRAY=0 make pkg-macos` / `MIA_TRAY=0 make pkg-win` build the agent
 packages without the tray. On Linux the tray needs a StatusNotifierItem host:

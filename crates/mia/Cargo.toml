@@ -158,18 +158,29 @@ exposes a local helper API for minting DPoP-bound child tokens to vetted \
 callers."""
 section = "admin"
 priority = "optional"
-# libtss2-esys is the runtime TPM 2.0 ESAPI dependency mia links on Linux.
-depends = "libc6 (>= 2.31), libtss2-esys-3.0.2-0, libssl3"
+# libtss2-esys is the runtime TPM 2.0 ESAPI dependency mia links on Linux. The
+# desktop dependencies belong here because the Debian package is the complete
+# workstation installer: it ships and starts mia-tray as well as the daemon.
+depends = "libc6 (>= 2.31), libtss2-esys-3.0.2-0, libssl3, libgtk-3-0, libxdo3, libayatana-appindicator3-1, policykit-1 | polkitd, pkexec | policykit-1, systemd, passwd, util-linux"
+conflicts = "ferrogate-mia-tray"
+replaces = "ferrogate-mia-tray"
+provides = "ferrogate-mia-tray"
+maintainer-scripts = "dist/debian"
 assets = [
     ["../../target/release/mia", "usr/bin/", "755"],
+    ["../../target/release/mia-tray", "usr/bin/", "755"],
+    ["../mia-tray/dist/mia-tray.desktop", "etc/xdg/autostart/mia-tray.desktop", "644"],
+    ["../mia-tray/dist/mia-tray.service", "usr/lib/systemd/user/mia-tray.service", "644"],
+    ["../mia-tray/dist/br.fgv.ferrogate.mia.setup.policy", "usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy", "644"],
     ["dist/mia.env", "etc/ferrogate/mia.env", "640"],
     ["dist/mia.toml", "etc/ferrogate/mia.toml", "640"],
     ["../../docs/mia.md", "usr/share/doc/ferrogate-mia/mia.md", "644"],
+    ["../../docs/mia-tray.md", "usr/share/doc/ferrogate-mia/mia-tray.md", "644"],
 ]
 conf-files = ["/etc/ferrogate/mia.env", "/etc/ferrogate/mia.toml"]
-# cargo-deb auto-generates the postinst/prerm maintainer scripts that register
-# the unit with systemd. enable/start are left to the operator (the agent needs
-# configuration in /etc/ferrogate/mia.env before it does anything useful).
+# cargo-deb expands the #DEBHELPER# markers in dist/debian around the custom
+# account/group lifecycle. enable/start are left to the operator (the agent
+# needs configuration in /etc/ferrogate/mia.env before it does anything useful).
 systemd-units = { unit-name = "mia", unit-scripts = "dist", enable = false, start = false }
 
 # cargo-generate-rpm: https://github.com/cat-in-136/cargo-generate-rpm

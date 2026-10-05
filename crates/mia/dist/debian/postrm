@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+# cargo-deb removes/reloads the packaged mia.service at this point.
+#DEBHELPER#
+
+case "${1:-}" in
+    remove|purge)
+        rm -f /etc/systemd/system/mia.service.d/10-ferrogate-groups.conf
+        rmdir /etc/systemd/system/mia.service.d 2>/dev/null || true
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -96,10 +96,11 @@ proptest = { workspace = true }
 # Only to pin the pipe access mask to the DACL contract in a test.
 ferro-winauth = { path = "../ferro-winauth" }
 
-# ── Linux packaging (opt-in package `ferrogate-mia-tray`) ─────────────────────
-# A separate package from `ferrogate-mia`, so servers never pull in GTK.
-# `make pkg-deb-tray` / `make pkg-rpm-tray`. Asset paths are relative to this
-# crate (deb) / the workspace root (rpm).
+# ── Linux packaging ───────────────────────────────────────────────────────────
+# Debian now ships this crate inside the combined `ferrogate-mia` workstation
+# package. The legacy cargo-deb metadata remains readable for package migration;
+# `make pkg-deb-tray` redirects to the combined package. RPM stays separate and
+# opt-in. Asset paths are relative to this crate (deb) / workspace root (rpm).
 [package.metadata.deb]
 name = "ferrogate-mia-tray"
 maintainer = "FerroGate contributors <https://github.com/ffquintella/FerroGate>"
@@ -116,6 +117,7 @@ maintainer-scripts = "dist/debian"
 assets = [
     ["../../target/release/mia-tray", "usr/bin/", "755"],
     ["dist/mia-tray.desktop", "etc/xdg/autostart/mia-tray.desktop", "644"],
+    ["dist/mia-tray.service", "usr/lib/systemd/user/mia-tray.service", "644"],
     ["dist/br.fgv.ferrogate.mia.setup.policy", "usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy", "644"],
     ["../../docs/mia-tray.md", "usr/share/doc/ferrogate-mia-tray/mia-tray.md", "644"],
 ]
@@ -127,6 +129,7 @@ license = "Apache-2.0"
 assets = [
     { source = "target/release/mia-tray", dest = "/usr/bin/mia-tray", mode = "755" },
     { source = "crates/mia-tray/dist/mia-tray.desktop", dest = "/etc/xdg/autostart/mia-tray.desktop", mode = "644" },
+    { source = "crates/mia-tray/dist/mia-tray.service", dest = "/usr/lib/systemd/user/mia-tray.service", mode = "644" },
     { source = "crates/mia-tray/dist/br.fgv.ferrogate.mia.setup.policy", dest = "/usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy", mode = "644" },
     { source = "docs/mia-tray.md", dest = "/usr/share/doc/ferrogate-mia-tray/mia-tray.md", mode = "644", doc = true },
 ]

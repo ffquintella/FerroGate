@@ -707,8 +707,8 @@ notifies on transitions that need a human, and offers a graphical setup wizard
 consent prompt), guided recovery from a closed set of fixed `mia` commands, and
 a viewer for the redacted log tail. It reads only the status endpoint and the
 output of `mia` commands; it holds no key material and never talks to the
-helper socket. It ships inside `make pkg-macos` and `make pkg-win`, and as the
-separate, opt-in `ferrogate-mia-tray` package on Linux. See
+helper socket. It ships inside `make pkg-deb`, `make pkg-macos` and
+`make pkg-win`; RPM keeps the separate, opt-in `ferrogate-mia-tray` package. See
 [mia-tray](mia-tray.md).
 
 ### `mia x509-svid` — inspect the machine-bound certificate store

@@ -48,9 +48,10 @@ In:
   N redacted records) for support tickets. Plus "open full log", which hands
   off to the platform tool (Console.app, Event Viewer / the log file,
   `journalctl -u mia`).
-- **Packaging:** shipped beside `mia` in `make pkg-macos` (login item),
-  `make pkg-win` (Startup entry) and the Linux packages (XDG autostart
-  `.desktop`), opt-in on Linux servers.
+- **Packaging:** shipped beside `mia` in `make pkg-deb` (XDG autostart and an
+  immediately-started user service), `make pkg-macos` (login item), and
+  `make pkg-win` (Startup entry). RPM keeps a separate opt-in tray package for
+  headless server distributions.
 
 Out:
 
@@ -366,11 +367,10 @@ and `mia` apply one implementation.
   macOS script compiles under `osacompile`) but have no automated end-to-end
   run against a real prompt; packaging is wired into `pkg-macos` (LaunchAgent),
   `pkg-win` (MSI Startup entry; stripped automatically if the tray does not
-  build) and the opt-in Linux `ferrogate-mia-tray` deb/rpm (XDG autostart,
-  polkit policy, `ferrogate-status` group), but none of those package builds
-  was run here. The status-group creation is in the macOS postinstall, the
-  Chocolatey install script (wixl cannot run commands) and the Linux tray
-  package's postinst.
+  build), the combined Linux `ferrogate-mia` deb, and the opt-in tray RPM
+  (XDG autostart, polkit policy, `ferrogate-status` group). The status-group
+  creation is in the macOS postinstall, the Chocolatey install script (wixl
+  cannot run commands), and the Linux package postinst.
 - **Not done:** a minimised-window fallback when Linux has no
   StatusNotifierItem host; a `.app` bundle for macOS (notifications from an
   unbundled binary may be attributed to another application).

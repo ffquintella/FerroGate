@@ -347,8 +347,8 @@ the bump, `FAILED_PRECONDITION` after, one `PolicyEpochBumped` leaf) plus
       prompt / UAC; cancel ⇒ "cancelled"), setup wizard on private `0600`
       drafts, log viewer, diagnostics bundle; English and Portuguese. (Phase 2.)
 - [~] Packaging: wired into `pkg-macos` (LaunchAgent), `pkg-win` (Startup
-      entry) and the opt-in Linux `ferrogate-mia-tray` package (XDG autostart,
-      polkit policy, status group); the package builds have not been run yet.
+      entry), the combined Linux `ferrogate-mia` deb (XDG autostart, immediate
+      user-service start, access groups) and the opt-in tray RPM.
 - [ ] Agent states driven from the e2e harness; per-platform OS-level test that
       a peer outside the status group cannot connect; end-to-end wizard and
       consent-prompt runs.

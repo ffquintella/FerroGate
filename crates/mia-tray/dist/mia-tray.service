@@ -1,0 +1,11 @@
+[Unit]
+Description=FerroGate MIA desktop companion
+Documentation=https://github.com/ffquintella/FerroGate/blob/main/docs/mia-tray.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mia-tray
+Restart=on-failure
+RestartSec=5s

@@ -25,6 +25,8 @@ record them.
 
 ## [Unreleased]
 
+## [0.21.8] - 2026-10-05
+
 ### Added
 
 #### Reconstructed from git history during the PTF migration
@@ -87,6 +89,15 @@ record them.
   `rust-version = "1.95.0"`.
 
 ### Fixed
+
+- Make the Debian MIA installer provision its runtime identities and install and start the desktop tray (T211)
+  `make pkg-deb` now produces the complete Debian workstation package: the
+  `_ferrogate` service account, `ferrogate-clients` and `ferrogate-status`
+  access groups, helper-socket systemd drop-in, `mia-tray`, polkit policy and
+  XDG autostart entry are installed together. The sudo installer is enrolled in
+  both access groups; other active local graphical users receive read-only
+  status access. Their tray user service starts during installation, and group
+  access takes effect on their next login.
 
 #### Reconstructed from git history during the PTF migration
 
@@ -2286,7 +2297,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.21.7...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.21.8...HEAD
+[0.21.8]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.8
 [0.21.7]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.7
 [0.21.5]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.5
 [0.21.4]: https://github.com/ffquintella/FerroGate/releases/tag/v0.21.4
