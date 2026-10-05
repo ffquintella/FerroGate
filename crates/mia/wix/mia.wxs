@@ -37,6 +37,10 @@
              Description="FerroGate Machine Identity Agent installer"
              Comments="https://github.com/ffquintella/FerroGate" />
 
+    <!-- Icon shown in "Apps & features" / Add or Remove Programs. -->
+    <Icon Id="FerroGateMia.ico" SourceFile="crates/mia-tray/dist/icons/ferrogate-mia.ico" />
+    <Property Id="ARPPRODUCTICON" Value="FerroGateMia.ico" />
+
     <!-- Replace any previously installed version on upgrade. -->
     <Upgrade Id="6F9B1F2E-1C3A-4E84-9A2D-2B7E5C0A1D44">
       <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes"

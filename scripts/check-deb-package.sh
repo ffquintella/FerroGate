@@ -32,6 +32,8 @@ for path in \
     /usr/bin/mia-tray \
     /etc/xdg/autostart/mia-tray.desktop \
     /usr/lib/systemd/user/mia-tray.service \
+    /usr/share/icons/hicolor/scalable/apps/ferrogate-mia.svg \
+    /usr/share/icons/hicolor/256x256/apps/ferrogate-mia.png \
     /usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy; do
     require_file "$path"
 done

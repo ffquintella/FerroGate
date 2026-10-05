@@ -170,6 +170,8 @@ assets = [
     ["../../target/release/mia", "usr/bin/", "755"],
     ["../../target/release/mia-tray", "usr/bin/", "755"],
     ["../mia-tray/dist/mia-tray.desktop", "etc/xdg/autostart/mia-tray.desktop", "644"],
+    ["../mia-tray/dist/icons/ferrogate-mia.svg", "usr/share/icons/hicolor/scalable/apps/ferrogate-mia.svg", "644"],
+    ["../mia-tray/dist/icons/ferrogate-mia.png", "usr/share/icons/hicolor/256x256/apps/ferrogate-mia.png", "644"],
     ["../mia-tray/dist/mia-tray.service", "usr/lib/systemd/user/mia-tray.service", "644"],
     ["../mia-tray/dist/br.fgv.ferrogate.mia.setup.policy", "usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy", "644"],
     ["dist/mia.env", "etc/ferrogate/mia.env", "640"],

@@ -25,6 +25,19 @@ record them.
 
 ## [Unreleased]
 
+### Added
+
+- Give the MIA tray companion its own application icon (S18)
+  A steel shield carrying a machine chip with a green keyhole, mastered as
+  `crates/mia-tray/dist/icons/ferrogate-mia.svg`. `make icons`
+  (`scripts/gen-mia-icons.sh`) regenerates the committed 256 px PNG, macOS
+  `.icns` and Windows `.ico` from it. `FerroGate MIA.app` now carries the
+  `.icns` (`CFBundleIconFile`). The Debian and RPM packages install the SVG
+  and PNG into the hicolor theme, and the XDG autostart entry uses
+  `Icon=ferrogate-mia` instead of the generic `security-high`. The MSI sets
+  it as the Add or Remove Programs icon. The tray's live state disc is
+  unchanged.
+
 ## [0.23.1] - 2026-10-05
 
 ### Fixed

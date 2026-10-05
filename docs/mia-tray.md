@@ -193,6 +193,12 @@ are held and counted).
 | Linux (Debian/Ubuntu) | inside `ferrogate-mia` (`make pkg-deb`) | started for active graphical users during install; XDG autostart `/etc/xdg/autostart/mia-tray.desktop` on later logins |
 | Linux (RPM) | separate, opt-in `ferrogate-mia-tray` package (`make pkg-rpm-tray`) | XDG autostart `/etc/xdg/autostart/mia-tray.desktop` |
 
+The application icon is mastered as `crates/mia-tray/dist/icons/ferrogate-mia.svg`.
+After editing it, run `make icons` (`scripts/gen-mia-icons.sh`) to regenerate
+the committed PNG, `.icns` (app bundle) and `.ico` (MSI). The packages install
+it as `ferrogate-mia` in the hicolor icon theme on Linux. The menu-bar icon
+itself is the state disc drawn in `src/icon.rs`.
+
 `MIA_TRAY=0 make pkg-macos` / `MIA_TRAY=0 make pkg-win` build the agent
 packages without the tray. On Linux the tray needs a StatusNotifierItem host:
 KDE, Xfce, Cinnamon and most others have one; GNOME needs the

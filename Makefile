@@ -2,7 +2,7 @@
         formal formal-tamarin formal-cryptoverif docs container-image container-image-push \
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
         pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk \
-        tray lint-tray test-tray deny-tray pkg-deb-tray pkg-rpm-tray pkg-tray \
+        tray icons lint-tray test-tray deny-tray pkg-deb-tray pkg-rpm-tray pkg-tray \
         publish-sdk publish-sdk-dry-run release deploy-release
 
 # Default target: list available targets with their descriptions.
@@ -58,6 +58,9 @@ TRAY := -p mia-tray --features mia-tray/gui
 
 tray: ## Build the mia-tray desktop companion with its GUI (release)
 	cargo build --release $(TRAY) --bin mia-tray
+
+icons: ## Regenerate the MIA app icons (PNG/ICNS/ICO) from crates/mia-tray/dist/icons/ferrogate-mia.svg
+	scripts/gen-mia-icons.sh
 
 lint-tray: ## Clippy the mia-tray GUI build (and mia-status-proto) with warnings denied
 	cargo clippy $(TRAY) -p mia-status-proto --all-targets -- -D warnings
@@ -507,6 +510,8 @@ ifneq ($(MIA_TRAY),0)
 	# ferrogate-status group, adds the console user and starts the tray in
 	# that user's session.
 	install -d -m 0755 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS"
+	install -d -m 0755 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Resources"
+	install -m 0644 $(TRAY_DIST)/icons/ferrogate-mia.icns "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Resources/ferrogate-mia.icns"
 	install -m 0755 target/release/mia-tray "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray"
 	sed 's/@VERSION@/$(CARGO_VERSION)/g' $(TRAY_DIST)/macos/Info.plist > "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Info.plist"
 	chmod 0644 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Info.plist"
