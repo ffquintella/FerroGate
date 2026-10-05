@@ -25,6 +25,8 @@ record them.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-05
+
 ### Added
 
 - Give the MIA tray companion its own application icon (S18)
@@ -2507,7 +2509,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.23.1...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.24.0...HEAD
+[0.24.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.24.0
 [0.23.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.23.1
 [0.23.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.23.0
 [0.22.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.22.0
