@@ -4,7 +4,9 @@
 //! - **`resync-allowlist`** re-fetches this host's signed caller allowlist. The
 //!   daemon fetches it once at startup (when `allowlist.fetch` is set); this
 //!   performs the **identical** fetch at any time — keyed by the same
-//!   fingerprint-derived host UUID — writes the signed body to `allowlist.path`,
+//!   fingerprint-derived host UUID — writes the signed body to `allowlist.path`
+//!   (or its per-environment default,
+//!   [`Config::allowlist_path`](crate::config::Config::allowlist_path)),
 //!   and verifies it against the locally pinned enrollment key so the operator
 //!   gets immediate, authoritative feedback.
 //! - **`refresh-key`** re-fetches the CMIS **enrollment key** (the public key
@@ -176,11 +178,9 @@ fn load(
 /// Fetch the signed allowlist from CMIS, write it, and verify it. When `reload`
 /// is set, signal the running agent to swap in the new body live (no restart).
 async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
-    let path = config
-        .allowlist
-        .path
-        .as_deref()
-        .context("allowlist.path is not configured; nothing to write (run `mia setup`)")?;
+    // `allowlist.path`, or its per-environment default — the same body the
+    // daemon loads (`Config::allowlist_path`).
+    let path = config.allowlist_path();
     let resolver = crate::endpoint::CmisResolver::from_config(&config.cmis)?
         .context("cmis is not configured (set cmis.endpoint or cmis.srv); run `mia setup`")?;
 
@@ -215,11 +215,11 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
 
     // The body is integrity-protected by its CMIS signature, so a world-readable
     // file is fine (mirrors the daemon's own startup fetch).
-    write_allowlist_file(path, &bytes)
+    write_allowlist_file(&path, &bytes)
         .with_context(|| format!("writing {}", path.display()))?;
     println!("✓ fetched and wrote {} ({} bytes)", path.display(), bytes.len());
 
-    match config.allowlist.key.as_deref() {
+    match config.allowlist_key() {
         Some(key_path) => verify_after_write(&bytes, key_path, config.allowlist_max_age()),
         None => println!(
             "note: allowlist.key is not configured, so the body was written unverified; the \
@@ -297,10 +297,10 @@ pub(crate) fn send_reload() -> anyhow::Result<()> {
 fn refresh_key(config: &Config) -> anyhow::Result<()> {
     let resolver = crate::endpoint::CmisResolver::from_config(&config.cmis)?
         .context("cmis is not configured (set cmis.endpoint or cmis.srv); run `mia setup`")?;
+    // The key is the allowlist's trust anchor and has no default: it must be
+    // named explicitly before anything is fetched into it.
     let key_path = config
-        .allowlist
-        .key
-        .as_deref()
+        .allowlist_key()
         .context("allowlist.key is not configured; nowhere to write the key (run `mia setup`)")?;
     println!();
 
@@ -315,15 +315,13 @@ fn refresh_key(config: &Config) -> anyhow::Result<()> {
     // *new* key. After a CMIS key rotation it typically will NOT (the on-disk
     // body was signed by the old key) — the operator then runs resync-allowlist
     // to pull a body signed by the new key.
-    match config.allowlist.path.as_deref() {
-        Some(path) => match std::fs::read(path) {
-            Ok(bytes) => verify_after_write(&bytes, key_path, config.allowlist_max_age()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!("note: no allowlist at {} yet.", path.display());
-            }
-            Err(e) => println!("note: could not read {} ({e}).", path.display()),
-        },
-        None => println!("note: allowlist.path is not configured."),
+    let path = config.allowlist_path();
+    match std::fs::read(&path) {
+        Ok(bytes) => verify_after_write(&bytes, key_path, config.allowlist_max_age()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("note: no allowlist at {} yet.", path.display());
+        }
+        Err(e) => println!("note: could not read {} ({e}).", path.display()),
     }
 
     println!(
@@ -406,8 +404,9 @@ fn print_help_resync() {
          {USAGE_RESYNC}\n\
          \n\
          Fetches the allowlist CMIS holds for this host (keyed by its hardware\n\
-         fingerprint), writes it to allowlist.path, and verifies it against the\n\
-         pinned enrollment key (allowlist.key).\n\
+         fingerprint), writes it to allowlist.path (unset: allowlist[-<env>].cbor\n\
+         beside the system mia.toml), and verifies it against the pinned\n\
+         enrollment key (allowlist.key).\n\
          \n\
          With --reload, the running agent is signalled (SIGHUP) to swap in the\n\
          new body immediately — no restart, so the helper socket never drops.\n\

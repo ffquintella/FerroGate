@@ -27,7 +27,10 @@
 //! informationally, whether a hardware root of trust is present and whether the
 //! daemon will attest with it. That line is never a pass/fail condition: a
 //! TPM-less host (the common VM case) is fully supported via the host-key
-//! software tier.
+//! software tier. Likewise informational, the "allowlist" line names the
+//! signed allowlist body the daemon loads — the explicit `allowlist.path` or
+//! its per-environment default — and whether it verifies against
+//! `allowlist.key`.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -294,6 +297,11 @@ async fn run_checks(config: &Config, audience: &str) -> Vec<&'static str> {
     // and where this one listens (the address step 5 dials).
     let (status, detail) = default_environment_detail(config);
     report("default environment", status, &detail);
+
+    // Informational: where the daemon reads the signed caller allowlist (the
+    // explicit allowlist.path or its per-environment default) and whether it
+    // would verify. Never a failure — step 5 is the authority on minting.
+    report_allowlist(config);
 
     // 2. CMIS connection / 3. CRL publishing ------------------------------
     let mut server_crl = ServerCrl::Unknown;
@@ -1230,6 +1238,87 @@ fn default_environment_detail(config: &Config) -> (&'static str, String) {
     (status, format!("{owner} ({}) — {role}", selection.source()))
 }
 
+/// Print the informational "allowlist" line (never pass/fail), with hints
+/// when every caller would be denied.
+fn report_allowlist(config: &Config) {
+    let (status, detail, advice) = allowlist_detail(config, unix_now());
+    report("allowlist", status, &detail);
+    if !advice.is_empty() {
+        hints(&advice);
+    }
+}
+
+/// The "allowlist" line: the body the daemon loads — [`Config::allowlist_path`],
+/// marked `(default)` when it is the per-environment default — and what the
+/// daemon would make of it, verified exactly as it does at startup. `warn`
+/// whenever every caller would be denied (fail closed), `info` once a
+/// verified allowlist is in place.
+fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<String>) {
+    use crate::helper::allowlist::{load_classified, AllowlistLoad};
+    let path = config.allowlist_path();
+    let body = if config.allowlist_path_is_default() {
+        format!("{} (default)", path.display())
+    } else {
+        path.display().to_string()
+    };
+    let resync = "Pull this host's allowlist from CMIS with `mia resync-allowlist` (add -e <env> \
+                  for a named environment), or enable allowlist.fetch."
+        .to_string();
+    let Some(key) = config.allowlist_key() else {
+        return (
+            "warn",
+            format!("{body}; allowlist.key is not set, so every caller is denied (fail closed)"),
+            vec![
+                "Set allowlist.key to the CMIS enrollment public key (it has no default): \
+                 `mia setup` can fetch it over the pinned channel."
+                    .to_string(),
+            ],
+        );
+    };
+    match load_classified(&path, key, now, config.allowlist_max_age()) {
+        Ok((_, AllowlistLoad::Loaded { entries, not_after })) => (
+            "info",
+            format!(
+                "{body} — verified with {}: {entries} entries, valid for {}s",
+                key.display(),
+                (not_after - now).max(0)
+            ),
+            Vec::new(),
+        ),
+        Ok((_, AllowlistLoad::Missing)) => (
+            "warn",
+            format!("{body} not found — every caller is denied (fail closed)"),
+            vec![resync],
+        ),
+        Ok((_, AllowlistLoad::Invalid)) => (
+            "warn",
+            format!(
+                "{body} does not verify against {} (bad signature, stale, or a missing or \
+                 unparseable key) — every caller is denied (fail closed)",
+                key.display()
+            ),
+            vec![
+                "Re-fetch the enrollment key (`mia refresh-key`), then the allowlist \
+                 (`mia resync-allowlist`)."
+                    .to_string(),
+            ],
+        ),
+        Err(e) => (
+            "warn",
+            format!(
+                "{body}: cannot read it or {} ({e}) — {}",
+                key.display(),
+                if config.allowlist_path_is_default() {
+                    "every caller is denied (fail closed)"
+                } else {
+                    "the daemon refuses to start"
+                }
+            ),
+            Vec::new(),
+        ),
+    }
+}
+
 /// Print one aligned check line (or, with `--json`, record it).
 fn report(step: &str, status: &str, detail: &str) {
     let recorded = JSON_SINK.with(|sink| {
@@ -1355,6 +1444,62 @@ mod tests {
         let (detail, advice) = mint_target(&config).unwrap_err();
         assert!(detail.contains("disabled"), "{detail}");
         assert!(advice.iter().any(|h| h.contains("enable = false")));
+    }
+
+    #[test]
+    fn allowlist_line_reports_the_resolved_path() {
+        use crate::config::default_allowlist_path;
+        use crate::helper::allowlist::{encode, sign, AllowEntry, AllowlistDoc};
+        use ferro_crypto::composite::CompositeSecretKey;
+
+        // Nothing configured: the default body, flagged as such, and no key.
+        let config = Config::from_toml("").unwrap();
+        let (status, detail, advice) = allowlist_detail(&config, 1000);
+        assert_eq!(status, "warn");
+        let default = default_allowlist_path(None).display().to_string();
+        assert!(
+            detail.starts_with(&format!("{default} (default)")),
+            "{detail}"
+        );
+        assert!(detail.contains("allowlist.key is not set"), "{detail}");
+        assert!(advice.iter().any(|h| h.contains("allowlist.key")));
+
+        // An explicit, verifiable allowlist is reported verbatim and verified.
+        let dir = std::env::temp_dir().join(format!("mia-selftest-al-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let doc = AllowlistDoc {
+            trust_domain: "ferrogate.test".into(),
+            issued_at: 1000,
+            not_after: 4600,
+            entries: vec![AllowEntry {
+                uid: Some(1001),
+                bin_sha: hex::encode([0xAA; 48]),
+            }],
+        };
+        let (body, key) = (dir.join("al.cbor"), dir.join("al.pub"));
+        std::fs::write(&body, encode(&sign(&doc, &sk).unwrap()).unwrap()).unwrap();
+        std::fs::write(&key, pk.to_concat_bytes()).unwrap();
+        let config = Config::from_toml(&format!(
+            "[allowlist]\npath = '{}'\nkey = '{}'",
+            body.display(),
+            key.display()
+        ))
+        .unwrap();
+        let (status, detail, _) = allowlist_detail(&config, 1000);
+        assert_eq!(status, "info", "{detail}");
+        assert!(detail.starts_with(&body.display().to_string()), "{detail}");
+        assert!(!detail.contains("(default)"), "{detail}");
+        assert!(detail.contains("1 entries"), "{detail}");
+
+        // The same key with a body that is not there: deny-all, with a hint.
+        std::fs::remove_file(&body).unwrap();
+        let (status, detail, advice) = allowlist_detail(&config, 1000);
+        assert_eq!(status, "warn");
+        assert!(detail.contains("not found"), "{detail}");
+        assert!(advice.iter().any(|h| h.contains("resync-allowlist")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

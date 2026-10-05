@@ -375,8 +375,8 @@ socket = "/run/ferrogate/mia.sock"   # optional; this is the Linux default
 socket_mode = "660"
 
 [allowlist]
-path = "/etc/ferrogate/allowlist.cbor"
-key  = "/etc/ferrogate/allowlist.pub"
+path = "/etc/ferrogate/allowlist.cbor"   # optional; this is the Linux default
+key  = "/etc/ferrogate/allowlist.pub"    # no default: required for any caller to be allowed
 max_age_secs = 345600   # 96 h; must be >= the CMIS allowlist TTL
 fetch = false   # fetch this host's allowlist from CMIS at startup and write `path`
 propose = false # propose the callers this host observes back to CMIS (bootstrap)
@@ -467,6 +467,42 @@ On macOS the root daemon owns `/Library/Application Support/FerroGate/run`:
 
 On Linux and macOS sockets are `0660` (`socket_mode`), and a pre-existing
 non-socket file at the path is refused, never deleted.
+
+#### Allowlist: default location
+
+Like the helper socket, the signed allowlist **body** has a per-platform,
+per-environment default. When neither `allowlist.path` nor
+`FERROGATE_ALLOWLIST` is set (a blank value counts as unset), the daemon,
+`mia test`, `mia setup`, `mia resync-allowlist` and `mia refresh-key` all
+resolve the same file through `mia::config::default_allowlist_path`, beside the
+system `mia.toml`:
+
+| OS | default environment (`mia.toml`) | named environment (`mia-<env>.toml`) |
+|----|----------------------------------|--------------------------------------|
+| Linux | `/etc/ferrogate/allowlist.cbor` | `/etc/ferrogate/allowlist-<env>.cbor` |
+| macOS | `/Library/Application Support/FerroGate/allowlist.cbor` | `…/FerroGate/allowlist-<env>.cbor` |
+| Windows | `%ProgramData%\FerroGate\allowlist.cbor` | `%ProgramData%\FerroGate\allowlist-<env>.cbor` |
+
+The environment is judged as for the helper socket, and the system directory is
+used even for a per-user configuration file. Precedence: default <
+`allowlist.path` < `FERROGATE_ALLOWLIST`. `allowlist.fetch` and
+`mia resync-allowlist` write the body there.
+
+The verification key **`allowlist.key` has no default**. It is the trust
+anchor of the allowlist, so it must be named explicitly: a key file merely
+present at a well-known path is never trusted. The default does not loosen the
+fail-closed rules:
+
+- no `allowlist.key` ⇒ every caller is denied (logged), and `allowlist.fetch`
+  does not write anything; with an **explicit** `allowlist.path` and no key the
+  daemon still refuses to start;
+- a body that is missing, stale, unsigned or does not verify ⇒ every caller is
+  denied;
+- a default location that cannot be read (for example a directory in its place)
+  ⇒ every caller is denied and the error is logged. The daemon still starts. An
+  explicit `allowlist.path` that cannot be read still stops it, as before.
+
+`mia test` prints the resolved body (marked `(default)`) and whether it verifies.
 
 #### Default environment: who serves the well-known address
 
@@ -670,8 +706,11 @@ keyed by the host's EK-derived UUID. The wizard additionally offers to enable
 **`allowlist.fetch`** — when set, the daemon pulls this host's allowlist from
 CMIS at every start (after attestation supplies its identity) and writes
 `allowlist.path` before loading, so it stays in sync without out-of-band
-delivery. See [allowlist-provisioning.md](allowlist-provisioning.md) for the full
-workflow.
+delivery. The wizard suggests the per-environment default body path (see
+[Allowlist: default location](#allowlist-default-location)) and leaves
+`allowlist.path` unset in the file when you accept it, as it does for the
+helper socket; the key is always written. See
+[allowlist-provisioning.md](allowlist-provisioning.md) for the full workflow.
 
 **`allowlist.propose`** closes the bootstrap gap from the other direction. With
 it enabled the daemon sends CMIS the local callers it has actually observed —
@@ -761,8 +800,8 @@ enable = true                                # false ⇒ `enable = false` (helpe
 socket = "/run/ferrogate/mia.sock"           # optional; blank ⇒ the platform default
 socket_mode = "660"                          # windows_group = "FerroGateClients"
 [allowlist]
-path = "/etc/ferrogate/allowlist.cbor"
-key = "/etc/ferrogate/allowlist.pub"
+path = "/etc/ferrogate/allowlist.cbor"       # optional; omitted or blank ⇒ the default
+key = "/etc/ferrogate/allowlist.pub"         # no default
 max_age_secs = 259200
 fetch = true
 propose = false
@@ -810,6 +849,11 @@ scripts. It runs four checks in order:
    token or interpreting the refusal. It fails only if the helper API is
    switched off (`helper.enable = false`) or the daemon cannot be reached.
 
+Informational lines, never failures, also report the attestation backend, the
+default environment and the **allowlist**: the body the daemon loads
+(`allowlist.path`, else the default, marked `(default)`) and whether it
+verifies against `allowlist.key` (`warn` when every caller would be denied).
+
 Each failing step prints targeted remediation hints (mirroring the
 [operations runbooks](operations/runbooks/README.md)); a `crl_stale` refusal in
 step 4 is cross-referenced with step 3's result to say whether the server or
@@ -828,7 +872,8 @@ the allowlist check works. Options:
   "checks": [{"id", "step", "status", "detail", "hints": [...], "notes": [...]}]}`,
   where `id` is a stable slug (`configuration`, `cmis_connection`,
   `cluster_identity`, `cmis_crl_publishing`, `helper_token_mint`,
-  `attestation`) and `status` is `ok` / `FAIL` / `skip` / `info` / `warn`.
+  `attestation`, `default_environment`, `allowlist`) and `status` is `ok` /
+  `FAIL` / `skip` / `info` / `warn`.
 
 ### Status endpoint and `mia status`
 

@@ -149,7 +149,10 @@ return its output, so on Windows elevated actions report only their outcome.
 2. Every field is validated locally with `mia`'s own rules (CMIS endpoint or
    SRV record, SPKI pin, helper socket / pipe group, allowlist path, key, max
    age, `fetch` / `propose`, attestation backend, IMA log, log directive) plus
-   the cross-field rules.
+   the cross-field rules. A blank helper socket or allowlist file leaves the
+   key out of the file, so `mia` uses the platform default for the
+   environment; the allowlist key has no default and must be filled in for
+   any caller to be allowed.
 3. **Check with mia** writes the draft to a fresh private directory (`0700`,
    random name, under `$XDG_RUNTIME_DIR` or the per-user temp directory) as
    `draft.toml` (`0600`, created exclusively) and runs `mia setup --check`;

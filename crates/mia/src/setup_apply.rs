@@ -194,7 +194,12 @@ struct DraftHelper {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct DraftAllowlist {
+    /// `allowlist.path`. Absent or blank ⇒ not written, so the file follows
+    /// the per-environment default ([`crate::config::default_allowlist_path`]).
+    /// Omitting it never widens trust: the body is still verified against the
+    /// explicit `key`.
     path: Option<String>,
+    /// `allowlist.key` — no default (the trust anchor); required with `path`.
     key: Option<String>,
     max_age_secs: Option<u64>,
     fetch: bool,
@@ -1502,6 +1507,43 @@ mod tests {
         let draft = write_draft(&dir, "[helper]\nenable = false\n");
         apply(&draft, &apply_opts(&target)).unwrap();
         assert!(!setup::load_existing(&target).helper_enabled());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_draft_omitting_the_allowlist_path_gets_the_default() {
+        use crate::config::default_allowlist_path;
+        let dir = scratch("allowlist-default");
+        let key = dir.join("allowlist.pub").display().to_string();
+
+        // A previous explicit path is not kept when the draft leaves it out:
+        // the file then follows the per-environment default.
+        let target = dir.join("mia.toml");
+        std::fs::write(&target, "[allowlist]\npath = '/old/allowlist.cbor'\n").unwrap();
+        let draft = write_draft(&dir, &format!("[allowlist]\nkey = '{key}'\n"));
+        apply(&draft, &apply_opts(&target)).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        let default = default_allowlist_path(None).display().to_string();
+        assert!(text.contains(&format!("\n#path = '{default}'\n")), "{text}");
+        let cfg = setup::load_existing(&target);
+        assert_eq!(cfg.allowlist.path, None);
+        assert_eq!(cfg.allowlist_path(), default_allowlist_path(None));
+        // The trust anchor is still the explicit key.
+        assert_eq!(cfg.allowlist_key(), Some(Path::new(&key)));
+
+        // A blank path is the same as an omitted one, and a named
+        // environment's file shows its own default.
+        let target = dir.join("mia-qa.toml");
+        let draft = write_draft(&dir, &format!("[allowlist]\npath = ' '\nkey = '{key}'\n"));
+        apply(&draft, &apply_opts(&target)).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        let qa = default_allowlist_path(Some("qa")).display().to_string();
+        assert!(text.contains(&format!("\n#path = '{qa}'\n")), "{text}");
+        assert_eq!(setup::load_existing(&target).allowlist.path, None);
+
+        // A draft that sets a path without a key is still rejected.
+        let draft = write_draft(&dir, "[allowlist]\npath = '/x/allowlist.cbor'\n");
+        assert!(apply(&draft, &apply_opts(&target)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

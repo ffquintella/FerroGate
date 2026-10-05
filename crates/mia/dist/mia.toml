@@ -76,8 +76,16 @@
 #require_authenticode = true
 
 # --- Allowlist --------------------------------------------------------------
-# Signed CBOR allowlist of vetted local callers. With no `path`, the helper API
-# denies every caller (fail closed). `key` is required whenever `path` is set.
+# Signed CBOR allowlist of vetted local callers. `path` unset => the platform
+# default for this environment, beside this file (mia-<env>.toml gets an
+# `-<env>` suffix, so environments never share one body):
+#   Linux    /etc/ferrogate/allowlist.cbor          (allowlist-<env>.cbor)
+#   macOS    /Library/Application Support/FerroGate/allowlist.cbor
+#   Windows  %ProgramData%\FerroGate\allowlist.cbor
+# Set it only to move the body. `key` — the CMIS enrollment public key that
+# verifies the body — has NO default: without it every caller is denied (fail
+# closed), and it is required whenever `path` is set. A missing, stale or
+# non-verifying body also denies every caller.
 [allowlist]
 #path = "/etc/ferrogate/allowlist.cbor"
 #key = "/etc/ferrogate/allowlist.pub"
@@ -86,7 +94,8 @@
 # long as the host can reach CMIS; keep it ≥ the CMIS allowlist_ttl_secs.
 #max_age_secs = 259200
 # Fetch this host's signed allowlist from CMIS at startup (the GetAllowlist RPC,
-# keyed by the host's EK-derived UUID) and write it to `path` before loading, so
+# keyed by the host's EK-derived UUID) and write it to `path` (or its default)
+# before loading, so
 # the on-disk artefact stays in sync with what the operator provisioned. Needs
 # cmis.endpoint + cmis.spki_pin and a successful attestation; a fetch failure is
 # non-fatal and falls back to whatever is already at `path`. Default: false.

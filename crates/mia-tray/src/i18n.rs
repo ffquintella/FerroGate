@@ -269,9 +269,9 @@ messages! {
     FieldHelperWindowsGroup => "Pipe group (Windows)", "Grupo do pipe (Windows)";
     HelpHelperWindowsGroup => "Local group allowed to open the helper pipe, e.g. FerroGateClients.", "Grupo local autorizado a abrir o pipe do helper, por exemplo FerroGateClients.";
     FieldAllowlistPath => "Allowlist file", "Arquivo da lista de permissões";
-    HelpAllowlistPath => "Path of the signed caller allowlist.", "Caminho da lista de permissões assinada.";
+    HelpAllowlistPath => "Path of the signed caller allowlist; leave blank for the platform default.", "Caminho da lista de permissões assinada; deixe em branco para usar o padrão da plataforma.";
     FieldAllowlistKey => "Enrollment public key", "Chave pública de registro";
-    HelpAllowlistKey => "Path of the CMIS enrollment key that verifies the allowlist.", "Caminho da chave de registro do CMIS que verifica a lista de permissões.";
+    HelpAllowlistKey => "Path of the CMIS enrollment key that verifies the allowlist; no default — without it every caller is denied.", "Caminho da chave de registro do CMIS que verifica a lista de permissões; sem padrão — sem ela todo chamador é negado.";
     FieldAllowlistMaxAge => "Allowlist maximum age (seconds)", "Idade máxima da lista de permissões (segundos)";
     HelpAllowlistMaxAge => "Oldest allowlist accepted, in seconds; blank for the default.", "Lista de permissões mais antiga aceita, em segundos; em branco para o padrão.";
     FieldAllowlistFetch => "Fetch the allowlist from CMIS at startup", "Obter a lista de permissões do CMIS ao iniciar";

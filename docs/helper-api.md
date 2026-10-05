@@ -71,6 +71,11 @@ caller's identity from kernel-attested sources:
    [allowlist-provisioning.md](allowlist-provisioning.md)); the MIA verifies the
    signature before each access and **fails closed** — any decode, signature,
    or freshness failure leaves no usable allowlist, so every caller is denied.
+   The body is read from `allowlist.path`, by default `allowlist.cbor`
+   (`allowlist-<env>.cbor` for a named environment) beside the system
+   `mia.toml`; the verification key `allowlist.key` has no default, and
+   without it every caller is denied — see
+   [mia.md](mia.md#allowlist-default-location).
 
    The on-disk artefact is a CBOR `SignedAllowlist`: a canonical-CBOR
    `AllowlistDoc` body (`trust_domain`, `issued_at`, `not_after`, `entries`)

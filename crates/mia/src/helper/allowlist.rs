@@ -255,10 +255,12 @@ pub fn load_at_startup(
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // CMIS may have no allowlist for this host and none was ever
-            // written, so the configured path can legitimately be empty.
+            // written, so the path (configured or the per-environment
+            // default) can legitimately be empty.
             tracing::warn!(
                 path = %path.display(),
-                "allowlist.path configured but no file present; helper API denies all callers (fail closed)"
+                "no allowlist file present (allowlist.path or its default); helper API denies \
+                 all callers (fail closed)"
             );
             return Ok(None);
         }
@@ -304,6 +306,109 @@ pub fn load_at_startup(
             Ok(None)
         }
     }
+}
+
+/// The daemon-start policy for the allowlist `config` resolves to: the body
+/// at [`Config::allowlist_path`](crate::config::Config::allowlist_path) (the
+/// explicit `allowlist.path`, else the per-environment default), verified with
+/// [`Config::allowlist_key`](crate::config::Config::allowlist_key).
+///
+/// Every trust problem fails closed — no allowlist (deny every caller), with
+/// the [`AllowlistLoad`] saying why — and only an *explicitly* configured
+/// allowlist can make the daemon refuse to start (`Err`), exactly as before
+/// the default existed:
+///
+/// - **no `allowlist.key`**: with an explicit `allowlist.path` that is a
+///   misconfiguration and an error; with the default path it is simply the
+///   unconfigured state — deny all, logged (the key, the trust anchor, has no
+///   default);
+/// - **an unexpected I/O error** (not `NotFound`) reading the body or key: an
+///   error for an explicit path; at the default location — which the operator
+///   never named — it is logged and served as deny-all, so an unreadable
+///   well-known path can never keep the daemon from starting;
+/// - a missing, unsigned, stale or non-verifying body: deny all
+///   ([`load_at_startup`]).
+pub fn load_for_startup(
+    config: &crate::config::Config,
+    now: i64,
+) -> anyhow::Result<(Option<Allowlist>, AllowlistLoad)> {
+    startup_policy(
+        &config.allowlist_path(),
+        config.allowlist_path_is_default(),
+        config.allowlist_key(),
+        now,
+        config.allowlist_max_age(),
+    )
+}
+
+/// The core of [`load_for_startup`] over already-resolved inputs (`is_default`
+/// ⇒ `path` is the built-in default, not an operator's choice), split out so
+/// the I/O-error branch can be exercised against a scratch directory.
+fn startup_policy(
+    path: &std::path::Path,
+    is_default: bool,
+    key: Option<&std::path::Path>,
+    now: i64,
+    max_age_secs: i64,
+) -> anyhow::Result<(Option<Allowlist>, AllowlistLoad)> {
+    use anyhow::Context as _;
+    let Some(key) = key else {
+        anyhow::ensure!(
+            is_default,
+            "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing"
+        );
+        warn_no_key(path);
+        return Ok((None, AllowlistLoad::Missing));
+    };
+    match load_classified(path, key, now, max_age_secs) {
+        Ok(loaded) => Ok(loaded),
+        Err(e) if is_default => {
+            tracing::error!(
+                path = %path.display(),
+                key = %key.display(),
+                error = %e,
+                "cannot read the allowlist (default location) or its key; helper API denies \
+                 all callers (fail closed)"
+            );
+            let outcome = if path.exists() {
+                AllowlistLoad::Invalid
+            } else {
+                AllowlistLoad::Missing
+            };
+            Ok((None, outcome))
+        }
+        Err(e) => {
+            Err(e).with_context(|| format!("reading allowlist (allowlist.path) {}", path.display()))
+        }
+    }
+}
+
+/// The live-reload (`SIGHUP`) and post-re-attestation policy for an already
+/// resolved allowlist `path` (see
+/// [`Config::allowlist_path`](crate::config::Config::allowlist_path)) and
+/// verification `key`. Never fatal: with no key every caller is denied (fail
+/// closed, logged); otherwise [`load_classified`], whose `Err` (an unexpected
+/// I/O error) tells the caller to keep the allowlist currently in force.
+pub fn load_for_reload(
+    path: &std::path::Path,
+    key: Option<&std::path::Path>,
+    now: i64,
+    max_age_secs: i64,
+) -> std::io::Result<(Option<Allowlist>, AllowlistLoad)> {
+    let Some(key) = key else {
+        warn_no_key(path);
+        return Ok((None, AllowlistLoad::Missing));
+    };
+    load_classified(path, key, now, max_age_secs)
+}
+
+/// Log the "no verification key" deny-all state.
+fn warn_no_key(path: &std::path::Path) {
+    tracing::warn!(
+        path = %path.display(),
+        "no allowlist verification key configured (allowlist.key / FERROGATE_ALLOWLIST_KEY); \
+         helper API denies all callers (fail closed)"
+    );
 }
 
 #[cfg(test)]
@@ -643,5 +748,101 @@ mod tests {
         for d in [ok, missing, invalid] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// A configuration whose allowlist body resolves to the per-environment
+    /// default of an environment no host has, so the default file is absent.
+    fn default_path_config(toml: &str) -> crate::config::Config {
+        let c = crate::config::Config::from_toml(toml)
+            .unwrap()
+            .with_environment("zz-mia-unit-test-absent");
+        assert!(c.allowlist_path_is_default());
+        assert!(
+            !c.allowlist_path().exists(),
+            "{}",
+            c.allowlist_path().display()
+        );
+        c
+    }
+
+    /// `key = '<dir>/allowlist.pub'`, plus `extra` TOML lines.
+    fn key_toml(dir: &std::path::Path, extra: &str) -> String {
+        format!(
+            "[allowlist]\nkey = '{}'\n{extra}",
+            dir.join("allowlist.pub").display()
+        )
+    }
+
+    #[test]
+    fn startup_without_a_key_denies_all_at_the_default_path() {
+        // The unconfigured state: the body defaults, the trust anchor does
+        // not, so every caller is denied — and the daemon still starts.
+        let (al, outcome) = load_for_startup(&default_path_config(""), 1000).unwrap();
+        assert!(al.is_none());
+        assert_eq!(outcome, AllowlistLoad::Missing);
+    }
+
+    #[test]
+    fn startup_with_a_nonexistent_default_file_denies_all_without_crashing() {
+        let (_sk, pk) = keypair();
+        let dir = startup_dir("default-absent", None, Some(&pk.to_concat_bytes()));
+        let c = default_path_config(&key_toml(&dir, ""));
+        let (al, outcome) = load_for_startup(&c, 1000).unwrap();
+        assert!(al.is_none());
+        assert_eq!(outcome, AllowlistLoad::Missing);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_with_an_explicit_path_but_no_key_still_refuses_to_start() {
+        let c =
+            crate::config::Config::from_toml("[allowlist]\npath = '/nonexistent/al.cbor'").unwrap();
+        let err = load_for_startup(&c, 1000).unwrap_err();
+        assert!(err.to_string().contains("allowlist.key"), "{err}");
+    }
+
+    #[test]
+    fn startup_loads_and_verifies_an_explicit_allowlist() {
+        let (sk, pk) = keypair();
+        let dir = startup_dir(
+            "explicit-ok",
+            Some(&signed_bytes(&doc(1000), &sk)),
+            Some(&pk.to_concat_bytes()),
+        );
+        let path = format!("path = '{}'", dir.join("allowlist.cbor").display());
+        let c = crate::config::Config::from_toml(&key_toml(&dir, &path)).unwrap();
+        let (al, outcome) = load_for_startup(&c, 1000).unwrap();
+        assert!(al.expect("verified").permits(1001, &[0xAA; 48]));
+        assert!(matches!(outcome, AllowlistLoad::Loaded { entries: 1, .. }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_unreadable_body_is_fatal_only_when_explicit() {
+        // A directory where the body should be: reading it is an I/O error
+        // other than NotFound.
+        let (_sk, pk) = keypair();
+        let dir = startup_dir("unreadable", None, Some(&pk.to_concat_bytes()));
+        let body = dir.join("allowlist.cbor");
+        std::fs::create_dir_all(&body).unwrap();
+        let key = dir.join("allowlist.pub");
+        // An operator-named path keeps the loud failure ...
+        assert!(startup_policy(&body, false, Some(&key), 1000, 86_400).is_err());
+        // ... the default location fails closed instead of stopping the daemon.
+        let (al, outcome) = startup_policy(&body, true, Some(&key), 1000, 86_400).unwrap();
+        assert!(al.is_none());
+        assert_eq!(outcome, AllowlistLoad::Invalid);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_without_a_key_denies_all_and_never_fails() {
+        let (sk, _pk) = keypair();
+        let dir = startup_dir("reload-no-key", Some(&signed_bytes(&doc(1000), &sk)), None);
+        let (al, outcome) = load_for_reload(&dir.join("allowlist.cbor"), None, 1000, 86_400)
+            .expect("no key is not an I/O error");
+        assert!(al.is_none());
+        assert_eq!(outcome, AllowlistLoad::Missing);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

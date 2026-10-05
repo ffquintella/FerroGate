@@ -29,8 +29,8 @@ Verification needs two files on the host:
 
 | File (config key) | What it is | Secret? |
 |-------------------|------------|---------|
-| `allowlist.key` (`FERROGATE_ALLOWLIST_KEY`) | the **CMIS enrollment public key** — the composite (hybrid-PQC) public key whose private half signs allowlists | No — public key material |
-| `allowlist.path` (`FERROGATE_ALLOWLIST`) | the **signed allowlist body** (CBOR) issued by CMIS for this host | No — integrity-protected by its signature |
+| `allowlist.key` (`FERROGATE_ALLOWLIST_KEY`) | the **CMIS enrollment public key** — the composite (hybrid-PQC) public key whose private half signs allowlists. **No default**: it is the trust anchor, so it is always named explicitly | No — public key material |
+| `allowlist.path` (`FERROGATE_ALLOWLIST`) | the **signed allowlist body** (CBOR) issued by CMIS for this host. Optional: unset ⇒ `allowlist.cbor` (`allowlist-<env>.cbor`) beside the system `mia.toml` — see [mia.md](mia.md#allowlist-default-location) | No — integrity-protected by its signature |
 
 This workflow provisions the first one. The MIA verifies the allowlist with
 `allowlist.key` under the domain-separation context `ferrogate-allowlist-v1`,
@@ -91,8 +91,11 @@ issuer composite key                   mia setup
   (it is written `0644`, owned by the installing user/root).
 - **Fail-closed everywhere.** A missing/expired/too-old/bad-signature allowlist
   yields *no* usable allowlist, so the helper API denies every caller rather than
-  fall open. A missing `allowlist.key` while `allowlist.path` is set makes the
-  daemon **refuse to start** (loud), rather than silently run unprotected.
+  fall open. A missing `allowlist.key` while `allowlist.path` is set explicitly
+  makes the daemon **refuse to start** (loud). With the body at its default
+  location and no key, the daemon starts and denies every caller, which is the
+  unconfigured state. The key never has a default, so a file merely present at
+  a well-known path cannot become a trust anchor.
 - **Key reuse couples rotation.** Because the enrollment key *is* the issuer
   key, rotating the issuer (root key ceremony, compromise) also rotates the
   allowlist trust root: every host must re-fetch `allowlist.key` and CMIS must
@@ -212,7 +215,8 @@ startup.)
 
 | Symptom | Cause | Remedy |
 |---------|-------|--------|
-| `allowlist key file missing` / `unparseable` (daemon serves deny-all) | `allowlist.path`/`key` set but the key file is missing or corrupt | Fetch it with `mia refresh-key` (or `mia setup`), deliver it out of band, or remove the `[allowlist]` keys to start fail-closed |
+| `allowlist key file missing` / `unparseable` (daemon serves deny-all) | `allowlist.key` set but the key file is missing or corrupt | Fetch it with `mia refresh-key` (or `mia setup`), deliver it out of band, or remove the `[allowlist]` keys to start fail-closed |
+| `no allowlist verification key configured` (daemon serves deny-all) | `allowlist.key` unset; the body path is the default | Set `allowlist.key` and fetch the key (`mia setup`); `mia test` shows the resolved body path |
 | `allowlist verification failed: bad signature` (daemon serves deny-all) | wrong `allowlist.key`, or an allowlist signed by a different/rotated issuer (e.g. a CMIS redeploy changed the enrollment key) | `mia refresh-key` to re-fetch the key, then `mia resync-allowlist` to pull a body signed by it; restart the daemon |
 | `allowlist verification failed: expired` / `too old` (daemon serves deny-all) | `not_after` passed, or older than `max_age_secs` | Re-issue a fresh allowlist; check clock skew; restart the daemon |
 | fetch fails with a TLS/pin error | wrong or missing SPKI pin, unreachable endpoint | Re-verify the pin out of band; confirm the endpoint |

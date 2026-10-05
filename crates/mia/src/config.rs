@@ -9,7 +9,13 @@
 //!
 //! Lowest to highest:
 //!
-//! 1. built-in defaults (e.g. socket mode `660`, allowlist max-age `259200`);
+//! 1. built-in defaults (e.g. socket mode `660`, allowlist max-age `259200`,
+//!    and the per-platform, per-environment helper socket
+//!    ([`default_helper_socket`](crate::config::default_helper_socket)) and
+//!    signed allowlist body
+//!    ([`default_allowlist_path`](crate::config::default_allowlist_path)); the
+//!    allowlist's verification key `allowlist.key` deliberately has no
+//!    default);
 //! 2. the TOML configuration file, if one is found;
 //! 3. environment variables (`FERROGATE_*`, `RUST_LOG`).
 //!
@@ -369,6 +375,40 @@ pub fn default_helper_address(
     }
 }
 
+/// The signed allowlist body's file name for an environment:
+/// `allowlist.cbor` or `allowlist-<env>.cbor`.
+fn allowlist_file_name(environment: Option<&str>) -> String {
+    match environment {
+        Some(env) => format!("allowlist-{env}.cbor"),
+        None => "allowlist.cbor".to_string(),
+    }
+}
+
+/// The platform's default location of the signed caller allowlist body:
+/// `allowlist.cbor` (or `allowlist-<env>.cbor` for a named environment, so
+/// side-by-side environments never share one body) in the system
+/// configuration directory, beside `mia.toml`:
+///
+/// | OS | default environment | named environment |
+/// |----|---------------------|-------------------|
+/// | Linux | `/etc/ferrogate/allowlist.cbor` | `/etc/ferrogate/allowlist-<env>.cbor` |
+/// | macOS | `/Library/Application Support/FerroGate/allowlist.cbor` | `…/FerroGate/allowlist-<env>.cbor` |
+/// | Windows | `%ProgramData%\FerroGate\allowlist.cbor` | `%ProgramData%\FerroGate\allowlist-<env>.cbor` |
+///
+/// This is what [`Config::allowlist_path`] resolves to when neither
+/// `allowlist.path` nor `FERROGATE_ALLOWLIST` is set. It is always the
+/// administrator-managed system configuration directory — never the per-user
+/// directory or a runtime tmpfs — even for a per-user configuration file. The
+/// location carries no trust: the body is verified against the explicitly
+/// configured `allowlist.key` (which deliberately has no default), and a
+/// missing, unreadable or non-verifying body denies every caller.
+/// `environment` must already have passed [`validate_environment`].
+#[must_use]
+pub fn default_allowlist_path(environment: Option<&str>) -> PathBuf {
+    debug_assert!(environment.is_none_or(|e| validate_environment(e).is_ok()));
+    system_config_dir().join(allowlist_file_name(environment))
+}
+
 /// The classification of a config filename for environment discovery.
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigFile {
@@ -425,7 +465,7 @@ pub struct Config {
     /// environment's identity: the loader sets it from the `--environment`
     /// selector or, failing that, from the `mia-<env>.toml` file name (see
     /// [`environment_for_path`]). It selects the per-environment
-    /// [`default_helper_socket`].
+    /// [`default_helper_socket`] and [`default_allowlist_path`].
     #[serde(skip)]
     environment: Option<String>,
     /// The host-wide default-environment selection this configuration was
@@ -502,16 +542,25 @@ pub struct HelperConfig {
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AllowlistConfig {
-    /// Path to the signed CBOR allowlist. Absent ⇒ deny every caller.
+    /// Path to the signed CBOR allowlist. `None` or blank ⇒ the platform
+    /// default for this configuration's environment,
+    /// [`default_allowlist_path`] (resolved by [`Config::allowlist_path`]). A
+    /// body that is missing, unreadable, stale or does not verify against
+    /// [`key`](Self::key) denies every caller (fail closed).
     pub path: Option<PathBuf>,
-    /// Trusted CMIS enrollment public key used to verify the allowlist.
+    /// Trusted CMIS enrollment public key used to verify the allowlist — the
+    /// trust anchor of the whole allowlist, so it has **no default**: `None`
+    /// or blank ⇒ nothing can verify a body and every caller is denied (fail
+    /// closed). Set explicitly whenever `path` is set (the daemon refuses to
+    /// start on an explicit `path` without a key).
     pub key: Option<PathBuf>,
     /// Maximum accepted allowlist age in seconds; default
     /// [`DEFAULT_ALLOWLIST_MAX_AGE_SECS`].
     pub max_age_secs: Option<i64>,
     /// When `true`, the daemon fetches this host's signed allowlist from CMIS
     /// (the `GetAllowlist` RPC, keyed by the host's EK-derived UUID) at startup
-    /// and writes it to `path` before loading — so the on-disk artefact stays in
+    /// and writes it to `path` (or its default, [`Config::allowlist_path`])
+    /// before loading — so the on-disk artefact stays in
     /// sync with what the operator provisioned. Requires `cmis.endpoint` +
     /// `cmis.spki_pin` and a successful attestation; a fetch failure is
     /// non-fatal and falls back to whatever is already at `path`.
@@ -1054,10 +1103,7 @@ impl Config {
 
     /// The explicit `helper.socket`, if set and not blank.
     fn explicit_helper_socket(&self) -> Option<&Path> {
-        self.helper
-            .socket
-            .as_deref()
-            .filter(|p| !p.to_string_lossy().trim().is_empty())
+        non_blank_path(self.helper.socket.as_deref())
     }
 
     /// The host-wide default-environment selection this configuration was
@@ -1152,6 +1198,54 @@ impl Config {
         self.allowlist
             .max_age_secs
             .unwrap_or(DEFAULT_ALLOWLIST_MAX_AGE_SECS)
+    }
+
+    /// The signed allowlist body the helper API verifies callers against.
+    ///
+    /// An explicit `allowlist.path` (file or `FERROGATE_ALLOWLIST`) is used
+    /// verbatim; an unset or blank one resolves to the platform default for
+    /// this configuration's [`environment`](Self::environment), see
+    /// [`default_allowlist_path`]. Precedence: default < `allowlist.path` <
+    /// `FERROGATE_ALLOWLIST`. The daemon, `mia test`, `mia setup`,
+    /// `mia resync-allowlist` and `mia refresh-key` all resolve the body here,
+    /// so they always agree on where it lives.
+    #[must_use]
+    pub fn allowlist_path(&self) -> PathBuf {
+        self.explicit_allowlist_path().map_or_else(
+            || default_allowlist_path(self.environment()),
+            Path::to_path_buf,
+        )
+    }
+
+    /// Whether [`Self::allowlist_path`] is the built-in default (no explicit,
+    /// non-blank `allowlist.path` / `FERROGATE_ALLOWLIST`).
+    #[must_use]
+    pub fn allowlist_path_is_default(&self) -> bool {
+        self.explicit_allowlist_path().is_none()
+    }
+
+    /// The trusted CMIS enrollment key that verifies the allowlist
+    /// (`allowlist.key` / `FERROGATE_ALLOWLIST_KEY`), or `None` when unset or
+    /// blank. Deliberately **without** a default: the key is the trust anchor,
+    /// so it must be named by the operator — a key file merely appearing at a
+    /// well-known path must never become trusted. With no key every caller is
+    /// denied (fail closed).
+    #[must_use]
+    pub fn allowlist_key(&self) -> Option<&Path> {
+        non_blank_path(self.allowlist.key.as_deref())
+    }
+
+    /// The explicit `allowlist.path`, if set and not blank.
+    fn explicit_allowlist_path(&self) -> Option<&Path> {
+        non_blank_path(self.allowlist.path.as_deref())
+    }
+
+    /// Test-only: record `environment` as the loader would, so other modules'
+    /// tests can resolve per-environment defaults.
+    #[cfg(test)]
+    pub(crate) fn with_environment(mut self, environment: &str) -> Self {
+        self.environment = Some(environment.to_owned());
+        self
     }
 
     /// Whether the status endpoint is served (`status.enable`, default on).
@@ -1287,6 +1381,12 @@ fn parse_bool_env(name: &str, raw: &str) -> anyhow::Result<bool> {
         "0" | "false" | "no" | "off" | "" => Ok(false),
         other => anyhow::bail!("{name} must be a boolean (true/false), got `{other}`"),
     }
+}
+
+/// A configured path, unless it is blank (empty or whitespace only): a blank
+/// value counts as unset, so the key's default (or absence) applies.
+fn non_blank_path(path: Option<&Path>) -> Option<&Path> {
+    path.filter(|p| !p.to_string_lossy().trim().is_empty())
 }
 
 #[cfg(test)]
@@ -2040,6 +2140,117 @@ mod tests {
         if std::env::var_os("FERROGATE_HELPER_SOCKET").is_none() {
             assert_eq!(main_cfg.helper_socket(), Some(yielded_helper_socket()));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_allowlist_path_is_platform_and_environment_scoped() {
+        let default = default_allowlist_path(None);
+        let staging = default_allowlist_path(Some("staging"));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                default,
+                Path::new("/Library/Application Support/FerroGate/allowlist.cbor")
+            );
+            assert_eq!(
+                staging,
+                Path::new("/Library/Application Support/FerroGate/allowlist-staging.cbor")
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(default, system_config_dir().join("allowlist.cbor"));
+            assert_eq!(staging, system_config_dir().join("allowlist-staging.cbor"));
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            assert_eq!(default, Path::new("/etc/ferrogate/allowlist.cbor"));
+            assert_eq!(staging, Path::new("/etc/ferrogate/allowlist-staging.cbor"));
+        }
+        // Beside the system config, never in the per-user directory, and side-
+        // by-side environments never share one body.
+        assert_eq!(default.parent(), system_config_path().parent());
+        assert_eq!(staging.parent(), system_config_path().parent());
+        assert_ne!(default, staging);
+    }
+
+    #[test]
+    fn allowlist_path_precedence_default_then_toml_then_env() {
+        let get = |env: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                env.iter()
+                    .find(|(var, _)| *var == k)
+                    .map(|(_, v)| (*v).to_string())
+            }
+        };
+        // 1. built-in default, scoped by the configuration's environment.
+        let mut c = Config::from_toml("").unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, get(&[])).unwrap();
+        assert_eq!(c.allowlist_path(), default_allowlist_path(None));
+        assert!(c.allowlist_path_is_default());
+        let named = Config {
+            environment: Some("qa".into()),
+            ..Config::default()
+        };
+        assert_eq!(named.allowlist_path(), default_allowlist_path(Some("qa")));
+        // 2. the TOML value beats the default.
+        let mut c = Config::from_toml("[allowlist]\npath = '/from/file.cbor'").unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, get(&[])).unwrap();
+        assert_eq!(c.allowlist_path(), Path::new("/from/file.cbor"));
+        assert!(!c.allowlist_path_is_default());
+        // 3. the env var beats the TOML value.
+        c.apply_overrides(
+            EnvOverrideScope::Full,
+            get(&[("FERROGATE_ALLOWLIST", "/from/env.cbor")]),
+        )
+        .unwrap();
+        assert_eq!(c.allowlist_path(), Path::new("/from/env.cbor"));
+        assert!(!c.allowlist_path_is_default());
+    }
+
+    #[test]
+    fn blank_allowlist_values_count_as_unset() {
+        // A blank path (TOML or env) falls back to the default ...
+        let c = Config::from_toml("[allowlist]\npath = '  '\nkey = ''").unwrap();
+        assert!(c.allowlist_path_is_default());
+        assert_eq!(c.allowlist_path(), default_allowlist_path(None));
+        // ... and a blank key is no key at all (never the empty path).
+        assert_eq!(c.allowlist_key(), None);
+        let mut c = Config::from_toml("[allowlist]\npath = '/from/file.cbor'").unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, |k| {
+            (k == "FERROGATE_ALLOWLIST").then(|| " ".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.allowlist_path(), default_allowlist_path(None));
+    }
+
+    #[test]
+    fn allowlist_key_has_no_default() {
+        // The trust anchor is never inferred from a well-known location.
+        let c = Config::from_toml("").unwrap();
+        assert_eq!(c.allowlist_key(), None);
+        let c = Config::from_toml("[allowlist]\nkey = '/etc/ferrogate/allowlist.pub'").unwrap();
+        assert_eq!(
+            c.allowlist_key(),
+            Some(Path::new("/etc/ferrogate/allowlist.pub"))
+        );
+        // The key alone is enough: the body then lives at the default.
+        assert_eq!(c.allowlist_path(), default_allowlist_path(None));
+    }
+
+    #[test]
+    fn loader_records_the_environment_for_the_default_allowlist() {
+        let dir = std::env::temp_dir().join(format!("mia-env-allowlist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = dir.join("mia-qa.toml");
+        std::fs::write(&named, "").unwrap();
+        let (c, _) = Config::load_file(Some(&named), None).unwrap();
+        assert_eq!(c.allowlist_path(), default_allowlist_path(Some("qa")));
+        let plain = dir.join("custom.toml");
+        std::fs::write(&plain, "").unwrap();
+        let (c, _) = Config::load_file(Some(&plain), None).unwrap();
+        assert_eq!(c.allowlist_path(), default_allowlist_path(None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

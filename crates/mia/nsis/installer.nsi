@@ -150,9 +150,11 @@ Section "FerroGate MIA" SecMia
   ${EndIf}
 
   ; Start it now. The helper API is on by default (\\.\pipe\ferrogate-mia), so
-  ; the service keeps running; until CMIS and the allowlist are configured it
-  ; refuses every token request (fail closed). helper.enable = false in
-  ; mia.toml switches the helper API off (the service then exits idle).
+  ; the service keeps running; until CMIS and the allowlist key are configured it
+  ; refuses every token request (fail closed). The signed allowlist body defaults
+  ; to %ProgramData%\FerroGate\allowlist.cbor; allowlist.key has no default.
+  ; helper.enable = false in mia.toml switches the helper API off (the service
+  ; then exits idle).
   DetailPrint "Starting the mia service..."
   nsExec::ExecToLog '"$INSTDIR\mia.exe" service start'
   Pop $0

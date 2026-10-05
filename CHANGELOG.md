@@ -37,6 +37,41 @@ record them.
   `Icon=ferrogate-mia` instead of the generic `security-high`. The MSI sets
   it as the Add or Remove Programs icon. The tray's live state disc is
   unchanged.
+- Report the resolved signed allowlist in `mia test` (S8, S29)
+  A new informational `allowlist` line (`--json` id `allowlist`) names the body
+  the daemon loads, marked `(default)` when it is the per-environment default,
+  and verifies it against `allowlist.key` the way the daemon does. It is `warn`
+  whenever every caller would be denied (no key, body missing or not
+  verifying) and never counts as a failure.
+
+### Changed
+
+- Default the MIA allowlist body to a per-platform, per-environment path (S8, S29, S32)
+  When neither `allowlist.path` nor `FERROGATE_ALLOWLIST` is set (blank counts
+  as unset), the daemon, `mia test`, `mia setup`, `mia resync-allowlist` and
+  `mia refresh-key` all resolve the same body through
+  `mia::config::default_allowlist_path`: `allowlist.cbor`, or
+  `allowlist-<env>.cbor` for a named environment, beside the system
+  `mia.toml` (`/etc/ferrogate`, `/Library/Application Support/FerroGate`,
+  `%ProgramData%\FerroGate`). Precedence: default < `allowlist.path` <
+  `FERROGATE_ALLOWLIST`. `mia setup` suggests the default and, as for the
+  helper socket, does not write it to the file when accepted; `mia setup
+  --apply` (and the tray wizard) leave `path` out when the draft omits it or
+  leaves it blank. The tray's help text says so.
+  `allowlist.key` deliberately has **no default**: it is the trust anchor,
+  so it is never inferred from a file at a well-known path. Everything stays
+  fail closed. No key, or a body that is missing, stale or does not verify,
+  denies every caller. `allowlist.fetch` writes nothing without a key. A
+  default location that cannot be read is logged and denies every caller; it
+  never stops the daemon. An explicit `allowlist.path` without a key, or one
+  that cannot be read, still refuses to start, as before.
+  - **Migration:** configurations that set `allowlist.key` but not
+    `allowlist.path` used to deny every caller and ignore the key. They now
+    load and verify the default body if it exists. To keep denying every
+    caller, remove `allowlist.key`. `mia resync-allowlist` no longer fails with
+    "allowlist.path is not configured"; it writes the default body. An
+    explicit `allowlist.path` with `key = ''` now refuses to start, because a
+    blank key counts as unset; before, it served deny-all.
 
 ## [0.23.1] - 2026-10-05
 

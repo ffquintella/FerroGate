@@ -128,7 +128,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let listener = ListenerDefaults::new(file_env.as_deref(), &selection);
 
     let existing = load_existing(&output);
-    let settings = match prompt_all(&existing, env, &listener) {
+    let settings = match prompt_all(&existing, file_env.as_deref(), &listener) {
         Ok(s) => s,
         // Esc / Ctrl-C: abort cleanly without writing.
         Err(WizardError::Aborted) => {
@@ -296,8 +296,9 @@ impl From<inquire::InquireError> for WizardError {
 }
 
 /// Drive every prompt section, seeding defaults from the existing config.
-/// `environment` is the `--environment` selector, if any: it suffixes the
-/// suggested default paths (helper socket, allowlist body, verification key) so
+/// `environment` is the file's environment as the daemon judges it (the
+/// `--environment` selector, else a `mia-<env>.toml` output name), if any: it
+/// suffixes the suggested default paths (allowlist body, verification key) so
 /// a side-by-side deployment configured on the same host does not collide with
 /// the default one.
 #[allow(clippy::too_many_lines)] // a linear wizard; splitting it hurts readability
@@ -457,31 +458,37 @@ fn prompt_all(
 
     // ── Allowlist ────────────────────────────────────────────────────────────
     println!("\n— Caller allowlist (signed list of vetted local callers) —");
+    let default_body = crate::config::default_allowlist_path(environment);
     println!(
         "  The helper API mints child tokens only for callers named on this list;\n\
-         \x20 with no allowlist configured it fails closed and denies everyone. The\n\
+         \x20 with no verifiable allowlist it fails closed and denies everyone. The\n\
          \x20 list is a CBOR document that CMIS issues per host and signs with its\n\
-         \x20 enrollment key. You provide two files:\n\
-         \x20   • path — the signed allowlist body (supplied out of band today;\n\
-         \x20     ask your CMIS operator for this host's allowlist)\n\
+         \x20 enrollment key. Two files are involved:\n\
+         \x20   • path — the signed allowlist body; by default\n\
+         \x20     {} (CMIS can deliver it there: allowlist.fetch\n\
+         \x20     below, or `mia resync-allowlist`)\n\
          \x20   • key  — the CMIS enrollment public key that signed it, so the\n\
-         \x20     agent can verify the signature (the wizard can fetch this for you\n\
-         \x20     below if you gave a CMIS endpoint + SPKI pin above)."
+         \x20     agent can verify the signature. It has no default and must be set\n\
+         \x20     for any caller to be allowed (the wizard can fetch it for you\n\
+         \x20     below if you gave a CMIS endpoint + SPKI pin above).",
+        default_body.display()
     );
     let configure_allowlist = Confirm::new("Configure a signed caller allowlist?")
-        .with_default(existing.allowlist.path.is_some())
-        .with_help_message("absent ⇒ the helper API denies every caller (fail closed)")
+        .with_default(existing.allowlist.path.is_some() || existing.allowlist.key.is_some())
+        .with_help_message("no verification key ⇒ the helper API denies every caller (fail closed)")
         .prompt()?;
     if configure_allowlist {
         let path = Text::new("Allowlist path (signed CBOR):")
             .with_default(&path_default(
                 existing.allowlist.path.as_deref(),
-                dist_sibling(&env_filename("allowlist.cbor", environment)),
+                default_body.display().to_string(),
             ))
-            .with_help_message("the signed list CMIS issued for this host (place it here)")
+            .with_help_message(
+                "blank or the suggested default ⇒ left unset, following the platform default",
+            )
             .with_validator(literal_validator)
             .prompt()?;
-        s.allowlist = non_empty(path);
+        s.allowlist = allowlist_path_setting(non_empty(path), environment);
 
         let key = Text::new("Allowlist verification key (CMIS enrollment pubkey):")
             .with_default(&path_default(
@@ -738,6 +745,18 @@ fn dist_sibling(name: &str) -> String {
 /// Choose a prompt default: the existing path if set, else `fallback`.
 fn path_default(existing: Option<&Path>, fallback: String) -> String {
     existing.map_or(fallback, |p| p.display().to_string())
+}
+
+/// The `allowlist.path` value to write for `answer`: `None` when it is just
+/// this environment's default ([`crate::config::default_allowlist_path`]), so
+/// the file keeps following the platform default instead of pinning today's
+/// path — mirroring how the helper socket is written.
+pub(crate) fn allowlist_path_setting(
+    answer: Option<String>,
+    environment: Option<&str>,
+) -> Option<String> {
+    let default = crate::config::default_allowlist_path(environment);
+    answer.filter(|v| Path::new(v) != default)
 }
 
 /// Fetch the CMIS enrollment public key over pinned TLS and write it to
@@ -1054,18 +1073,24 @@ pub(crate) fn render(
     out.push('\n');
 
     out.push_str("[allowlist]\n");
-    out.push_str("# Signed CBOR allowlist of vetted local callers. Absent => deny every caller.\n");
+    out.push_str("# Signed CBOR allowlist of vetted local callers. Default: the platform path\n");
+    out.push_str("# for this environment, shown here. A missing, stale or unverifiable file\n");
+    out.push_str("# denies every caller (fail closed).\n");
     out.push_str(&str_line(
         s.allowlist.as_deref(),
         "path",
-        "/etc/ferrogate/allowlist.cbor",
+        &crate::config::default_allowlist_path(environment)
+            .display()
+            .to_string(),
     ));
-    out.push_str("# Trusted CMIS enrollment public key used to verify the allowlist. Required\n");
-    out.push_str("# whenever `path` is set.\n");
+    out.push_str("# Trusted CMIS enrollment public key used to verify the allowlist. No\n");
+    out.push_str(
+        "# default: without it every caller is denied. Required whenever `path` is set.\n",
+    );
     out.push_str(&str_line(
         s.allowlist_key.as_deref(),
         "key",
-        "/etc/ferrogate/allowlist.pub",
+        &dist_sibling(&env_filename("allowlist.pub", environment)),
     ));
     out.push_str("# Maximum accepted allowlist age in seconds. Default: 86400.\n");
     out.push_str(&int_line(
@@ -1498,6 +1523,55 @@ mod tests {
         // carries the env-suffixed default.
         let out = render(&Settings::default(), Some("staging"), None);
         assert!(out.contains("staging"), "{out}");
+    }
+
+    #[test]
+    fn render_leaves_the_default_allowlist_path_unset() {
+        use crate::config::default_allowlist_path;
+        for env in [None, Some("staging")] {
+            let out = render(&Settings::default(), env, None);
+            let default = default_allowlist_path(env).display().to_string();
+            // Only a commented placeholder showing this environment's default.
+            assert!(out.contains(&format!("\n#path = '{default}'\n")), "{out}");
+            let parsed = Config::from_toml(&out).unwrap();
+            assert_eq!(parsed.allowlist.path, None);
+            assert!(parsed.allowlist_path_is_default());
+            // The key stays a placeholder too: no trust anchor is invented.
+            assert_eq!(parsed.allowlist_key(), None);
+        }
+    }
+
+    #[test]
+    fn the_wizard_does_not_write_the_default_allowlist_path() {
+        use crate::config::default_allowlist_path;
+        let default = default_allowlist_path(None).display().to_string();
+        let staging = default_allowlist_path(Some("staging"))
+            .display()
+            .to_string();
+        // Accepting the suggested default (or leaving it blank) writes nothing.
+        assert_eq!(allowlist_path_setting(Some(default.clone()), None), None);
+        assert_eq!(allowlist_path_setting(None, None), None);
+        assert_eq!(
+            allowlist_path_setting(Some(staging.clone()), Some("staging")),
+            None
+        );
+        // Anything else — including another environment's default — is kept.
+        assert_eq!(
+            allowlist_path_setting(Some(default.clone()), Some("staging")),
+            Some(default)
+        );
+        assert_eq!(
+            allowlist_path_setting(Some("/srv/al.cbor".into()), None),
+            Some("/srv/al.cbor".into())
+        );
+        // And what is written renders as an active key.
+        let s = Settings {
+            allowlist: allowlist_path_setting(Some("/srv/al.cbor".into()), None),
+            allowlist_key: Some("/srv/al.pub".into()),
+            ..Settings::default()
+        };
+        let parsed = Config::from_toml(&render(&s, None, None)).unwrap();
+        assert_eq!(parsed.allowlist_path(), Path::new("/srv/al.cbor"));
     }
 
     #[test]

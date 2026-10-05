@@ -54,10 +54,17 @@
 //!   `/Library/Application Support/FerroGate` (`ferrogate-status` after a
 //!   package install), re-applied to `run/` on every start.
 //! - `FERROGATE_ALLOWLIST` (`allowlist.path`) — path to the signed CBOR
-//!   allowlist. Absent ⇒ the API denies every caller (fail closed).
+//!   allowlist. Absent ⇒ the platform default for the environment
+//!   ([`mia::config::default_allowlist_path`]: `allowlist[-<env>].cbor` beside
+//!   the system `mia.toml` — `/etc/ferrogate` on Linux,
+//!   `/Library/Application Support/FerroGate` on macOS,
+//!   `%ProgramData%\FerroGate` on Windows). A missing, unreadable, stale or
+//!   non-verifying body ⇒ the API denies every caller (fail closed).
 //! - `FERROGATE_ALLOWLIST_KEY` (`allowlist.key`) — path to the trusted CMIS
-//!   enrollment public key used to verify the allowlist. Required whenever the
-//!   allowlist is set.
+//!   enrollment public key used to verify the allowlist. No default (it is the
+//!   trust anchor): absent ⇒ every caller is denied; required whenever
+//!   `allowlist.path` is set explicitly (the daemon refuses to start without
+//!   it).
 //! - `FERROGATE_ALLOWLIST_MAX_AGE_SECS` (`allowlist.max_age_secs`) — max
 //!   allowlist age (default `345600`, i.e. 96 h).
 //! - `FERROGATE_IMA_LOG` (`attestation.ima_log`) — override the IMA
@@ -1586,24 +1593,33 @@ fn host_uuid_from_spiffe_id(spiffe_id: &str) -> Option<&str> {
 }
 
 /// If `allowlist.fetch` is enabled, fetch this host's signed allowlist from CMIS
-/// (keyed by its EK-derived host UUID) and write it to `allowlist.path` before
-/// the daemon loads it. Every failure mode is non-fatal and logged: the daemon
-/// then falls back to whatever is already on disk (or fails closed if nothing
-/// is), exactly as if auto-fetch were off.
+/// (keyed by its EK-derived host UUID) and write it to `path` — the resolved
+/// `allowlist.path` or its per-environment default
+/// ([`mia::config::Config::allowlist_path`]) — before the daemon loads it.
+/// Every failure mode is non-fatal and logged: the daemon then falls back to
+/// whatever is already on disk (or fails closed if nothing is), exactly as if
+/// auto-fetch were off. With no verification `key` configured nothing is
+/// written — no body could be verified — so an unconfigured host never writes
+/// to the default location.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 async fn maybe_fetch_allowlist(
     fetch: bool,
-    allowlist_path: Option<&std::path::Path>,
+    path: &std::path::Path,
+    key: Option<&std::path::Path>,
     resolver: Option<&mia::endpoint::CmisResolver>,
     host_spiffe_id: Option<&str>,
 ) {
     if !fetch {
         return;
     }
-    let Some(path) = allowlist_path else {
-        tracing::warn!("allowlist.fetch is set but allowlist.path is unset; nothing to write");
+    if key.is_none() {
+        tracing::warn!(
+            path = %path.display(),
+            "allowlist.fetch is set but allowlist.key is not; nothing could verify the body, \
+             so it is not fetched"
+        );
         return;
-    };
+    }
     let Some(spiffe_id) = host_spiffe_id else {
         tracing::warn!(
             "allowlist.fetch is set but no host SVID this start; keeping any existing allowlist"
@@ -1942,7 +1958,9 @@ const REATTEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 struct ReattestParams {
     allowlist_fetch: bool,
-    allowlist_path: Option<std::path::PathBuf>,
+    /// The resolved allowlist body (`allowlist.path` or its default).
+    allowlist_path: std::path::PathBuf,
+    /// The verification key; `None` ⇒ deny every caller (no default).
     allowlist_key: Option<std::path::PathBuf>,
     allowlist_max_age_secs: i64,
     propose: bool,
@@ -2004,41 +2022,34 @@ fn spawn_reattest_task<A>(
             //    expired at startup — exactly the state a boot-time failure leaves.
             maybe_fetch_allowlist(
                 params.allowlist_fetch,
-                params.allowlist_path.as_deref(),
+                &params.allowlist_path,
+                params.allowlist_key.as_deref(),
                 Some(&resolver),
                 Some(&spiffe_id),
             )
             .await;
-            match (params.allowlist_path.as_deref(), params.allowlist_key.as_deref()) {
-                (Some(path), Some(key)) => {
-                    match mia::helper::allowlist::load_classified(
-                        path,
-                        key,
-                        clock(),
-                        params.allowlist_max_age_secs,
-                    ) {
-                        Ok((al, outcome)) => {
-                            let loaded = al.is_some();
-                            status.set_allowlist(outcome);
-                            allowlist_reloader.set(al).await;
-                            if loaded {
-                                tracing::info!("allowlist reloaded after re-attestation");
-                            } else {
-                                tracing::warn!(
-                                    "allowlist absent or unverified after re-attestation; serving deny-all (fail closed)"
-                                );
-                            }
-                        }
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "could not reload allowlist after re-attestation; keeping current"
-                        ),
+            match mia::helper::allowlist::load_for_reload(
+                &params.allowlist_path,
+                params.allowlist_key.as_deref(),
+                clock(),
+                params.allowlist_max_age_secs,
+            ) {
+                Ok((al, outcome)) => {
+                    let loaded = al.is_some();
+                    status.set_allowlist(outcome);
+                    allowlist_reloader.set(al).await;
+                    if loaded {
+                        tracing::info!("allowlist reloaded after re-attestation");
+                    } else {
+                        tracing::warn!(
+                            "allowlist absent or unverified after re-attestation; serving deny-all (fail closed)"
+                        );
                     }
                 }
-                (Some(_), None) => tracing::warn!(
-                    "allowlist.path set but allowlist.key missing; not reloading after re-attestation"
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not reload allowlist after re-attestation; keeping current"
                 ),
-                (None, _) => {}
             }
 
             // 3. Start proposing the observed callers back to CMIS, if configured
@@ -2145,35 +2156,25 @@ where
 
     // Optionally refresh the on-disk allowlist from CMIS before loading it, so
     // the served body stays in sync with what the operator provisioned.
+    let allowlist_path = config.allowlist_path();
     maybe_fetch_allowlist(
         config.allowlist.fetch,
-        config.allowlist.path.as_deref(),
+        &allowlist_path,
+        config.allowlist_key(),
         resolver.as_ref(),
         host_spiffe_id.as_deref(),
     )
     .await;
 
-    // Allowlist: configured ⇒ load and verify, denying all callers (fail
-    // closed) on a missing file or a verification failure rather than crashing
-    // — a crash here would loop under the service supervisor and unbind the
-    // helper socket, hiding the real error behind ECONNREFUSED. Absent
-    // configuration also denies all.
-    let allowlist = if let Some(path) = config.allowlist.path.as_deref() {
-        let key_path = config.allowlist.key.as_deref().context(
-            "allowlist.path is set but allowlist.key (FERROGATE_ALLOWLIST_KEY) is missing",
-        )?;
-        let (allowlist, outcome) =
-            mia::helper::allowlist::load_classified(path, key_path, clock(), max_age)
-                .with_context(|| {
-                    format!("reading allowlist (allowlist.path) {}", path.display())
-                })?;
-        status.set_allowlist(outcome);
-        allowlist
-    } else {
-        tracing::warn!("no allowlist configured; helper API denies all callers (fail closed)");
-        status.set_allowlist(mia::helper::allowlist::AllowlistLoad::Missing);
-        None
-    };
+    // Allowlist: the body at `allowlist.path` (or its per-environment
+    // default), verified with `allowlist.key`. Every trust problem — no key,
+    // a missing, stale or non-verifying body — denies all callers (fail
+    // closed) rather than crashing: a crash here would loop under the service
+    // supervisor and unbind the helper socket, hiding the real error behind
+    // ECONNREFUSED. Only an explicitly configured allowlist without a key, or
+    // one that cannot be read, refuses to start (see `load_for_startup`).
+    let (allowlist, outcome) = mia::helper::allowlist::load_for_startup(config, clock())?;
+    status.set_allowlist(outcome);
 
     // The socket's group: `helper.socket_gid` when set; on macOS, for a socket
     // in the daemon's own `run/` directory, the config directory's group
@@ -2259,8 +2260,8 @@ where
                 server.ledger(),
                 ReattestParams {
                     allowlist_fetch: config.allowlist.fetch,
-                    allowlist_path: config.allowlist.path.clone(),
-                    allowlist_key: config.allowlist.key.clone(),
+                    allowlist_path,
+                    allowlist_key: config.allowlist_key().map(std::path::Path::to_path_buf),
                     allowlist_max_age_secs: max_age,
                     propose: config.allowlist.propose,
                     propose_interval: config.allowlist_propose_interval(),
@@ -2301,9 +2302,10 @@ async fn start_helper_api(
 /// socket, the CMIS endpoint, attestation inputs, the hardening profile — are
 /// intentionally *not* re-applied here; they require a restart.
 ///
-/// Reload mirrors `load_at_startup`: a missing or non-verifying body (or an
-/// allowlist that has been removed from the config) swaps in deny-all (fail
-/// closed); an unexpected I/O error keeps the current allowlist. A config file
+/// Reload mirrors `load_at_startup`: a missing or non-verifying body at the
+/// resolved path (`allowlist.path` or its per-environment default), or a
+/// verification key that has been removed from the config, swaps in deny-all
+/// (fail closed); an unexpected I/O error keeps the current allowlist. A config file
 /// that no longer parses is logged and the previous configuration is kept.
 #[cfg(unix)]
 fn spawn_reload_task<A>(
@@ -2341,41 +2343,31 @@ fn spawn_reload_task<A>(
             log_reload(config.log_directive());
 
             // Allowlist: re-load from the (possibly changed) path/key/max-age.
-            // Both must be configured to verify a body; otherwise fail closed.
-            if let (Some(path), Some(key_path)) = (
-                config.allowlist.path.as_deref(),
-                config.allowlist.key.as_deref(),
+            // The body falls back to its per-environment default; without a
+            // verification key nothing can verify it, so fail closed.
+            match mia::helper::allowlist::load_for_reload(
+                &config.allowlist_path(),
+                config.allowlist_key(),
+                clock(),
+                config.allowlist_max_age(),
             ) {
-                match mia::helper::allowlist::load_classified(
-                    path,
-                    key_path,
-                    clock(),
-                    config.allowlist_max_age(),
-                ) {
-                    // `load_at_startup` already logs loudly on a missing or
-                    // non-verifying body; here we only note the swap outcome.
-                    Ok((al, outcome)) => {
-                        let loaded = al.is_some();
-                        status.set_allowlist(outcome);
-                        reloader.set(al).await;
-                        if loaded {
-                            tracing::info!(
-                                "configuration and signed allowlist reloaded and swapped in live"
-                            );
-                        } else {
-                            tracing::warn!("reloaded allowlist absent or unverified; serving deny-all (fail closed)");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "allowlist reload failed (I/O); keeping the current allowlist");
+                // `load_at_startup` already logs loudly on a missing or
+                // non-verifying body or key; here we only note the swap outcome.
+                Ok((al, outcome)) => {
+                    let loaded = al.is_some();
+                    status.set_allowlist(outcome);
+                    reloader.set(al).await;
+                    if loaded {
+                        tracing::info!(
+                            "configuration and signed allowlist reloaded and swapped in live"
+                        );
+                    } else {
+                        tracing::warn!("reloaded allowlist absent or unverified; serving deny-all (fail closed)");
                     }
                 }
-            } else {
-                tracing::warn!(
-                    "no allowlist configured after reload; serving deny-all (fail closed)"
-                );
-                status.set_allowlist(mia::helper::allowlist::AllowlistLoad::Missing);
-                reloader.set(None).await;
+                Err(e) => {
+                    tracing::warn!(error = %e, "allowlist reload failed (I/O); keeping the current allowlist");
+                }
             }
         }
     });

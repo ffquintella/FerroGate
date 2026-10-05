@@ -100,7 +100,10 @@ The `mia` binary starts the helper API by default — on `FERROGATE_HELPER_SOCKE
 (`/run/ferrogate/mia[-<env>].sock` on Linux); `helper.enable = false` switches
 it off. (This section predates the macOS and Windows transports; see
 [mia.md](../mia.md#helper-listener-default-and-off-switch).) It loads and verifies the signed
-allowlist from `FERROGATE_ALLOWLIST` (key in `FERROGATE_ALLOWLIST_KEY`), binds
+allowlist from `FERROGATE_ALLOWLIST` / `allowlist.path`, else the
+per-environment default beside the system `mia.toml` (key in
+`FERROGATE_ALLOWLIST_KEY`, which has no default — see
+[mia.md](../mia.md#allowlist-default-location)), binds
 the socket with `FERROGATE_HELPER_SOCKET_MODE` (default `660`), drains audit
 events to the log, and serves until `SIGINT`/`SIGTERM`. Until the attestation
 loop (F04) is wired into the daemon to supply the host SVID composite key, the
