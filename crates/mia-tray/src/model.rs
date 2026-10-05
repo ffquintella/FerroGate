@@ -292,6 +292,9 @@ pub fn detail_lines(s: &StatusSnapshot, now: i64, lang: Lang) -> Vec<String> {
         t(snapshot_title(s)),
         fill(t(Msg::DetailFor), &[("d", &human_duration(now - s.since))])
     )];
+    if s.default_address {
+        out.push(t(Msg::DetailDefaultAddress).to_string());
+    }
     if let Some(e) = &s.last_error {
         out.push(format!(
             "{}: {} ({})",
@@ -381,6 +384,35 @@ pub struct EnvView {
     pub details: Vec<String>,
     /// Suggested recoveries.
     pub recoveries: Vec<Recovery>,
+    /// This environment serves the helper API's well-known default address
+    /// (the daemon's `default_address`): the marker in [`Self::headline`].
+    pub default_address: bool,
+    /// The default-environment action offered for it ([`default_choice`]).
+    pub default_choice: Option<Recovery>,
+}
+
+/// The name `mia` reserves for the `mia.toml` environment's label
+/// (`mia status -e default`); it can never be selected as the default.
+const RESERVED_ENVIRONMENT: &str = "default";
+
+/// The default-environment action for a snapshot: "Use mia.toml as default"
+/// for the `mia.toml` environment, "Set as default environment" for a named
+/// one. Offered only when the agent itself reported the snapshot (`source` is
+/// not [`Source::Synthesised`]), only for an environment that does not
+/// already serve the well-known address, and never for a name the shared
+/// validator rejects or the reserved `default`.
+#[must_use]
+pub fn default_choice(s: &StatusSnapshot, source: Source) -> Option<Recovery> {
+    if s.default_address || source == Source::Synthesised {
+        return None;
+    }
+    match s.environment.as_deref() {
+        None => Some(Recovery::Run(Action::ClearDefaultEnvironment)),
+        Some(RESERVED_ENVIRONMENT) => None,
+        Some(e) => EnvName::parse(e)
+            .ok()
+            .map(|_| Recovery::Run(Action::SetDefaultEnvironment)),
+    }
 }
 
 /// Everything the tray shows for one observation.
@@ -417,13 +449,20 @@ pub fn tray_view(obs: &Observation, now: i64, lang: Lang) -> TrayView {
             if !valid_name {
                 recs.retain(|r| matches!(r, Recovery::Read(_)));
             }
+            let marker = if s.default_address {
+                format!(" {}", Msg::MarkerDefaultAddress.text(lang))
+            } else {
+                String::new()
+            };
             EnvView {
-                headline: format!("{label}: {}", snapshot_title(s).text(lang)),
+                headline: format!("{label}{marker}: {}", snapshot_title(s).text(lang)),
                 label,
                 env: env_arg(s),
                 state: s.state,
                 details: detail_lines(s, now, lang),
                 recoveries: recs,
+                default_address: s.default_address,
+                default_choice: default_choice(s, obs.source),
             }
         })
         .collect();
@@ -561,6 +600,13 @@ pub fn menu_model(view: &TrayView, lang: Lang, last_action: Option<&str>) -> Vec
                     recovery_command(*r, env.env.clone()),
                 ));
             }
+        }
+        if let Some(r) = env.default_choice {
+            children.push(MenuNode::Separator);
+            children.push(MenuNode::Item(
+                r.label(lang),
+                recovery_command(r, env.env.clone()),
+            ));
         }
         menu.push(MenuNode::Submenu(env.headline.clone(), children));
     }
@@ -837,6 +883,93 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "prod"
+        );
+    }
+
+    #[test]
+    fn the_default_address_is_marked_and_the_others_can_take_it() {
+        let main = snap(AgentState::Healthy, None, None);
+        let mut prod = snap(AgentState::Healthy, Some("prod"), None);
+        prod.default_address = true;
+        let staging = snap(AgentState::Healthy, Some("staging"), None);
+        let reserved = snap(AgentState::Healthy, Some("default"), None);
+        let obs = Observation {
+            snapshots: vec![main, prod, staging, reserved],
+            source: Source::Endpoint,
+        };
+        let v = tray_view(&obs, 100, Lang::En);
+        let staging_env = Some(EnvName::parse("staging").unwrap());
+
+        // Only the environment that serves the address carries the marker
+        // (headline) and the detail line.
+        assert_eq!(v.envs[1].headline, "prod [default address]: Healthy");
+        assert!(v.envs[1].default_address);
+        assert!(v.envs[1].details[1].starts_with("Helper API: serves the well-known"));
+        for i in [0, 2, 3] {
+            assert!(!v.envs[i].headline.contains("[default address]"), "{i}");
+            assert!(!v.envs[i].default_address);
+            assert!(!v.envs[i].details.join("\n").contains("well-known"));
+        }
+        // The holder is offered nothing; mia.toml can take the address back;
+        // a named environment can take it; the reserved name cannot.
+        assert_eq!(v.envs[1].default_choice, None);
+        assert_eq!(
+            v.envs[0].default_choice,
+            Some(Recovery::Run(Action::ClearDefaultEnvironment))
+        );
+        assert_eq!(
+            v.envs[2].default_choice,
+            Some(Recovery::Run(Action::SetDefaultEnvironment))
+        );
+        assert_eq!(v.envs[3].default_choice, None);
+
+        // In the menu: inside each environment's submenu, with the name passed
+        // along; never among the top-level (worst-state) recoveries.
+        let menu = menu_model(&v, Lang::En, None);
+        let submenu = |label: &str| {
+            menu.iter()
+                .find_map(|n| match n {
+                    MenuNode::Submenu(h, kids) if h.starts_with(label) => Some(kids.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(submenu("staging").contains(&MenuNode::Item(
+            "Set as default environment".into(),
+            MenuCommand::Recover(Recovery::Run(Action::SetDefaultEnvironment), staging_env)
+        )));
+        assert!(submenu("default:").contains(&MenuNode::Item(
+            "Use mia.toml as default".into(),
+            MenuCommand::Recover(Recovery::Run(Action::ClearDefaultEnvironment), None)
+        )));
+        assert!(!submenu("prod")
+            .iter()
+            .any(|n| matches!(n, MenuNode::Item(..))));
+        assert!(!menu.iter().any(|n| matches!(
+            n,
+            MenuNode::Item(_, MenuCommand::Recover(Recovery::Run(a), _))
+                if a.applies_on_restart()
+        )));
+
+        // Portuguese marker.
+        let pt = tray_view(&obs, 100, Lang::Pt);
+        assert_eq!(pt.envs[1].headline, "prod [endereço padrão]: Saudável");
+
+        // Not offered without the agent's own report, nor for a name the
+        // shared validator rejects.
+        let synthesised = Observation {
+            snapshots: vec![snap(AgentState::NotRunning, None, Some("not_running"))],
+            source: Source::Synthesised,
+        };
+        assert_eq!(
+            tray_view(&synthesised, 100, Lang::En).envs[0].default_choice,
+            None
+        );
+        let bad = snap(AgentState::Healthy, Some("../etc"), None);
+        assert_eq!(default_choice(&bad, Source::Endpoint), None);
+        assert_eq!(
+            default_choice(&snap(AgentState::Healthy, Some("qa"), None), Source::Cli),
+            Some(Recovery::Run(Action::SetDefaultEnvironment))
         );
     }
 

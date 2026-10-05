@@ -109,6 +109,18 @@ refuses to mint (`no_host_svid`) — a fail-safe, deployable surface for
 verifying socket permissions, caller attestation, and the allowlist in
 production ahead of minting.
 
+The well-known address (`mia.sock`) belongs to the host's **default
+environment**: `mia.toml` unless `default_environment` in the system
+`environments.toml` (or `FERROGATE_DEFAULT_ENVIRONMENT`) selects a named one
+(`crates/mia/src/default_env.rs`). The selected environment then serves it in
+place of `mia-<env>.sock`, `mia.toml` yields to `mia.default.sock`, and an
+explicit `helper.socket` claiming the well-known address elsewhere is refused.
+An invalid selection, or one with no `mia-<env>.toml` in serve-all mode, stops
+startup (fail closed). `mia default-environment show | set <env> | clear`
+(`crates/mia/src/default_env_cli.rs`) is the audited, atomic writer of that
+file, also driven by `mia-tray`. See
+[mia.md](../mia.md#default-environment-who-serves-the-well-known-address).
+
 ## Acceptance criteria
 
 - [x] Server listens with correct UDS permissions; verified by `stat` in a
@@ -127,6 +139,12 @@ production ahead of minting.
       grant/deny integration tests).
 - [x] Concurrent clients are isolated; one slow client cannot starve others
       (`slow_client_does_not_starve_a_good_client`).
+- [x] Only the host's default environment gets the well-known address; with
+      no selection nothing changes, a selected environment takes it, `mia.toml`
+      yields to a non-colliding address, and an explicit claim elsewhere or an
+      invalid selection fails closed (`config::tests::*selection*`,
+      `*well_known*`, `mia_toml_yields_to_a_distinct_address`;
+      `default_env::tests`).
 
 ## Risks
 

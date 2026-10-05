@@ -50,6 +50,13 @@ logs the choice.
   another host will not decrypt there. Pre-F16 plaintext key files are migrated in
   place on first open, preserving the pinned identity. **This is clone resistance
   bound to machine identity, not confidentiality against a local root attacker.**
+  It is not confidentiality against an unprivileged local user either, because
+  the fingerprint inputs are not secret (on macOS any user can run `ioreg`).
+  The key file must therefore be owner-only. `ferro-sep` creates it `0600` with
+  `O_EXCL`, tightens a wider existing file before reading it
+  (`restrict_key_file`), and re-seals only an owner-only file. The daemon also
+  runs the repair at start, before the Linux privilege drop (see
+  [mia.md](../mia.md#the-machine-key-and-svid-seed)).
 
 ## CMIS side
 

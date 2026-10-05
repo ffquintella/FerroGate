@@ -143,7 +143,8 @@ pub fn verify_p256(spki: &[u8], message: &[u8], der_sig: &[u8]) -> Result<(), Se
 /// A portable machine key backed by an on-disk ECDSA P-256 private key.
 ///
 /// Used wherever the Secure Enclave is unavailable (Intel Macs, Linux, Windows,
-/// CI). The key is stored as its raw 32-byte scalar in a caller-protected file.
+/// CI). The key is stored as its raw 32-byte scalar, or sealed, in a file the
+/// constructors keep owner-only (`0600`) on Unix.
 pub struct SoftwareMachineKey {
     signing: SigningKey,
 }
@@ -189,22 +190,32 @@ impl SoftwareMachineKey {
 
     /// Load the key from `path`, generating and persisting a new one if absent.
     ///
-    /// The file holds the raw 32-byte scalar. Callers are responsible for the
-    /// directory and file permissions (`0600`).
+    /// The file holds the raw 32-byte scalar. On Unix a new file is created
+    /// exclusively with mode [`KEY_FILE_MODE`] (`0600`), and an existing file
+    /// that group or other can access is tightened to `0600` before it is read
+    /// (see [`restrict_key_file`]). The caller still owns the directory's
+    /// permissions.
     ///
     /// # Errors
-    /// Returns [`SepError::Io`] on filesystem errors and [`SepError::Malformed`]
+    /// Returns [`SepError::Io`] on filesystem errors — including an existing
+    /// file whose permissions cannot be tightened — and [`SepError::Malformed`]
     /// if an existing file is corrupt.
     pub fn open_or_create(path: &std::path::Path) -> Result<Self, SepError> {
-        match std::fs::read(path) {
-            Ok(bytes) => Self::from_bytes(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let key = Self::generate()?;
-                std::fs::write(path, key.to_bytes())
-                    .map_err(|e| SepError::Io(format!("write {}: {e}", path.display())))?;
-                Ok(key)
+        if let Some(bytes) = read_key_file(path)? {
+            return Self::from_bytes(&bytes);
+        }
+        let key = Self::generate()?;
+        let scalar = Zeroizing::new(key.to_bytes());
+        match create_key_file(path, scalar.as_slice()) {
+            Ok(()) => Ok(key),
+            // Another opener won the race: use the key it persisted.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let bytes = read_key_file(path)?.ok_or_else(|| {
+                    SepError::Io(format!("{} vanished while being created", path.display()))
+                })?;
+                Self::from_bytes(&bytes)
             }
-            Err(e) => Err(SepError::Io(format!("read {}: {e}", path.display()))),
+            Err(e) => Err(SepError::Io(format!("create {}: {e}", path.display()))),
         }
     }
 
@@ -219,52 +230,67 @@ impl SoftwareMachineKey {
     /// hardware root of trust: an attacker with both the file and the seal secret
     /// (e.g. root on the same host) can still recover the key.
     ///
-    /// The file still holds a secret and callers remain responsible for `0600`
-    /// permissions.
+    /// The file still holds a secret, and the seal adds no confidentiality
+    /// against a local user who can read the fingerprint inputs (on macOS
+    /// `ioreg` hands them to any user). File permissions are therefore what keep
+    /// other local users out: on Unix a new file is created exclusively with
+    /// mode [`KEY_FILE_MODE`] (`0600`), an existing file that group or other can
+    /// access is tightened to `0600` before it is read, and the pre-F16 re-seal
+    /// only ever rewrites an owner-only file (see [`restrict_key_file`]).
     ///
     /// # Errors
-    /// Returns [`SepError::Io`] on filesystem errors, [`SepError::KeyGen`] on RNG
+    /// Returns [`SepError::Io`] on filesystem errors — including an existing
+    /// file whose permissions cannot be tightened — [`SepError::KeyGen`] on RNG
     /// or key-derivation failure, and [`SepError::Malformed`] if an existing file
     /// is not a sealed key or fails to decrypt (wrong host or corruption).
     pub fn open_or_create_sealed(
         path: &std::path::Path,
         seal_secret: &[u8],
     ) -> Result<Self, SepError> {
-        match std::fs::read(path) {
-            // Seamless upgrade: a pre-F16 file is the raw 32-byte scalar with no
-            // magic. Load it, then re-seal in place so the *same* key (and thus
-            // the pubkey CMIS has pinned) is preserved — regenerating would change
-            // the identity and be rejected at enrollment.
-            Ok(bytes) if bytes.len() == 32 && bytes[0..4] != SEAL_MAGIC => {
-                let key = Self::from_bytes(&bytes)?;
-                let mut scalar = key.to_bytes();
-                let blob = seal_scalar(&scalar, seal_secret);
-                scalar.zeroize();
-                if let Ok(blob) = blob {
-                    // Best-effort: if the re-seal write fails the daemon still runs
-                    // this session; it just re-migrates next start.
-                    let _ = std::fs::write(path, &blob);
-                }
-                Ok(key)
-            }
-            Ok(bytes) => {
-                let mut scalar = unseal_scalar(&bytes, seal_secret)?;
-                let key = Self::from_bytes(&scalar);
-                scalar.zeroize();
-                key
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let key = Self::generate()?;
-                let mut scalar = key.to_bytes();
-                let blob = seal_scalar(&scalar, seal_secret);
-                scalar.zeroize();
-                let blob = blob?;
-                std::fs::write(path, &blob)
-                    .map_err(|e| SepError::Io(format!("write {}: {e}", path.display())))?;
-                Ok(key)
-            }
-            Err(e) => Err(SepError::Io(format!("read {}: {e}", path.display()))),
+        if let Some(bytes) = read_key_file(path)? {
+            return Self::load_sealed(path, &bytes, seal_secret);
         }
+        let key = Self::generate()?;
+        let scalar = Zeroizing::new(key.to_bytes());
+        let blob = seal_scalar(&scalar, seal_secret)?;
+        match create_key_file(path, &blob) {
+            Ok(()) => Ok(key),
+            // Another opener won the race: use the key it persisted.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let bytes = read_key_file(path)?.ok_or_else(|| {
+                    SepError::Io(format!("{} vanished while being created", path.display()))
+                })?;
+                Self::load_sealed(path, &bytes, seal_secret)
+            }
+            Err(e) => Err(SepError::Io(format!("create {}: {e}", path.display()))),
+        }
+    }
+
+    /// Decode the contents of an existing sealed key file read from `path`,
+    /// migrating a pre-F16 plaintext scalar in place.
+    fn load_sealed(
+        path: &std::path::Path,
+        bytes: &[u8],
+        seal_secret: &[u8],
+    ) -> Result<Self, SepError> {
+        // Seamless upgrade: a pre-F16 file is the raw 32-byte scalar with no
+        // magic. Load it, then re-seal in place so the *same* key (and thus the
+        // pubkey CMIS has pinned) is preserved — regenerating would change the
+        // identity and be rejected at enrollment.
+        if bytes.len() == 32 && bytes[0..4] != SEAL_MAGIC {
+            let key = Self::from_bytes(bytes)?;
+            let scalar = Zeroizing::new(key.to_bytes());
+            if let Ok(blob) = seal_scalar(&scalar, seal_secret) {
+                // Best-effort: if the re-seal write fails the daemon still runs
+                // this session; it just re-migrates next start.
+                let _ = rewrite_key_file(path, &blob);
+            }
+            return Ok(key);
+        }
+        let mut scalar = unseal_scalar(bytes, seal_secret)?;
+        let key = Self::from_bytes(&scalar);
+        scalar.zeroize();
+        key
     }
 
     fn verifying_key(&self) -> VerifyingKey {
@@ -282,6 +308,137 @@ impl MachineKey for SoftwareMachineKey {
         let sig: Signature = self.signing.sign(message);
         Ok(sig.to_der().as_bytes().to_vec())
     }
+}
+
+// ---- Key-file permissions -------------------------------------------------
+
+/// Unix permission bits of a machine-key file: owner read/write only.
+pub const KEY_FILE_MODE: u32 = 0o600;
+
+/// The group and other permission bits; none may be set on a key file.
+#[cfg(unix)]
+const GROUP_OTHER: u32 = 0o077;
+
+/// What [`restrict_key_file`] found and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFilePermissions {
+    /// There is no file at the path; nothing was changed.
+    Absent,
+    /// The file was already inaccessible to group and other; nothing changed.
+    AlreadyPrivate,
+    /// The file was accessible to group or other and is now [`KEY_FILE_MODE`].
+    Tightened {
+        /// The permission bits the file had before (e.g. `0o644`).
+        previous_mode: u32,
+    },
+    /// Not a Unix platform: access is governed by the directory's ACL and the
+    /// file was left as it is.
+    Unmanaged,
+}
+
+/// Make the key file at `path` owner-only ([`KEY_FILE_MODE`]) if group or other
+/// can access it.
+///
+/// Both `open_or_create*` constructors call this before reading, so every
+/// caller gets the repair. It is public so a daemon can also run it early — for
+/// instance before it drops root, or to log the repair, which this crate does
+/// not do. The `chmod` follows a symlink, as the read that follows does.
+///
+/// # Errors
+/// Returns [`SepError::Io`] if the file's metadata cannot be read or its mode
+/// cannot be changed (e.g. the process neither owns the file nor is root).
+pub fn restrict_key_file(path: &std::path::Path) -> Result<KeyFilePermissions, SepError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(KeyFilePermissions::Absent)
+            }
+            Err(e) => return Err(SepError::Io(format!("stat {}: {e}", path.display()))),
+        };
+        let previous_mode = meta.permissions().mode() & 0o7777;
+        if previous_mode & GROUP_OTHER == 0 {
+            return Ok(KeyFilePermissions::AlreadyPrivate);
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_FILE_MODE)).map_err(
+            |e| {
+                SepError::Io(format!(
+                    "restrict {} to {KEY_FILE_MODE:o} (was {previous_mode:o}): {e}",
+                    path.display()
+                ))
+            },
+        )?;
+        Ok(KeyFilePermissions::Tightened { previous_mode })
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::metadata(path) {
+            Ok(_) => Ok(KeyFilePermissions::Unmanaged),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(KeyFilePermissions::Absent),
+            Err(e) => Err(SepError::Io(format!("stat {}: {e}", path.display()))),
+        }
+    }
+}
+
+/// Read an existing key file after making it owner-only; `None` if absent.
+///
+/// The repair comes first so a file left group/world-readable by an older build
+/// is closed before the process relies on it again.
+fn read_key_file(path: &std::path::Path) -> Result<Option<Zeroizing<Vec<u8>>>, SepError> {
+    if restrict_key_file(path)? == KeyFilePermissions::Absent {
+        return Ok(None);
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SepError::Io(format!("read {}: {e}", path.display()))),
+    }
+}
+
+/// Create `path` exclusively and write `bytes` to it.
+///
+/// On Unix `open(2)` applies [`KEY_FILE_MODE`] at creation, so the file is
+/// never wider than `0600` (the umask can only clear bits) and no follow-up
+/// `chmod` is needed. Exclusive creation (`O_EXCL`) never truncates or follows
+/// a file that appeared after the caller saw the path empty; the caller sees
+/// `AlreadyExists` instead. A temp-file-and-rename was rejected: the Linux
+/// daemon writes this file after its privilege drop, and the seccomp
+/// allow-list (`ferro-harden`) has no `rename`.
+fn create_key_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(KEY_FILE_MODE);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Overwrite the existing key file at `path` with `bytes`, making it owner-only
+/// first so the new contents never land in a group/world-readable file.
+///
+/// Not atomic: a crash mid-write leaves a torn file (see [`create_key_file`] for
+/// why there is no rename).
+fn rewrite_key_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), SepError> {
+    use std::io::Write as _;
+    if restrict_key_file(path)? == KeyFilePermissions::Absent {
+        return create_key_file(path, bytes)
+            .map_err(|e| SepError::Io(format!("create {}: {e}", path.display())));
+    }
+    let io = |e: std::io::Error| SepError::Io(format!("rewrite {}: {e}", path.display()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(io)?;
+    f.write_all(bytes).map_err(io)?;
+    f.sync_all().map_err(io)
 }
 
 // ---- Clone-resistant at-rest sealing (F16) ------------------------------
@@ -641,6 +798,107 @@ mod tests {
         // And it reopens under the same secret afterward.
         let reopened = SoftwareMachineKey::open_or_create_sealed(&path, secret).unwrap();
         assert_eq!(legacy.public_spki_der(), reopened.public_spki_der());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The permission bits of `path` (Unix).
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_key_file_is_owner_only() {
+        // `open(2)` applies the mode at creation and the umask can only clear
+        // bits, so "no group/other bits" holds under any umask — and fails
+        // under the common 022 umask if the file is written with the default
+        // 0666 creation mode.
+        for (tag, sealed) in [("create-sealed", true), ("create-plain", false)] {
+            let path = seal_scratch(tag);
+            let _ = std::fs::remove_file(&path);
+            if sealed {
+                SoftwareMachineKey::open_or_create_sealed(&path, b"fingerprint").unwrap();
+            } else {
+                SoftwareMachineKey::open_or_create(&path).unwrap();
+            }
+            let mode = mode_of(&path);
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{tag}: key file is {mode:o}, must be owner-only"
+            );
+            assert_eq!(mode & 0o600, 0o600, "{tag}: owner must keep read/write");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_reseal_leaves_file_owner_only() {
+        // The pre-F16 migration rewrites the file in place; the sealed blob must
+        // never land in a group/world-readable file, even when the legacy file
+        // was (as `std::fs::write` left it) 0644.
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = seal_scratch("legacy-mode");
+        let _ = std::fs::remove_file(&path);
+        let legacy = SoftwareMachineKey::generate().unwrap();
+        std::fs::write(&path, legacy.to_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let opened = SoftwareMachineKey::open_or_create_sealed(&path, b"fingerprint").unwrap();
+        assert_eq!(legacy.public_spki_der(), opened.public_spki_der());
+        assert_eq!(&std::fs::read(&path).unwrap()[0..4], &SEAL_MAGIC);
+        assert_eq!(mode_of(&path), 0o600);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_readable_key_file_is_tightened() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = seal_scratch("tighten");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            restrict_key_file(&path).unwrap(),
+            KeyFilePermissions::Absent
+        );
+
+        let key = SoftwareMachineKey::open_or_create_sealed(&path, b"fingerprint").unwrap();
+        assert_eq!(
+            restrict_key_file(&path).unwrap(),
+            KeyFilePermissions::AlreadyPrivate
+        );
+
+        // A file an older build left 0644: the helper reports and fixes it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            restrict_key_file(&path).unwrap(),
+            KeyFilePermissions::Tightened {
+                previous_mode: 0o644
+            }
+        );
+        assert_eq!(mode_of(&path), KEY_FILE_MODE);
+
+        // And opening such a file repairs it too, without changing the key.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let reopened = SoftwareMachineKey::open_or_create_sealed(&path, b"fingerprint").unwrap();
+        assert_eq!(key.public_spki_der(), reopened.public_spki_der());
+        assert_eq!(mode_of(&path), KEY_FILE_MODE);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_never_clobbers_an_existing_file() {
+        // Exclusive creation: a file that appeared after the caller saw the
+        // path empty is reported, never truncated or overwritten.
+        let path = seal_scratch("excl");
+        let _ = std::fs::remove_file(&path);
+        create_key_file(&path, b"first").unwrap();
+        let err = create_key_file(&path, b"second").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
         let _ = std::fs::remove_file(&path);
     }
 

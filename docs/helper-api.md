@@ -11,11 +11,22 @@ uses when `helper.socket` is unset (a named environment `mia-<env>.toml` gets an
 `-<env>` suffix), and `helper.enable = false` switches it off — see
 [mia.md](mia.md#helper-listener-default-and-off-switch).
 
+The unsuffixed address below is the **well-known** one callers dial without
+configuration. `mia.toml` serves it unless the host selects another
+environment as its default (`default_environment` in `environments.toml`, or
+`FERROGATE_DEFAULT_ENVIRONMENT`). That environment then serves it instead of
+its `mia-<env>` address, and `mia.toml` moves to `mia.default.sock`
+(`\\.\pipe\ferrogate-mia.default`). No other environment may claim the
+well-known address with an explicit `helper.socket`. See
+[mia.md](mia.md#default-environment-who-serves-the-well-known-address).
+
 - **Linux:** Unix Domain Socket at `/run/ferrogate/mia.sock`, mode `0660`,
   group `ferrogate-clients`.
 - **macOS:** Unix Domain Socket at
   `/Library/Application Support/FerroGate/run/mia.sock`, mode `0660`, group
-  `helper.socket_gid` when set.
+  `ferrogate-status` — the config directory's group, re-applied to `run/` on
+  every start — unless `helper.socket_gid` sets another (see
+  [mia.md](mia.md#helper-listener-default-and-off-switch)).
 - **Windows:** Named pipe `\\.\pipe\ferrogate-mia`, ACL grants only members
   of the `FerroGateClients` local group — and only `FILE_GENERIC_READ |
   FILE_WRITE_DATA` (`0x0012008B`), never `FILE_CREATE_PIPE_INSTANCE`, so a

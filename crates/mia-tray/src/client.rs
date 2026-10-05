@@ -450,6 +450,8 @@ pub fn synthesised(state: AgentState, code: &str, message: &str, now: i64) -> St
             message: message.to_string(),
         }),
         version: String::new(),
+        // Nothing answered, so nothing is known to serve the address.
+        default_address: false,
     }
 }
 

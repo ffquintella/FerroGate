@@ -71,8 +71,17 @@ pub struct HelperServerConfig {
     pub socket_path: PathBuf,
     /// **Unix only.** Permission bits applied to the socket (e.g. `0o660`).
     pub socket_mode: u32,
-    /// **Unix only.** Optional gid to `chown` the socket to.
+    /// **Unix only.** Optional gid to `chown` the socket to — and its
+    /// directory, when the bind creates it or [`Self::own_socket_dir`] is set.
+    /// The daemon fills it from [`crate::helper::socket_dir::plan`].
     pub socket_gid: Option<u32>,
+    /// **Unix only.** The socket's directory belongs to the daemon (macOS
+    /// `…/FerroGate/run`): its mode `0750` and [`Self::socket_gid`] are
+    /// re-applied on every bind, not only when the bind creates it, so a
+    /// directory an older release left with the wrong group is repaired on
+    /// restart. `false` ⇒ a pre-existing directory is left as the operator
+    /// set it.
+    pub own_socket_dir: bool,
     /// **Windows only.** Local group whose members may open the pipe (e.g.
     /// `FerroGateClients`). `None` ⇒ the pipe's default DACL applies.
     pub windows_group: Option<String>,
@@ -91,6 +100,7 @@ impl Default for HelperServerConfig {
             socket_path: PathBuf::from(r"\\.\pipe\ferrogate-mia"),
             socket_mode: 0o660,
             socket_gid: None,
+            own_socket_dir: false,
             windows_group: None,
             max_concurrent: 64,
             read_timeout: Duration::from_secs(5),

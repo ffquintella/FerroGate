@@ -48,6 +48,12 @@
 #   Linux    /run/ferrogate/mia.sock          (mia-<env>.sock)
 #   macOS    /Library/Application Support/FerroGate/run/mia.sock
 #   Windows  \\.\pipe\ferrogate-mia           (\\.\pipe\ferrogate-mia-<env>)
+# The unsuffixed (well-known) address belongs to the host's DEFAULT
+# environment: this file, unless `default_environment` in environments.toml
+# (same directory; or FERROGATE_DEFAULT_ENVIRONMENT) selects a mia-<env>.toml.
+# That environment then takes the well-known address and this file yields to
+# mia.default.sock (\\.\pipe\ferrogate-mia.default). An explicit `socket`
+# naming the well-known address is refused in any non-default environment.
 # Set it only to move the listener.
 #socket = "/run/ferrogate/mia.sock"
 # Unix only. Octal socket mode (as a string). Default: "660".
@@ -55,8 +61,10 @@
 # Unix only. Numeric gid that owns the socket; members of that group may open
 # it (with the default 0660 mode). `make mia-install` creates a dedicated
 # FerroGate group and sets this via FERROGATE_HELPER_SOCKET_GID, so you don't
-# normally set it here. A group *name* is not accepted (the daemon is
-# unsafe-free and won't call getgrnam); use the numeric gid.
+# normally set it here. Unset on macOS => a socket in the default run/
+# directory takes the group of /Library/Application Support/FerroGate
+# (ferrogate-status after a package install). A group *name* is not accepted
+# (the daemon is unsafe-free and won't call getgrnam); use the numeric gid.
 #socket_gid = "555"
 # Windows only. Local group whose members may open the pipe (blank => default
 # pipe DACL).

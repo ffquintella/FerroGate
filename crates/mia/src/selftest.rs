@@ -214,7 +214,9 @@ impl Opts {
                     config = Some(PathBuf::from(path));
                 }
                 "-e" | "--environment" => {
-                    let env = it.next().context("--environment requires a name argument")?;
+                    let env = it
+                        .next()
+                        .context("--environment requires a name argument")?;
                     environment = Some(env.clone());
                 }
                 "-a" | "--audience" => {
@@ -287,6 +289,11 @@ async fn run_checks(config: &Config, audience: &str) -> Vec<&'static str> {
     // Never contributes to `failures` — a TPM-less host attests via the
     // host-key software tier, which is a fully supported (lower-assurance) tier.
     report_attestation(config);
+
+    // Informational: which environment owns the well-known helper address,
+    // and where this one listens (the address step 5 dials).
+    let (status, detail) = default_environment_detail(config);
+    report("default environment", status, &detail);
 
     // 2. CMIS connection / 3. CRL publishing ------------------------------
     let mut server_crl = ServerCrl::Unknown;
@@ -420,8 +427,11 @@ async fn connect_best(
     let pins = resolver.pins().to_vec();
     let mut last_err: Option<String> = None;
     for ep in &candidates {
-        match tokio::time::timeout(STEP_TIMEOUT, crate::client::connect_pinned(ep, pins.clone()))
-            .await
+        match tokio::time::timeout(
+            STEP_TIMEOUT,
+            crate::client::connect_pinned(ep, pins.clone()),
+        )
+        .await
         {
             Ok(Ok(client)) => {
                 if resolver.is_srv() {
@@ -474,12 +484,20 @@ async fn check_cluster_identity(resolver: &CmisResolver) -> bool {
         Ok(c) => c,
         Err(e) => {
             // SRV resolution / reachability is step 2's concern — don't double-fail.
-            report(label, "skip", &format!("could not resolve SRV candidates: {e:#}"));
+            report(
+                label,
+                "skip",
+                &format!("could not resolve SRV candidates: {e:#}"),
+            );
             return true;
         }
     };
     if candidates.len() < 2 {
-        report(label, "ok", "SRV resolved to a single node — no peers to cross-check");
+        report(
+            label,
+            "ok",
+            "SRV resolved to a single node — no peers to cross-check",
+        );
         return true;
     }
 
@@ -501,7 +519,11 @@ async fn check_cluster_identity(resolver: &CmisResolver) -> bool {
     let groups = group_by_identity(probes);
     let compared: usize = groups.iter().map(|(_, eps)| eps.len()).sum();
     if compared == 0 {
-        report(label, "skip", "no nodes answered the enrollment-key RPC (see step 2)");
+        report(
+            label,
+            "skip",
+            "no nodes answered the enrollment-key RPC (see step 2)",
+        );
         return true;
     }
 
@@ -566,11 +588,17 @@ async fn probe_enrollment_key(
     )
     .await
     .map_err(|_| anyhow::anyhow!("connect timed out after {}s", STEP_TIMEOUT.as_secs()))??;
-    tokio::time::timeout(STEP_TIMEOUT, crate::client::fetch_enrollment_key(&mut client))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("enrollment-key RPC timed out after {}s", STEP_TIMEOUT.as_secs())
-        })?
+    tokio::time::timeout(
+        STEP_TIMEOUT,
+        crate::client::fetch_enrollment_key(&mut client),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "enrollment-key RPC timed out after {}s",
+            STEP_TIMEOUT.as_secs()
+        )
+    })?
 }
 
 /// Group `(endpoint, enrollment_key)` probes by the key served. One entry in
@@ -710,7 +738,12 @@ async fn check_server_crl(
 /// (UDS on Unix, named pipe on Windows) and interpret the reply. Returns `true`
 /// when a token was minted.
 #[cfg(any(unix, windows))]
-async fn run_mint_exchange<S>(mut stream: S, label: &str, audience: &str, server_crl: ServerCrl) -> bool
+async fn run_mint_exchange<S>(
+    mut stream: S,
+    label: &str,
+    audience: &str,
+    server_crl: ServerCrl,
+) -> bool
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -841,8 +874,9 @@ fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
         ],
         std::io::ErrorKind::PermissionDenied => vec![
             "The socket exists but this user may not open it: membership in the socket's group \
-             is required (the dedicated FerroGate group, e.g. `_ferrogate` on macOS or the group \
-             passed to `make mia-install`)."
+             is required (helper.socket_gid; by default `ferrogate-status` on a macOS package \
+             install, `ferrogate-clients` on Debian, or the group passed to \
+             `make mia-install`)."
                 .to_string(),
             "Add the user to that group (a new login is needed for it to take effect) or re-run \
              the test as a permitted user."
@@ -1149,6 +1183,53 @@ fn report_attestation(config: &Config) {
     report("attestation", status, &detail);
 }
 
+/// The informational "default environment" line: the host's default
+/// environment and where the selection came from, and this configuration's
+/// relation to the well-known helper address. `warn` when an explicitly
+/// selected default does not serve that address (nobody else will); `info`
+/// otherwise.
+fn default_environment_detail(config: &Config) -> (&'static str, String) {
+    let selection = config.default_selection();
+    let well_known = crate::config::default_helper_socket(None);
+    let owner = selection
+        .environment()
+        .map_or_else(|| "mia.toml".to_string(), |e| format!("`{e}`"));
+    let listener = config.helper_socket().map_or_else(
+        || "nowhere (helper API off)".to_string(),
+        |s| s.display().to_string(),
+    );
+    let (status, role) = if config.serves_well_known_address() {
+        (
+            "info",
+            format!(
+                "this environment serves the well-known address {}",
+                well_known.display()
+            ),
+        )
+    } else if config.is_default_environment() {
+        (
+            if selection.environment().is_some() {
+                "warn"
+            } else {
+                "info"
+            },
+            format!(
+                "this environment is the default but listens on {listener}, so nothing serves \
+                 the well-known address {}",
+                well_known.display()
+            ),
+        )
+    } else if config.environment().is_none() {
+        (
+            "info",
+            format!("mia.toml yields the well-known address; it listens on {listener}"),
+        )
+    } else {
+        ("info", format!("this environment listens on {listener}"))
+    };
+    (status, format!("{owner} ({}) — {role}", selection.source()))
+}
+
 /// Print one aligned check line (or, with `--json`, record it).
 fn report(step: &str, status: &str, detail: &str) {
     let recorded = JSON_SINK.with(|sink| {
@@ -1196,6 +1277,60 @@ fn hints(lines: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_environment_line_names_the_owner_and_this_role() {
+        let unset = crate::default_env::DefaultSelection::unset();
+        let prod = crate::default_env::DefaultSelection::resolve(
+            std::path::Path::new("/nonexistent/environments.toml"),
+            Some("prod".into()),
+        )
+        .unwrap();
+
+        // No selection: mia.toml owns and serves the address.
+        let mut main = Config::from_toml("").unwrap();
+        main.apply_default_selection(&unset).unwrap();
+        let (status, detail) = default_environment_detail(&main);
+        assert_eq!(status, "info");
+        assert!(
+            detail.starts_with("mia.toml (built-in default)"),
+            "{detail}"
+        );
+        assert!(detail.contains("serves the well-known address"), "{detail}");
+
+        // prod selected: mia.toml yields, and step 5 dials its new address.
+        main.apply_default_selection(&prod).unwrap();
+        let (status, detail) = default_environment_detail(&main);
+        assert_eq!(status, "info");
+        assert!(detail.contains("`prod`"), "{detail}");
+        assert!(detail.contains("mia.toml yields"), "{detail}");
+        assert_eq!(
+            mint_target(&main).unwrap(),
+            crate::config::yielded_helper_socket()
+        );
+
+        // The built-in default with its helper API off is informational…
+        let mut off = Config::from_toml("[helper]\nenable = false").unwrap();
+        off.apply_default_selection(&unset).unwrap();
+        assert_eq!(default_environment_detail(&off).0, "info");
+
+        // …but an explicitly selected default that serves nothing warns.
+        let dir = std::env::temp_dir().join(format!("mia-selftest-defenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("mia-prod.toml");
+        std::fs::write(&file, "[helper]\nenable = false\n").unwrap();
+        let (cfg, _) = crate::config::ConfigSource {
+            path: Some(file),
+            environment: None,
+            discovered_named_env: true,
+        }
+        .load_with(&prod)
+        .unwrap();
+        let (status, detail) = default_environment_detail(&cfg);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(detail.contains("nothing serves"), "{detail}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn mint_target_defaults_when_socket_is_unset() {
@@ -1303,8 +1438,12 @@ mod tests {
         // present — otherwise it degrades to the host-key tier (never a warning).
         assert_eq!(attestation_detail(Auto, true, true).0, "info");
         assert!(attestation_detail(Auto, true, true).1.contains("in use"));
-        assert!(attestation_detail(Auto, true, false).1.contains("NOT in use"));
-        assert!(attestation_detail(Auto, false, false).1.contains("no usable TPM"));
+        assert!(attestation_detail(Auto, true, false)
+            .1
+            .contains("NOT in use"));
+        assert!(attestation_detail(Auto, false, false)
+            .1
+            .contains("no usable TPM"));
         // A missing EK cert must never be reported as an error condition.
         assert_eq!(attestation_detail(Auto, true, false).0, "info");
         assert_eq!(attestation_detail(Auto, false, false).0, "info");
@@ -1312,16 +1451,22 @@ mod tests {
         // `tpm` is fail-closed: no usable TPM is a warning, not silent downgrade.
         assert_eq!(attestation_detail(Tpm, true, false).0, "info");
         assert_eq!(attestation_detail(Tpm, false, false).0, "warn");
-        assert!(attestation_detail(Tpm, false, false).1.contains("fails closed"));
+        assert!(attestation_detail(Tpm, false, false)
+            .1
+            .contains("fails closed"));
 
         // `host-key` never uses a present TPM, and is informational either way.
         assert_eq!(attestation_detail(HostKey, true, false).0, "info");
         assert_eq!(attestation_detail(HostKey, false, false).0, "info");
-        assert!(attestation_detail(HostKey, true, false).1.contains("not used"));
+        assert!(attestation_detail(HostKey, true, false)
+            .1
+            .contains("not used"));
 
         // `virtual-tpm` is always flagged as the insecure dev/test tier.
         assert_eq!(attestation_detail(VirtualTpm, false, false).0, "warn");
-        assert!(attestation_detail(VirtualTpm, true, true).1.contains("INSECURE"));
+        assert!(attestation_detail(VirtualTpm, true, true)
+            .1
+            .contains("INSECURE"));
     }
 
     #[test]

@@ -15,12 +15,15 @@
 //! - [`token`] — the DPoP-bound child-token minter (feature F09).
 //! - [`server`] — the transport-agnostic request pipeline plus the UDS
 //!   (Unix) and Named Pipe (Windows) listeners.
+//! - [`socket_dir`] — which group the Unix socket and its directory get, and
+//!   whether the daemon re-applies it to a directory it owns (macOS `run/`).
 
 pub mod allowlist;
 pub mod auth;
 pub mod crl;
 pub mod ledger;
 pub mod proto;
+pub mod socket_dir;
 pub mod token;
 
 #[cfg(any(unix, windows))]

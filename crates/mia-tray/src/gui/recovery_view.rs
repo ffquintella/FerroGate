@@ -265,6 +265,9 @@ fn finished_ui(ui: &mut egui::Ui, lang: Lang, os: Option<Os>, action: Action, do
         }
         Ok(r) => {
             ui.colored_label(outcome_color(r.outcome), r.outcome.label().text(lang));
+            if r.outcome == Outcome::Succeeded && action.applies_on_restart() {
+                ui.label(Msg::NoteRestartToApply.text(lang));
+            }
             if let Some(st) = &done.self_test {
                 self_test_ui(ui, lang, st);
             }

@@ -32,6 +32,15 @@ pub mod client;
 /// The TOML configuration file and its merge with the environment.
 pub mod config;
 
+/// The host-wide default environment: which environment serves the helper
+/// API's well-known address (`environments.toml` /
+/// `FERROGATE_DEFAULT_ENVIRONMENT`).
+pub mod default_env;
+
+/// `mia default-environment show | set <env> | clear`: the audited,
+/// privileged writer of the host's default-environment selection.
+pub mod default_env_cli;
+
 /// CMIS endpoint discovery (static or SRV), best-first selection, and fail-over.
 pub mod endpoint;
 

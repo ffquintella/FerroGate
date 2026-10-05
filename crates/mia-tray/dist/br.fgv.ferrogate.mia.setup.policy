@@ -8,7 +8,8 @@
   mia-tray runs a FIXED, closed set of mia commands elevated through pkexec:
   "setup" in apply mode (a draft the user wrote, optionally for one
   environment, with reload / enrollment-key fetch), "resync-allowlist" with
-  reload, and "refresh-key". No other program or argument is ever built.
+  reload, "refresh-key", and "default-environment set <env>" / "clear". No
+  other program or argument is ever built.
   pkexec selects the action by the program path only, so there is one action
   per packaged location of mia, and the message shows the exact command line
   ($(command_line)) the administrator is approving, whoever asked for it. Every request needs an administrator's

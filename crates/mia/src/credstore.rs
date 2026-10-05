@@ -301,6 +301,44 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Make each existing secret file in `paths` owner-only (`0600`) and return how
+/// many had to be tightened.
+///
+/// The daemon runs this at start for its state-directory secrets (machine key,
+/// SVID seed, this store), on Linux before it drops root. Up to 0.22.0 the
+/// machine key `host-key.bin` was written with the process umask, which left it
+/// `0644`. On macOS the state directory is the world-traversable config
+/// directory, and any local user can read the fingerprint the key's seal is
+/// derived from, so the file mode is what keeps the key private.
+///
+/// Each repair is logged at `warn` and each failure at `error`; neither stops
+/// the daemon here, because `ferro-sep` refuses to open a machine key it cannot
+/// make owner-only. Only paths and modes are logged, never file contents.
+pub fn restrict_secret_files<'a>(paths: impl IntoIterator<Item = &'a Path>) -> usize {
+    let mut tightened = 0;
+    for path in paths {
+        match ferro_sep::restrict_key_file(path) {
+            Ok(ferro_sep::KeyFilePermissions::Tightened { previous_mode }) => {
+                tightened += 1;
+                let was = format!("{previous_mode:o}");
+                tracing::warn!(
+                    path = %path.display(),
+                    previous_mode = %was,
+                    "secret file was accessible to other local users; restricted it to 0600. \
+                     It may already have been copied: treat the key as exposed"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "cannot restrict secret file to 0600"
+            ),
+        }
+    }
+    tightened
+}
+
 /// Seal `credential` to `path`, bound to this machine by `sealer`.
 ///
 /// The write is not atomic: a torn file simply fails to load next start and the
@@ -530,6 +568,35 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_secret_files_tightens_only_what_is_exposed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let exposed = scratch("restrict-exposed");
+        std::fs::write(&exposed, b"secret").unwrap();
+        std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let private = scratch("restrict-private");
+        write_secret_file(&private, b"secret").unwrap();
+        let absent = scratch("restrict-absent");
+
+        let paths = [exposed.as_path(), private.as_path(), absent.as_path()];
+        assert_eq!(
+            restrict_secret_files(paths),
+            1,
+            "only the 0644 file needs repair"
+        );
+        assert_eq!(mode(&exposed), 0o600);
+        assert_eq!(mode(&private), 0o600);
+        assert!(!absent.exists(), "an absent secret is not created");
+        // Idempotent: a second start has nothing left to repair.
+        assert_eq!(restrict_secret_files(paths), 0);
+
+        let _ = std::fs::remove_file(&exposed);
+        let _ = std::fs::remove_file(&private);
     }
 
     /// A real issued credential: CMIS mints the certificate, the host holds the

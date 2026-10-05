@@ -93,6 +93,13 @@ pub(crate) fn ui(ui: &mut egui::Ui, shared: &Shared, obs: Option<&Observation>) 
                             }
                         });
                     }
+                    // Hand this environment the well-known helper address.
+                    if let Some(r) = env.default_choice {
+                        ui.add_space(4.0);
+                        if let Some(i) = recovery_button(ui, shared, r, env.env.as_ref()) {
+                            out = Some(i);
+                        }
+                    }
                 });
         }
     });

@@ -168,6 +168,40 @@ regardless, and a fresh issuance overwrites the file. What the store buys is a
 credential that survives a restart and can be inspected — and, critically, one
 that is worthless on any other machine.
 
+### The machine key and SVID seed
+
+The host-key profile's software machine signing key lives in
+`<state-dir>/host-key.bin` (`ferro_sep::SoftwareMachineKey`), sealed to the
+hardware fingerprint `H` (F16). The 32-byte seed the composite SVID key is
+derived from lives beside it in `svid-seed.bin`. `<state-dir>` is
+`/var/lib/ferrogate` on Linux (`0750`, owned by `_ferrogate`) and the system
+config directory elsewhere. On macOS that is
+`/Library/Application Support/FerroGate`, which is `0755`.
+
+The seal stops a copied file from opening on another machine. It does **not**
+stop a local user on the same machine: the fingerprint inputs are not secret,
+and on macOS `ioreg` gives them to any user. The file mode is what keeps the
+key private, so all three state secrets (`host-key.bin`, `svid-seed.bin`,
+`x509-svid.sealed`) are owner-only:
+
+- **New files** are created exclusively with mode `0600` by `open(2)`, so they
+  are never wider than `0600` at any point, whatever the umask.
+- **Existing files** that group or other can access are tightened to `0600`
+  at daemon start, on Linux before the privilege drop. Each repair is logged at
+  `warn` with the old mode. `ferro-sep` repeats the check whenever it opens the
+  machine key, and refuses a key file it cannot make owner-only. The macOS
+  package's postinstall does the same repair at upgrade.
+- The pre-F16 migration (plaintext scalar re-sealed in place) rewrites only an
+  owner-only file.
+
+Up to 0.22.0, `host-key.bin` was created with the process umask (`0644`). On
+macOS that meant any local user could read it and recover the machine key. If a
+host logs the `restricted it to 0600` warning, treat its machine key as
+exposed. Tightening the mode does not undo a copy that was already made.
+Rotating the key needs a new CMIS binding as well as a new file, because CMIS
+pins `H ↔ pubkey` and rejects a rebind (`HostKeyRebindRejected`). No documented
+procedure clears that binding yet.
+
 ## Configuration
 
 MIA reads an optional TOML **configuration file** and overlays **environment
@@ -310,6 +344,9 @@ Notes and constraints:
   `mia-staging.sock`, see [Helper listener](#helper-listener-default-and-off-switch));
   a duplicate socket across environments is skipped with an error rather than
   crash-looping the one that bound first.
+- `mia.toml` serves the well-known `mia.sock` unless another environment is
+  selected as the host's default; see
+  [Default environment](#default-environment-who-serves-the-well-known-address).
 - An environment with `helper.enable = false` is left idle (not served).
 - `--config`, `--environment`, or `$FERROGATE_CONFIG` pins the daemon to **one**
   environment (the all-environments scan is bypassed). To serve only the default
@@ -404,9 +441,133 @@ Directories and permissions: on Linux, systemd creates `/run/ferrogate`
 `helper.socket_gid` (the Debian package and `make mia-install` set
 `FERROGATE_HELPER_SOCKET_GID` to `ferrogate-clients` / `ferrogate`), so the
 socket bound after the drop inherits that group without a `chown` (forbidden by
-the seccomp profile). On macOS the root daemon creates `run/` (`0750`, group
-`helper.socket_gid` when set) on first bind. Sockets are `0660` (`socket_mode`)
-and a pre-existing non-socket file at the path is refused, never deleted.
+the seccomp profile).
+
+On macOS the root daemon owns `/Library/Application Support/FerroGate/run`:
+
+- On **every** start it creates `run/` if needed and gives it mode `0750` and
+  the helper group. The sockets in it get the same group.
+- The helper group is `helper.socket_gid` when set. Otherwise it is the group of
+  `/Library/Application Support/FerroGate`, which is `ferrogate-status` once the
+  package's postinstall has handed the directory over. Members of that group can
+  connect to the helper socket; the signed allowlist still decides who may mint.
+- The config directory's group is adopted only while that directory is
+  root-owned and not group- or world-writable. Otherwise `run/` is left as it is
+  and a warning is logged. A `run/` that is a symlink is refused.
+- macOS gives a new directory or socket its parent directory's group. A `run/`
+  created by an older install, before the config directory was handed to
+  `ferrogate-status`, therefore kept `wheel`, and so did its sockets. The daemon
+  repairs this on start, and the postinstall repairs a `wheel` `run/` and its
+  sockets during the upgrade.
+- Environments that share `run/` should not set different `helper.socket_gid`
+  values: each one re-applies its own gid to the shared directory on start.
+- A custom `helper.socket` outside `run/` keeps the old behaviour: a directory
+  the daemon creates gets `0750` and `helper.socket_gid`, and a pre-existing one
+  is left alone.
+
+On Linux and macOS sockets are `0660` (`socket_mode`), and a pre-existing
+non-socket file at the path is refused, never deleted.
+
+#### Default environment: who serves the well-known address
+
+The default-environment address in the table above (`mia.sock` /
+`\\.\pipe\ferrogate-mia`) is the **well-known** helper address: the one local
+callers dial without configuration. By default `mia.toml` serves it. To have a
+named environment serve it instead, select it host-wide:
+
+```toml
+# /etc/ferrogate/environments.toml   (macOS: /Library/Application Support/FerroGate/,
+#                                     Windows: %ProgramData%\FerroGate\)
+default_environment = "prod"
+```
+
+or set `FERROGATE_DEFAULT_ENVIRONMENT=prod` (e.g. in `mia.env`). The variable
+wins over the file; a **blank** variable clears the selection (`mia.toml` keeps
+the address) whatever the file says. Unset everywhere ⇒ the behaviour above,
+unchanged. The template is `crates/mia/dist/environments.toml`.
+
+- **Only the system directory is read** — never the per-user one, which an
+  unprivileged user could write — and the file is separate from `mia.toml`, so
+  it works whether or not `mia.toml` exists and in every mode (serve-all,
+  `--environment`, `--config`). Keep it root-owned and world-readable (`0644`):
+  it holds no secret, and `mia test` run by an ordinary user must read it.
+  Unknown keys are rejected; the file is capped at 16 KiB.
+- With `prod` selected and `helper.socket` unset in `mia-prod.toml`, `prod`
+  binds the well-known address **instead of** `mia-prod.sock` (one listener).
+  Callers that dialled `mia-prod.sock` must move to the well-known address (or
+  give `prod` an explicit `helper.socket`).
+- `mia.toml` **yields**: with `helper.socket` unset it listens on
+  `mia.default.sock` beside the well-known socket
+  (`\\.\pipe\ferrogate-mia.default` on Windows). Environment-scoped addresses
+  always start with `mia-`, so no environment name — not even one called
+  `default` — can produce that address.
+- An explicit `helper.socket` (or `FERROGATE_HELPER_SOCKET`) that names the
+  well-known address in any environment other than the selected one is refused
+  at load (two identities never share an address). With no selection this rule
+  does not apply, so existing configurations keep working.
+- **Fails closed.** An invalid name, the reserved name `default` (the label of
+  `mia.toml`), an unreadable or malformed file, or — when the daemon serves
+  every environment — a selection with no matching `mia-<env>.toml` stops the
+  daemon (and `mia test` / `mia setup`) with an error. It never falls back to
+  `mia.toml`. If the selected environment's file exists but fails to load, it
+  is skipped like any broken environment and the well-known address stays
+  unserved (logged as an error).
+- The selection is a startup setting, like the socket itself: restart the
+  daemon after changing it (`mia --reload` does not move a bound listener).
+
+The daemon logs the selection and its source at startup, then which
+environment serves the well-known address (a warning if the selected
+environment does not, e.g. because its helper API is off). `mia test` prints a
+`default environment` line, `mia setup` explains it at the helper-listener
+prompt and leaves `helper.socket` unset when the suggested default is accepted,
+and `mia status` marks the environment that serves the address (`helper:`
+line; `default_address` in `--json`).
+
+##### `mia default-environment` — show, set or clear the selection
+
+```sh
+mia default-environment [show] [--json]     # effective selection and its source
+sudo mia default-environment set prod [--json]
+sudo mia default-environment clear [--json] # mia.toml is the default again
+sudo systemctl restart mia                  # apply (launchctl kickstart -k / Restart-Service)
+```
+
+`show` is read-only and needs no privileges; it fails closed exactly as the
+daemon would (an invalid file is an error, not "nothing selected"). Its
+`--json` form is `{"default_environment": "prod" | null, "label",
+"source": "built-in" | "file" | "env", "file", "well_known_address"}`.
+
+`set` and `clear` write `environments.toml` in the system config directory and
+nothing else — they take no path — so they need root / Administrator. This is
+the command [`mia-tray`](mia-tray.md) runs, through the OS consent prompt, for
+**Set as default environment** and **Use mia.toml as default**. They:
+
+- validate `<env>` with the same rule the loader applies (environment-name
+  characters, bounded length, `default` reserved) and require
+  `mia-<env>.toml` in the **system** config directory, beside
+  `environments.toml` (a per-user copy is not enough: an elevated process may
+  not see the same home directory as the daemon, and a selection the daemon
+  cannot find stops it at startup);
+- refuse a selection under which another environment that loads today would
+  stop loading (an explicit `helper.socket` on the well-known address outside
+  the selected environment), before anything is written;
+- render the file from the shipped template plus one
+  `default_environment = "<env>"` line (`clear` writes the template alone;
+  an absent file stays absent) and write it atomically — temp file, `fsync`,
+  rename, directory `fsync` — with mode `0644`, owned by the writer (root),
+  refusing a symlink or non-regular file at the target;
+- append `ConfigChanged { path, by_uid, keys: ["default_environment"] }` to the
+  local audit journal beside the file **before** the rename (no audit record ⇒
+  no change), the same journal `mia setup --apply` writes;
+- write and audit nothing when the selection is already the requested one,
+  and do not need the existing file to parse, so they also repair a broken one.
+
+`--json` prints `{"ok", "path", "previous", "default_environment", "changed",
+"restart_required", "env_override"}`. Exit status is `0` on success (also when
+nothing changed) and `1` on any error. A `FERROGATE_DEFAULT_ENVIRONMENT` in the
+service's own environment (e.g. `mia.env`) still overrides the file for the
+daemon. The change applies when the agent restarts; until then `mia status`
+keeps marking the environment that serves the address now.
 
 #### Attestation backend
 

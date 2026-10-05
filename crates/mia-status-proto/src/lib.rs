@@ -209,6 +209,13 @@ pub struct StatusSnapshot {
     pub last_error: Option<ErrorSummary>,
     /// The daemon's version string.
     pub version: String,
+    /// This environment serves the helper API's well-known default address
+    /// (`mia.sock` / `\\.\pipe\ferrogate-mia`): it is the host's default
+    /// environment — `mia.toml` unless `environments.toml` /
+    /// `FERROGATE_DEFAULT_ENVIRONMENT` selects another — and binds that
+    /// address. Absent from older daemons ⇒ `false`.
+    #[serde(default)]
+    pub default_address: bool,
 }
 
 /// Every state an environment can be in. Ordered by [`AgentState::severity`]
@@ -624,6 +631,7 @@ mod tests {
                 message: "the cached CRL is stale".into(),
             }),
             version: "0.0.0-test".into(),
+            default_address: true,
         }
     }
 
@@ -659,6 +667,7 @@ mod tests {
             "attest_backend",
             "cmis_node",
             "crl_age_secs",
+            "default_address",
             "environment",
             "last_error",
             "last_error.code",
@@ -711,6 +720,17 @@ mod tests {
         let frame = encode_frame(&resp).unwrap();
         let back: StatusResponse = read_frame(&mut &frame[..]).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn snapshot_from_an_older_daemon_has_no_default_address() {
+        // A daemon predating `default_address` omits it; it decodes as false.
+        let mut json = serde_json::to_value(full_snapshot()).unwrap();
+        json.as_object_mut().unwrap().remove("default_address");
+        let mut body = Vec::new();
+        ciborium::into_writer(&json, &mut body).unwrap();
+        let old: StatusSnapshot = decode_body(&body).unwrap();
+        assert!(!old.default_address);
     }
 
     #[test]

@@ -163,6 +163,7 @@ fn spawn_server_with_crl(
         socket_path: path.clone(),
         socket_mode: 0o660,
         socket_gid: None,
+        own_socket_dir: false,
         windows_group: None,
         max_concurrent: 16,
         read_timeout: Duration::from_millis(300),

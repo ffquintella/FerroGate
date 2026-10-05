@@ -157,6 +157,8 @@ messages! {
     DetailX509Store => "X.509 store", "Repositório X.509";
     DetailAgent => "Agent", "Agente";
     DefaultEnvironment => "default", "padrão";
+    MarkerDefaultAddress => "[default address]", "[endereço padrão]";
+    DetailDefaultAddress => "Helper API: serves the well-known default address — local applications reach this environment without configuration", "API do helper: atende o endereço padrão conhecido — as aplicações locais chegam a este ambiente sem configuração";
     SourceEndpoint => "from the status endpoint", "do endpoint de status";
     SourceCli => "from `mia status` (fallback)", "de `mia status` (alternativa)";
     SourceSynthesised => "agent not reachable", "agente inacessível";
@@ -171,6 +173,8 @@ messages! {
     ActionResyncAllowlist => "Resync the allowlist", "Ressincronizar a lista de permissões";
     ActionRefreshKey => "Re-fetch the enrollment key", "Obter novamente a chave de registro";
     ActionApplySetup => "Apply the configuration", "Aplicar a configuração";
+    ActionSetDefaultEnvironment => "Set as default environment", "Definir como ambiente padrão";
+    ActionClearDefaultEnvironment => "Use mia.toml as default", "Usar o mia.toml como padrão";
     RecoveryOpenWizard => "Open the setup wizard", "Abrir o assistente de configuração";
     RecoveryOpenWizardPins => "Update the SPKI pin", "Atualizar o pin SPKI";
     RecoveryOpenWizardAttestation => "Choose the attestation backend", "Escolher o backend de atestação";
@@ -202,6 +206,7 @@ messages! {
     ErrorStartFailed => "Could not start the command.", "Não foi possível iniciar o comando.";
     ErrorUnexpectedOutput => "mia replied with output the tray could not read.", "O mia respondeu com uma saída que o tray não conseguiu ler.";
     NoteElevation => "This action needs administrator approval; your system will ask for it.", "Esta ação requer aprovação do administrador; o sistema irá solicitá-la.";
+    NoteRestartToApply => "Restart the service to apply it: the default address moves only when the agent restarts.", "Reinicie o serviço para aplicar: o endereço padrão só muda quando o agente reinicia.";
 
     NotifyAttentionTitle => "FerroGate MIA needs attention", "O FerroGate MIA precisa de atenção";
     NotifySvidExpiringTitle => "Machine identity expiring", "Identidade da máquina expirando";

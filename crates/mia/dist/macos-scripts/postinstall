@@ -47,6 +47,43 @@ if [ -d "$CONFIG_DIR" ] && [ -n "$STATUS_GID" ]; then
   done
 fi
 
+# ── State secrets ────────────────────────────────────────────────────────────
+# The machine signing key, SVID seed and sealed X.509-SVID live in the config
+# directory, which stays 0755. Up to 0.22.0 the daemon wrote host-key.bin with
+# its umask, leaving it 0644, and on macOS any user can read the hardware
+# fingerprint the key is sealed to. Make every one owner-only now, without
+# waiting for the daemon (which does the same at start). Symlinks are skipped
+# so the chmod never lands outside the directory.
+if [ -d "$CONFIG_DIR" ]; then
+  for f in host-key.bin svid-seed.bin x509-svid.sealed; do
+    [ -f "$CONFIG_DIR/$f" ] && [ ! -L "$CONFIG_DIR/$f" ] || continue
+    chmod 0600 "$CONFIG_DIR/$f"
+  done
+fi
+
+# ── Helper socket directory ──────────────────────────────────────────────────
+# The helper API listens in $CONFIG_DIR/run (mia.sock, mia-<env>.sock), which
+# the daemon gives the config directory's group (ferrogate-status) unless
+# helper.socket_gid says otherwise. A run/ created before the config directory
+# was handed to the group (an older install) kept root:wheel, and so did the
+# sockets bound in it. Repair that state now so status-group members can reach
+# the helper API without waiting for a daemon restart (the daemon re-applies
+# the group on every start). Only gid 0 (wheel) is changed: any other group was
+# set on purpose (helper.socket_gid) and is left alone. Reaching the socket is
+# not being trusted by it: the signed allowlist still decides who may mint.
+RUN_DIR="$CONFIG_DIR/run"
+if [ -d "$RUN_DIR" ] && [ ! -L "$RUN_DIR" ] && [ -n "$STATUS_GID" ]; then
+  if [ "$(stat -f %g "$RUN_DIR")" = 0 ]; then
+    chgrp -h "$STATUS_GID" "$RUN_DIR"
+    chmod 0750 "$RUN_DIR"
+  fi
+  for s in "$RUN_DIR"/mia*.sock; do
+    [ -S "$s" ] && [ ! -L "$s" ] || continue
+    [ "$(stat -f %g "$s")" = 0 ] || continue
+    chgrp -h "$STATUS_GID" "$s"
+  done
+fi
+
 CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
 case "$CONSOLE_USER" in
   ""|root|loginwindow) CONSOLE_USER="" ;;

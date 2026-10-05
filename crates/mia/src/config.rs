@@ -64,14 +64,14 @@ pub fn config_filename(environment: Option<&str>) -> String {
 /// where a system service / daemon / launchd job looks: macOS
 /// `/Library/Application Support/FerroGate`.
 #[cfg(target_os = "macos")]
-fn system_config_dir() -> PathBuf {
+pub(crate) fn system_config_dir() -> PathBuf {
     PathBuf::from("/Library/Application Support/FerroGate")
 }
 
 /// The OS-idiomatic *system* configuration directory: Windows
 /// `%ProgramData%\FerroGate`.
 #[cfg(windows)]
-fn system_config_dir() -> PathBuf {
+pub(crate) fn system_config_dir() -> PathBuf {
     std::env::var_os("ProgramData")
         .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
         .join("FerroGate")
@@ -80,7 +80,7 @@ fn system_config_dir() -> PathBuf {
 /// The OS-idiomatic *system* configuration directory: Linux/other Unix
 /// `/etc/ferrogate`.
 #[cfg(not(any(target_os = "macos", windows)))]
-fn system_config_dir() -> PathBuf {
+pub(crate) fn system_config_dir() -> PathBuf {
     PathBuf::from("/etc/ferrogate")
 }
 
@@ -275,7 +275,9 @@ pub fn default_helper_socket(environment: Option<&str>) -> PathBuf {
 /// parented there vanishes on every reboot and the daemon crash-loops on bind.
 /// The persistent, root-owned system Application Support tree (where the config
 /// and allowlist live) is used instead, in a dedicated `run/` subdirectory the
-/// daemon creates (mode `0750`) on first bind.
+/// daemon owns ([`owned_helper_socket_dir`]): it creates it and, on every
+/// start, gives it mode `0750` and the helper socket's group
+/// (`crate::helper::socket_dir`).
 ///
 /// This is what [`Config::helper_socket`] resolves to when neither
 /// `helper.socket` nor `FERROGATE_HELPER_SOCKET` is set. `environment` must
@@ -287,6 +289,26 @@ pub fn default_helper_socket(environment: Option<&str>) -> PathBuf {
     system_config_dir()
         .join("run")
         .join(helper_socket_name(environment))
+}
+
+/// The directory the daemon itself owns for its default helper sockets, if the
+/// platform has one: macOS `/Library/Application Support/FerroGate/run` (the
+/// parent of [`default_helper_socket`]). The daemon re-applies its mode and
+/// group on every start (`crate::helper::socket_dir`).
+///
+/// `None` elsewhere: on Linux `/run/ferrogate` is systemd's
+/// `RuntimeDirectory=`, prepared before the privilege drop
+/// (`hardening::prepare_runtime_paths`); Windows uses named pipes.
+#[must_use]
+pub fn owned_helper_socket_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(system_config_dir().join("run"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// The platform's default helper listener address (Linux/other Unix socket):
@@ -302,6 +324,49 @@ pub fn default_helper_socket(environment: Option<&str>) -> PathBuf {
 pub fn default_helper_socket(environment: Option<&str>) -> PathBuf {
     debug_assert!(environment.is_none_or(|e| validate_environment(e).is_ok()));
     PathBuf::from("/run/ferrogate").join(helper_socket_name(environment))
+}
+
+/// The address `mia.toml` falls back to when it **yields** the well-known
+/// address (`default_helper_socket(None)`) to another environment selected as
+/// the host's default ([`crate::default_env`]): `mia.default.sock` beside the
+/// well-known socket, or `\\.\pipe\ferrogate-mia.default` on Windows.
+///
+/// The `.` separator — environment-scoped addresses use `-` — makes it
+/// unreachable by any environment name: every `mia-<env>.sock` /
+/// `ferrogate-mia-<env>` starts with `mia-`, so not even an environment
+/// literally named `default` (`mia-default.sock`) can collide with it.
+#[must_use]
+pub fn yielded_helper_socket() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"\\.\pipe\ferrogate-mia.default")
+    }
+    #[cfg(not(windows))]
+    {
+        default_helper_socket(None).with_file_name("mia.default.sock")
+    }
+}
+
+/// The helper address an environment binds when its `helper.socket` is unset,
+/// given the host's selected default environment (`selected_default`, `None`
+/// ⇒ `mia.toml`; see [`crate::default_env`]):
+///
+/// - no selection ⇒ [`default_helper_socket`]`(environment)`, unchanged;
+/// - the selected environment ⇒ the well-known `default_helper_socket(None)`
+///   (its only listener — it no longer binds `mia-<env>.sock`);
+/// - `mia.toml` when another environment is selected ⇒ it yields, to
+///   [`yielded_helper_socket`];
+/// - any other named environment ⇒ its own `mia-<env>.sock`, unchanged.
+#[must_use]
+pub fn default_helper_address(
+    environment: Option<&str>,
+    selected_default: Option<&str>,
+) -> PathBuf {
+    match (environment, selected_default) {
+        (env, Some(selected)) if env == Some(selected) => default_helper_socket(None),
+        (None, Some(_)) => yielded_helper_socket(),
+        (env, _) => default_helper_socket(env),
+    }
 }
 
 /// The classification of a config filename for environment discovery.
@@ -363,6 +428,14 @@ pub struct Config {
     /// [`default_helper_socket`].
     #[serde(skip)]
     environment: Option<String>,
+    /// The host-wide default-environment selection this configuration was
+    /// resolved against (unset ⇒ `mia.toml` is the default). Not a TOML key:
+    /// it is host policy, set by the loader from `environments.toml` /
+    /// `FERROGATE_DEFAULT_ENVIRONMENT` ([`Self::apply_default_selection`]),
+    /// and decides who owns the well-known helper address
+    /// ([`default_helper_address`]).
+    #[serde(skip)]
+    default_selection: crate::default_env::DefaultSelection,
 }
 
 /// `[cmis]` — the Central Machine Identity Service to attest to.
@@ -405,8 +478,11 @@ pub struct HelperConfig {
     pub socket_mode: Option<String>,
     /// **Unix only.** Numeric gid to `chown` the socket to, as a string (e.g.
     /// `"555"`). Members of that group may then open the socket (with the
-    /// default `0o660` mode). `None`/blank ⇒ the socket keeps the daemon's
-    /// primary group. A *group name* is intentionally not accepted here:
+    /// default `0o660` mode). `None`/blank ⇒ on macOS, for a socket in the
+    /// daemon's own `run/` directory, the group of the system config directory
+    /// (`ferrogate-status` after a package install — see
+    /// `crate::helper::socket_dir`); otherwise the socket keeps the group it is
+    /// created with. A *group name* is intentionally not accepted here:
     /// resolving one needs `getgrnam`, and `mia` is `#![forbid(unsafe_code)]`,
     /// so the installer resolves the FerroGate group name to its gid and passes
     /// the number (see `make mia-install`).
@@ -704,12 +780,18 @@ impl Config {
     /// standard system/user locations instead of the default `mia.toml`, and is
     /// mutually exclusive with `explicit`. Returns the merged configuration and
     /// the path actually loaded (`None` ⇒ no file, env/defaults only).
+    ///
+    /// The host's default-environment selection
+    /// ([`crate::default_env::DefaultSelection::load`]) is resolved and applied
+    /// last, so an invalid selection, or an explicit `helper.socket` that
+    /// claims another environment's well-known address, fails the load.
     pub fn load(
         explicit: Option<&Path>,
         environment: Option<&str>,
     ) -> anyhow::Result<(Self, Option<PathBuf>)> {
         let (mut config, source) = Self::load_file(explicit, environment)?;
         config.apply_env(EnvOverrideScope::Full)?;
+        config.apply_default_selection(&crate::default_env::DefaultSelection::load()?)?;
         Ok((config, source))
     }
 
@@ -955,23 +1037,88 @@ impl Config {
     ///
     /// An explicit `helper.socket` (file or `FERROGATE_HELPER_SOCKET`) is used
     /// verbatim; an unset or blank one resolves to the platform default for
-    /// this configuration's [`environment`](Self::environment), see
-    /// [`default_helper_socket`]. The daemon, `mia test` and `mia setup` all
+    /// this configuration's [`environment`](Self::environment) under the
+    /// host's [`default_selection`](Self::default_selection), see
+    /// [`default_helper_address`]. The daemon, `mia test` and `mia setup` all
     /// resolve the address through here, so they always agree.
     #[must_use]
     pub fn helper_socket(&self) -> Option<PathBuf> {
         if !self.helper_enabled() {
             return None;
         }
-        let explicit = self
-            .helper
-            .socket
-            .as_deref()
-            .filter(|p| !p.to_string_lossy().trim().is_empty());
-        Some(explicit.map_or_else(
-            || default_helper_socket(self.environment()),
+        Some(self.explicit_helper_socket().map_or_else(
+            || default_helper_address(self.environment(), self.default_selection.environment()),
             Path::to_path_buf,
         ))
+    }
+
+    /// The explicit `helper.socket`, if set and not blank.
+    fn explicit_helper_socket(&self) -> Option<&Path> {
+        self.helper
+            .socket
+            .as_deref()
+            .filter(|p| !p.to_string_lossy().trim().is_empty())
+    }
+
+    /// The host-wide default-environment selection this configuration was
+    /// resolved against (unset until [`Self::apply_default_selection`]).
+    #[must_use]
+    pub fn default_selection(&self) -> &crate::default_env::DefaultSelection {
+        &self.default_selection
+    }
+
+    /// Whether this configuration's environment is the host's default
+    /// environment — the one entitled to the well-known helper address
+    /// (`mia.toml` unless another environment is selected).
+    #[must_use]
+    pub fn is_default_environment(&self) -> bool {
+        self.default_selection.is_default(self.environment())
+    }
+
+    /// Whether this configuration's helper listener is the well-known default
+    /// address (`default_helper_socket(None)`).
+    #[must_use]
+    pub fn serves_well_known_address(&self) -> bool {
+        self.helper_socket().is_some_and(|s| {
+            crate::default_env::same_helper_address(&s, &default_helper_socket(None))
+        })
+    }
+
+    /// Resolve this configuration against the host's default-environment
+    /// `selection` (see [`crate::default_env`]); the loaders call it last.
+    ///
+    /// With a selection in force, an explicit `helper.socket` that names the
+    /// well-known address in any environment other than the selected one is
+    /// refused — two identities must never share one address — unless the
+    /// helper API is switched off here. With no selection nothing is checked,
+    /// so existing deployments behave exactly as before.
+    pub fn apply_default_selection(
+        &mut self,
+        selection: &crate::default_env::DefaultSelection,
+    ) -> anyhow::Result<()> {
+        self.default_selection = selection.clone();
+        let Some(selected) = selection.environment() else {
+            return Ok(());
+        };
+        if self.is_default_environment() || !self.helper_enabled() {
+            return Ok(());
+        }
+        let well_known = default_helper_socket(None);
+        if let Some(explicit) = self.explicit_helper_socket() {
+            anyhow::ensure!(
+                !crate::default_env::same_helper_address(explicit, &well_known),
+                "helper.socket {} is the well-known default helper address, which belongs to \
+                 the default environment `{selected}` ({}); environment `{}` must not serve it \
+                 (two identities on one address). Unset helper.socket to use {} instead, or \
+                 choose another path",
+                explicit.display(),
+                selection.source(),
+                self.environment()
+                    .unwrap_or(crate::default_env::RESERVED_ENVIRONMENT),
+                default_helper_address(self.environment(), Some(selected)).display(),
+            );
+        }
+        Ok(())
     }
 
     /// The helper socket mode, parsed as octal; default [`DEFAULT_SOCKET_MODE`].
@@ -984,8 +1131,10 @@ impl Config {
     }
 
     /// The gid to `chown` the helper socket to, parsed from `helper.socket_gid`.
-    /// A blank value is treated as unset. `None` ⇒ leave the socket's group as
-    /// the daemon's primary group.
+    /// A blank value is treated as unset. `None` ⇒ no explicit group; the
+    /// daemon then applies the platform default
+    /// (`crate::helper::socket_dir::plan`: on macOS the config directory's
+    /// group for a socket in its own `run/` directory).
     pub fn socket_gid(&self) -> anyhow::Result<Option<u32>> {
         match self.helper.socket_gid.as_deref().map(str::trim) {
             None | Some("") => Ok(None),
@@ -1103,8 +1252,20 @@ pub struct ConfigSource {
 }
 
 impl ConfigSource {
-    /// Resolve and load the configuration this source describes.
+    /// Resolve and load the configuration this source describes, against the
+    /// host's current default-environment selection (re-read now — the
+    /// SIGHUP reload path).
     pub fn load(&self) -> anyhow::Result<(Config, Option<PathBuf>)> {
+        self.load_with(&crate::default_env::DefaultSelection::load()?)
+    }
+
+    /// [`Self::load`] against an already-resolved `selection`, so a daemon
+    /// serving several environments resolves the selection once and applies
+    /// the same one to all of them.
+    pub fn load_with(
+        &self,
+        selection: &crate::default_env::DefaultSelection,
+    ) -> anyhow::Result<(Config, Option<PathBuf>)> {
         let (mut config, path) =
             Config::load_file(self.path.as_deref(), self.environment.as_deref())?;
         let scope = if self.discovered_named_env {
@@ -1113,6 +1274,7 @@ impl ConfigSource {
             EnvOverrideScope::Full
         };
         config.apply_env(scope)?;
+        config.apply_default_selection(selection)?;
         Ok((config, path))
     }
 }
@@ -1168,13 +1330,19 @@ mod tests {
             assert!(validate_environment(ok).is_ok(), "{ok} should be valid");
         }
         for bad in ["", ".", "..", "a/b", "../etc", "a b", "a\\b"] {
-            assert!(validate_environment(bad).is_err(), "{bad:?} should be rejected");
+            assert!(
+                validate_environment(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 
     #[test]
     fn classify_config_filename_classifies() {
-        assert_eq!(classify_config_filename("mia.toml"), Some(ConfigFile::Default));
+        assert_eq!(
+            classify_config_filename("mia.toml"),
+            Some(ConfigFile::Default)
+        );
         assert_eq!(
             classify_config_filename("mia-staging.toml"),
             Some(ConfigFile::Named("staging".to_string()))
@@ -1203,7 +1371,10 @@ mod tests {
         let found = scan_config_dirs(&[sys.clone(), user.clone()]);
         // Order: default (None) first, then prod, then staging.
         assert_eq!(
-            found.iter().map(|d| d.environment.clone()).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|d| d.environment.clone())
+                .collect::<Vec<_>>(),
             vec![None, Some("prod".to_string()), Some("staging".to_string())]
         );
         // The system copy of `prod` wins over the user one.
@@ -1580,6 +1751,24 @@ mod tests {
     }
 
     #[test]
+    fn the_owned_socket_directory_holds_every_default_socket_on_macos_only() {
+        let owned = owned_helper_socket_dir();
+        #[cfg(target_os = "macos")]
+        {
+            let owned = owned.expect("macOS owns its helper socket directory");
+            assert_eq!(
+                owned,
+                Path::new("/Library/Application Support/FerroGate/run")
+            );
+            for env in [None, Some("staging")] {
+                assert_eq!(default_helper_socket(env).parent(), Some(owned.as_path()));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(owned, None);
+    }
+
+    #[test]
     fn environment_for_path_follows_the_discovery_naming() {
         assert_eq!(
             environment_for_path(Path::new("/etc/ferrogate/mia.toml")),
@@ -1703,5 +1892,154 @@ mod tests {
         // Only the loader decides which environment a file belongs to.
         assert!(Config::from_toml("environment = 'prod'").is_err());
         assert_eq!(Config::from_toml("").unwrap().environment(), None);
+    }
+
+    /// A selection of `env` from the environment variable (no file needed).
+    fn select(env: &str) -> crate::default_env::DefaultSelection {
+        crate::default_env::DefaultSelection::resolve(
+            Path::new("/nonexistent/environments.toml"),
+            Some(env.to_string()),
+        )
+        .unwrap()
+    }
+
+    /// A configuration for `environment` parsed from `toml`, resolved against
+    /// `selection`.
+    fn resolved(
+        environment: Option<&str>,
+        toml: &str,
+        selection: &crate::default_env::DefaultSelection,
+    ) -> anyhow::Result<Config> {
+        let mut c = Config::from_toml(toml).unwrap();
+        c.environment = environment.map(str::to_owned);
+        c.apply_default_selection(selection)?;
+        Ok(c)
+    }
+
+    #[test]
+    fn unset_selection_keeps_the_historical_addresses() {
+        let unset = crate::default_env::DefaultSelection::unset();
+        let main = resolved(None, "", &unset).unwrap();
+        let prod = resolved(Some("prod"), "", &unset).unwrap();
+        assert_eq!(main.helper_socket(), Some(default_helper_socket(None)));
+        assert_eq!(
+            prod.helper_socket(),
+            Some(default_helper_socket(Some("prod")))
+        );
+        assert!(main.is_default_environment() && main.serves_well_known_address());
+        assert!(!prod.is_default_environment() && !prod.serves_well_known_address());
+        // No selection ⇒ no new collision rule: a named environment that
+        // explicitly takes the well-known address keeps working as before.
+        let well_known = default_helper_socket(None);
+        let legacy = format!("[helper]\nsocket = '{}'", well_known.display());
+        let c = resolved(Some("prod"), &legacy, &unset).unwrap();
+        assert_eq!(c.helper_socket(), Some(well_known));
+    }
+
+    #[test]
+    fn selected_environment_takes_the_well_known_address() {
+        let sel = select("prod");
+        let prod = resolved(Some("prod"), "", &sel).unwrap();
+        assert!(prod.is_default_environment());
+        // One listener: the well-known address, not mia-prod.sock.
+        assert_eq!(prod.helper_socket(), Some(default_helper_socket(None)));
+        assert!(prod.serves_well_known_address());
+        // Other named environments are untouched.
+        let staging = resolved(Some("staging"), "", &sel).unwrap();
+        assert_eq!(
+            staging.helper_socket(),
+            Some(default_helper_socket(Some("staging")))
+        );
+        // The selected environment's own explicit socket still wins.
+        let moved = resolved(Some("prod"), "[helper]\nsocket = '/tmp/prod.sock'", &sel).unwrap();
+        assert_eq!(
+            moved.helper_socket().as_deref(),
+            Some(Path::new("/tmp/prod.sock"))
+        );
+        assert!(!moved.serves_well_known_address());
+    }
+
+    #[test]
+    fn mia_toml_yields_to_a_distinct_address() {
+        let main = resolved(None, "", &select("prod")).unwrap();
+        assert!(!main.is_default_environment());
+        assert_eq!(main.helper_socket(), Some(yielded_helper_socket()));
+        assert!(!main.serves_well_known_address());
+        // The yielded address collides with nothing an environment can get —
+        // not even an environment literally named `default`.
+        let yielded = yielded_helper_socket();
+        assert_ne!(yielded, default_helper_socket(None));
+        for env in ["default", "prod", "default.sock", "status", "a"] {
+            assert_ne!(yielded, default_helper_socket(Some(env)), "{env}");
+        }
+        #[cfg(not(windows))]
+        assert_eq!(
+            yielded.parent(),
+            default_helper_socket(None).parent(),
+            "beside the well-known socket"
+        );
+    }
+
+    #[test]
+    fn explicit_well_known_socket_outside_the_default_is_rejected() {
+        let sel = select("prod");
+        let well_known = default_helper_socket(None);
+        let claim = format!("[helper]\nsocket = '{}'", well_known.display());
+        // mia.toml has yielded: it may not keep the address explicitly.
+        let err = resolved(None, &claim, &sel).unwrap_err();
+        assert!(err.to_string().contains("`prod`"), "{err}");
+        // Nor may any other non-selected environment.
+        assert!(resolved(Some("staging"), &claim, &sel).is_err());
+        // The selected environment may name it explicitly.
+        assert!(resolved(Some("prod"), &claim, &sel).is_ok());
+        // A switched-off helper API claims nothing.
+        let off = format!("{claim}\nenable = false");
+        assert!(resolved(None, &off, &sel).is_ok());
+        // Other explicit paths are fine.
+        assert!(resolved(None, "[helper]\nsocket = '/tmp/main.sock'", &sel).is_ok());
+        // The explicit check applies to FERROGATE_HELPER_SOCKET too (it lands
+        // in helper.socket before the selection is applied).
+        let mut c = Config::from_toml("").unwrap();
+        c.apply_overrides(EnvOverrideScope::Full, |k| {
+            (k == "FERROGATE_HELPER_SOCKET").then(|| well_known.display().to_string())
+        })
+        .unwrap();
+        assert!(c.apply_default_selection(&sel).is_err());
+    }
+
+    #[test]
+    fn loader_applies_the_selection_to_discovered_environments() {
+        let dir = std::env::temp_dir().join(format!("mia-default-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = dir.join("mia-prod.toml");
+        std::fs::write(&named, "").unwrap();
+        let main = dir.join("mia.toml");
+        std::fs::write(&main, "").unwrap();
+        let sel = select("prod");
+
+        let (prod, _) = ConfigSource {
+            path: Some(named),
+            environment: None,
+            discovered_named_env: true,
+        }
+        .load_with(&sel)
+        .unwrap();
+        assert_eq!(prod.default_selection(), &sel);
+        assert_eq!(prod.helper_socket(), Some(default_helper_socket(None)));
+
+        // mia.toml, loaded the way serve-all loads it, yields.
+        let (main_cfg, _) = ConfigSource {
+            path: Some(main),
+            environment: None,
+            discovered_named_env: false,
+        }
+        .load_with(&sel)
+        .unwrap();
+        // A process-wide FERROGATE_HELPER_SOCKET would legitimately override
+        // the default environment's address; only assert the yield otherwise.
+        if std::env::var_os("FERROGATE_HELPER_SOCKET").is_none() {
+            assert_eq!(main_cfg.helper_socket(), Some(yielded_helper_socket()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

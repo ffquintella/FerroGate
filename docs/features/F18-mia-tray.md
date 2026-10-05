@@ -159,6 +159,7 @@ struct StatusSnapshot {
     x509_store:      Option<StoreBackend>,
     last_error:      Option<ErrorSummary>,// stable code + short message
     version:         String,
+    default_address: bool,                // serves the well-known helper address
 }
 ```
 
@@ -226,6 +227,22 @@ use. Actions that change system state (service start/stop/restart, resync,
 refresh-key, system config apply) go through the consent prompt; read-only
 ones (`mia test --json`, `mia machine-id`, `mia status`) run as the user.
 Results are shown inline and attached to the diagnostics bundle.
+
+**Default environment.** The environment whose snapshot has
+`default_address: true` — the one serving the helper API's well-known address
+(F08, `environments.toml`) — is marked `[default address]` in its menu
+headline and status block, with a detail line. Every other environment the
+agent itself reported offers one elevated action: **Set as default
+environment** (`mia default-environment set <env>`) for a named environment,
+**Use mia.toml as default** (`mia default-environment clear`) for `mia.toml`.
+The name is a validated `EnvName` passed as one positional argument (never
+leading `-`); the reserved `default`, names the validator rejects and
+synthesised snapshots get no action. `mia` re-validates, checks that
+`mia-<env>.toml` exists in the system config directory and that no other
+environment would stop loading,
+writes the file atomically (`0644`, root-owned, no symlink) and audits the
+change. The selection applies on restart, so a successful run tells the
+operator to restart the service (the "Restart the service" action).
 
 ### Log viewer
 
@@ -371,6 +388,12 @@ and `mia` apply one implementation.
   (XDG autostart, polkit policy, `ferrogate-status` group). The status-group
   creation is in the macOS postinstall, the Chocolatey install script (wixl
   cannot run commands), and the Linux package postinst.
+- **Default environment (F08).** The status marker and the set/clear actions
+  above: `model::default_choice` / `EnvView::{default_address,
+  default_choice}`, `Action::{SetDefaultEnvironment, ClearDefaultEnvironment}`
+  (tests `model::tests::the_default_address_is_marked_and_the_others_can_take_it`,
+  `actions::tests::default_environment_actions_are_fixed_elevated_command_lines`),
+  backed by `mia default-environment` (`crates/mia/src/default_env_cli.rs`).
 - **Not done:** a minimised-window fallback when Linux has no
   StatusNotifierItem host; a `.app` bundle for macOS (notifications from an
   unbundled binary may be attributed to another application).

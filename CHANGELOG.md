@@ -25,6 +25,76 @@ record them.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-05
+
+### Added
+
+- Let the operator choose which environment serves the well-known MIA helper address (S8, S29, S31)
+  A new host-wide file, `environments.toml` in the system config directory
+  (`/etc/ferrogate`, `/Library/Application Support/FerroGate`,
+  `%ProgramData%\FerroGate`; template `crates/mia/dist/environments.toml`),
+  takes `default_environment = "<env>"`. `FERROGATE_DEFAULT_ENVIRONMENT`
+  overrides it, and a blank value clears it. With nothing set, `mia.toml`
+  keeps the well-known address (`mia.sock` / `\\.\pipe\ferrogate-mia`) exactly
+  as before. When an environment is selected and its `helper.socket` is unset,
+  it serves the well-known address instead of `mia-<env>.sock`, and `mia.toml`
+  moves to `mia.default.sock` (`\\.\pipe\ferrogate-mia.default`), an address
+  no environment name can produce. The per-user directory is never read.
+  - **Fails closed:** an invalid or reserved (`default`) name, an unreadable,
+    oversized or malformed file, or, in serve-all mode, a selection with no
+    `mia-<env>.toml` stops the daemon instead of falling back to `mia.toml`.
+    With a selection in force, an explicit `helper.socket` that names the
+    well-known address in another environment is refused.
+  - The daemon logs the selection and which environment serves the address.
+    `mia test` prints a `default environment` line. `mia status` marks that
+    environment, and the status snapshot gains `default_address`; older tray
+    and daemon versions read it as `false`.
+  - `mia setup` explains the selection at the helper-listener prompt and refuses
+    the well-known address for an environment that does not own it. It now
+    leaves `helper.socket` unset when the suggested default is accepted, so a
+    file follows a later change of default environment instead of pinning the
+    old path.
+  - Takes effect at daemon start; `mia --reload` does not move a bound
+    listener.
+  - `mia default-environment [show | set <env> | clear] [--json]` manages the
+    selection. `show` is read-only. `set` and `clear` write only the system
+    `environments.toml`, so they need root or Administrator. `set` checks the
+    name with the loader's own validator (`default` is reserved) and requires
+    `mia-<env>.toml` in the system config directory. It refuses a selection that would stop
+    another environment's configuration from loading. The file is written
+    atomically with mode `0644`, owned by the writer, and a symlink target is
+    refused. Each change appends `ConfigChanged` (key name
+    `default_environment`) to the local audit journal before the rename. An
+    unchanged selection writes nothing.
+  - `mia-tray` marks the environment that serves the well-known address as
+    `[default address]` in its menu and Status window. Other environments
+    offer **Set as default environment**, and `mia.toml` offers **Use mia.toml
+    as default**. Both run `mia default-environment` through the consent
+    prompt and then ask for a service restart. English and Portuguese strings
+    are included.
+
+### Security
+
+- Create the host-key machine signing key `0600` and repair a world-readable one (S15, S16, S29)
+  `host-key.bin`, the TPM-less profile's software machine signing key, was
+  written with the process umask and so was `0644`. On macOS it sits in the
+  `0755` config directory, and the hardware fingerprint it is sealed to is
+  readable by any user through `ioreg`. Any local user could therefore read the
+  file, re-derive the seal key and recover the machine key. `ferro-sep` now
+  creates the file exclusively (`O_EXCL`) with mode `0600` set by `open(2)`, so
+  it is never wider at any point. It tightens an existing file that group or
+  other can access before reading it (new `restrict_key_file`). The pre-F16
+  re-seal rewrites only an owner-only file. The daemon makes `host-key.bin`,
+  `svid-seed.bin` and `x509-svid.sealed` owner-only at start, before the Linux
+  privilege drop, and logs each repair at `warn`. The macOS postinstall does
+  the same at upgrade. Linux hosts were less exposed, because
+  `/var/lib/ferrogate` is `0750`.
+  - **Behaviour:** `ferro-sep` refuses to open a key file it cannot make
+    owner-only, so a key file the daemon user neither owns nor can `chmod`
+    now fails attestation instead of loading.
+  - **Action:** a host that logs `restricted it to 0600` had an exposed key.
+    Treat the key as compromised and rotate it together with its CMIS binding.
+
 ## [0.22.0] - 2026-10-05
 
 ### Added
@@ -68,6 +138,24 @@ record them.
   still root, it hands each helper-socket directory to `_ferrogate` group-owned
   by `helper.socket_gid` with the setgid bit (`02750`). The socket inherits the
   group, and the bind calls `chown` only if the group is still wrong.
+
+- Give the macOS helper socket directory and sockets the `ferrogate-status` group (S8, S29, S31)
+  On macOS `/Library/Application Support/FerroGate` is `root:ferrogate-status`,
+  but `run/` and the helper sockets in it (`mia.sock`, `mia-<env>.sock`) could
+  stay `root:wheel`, so status-group members could not reach the helper API.
+  macOS gives a new entry its parent directory's group, so a `run/` created
+  before the postinstall handed the config directory to the group kept
+  `wheel`. The daemon only set `run/` up when it created it and never
+  re-applied the group. Now, when `helper.socket_gid` is unset, a socket in
+  `run/` takes the config directory's group. That group is adopted only while
+  the config directory is root-owned and not group- or world-writable. The
+  daemon re-applies mode `0750` and the group to `run/` on every start and
+  refuses a `run/` that is a symlink. An explicit `helper.socket_gid` /
+  `FERROGATE_HELPER_SOCKET_GID` still wins. The postinstall regroups a `wheel`
+  `run/` and its sockets, so an upgrade fixes access before the daemon
+  restarts. Linux and custom socket paths are unchanged.
+  - **Access:** members of `ferrogate-status` can now connect to the macOS
+    helper socket. The signed allowlist still decides who may mint.
 
 ### Security
 
@@ -2355,7 +2443,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.22.0...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.23.0...HEAD
+[0.23.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.23.0
 [0.22.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.22.0
 [0.21.9]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.9
 [0.21.8]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.21.8

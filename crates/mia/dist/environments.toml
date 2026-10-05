@@ -1,0 +1,32 @@
+# FerroGate Machine Identity Agent (MIA) — host-wide environment settings.
+#
+# OPTIONAL. Read by every mia process (the daemon, `mia test`, `mia setup`)
+# from the SYSTEM config directory only — never the per-user one:
+#
+#   Linux    /etc/ferrogate/environments.toml
+#   macOS    /Library/Application Support/FerroGate/environments.toml
+#   Windows  %ProgramData%\FerroGate\environments.toml
+#
+# Keep it root/Administrators-owned and world-readable (0644): it holds no
+# secret, and `mia test` run by an unprivileged user must be able to read it.
+# Absent => mia.toml is the default environment (the historical behaviour).
+
+# The environment that serves the helper API's WELL-KNOWN address — the one
+# local callers dial without configuration:
+#
+#   Linux    /run/ferrogate/mia.sock
+#   macOS    /Library/Application Support/FerroGate/run/mia.sock
+#   Windows  \\.\pipe\ferrogate-mia
+#
+# Name an environment that has a mia-<env>.toml. Its helper listener then moves
+# to the well-known address (when its helper.socket is unset; it no longer
+# binds mia-<env>.sock), and mia.toml YIELDS: with its helper.socket unset it
+# falls back to mia.default.sock (\\.\pipe\ferrogate-mia.default on Windows).
+# An explicit helper.socket naming the well-known address in any environment
+# other than this one is refused at startup.
+#
+# FERROGATE_DEFAULT_ENVIRONMENT overrides this value (blank => mia.toml).
+# "default" is reserved (the label of mia.toml). An invalid name, or one with no
+# mia-<env>.toml when the daemon serves every environment, stops the daemon
+# instead of falling back. Takes effect on restart, not on `mia --reload`.
+#default_environment = "prod"

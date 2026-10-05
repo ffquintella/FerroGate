@@ -32,9 +32,11 @@
         <!-- No FERROGATE_HELPER_SOCKET here: the helper API is on by default at
              /Library/Application Support/FerroGate/run/mia.sock (mia-<env>.sock
              per environment). That persistent tree is used because /var/run is
-             a boot-cleared tmpfs on macOS; the daemon creates the run/ subdir
-             (mode 0750, group helper.socket_gid when set). Leaving the variable
-             out lets helper.socket / helper.enable in mia.toml take effect. -->
+             a boot-cleared tmpfs on macOS. The daemon owns the run/ subdir and
+             re-applies mode 0750 and the helper group on every start: the
+             config directory's group (ferrogate-status), or helper.socket_gid
+             when set. Leaving the variable out lets helper.socket /
+             helper.enable in mia.toml take effect. -->
     </dict>
 
     <key>RunAtLoad</key>

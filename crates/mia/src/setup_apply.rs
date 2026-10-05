@@ -482,6 +482,23 @@ fn check(draft: &Path, json: bool) -> anyhow::Result<()> {
 
 // ── --apply ──────────────────────────────────────────────────────────────────
 
+/// Render `settings` for `target`. The placeholder helper address follows the
+/// host's default environment ([`crate::default_env`], fail closed on an
+/// invalid selection); the file's environment is judged as the daemon judges
+/// it (the selector, else a `mia-<env>.toml` target name).
+fn render_for(settings: &Settings, opts: &Opts, target: &Path) -> anyhow::Result<String> {
+    let selection = crate::default_env::DefaultSelection::load()?;
+    let file_env = opts
+        .environment
+        .clone()
+        .or_else(|| crate::config::environment_for_path(target));
+    Ok(setup::render(
+        settings,
+        file_env.as_deref(),
+        selection.environment(),
+    ))
+}
+
 fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
     let target = opts.target()?;
     let parent = parent_dir(&target);
@@ -518,7 +535,7 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
     let existing = setup::load_existing(&target);
     settings.carried = Carried::from_existing(&existing);
     keep_helper_switch(&mut settings, &existing);
-    let rendered = setup::render(&settings, opts.environment.as_deref());
+    let rendered = render_for(&settings, opts, &target)?;
 
     let staged = stage(&target, rendered.as_bytes(), CONFIG_MODE)?;
     let keys = commit(staged, &target, &rendered, &existing, by_uid)?;
@@ -784,6 +801,29 @@ pub(crate) fn write_config(
     commit(staged, target, rendered, existing, by_uid)
 }
 
+/// Write `content` to the host-policy file `target` (e.g. `environments.toml`)
+/// through the same atomic, audited path `--apply` uses — temp file with
+/// exactly `mode` + `fsync`, a symlink or non-regular target refused, a
+/// `ConfigChanged { path, by_uid, keys }` record appended to the local audit
+/// journal before the rename (no record ⇒ no change) — except that the
+/// previous file's owner is **not** carried over: the result belongs to the
+/// writer (root, when elevated), so a file someone else once owned cannot
+/// stay theirs to rewrite. `keys` are key names only, never values.
+pub(crate) fn write_policy_file(
+    target: &Path,
+    content: &[u8],
+    mode: u32,
+    keys: Vec<String>,
+) -> anyhow::Result<()> {
+    let staged = stage_with(target, content, mode, Ownership::Writer)?;
+    let by_uid = by_uid(&staged);
+    staged.commit(&AuditEvent::ConfigChanged {
+        path: target.display().to_string(),
+        by_uid,
+        keys,
+    })
+}
+
 /// Audit, then atomically move the staged file over `target`.
 fn commit(
     staged: Staged,
@@ -821,10 +861,29 @@ struct Staged {
 const ELEVATION_HINT: &str = "the system path needs elevation — re-run with `sudo`/as admin, use \
      --user for a per-user file, or --output to write elsewhere";
 
+/// Who owns a staged file once it replaces its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    /// The previous file's owner and group (configuration the wizard edits).
+    Previous,
+    /// Whoever writes it (host-policy files: root when elevated).
+    Writer,
+}
+
 /// Write `content` to a fresh temp file in `target`'s directory with `mode`
 /// (the wizard's `0640` for configuration) and — when `target` exists — its
 /// owner and group, then `fsync` it. A symlink at `target` is refused.
 fn stage(target: &Path, content: &[u8], mode: u32) -> anyhow::Result<Staged> {
+    stage_with(target, content, mode, Ownership::Previous)
+}
+
+/// [`stage`] with an explicit [`Ownership`] rule for the result.
+fn stage_with(
+    target: &Path,
+    content: &[u8],
+    mode: u32,
+    ownership: Ownership,
+) -> anyhow::Result<Staged> {
     use std::io::Write as _;
     let parent = target
         .parent()
@@ -885,7 +944,10 @@ fn stage(target: &Path, content: &[u8], mode: u32) -> anyhow::Result<Staged> {
         // Through the open handle, so no path is re-resolved.
         file.set_permissions(std::fs::Permissions::from_mode(mode))
             .with_context(|| format!("setting the mode of {}", tmp.display()))?;
-        if let Some(prev) = &previous {
+        if let Some(prev) = previous
+            .as_ref()
+            .filter(|_| ownership == Ownership::Previous)
+        {
             if (prev.uid(), prev.gid()) != (staged.euid, file.metadata()?.gid()) {
                 std::os::unix::fs::chown(&tmp, Some(prev.uid()), Some(prev.gid())).with_context(
                     || {
@@ -902,7 +964,7 @@ fn stage(target: &Path, content: &[u8], mode: u32) -> anyhow::Result<Staged> {
         }
     }
     #[cfg(not(unix))]
-    let _ = &previous;
+    let _ = (&previous, ownership);
     file.sync_all()
         .with_context(|| format!("flushing {}", tmp.display()))?;
     drop(file);
@@ -1191,7 +1253,7 @@ mod tests {
         let existing = setup::load_existing(&target);
         let mut tty = tty_settings();
         tty.carried = Carried::from_existing(&existing);
-        let expected = setup::render(&tty, None);
+        let expected = setup::render(&tty, None, None);
 
         let draft = write_draft(&dir, &full_draft());
         apply(&draft, &apply_opts(&target)).unwrap();

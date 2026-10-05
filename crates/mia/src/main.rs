@@ -41,11 +41,18 @@
 //!   ([`mia::config::default_helper_socket`]: `/run/ferrogate/mia[-<env>].sock`
 //!   on Linux, `/Library/Application Support/FerroGate/run/mia[-<env>].sock`
 //!   on macOS, `\\.\pipe\ferrogate-mia[-<env>]` on Windows).
+//! - `FERROGATE_DEFAULT_ENVIRONMENT` (`default_environment` in the system
+//!   `environments.toml`, not `mia.toml`) — which environment serves the
+//!   well-known (unsuffixed) helper address; unset ⇒ `mia.toml`. See
+//!   [`mia::default_env`].
 //! - `FERROGATE_HELPER_SOCKET_MODE` (`helper.socket_mode`) — octal socket mode
 //!   (default `660`).
 //! - `FERROGATE_HELPER_SOCKET_GID` (`helper.socket_gid`) — numeric gid to own
 //!   the socket so that group's members may open it (Unix only; set by
-//!   `make mia-install` to the dedicated FerroGate group).
+//!   `make mia-install` to the dedicated FerroGate group). Unset on macOS ⇒ a
+//!   socket in the default `run/` directory takes the group of
+//!   `/Library/Application Support/FerroGate` (`ferrogate-status` after a
+//!   package install), re-applied to `run/` on every start.
 //! - `FERROGATE_ALLOWLIST` (`allowlist.path`) — path to the signed CBOR
 //!   allowlist. Absent ⇒ the API denies every caller (fail closed).
 //! - `FERROGATE_ALLOWLIST_KEY` (`allowlist.key`) — path to the trusted CMIS
@@ -100,6 +107,10 @@ fn main() -> anyhow::Result<()> {
         // Read the running agent's status endpoint (feature F18). Exits with a
         // stable code: 0 healthy, 1 not all healthy, 3 agent not running, …
         Some("status") => std::process::exit(mia::status_cli::run(&args[1..])),
+        // Show / set / clear which environment serves the well-known helper
+        // address (environments.toml). Writes are atomic and audited; the
+        // daemon applies a change when it restarts.
+        Some("default-environment") => return mia::default_env_cli::run(&args[1..]),
         // Windows service management (install/uninstall/start/stop) and the
         // internal `service run` the SCM launches. Windows-only.
         Some("service") => return service_cmd(&args[1..]),
@@ -142,6 +153,11 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
         || config_source.environment.is_some()
         || std::env::var_os(mia::config::ENV_CONFIG).is_some();
 
+    // The host-wide default environment (who serves the well-known helper
+    // address), resolved once and applied to every environment served here.
+    // Fails closed: an invalid selection stops startup.
+    let selection = mia::default_env::DefaultSelection::load()?;
+
     // Resolve the configuration before logging/hardening: it gives us the log
     // directive, and a malformed file must fail loudly and early. The primary
     // config supplies the process-wide log directive; in all-environments mode
@@ -151,7 +167,7 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
     } else {
         mia::config::ConfigSource::default()
     };
-    let (primary_config, primary_path) = primary_source.load()?;
+    let (primary_config, primary_path) = primary_source.load_with(&selection)?;
 
     // A reloadable filter layer: SIGHUP re-reads the config and applies a
     // changed `log` directive live (see `spawn_reload_task`).
@@ -192,6 +208,13 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
         component = "mia",
         "FerroGate Machine Identity Agent"
     );
+    // Which environment owns the well-known helper address, and why.
+    tracing::info!(
+        default_environment = %selection.label(),
+        source = %selection.source(),
+        well_known = %mia::config::default_helper_socket(None).display(),
+        "default environment: entitled to the well-known helper address"
+    );
 
     // The status endpoint is per process, configured from the primary config.
     let status_endpoint = status_endpoint_config(&primary_config);
@@ -217,6 +240,9 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
         }]
     } else {
         let discovered = mia::config::discover_environment_configs();
+        // A selected default with no mia-<env>.toml is a startup error, never
+        // a silent fallback of the well-known address to mia.toml.
+        selection.ensure_discovered(&discovered)?;
         if discovered.is_empty() {
             tracing::debug!("no configuration files found; using environment and defaults");
             vec![EnvInstance {
@@ -245,7 +271,7 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
                     environment: None,
                     discovered_named_env: d.environment.is_some(),
                 };
-                match source.load() {
+                match source.load_with(&selection) {
                     Ok((config, _)) => {
                         tracing::info!(env = %label, config = %d.path.display(), "loaded environment configuration");
                         instances.push(EnvInstance {
@@ -255,10 +281,19 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
                             source,
                         });
                     }
-                    // One broken environment must not take down the others.
+                    // One broken environment must not take down the others —
+                    // but if it is the default, say that nobody else takes
+                    // over the well-known address (fail closed).
                     Err(e) => tracing::error!(
                         env = %label, config = %d.path.display(), error = %e,
-                        "skipping environment: its configuration failed to load"
+                        default_environment = selection.is_default(d.environment.as_deref()),
+                        "skipping environment: its configuration failed to load{}",
+                        if selection.is_default(d.environment.as_deref()) {
+                            "; it is the default environment, so the well-known helper \
+                             address stays unserved"
+                        } else {
+                            ""
+                        }
                     ),
                 }
             }
@@ -492,6 +527,8 @@ fn print_usage() {
          \x20 x509-svid         inspect the machine-bound X.509-SVID store\n\
          \x20 test              check CMIS connectivity and helper-token issuance\n\
          \x20 status            report each environment's state from the running agent\n\
+         \x20 default-environment  show, set <env> or clear the environment that serves\n\
+         \x20                   the well-known helper address (applies on restart)\n\
          \x20 service           manage the Windows service (install/uninstall/start/stop)\n\
          \n\
          options:\n\
@@ -556,11 +593,13 @@ async fn run_all(
                     "helper API disabled for this environment (helper.enable = false); \
                      not serving it"
                 );
+                note_default_address(&inst, None);
                 inst.status
                     .set_not_configured(mia_status_proto::error_codes::HELPER_NOT_CONFIGURED);
             }
             Some(socket) => {
                 if seen_sockets.insert(socket.clone()) {
+                    note_default_address(&inst, Some(&socket));
                     serveable.push(inst);
                 } else {
                     inst.status
@@ -610,6 +649,44 @@ async fn run_all(
             futures::future::join_all(futures).await;
             Ok(())
         }
+    }
+}
+
+/// Record in `inst`'s status whether it serves the well-known default helper
+/// address (`socket` is its listener, `None` ⇒ helper API off), and log who
+/// owns that address. When the host's default environment does not take it
+/// (helper API off, or an explicit `helper.socket` elsewhere), say so: nobody
+/// else will serve it in its place. That is a warning when the operator chose
+/// the default explicitly, and informational for the built-in `mia.toml`.
+fn note_default_address(inst: &EnvInstance, socket: Option<&std::path::Path>) {
+    let well_known = mia::config::default_helper_socket(None);
+    let serves = inst.config.serves_well_known_address();
+    inst.status.set_default_address(serves);
+    if serves {
+        tracing::info!(
+            env = %inst.label, listener = %well_known.display(),
+            "this environment serves the well-known default helper address"
+        );
+        return;
+    }
+    if !inst.config.is_default_environment() {
+        return;
+    }
+    let reason = socket.map_or_else(
+        || "its helper API is switched off".to_string(),
+        |s| format!("its helper.socket is {}", s.display()),
+    );
+    if inst.config.default_selection().environment().is_some() {
+        tracing::warn!(
+            env = %inst.label, well_known = %well_known.display(),
+            "the default environment does not serve the well-known helper address ({reason}); \
+             no other environment serves it in its place"
+        );
+    } else {
+        tracing::info!(
+            env = %inst.label, well_known = %well_known.display(),
+            "the default environment does not serve the well-known helper address ({reason})"
+        );
     }
 }
 
@@ -809,7 +886,9 @@ fn prefetched_facts() -> Option<&'static ferro_machineid::MachineFacts> {
 /// Do the root-requiring startup work, then apply the hardening profile.
 ///
 /// A privilege-dropping daemon must perform everything that needs root *before*
-/// it drops: the machine fingerprint (root-only DMI serials) is prefetched, and
+/// it drops: the machine fingerprint (root-only DMI serials) is prefetched, the
+/// state secrets are made owner-only (`0600`; see
+/// [`mia::credstore::restrict_secret_files`]), and
 /// the directories the unprivileged process will write — each environment's
 /// helper-socket directory plus the [`state_dir`] holding the machine key and
 /// SVID seed — are created and handed to the `_ferrogate` user. Only then does
@@ -827,6 +906,11 @@ fn prepare_and_harden(
     // Prefetch the fingerprint on every platform so attestation reads it the
     // same way; on Linux it is the only chance to read the root-only DMI files.
     prefetch_machine_facts();
+    // Close state secrets an older build left readable by other users, while
+    // still root (on Linux, before the drop) so ownership never blocks it.
+    let store = mia::credstore::store_path();
+    let (key, seed) = (host_key_path(), svid_seed_path());
+    mia::credstore::restrict_secret_files([key.as_path(), seed.as_path(), store.as_path()]);
 
     let prepare_status = |cfg: mia::status_server::StatusEndpointConfig| {
         let path = cfg.path.clone();
@@ -2091,12 +2175,19 @@ where
         None
     };
 
+    // The socket's group: `helper.socket_gid` when set; on macOS, for a socket
+    // in the daemon's own `run/` directory, the config directory's group
+    // otherwise (`ferrogate-status` after a package install), re-applied to
+    // `run/` on every start.
+    let socket_dir = mia::helper::socket_dir::plan(config.socket_gid()?, &socket_path);
     let helper_config = HelperServerConfig {
         socket_path: socket_path.clone(),
-        // `socket_mode`/`socket_gid` are Unix-only; `windows_group` is
-        // Windows-only. Each transport ignores the fields that don't apply.
+        // `socket_mode`/`socket_gid`/`own_socket_dir` are Unix-only;
+        // `windows_group` is Windows-only. Each transport ignores the fields
+        // that don't apply.
         socket_mode: config.socket_mode()?,
-        socket_gid: config.socket_gid()?,
+        socket_gid: socket_dir.gid,
+        own_socket_dir: socket_dir.own_dir,
         windows_group: config.helper.windows_group.clone(),
         max_concurrent: 64,
         read_timeout: Duration::from_secs(5),
@@ -2365,7 +2456,10 @@ mod tests {
 
     #[test]
     fn no_self_sha_yields_only_observed_entries() {
-        assert_eq!(proposal_entries(&[], None), [] as [ferro_svid::AllowEntry; 0]);
+        assert_eq!(
+            proposal_entries(&[], None),
+            [] as [ferro_svid::AllowEntry; 0]
+        );
         let entries = proposal_entries(&[(0, [0x11; 48])], None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].uid, Some(0));

@@ -60,7 +60,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
                 explicit_output = Some(PathBuf::from(path));
             }
             "-e" | "--environment" => {
-                let env = it.next().context("--environment requires a name argument")?;
+                let env = it
+                    .next()
+                    .context("--environment requires a name argument")?;
                 validate_environment(env)?;
                 environment = Some(env.clone());
             }
@@ -116,8 +118,17 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     warn_if_target_unwritable(&output);
     println!();
 
+    // The host's default environment decides this file's default helper
+    // address; the file's environment is judged the way the daemon judges it
+    // (the selector, else a `mia-<env>.toml` output name).
+    let selection = crate::default_env::DefaultSelection::load()?;
+    let file_env = env
+        .map(str::to_owned)
+        .or_else(|| crate::config::environment_for_path(&output));
+    let listener = ListenerDefaults::new(file_env.as_deref(), &selection);
+
     let existing = load_existing(&output);
-    let settings = match prompt_all(&existing, env) {
+    let settings = match prompt_all(&existing, env, &listener) {
         Ok(s) => s,
         // Esc / Ctrl-C: abort cleanly without writing.
         Err(WizardError::Aborted) => {
@@ -127,7 +138,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         Err(WizardError::Inquire(e)) => return Err(e.into()),
     };
 
-    let rendered = render(&settings, env);
+    let rendered = render(&settings, file_env.as_deref(), selection.environment());
 
     println!("\n──────── {} ────────", output.display());
     print!("{rendered}");
@@ -290,7 +301,11 @@ impl From<inquire::InquireError> for WizardError {
 /// a side-by-side deployment configured on the same host does not collide with
 /// the default one.
 #[allow(clippy::too_many_lines)] // a linear wizard; splitting it hurts readability
-fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, WizardError> {
+fn prompt_all(
+    existing: &Config,
+    environment: Option<&str>,
+    listener: &ListenerDefaults,
+) -> Result<Settings, WizardError> {
     let mut s = Settings::default();
 
     // ── Logging ───────────────────────────────────────────────────────────
@@ -372,15 +387,33 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
         )
         .prompt()?;
     if enable_helper {
+        println!("  {}", listener.note);
+        // An existing explicit socket that another environment now owns is
+        // not offered again (the daemon would refuse it).
+        let existing_socket = existing.helper.socket.as_deref().filter(|p| {
+            let ok = listener.check(&p.to_string_lossy()).is_ok();
+            if !ok {
+                println!(
+                    "  (the current helper.socket {} is the well-known address, which another \
+                     environment now owns — suggesting this environment's own address)",
+                    p.display()
+                );
+            }
+            ok
+        });
+        let not_claimed = listener.clone();
         let socket = Text::new("Helper listener (Unix socket path / Windows pipe name):")
             .with_default(&path_default(
-                existing.helper.socket.as_deref(),
-                default_socket(environment),
+                existing_socket,
+                listener.default.display().to_string(),
             ))
-            .with_help_message("blank ⇒ the platform default for this environment")
+            .with_help_message(
+                "blank or the suggested default ⇒ left unset, following the platform default",
+            )
             .with_validator(literal_validator)
+            .with_validator(move |input: &str| to_validation(not_claimed.check(input)))
             .prompt()?;
-        s.helper_socket = non_empty(socket);
+        s.helper_socket = listener.normalize(non_empty(socket));
 
         // Socket mode is Unix-only; on Windows the pipe DACL governs access.
         #[cfg(not(windows))]
@@ -470,10 +503,13 @@ fn prompt_all(existing: &Config, environment: Option<&str>) -> Result<Settings, 
                 spki_pin: s.cmis_spki_pin.clone(),
             };
             if let Ok(Some(resolver)) = crate::endpoint::CmisResolver::from_config(&cfg) {
-                let fetch = Confirm::new(&format!("Fetch this key from {} now?", resolver.describe()))
-                    .with_default(true)
-                    .with_help_message("downloads the CMIS enrollment public key over pinned TLS")
-                    .prompt()?;
+                let fetch =
+                    Confirm::new(&format!("Fetch this key from {} now?", resolver.describe()))
+                        .with_default(true)
+                        .with_help_message(
+                            "downloads the CMIS enrollment public key over pinned TLS",
+                        )
+                        .prompt()?;
                 if fetch {
                     match fetch_enrollment_key_to(&resolver, Path::new(key_path)) {
                         Ok(()) => println!("  ✓ wrote {key_path}"),
@@ -597,14 +633,96 @@ fn env_filename(name: &str, environment: Option<&str>) -> String {
     }
 }
 
-/// The default helper listener address for `environment`, as the prompt and
-/// placeholder text. The address itself comes from
-/// [`crate::config::default_helper_socket`] — the one the daemon binds when
+/// The default helper listener address for `environment` under the host's
+/// selected default environment (`selected_default`, `None` ⇒ `mia.toml`), as
+/// the prompt and placeholder text. The address itself comes from
+/// [`crate::config::default_helper_address`] — the one the daemon binds when
 /// `helper.socket` is unset — so the wizard never suggests a different path.
-fn default_socket(environment: Option<&str>) -> String {
-    crate::config::default_helper_socket(environment)
+fn default_socket(environment: Option<&str>, selected_default: Option<&str>) -> String {
+    crate::config::default_helper_address(environment, selected_default)
         .display()
         .to_string()
+}
+
+/// The helper-listener prompt's view of the host's default environment
+/// ([`crate::default_env`]) for the environment being configured.
+#[derive(Debug, Clone)]
+pub(crate) struct ListenerDefaults {
+    /// What the daemon binds for this environment when `helper.socket` is
+    /// unset.
+    default: PathBuf,
+    /// The selected default environment when it is *another* one: the
+    /// well-known address is then off-limits here.
+    claimed_by: Option<String>,
+    /// One line for the operator: who owns the well-known address, and why.
+    note: String,
+}
+
+impl ListenerDefaults {
+    /// The defaults for `environment` (`None` ⇒ `mia.toml`) under `selection`.
+    pub(crate) fn new(
+        environment: Option<&str>,
+        selection: &crate::default_env::DefaultSelection,
+    ) -> Self {
+        let default = crate::config::default_helper_address(environment, selection.environment());
+        let well_known = crate::config::default_helper_socket(None);
+        let owner = selection
+            .environment()
+            .map_or_else(|| "mia.toml".to_string(), |e| format!("`{e}`"));
+        let role = if selection.is_default(environment) {
+            format!(
+                "this environment serves the well-known address {}",
+                well_known.display()
+            )
+        } else {
+            format!(
+                "the well-known address {} is not this environment's; its default is {}",
+                well_known.display(),
+                default.display()
+            )
+        };
+        Self {
+            claimed_by: selection
+                .environment()
+                .filter(|_| !selection.is_default(environment))
+                .map(str::to_owned),
+            note: format!(
+                "Default environment: {owner} ({}) — {role}.",
+                selection.source()
+            ),
+            default,
+        }
+    }
+
+    /// Refuse an answer that names the well-known address while another
+    /// environment is the selected default (the daemon would refuse it too).
+    fn check(&self, input: &str) -> Result<(), String> {
+        let Some(owner) = &self.claimed_by else {
+            return Ok(());
+        };
+        let t = input.trim();
+        if !t.is_empty()
+            && crate::default_env::same_helper_address(
+                Path::new(t),
+                &crate::config::default_helper_socket(None),
+            )
+        {
+            return Err(format!(
+                "this is the well-known default helper address, which belongs to the default \
+                 environment `{owner}`; leave it blank to use {}",
+                self.default.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `helper.socket` value to write for `answer`: `None` when it is just
+    /// this environment's default, so the file keeps following the platform
+    /// default (and a later change of the default environment) instead of
+    /// pinning today's path.
+    fn normalize(&self, answer: Option<String>) -> Option<String> {
+        answer.filter(|v| !crate::default_env::same_helper_address(Path::new(v), &self.default))
+    }
 }
 
 /// A file alongside the system config directory (e.g. the allowlist), as a
@@ -834,7 +952,11 @@ pub(crate) fn load_existing(path: &Path) -> Config {
 /// set are active assignments; everything else stays as a commented template
 /// line so the file remains a reference.
 #[allow(clippy::too_many_lines)] // a flat sequence of TOML-emitting blocks.
-pub(crate) fn render(s: &Settings, environment: Option<&str>) -> String {
+pub(crate) fn render(
+    s: &Settings,
+    environment: Option<&str>,
+    selected_default: Option<&str>,
+) -> String {
     use std::fmt::Write as _;
 
     // A quoted (TOML literal-string) value line, or a commented placeholder.
@@ -877,7 +999,11 @@ pub(crate) fn render(s: &Settings, environment: Option<&str>) -> String {
          # The agent resolves it, prefers records by priority/weight, dials the best\n\
          # live node, and fails over automatically. The pin below authenticates them all.\n",
     );
-    out.push_str(&str_line(s.cmis_srv.as_deref(), "srv", "_cmis._tcp.example.com"));
+    out.push_str(&str_line(
+        s.cmis_srv.as_deref(),
+        "srv",
+        "_cmis._tcp.example.com",
+    ));
     out.push_str("# Accepted CMIS SPKI pin (lowercase-hex SHA-384).\n");
     out.push_str(&str_line(
         s.cmis_spki_pin.as_deref(),
@@ -895,11 +1021,13 @@ pub(crate) fn render(s: &Settings, environment: Option<&str>) -> String {
         "#enable = true\n"
     });
     out.push_str("# Listener address: a Unix socket path (Linux/macOS) or a named-pipe name\n");
-    out.push_str("# (Windows). Default: the platform path for this environment, shown here.\n");
+    out.push_str("# (Windows). Default: the platform path for this environment, shown here —\n");
+    out.push_str("# the well-known address if it is the host's default environment\n");
+    out.push_str("# (environments.toml / FERROGATE_DEFAULT_ENVIRONMENT).\n");
     out.push_str(&str_line(
         s.helper_socket.as_deref(),
         "socket",
-        &default_socket(environment),
+        &default_socket(environment, selected_default),
     ));
     out.push_str("# Unix only. Octal socket mode. Default: 660.\n");
     out.push_str(&str_line(
@@ -1221,7 +1349,7 @@ mod tests {
             allowlist_max_age: Some("3600".into()),
             ..Settings::default()
         };
-        let out = render(&s, None);
+        let out = render(&s, None, None);
         assert!(out.contains("\nlog = 'info'\n"));
         assert!(out.contains("\nsocket = '/run/ferrogate/mia.sock'\n"));
         // Integer key is unquoted.
@@ -1277,11 +1405,54 @@ mod tests {
     }
 
     #[test]
+    fn listener_defaults_follow_the_default_environment() {
+        use crate::default_env::DefaultSelection;
+        let unset = DefaultSelection::unset();
+        let prod = DefaultSelection::resolve(
+            Path::new("/nonexistent/environments.toml"),
+            Some("prod".into()),
+        )
+        .unwrap();
+        let well_known = crate::config::default_helper_socket(None);
+        let wk = well_known.display().to_string();
+
+        // No selection: mia.toml's default is the well-known address, and
+        // accepting the suggestion leaves helper.socket unset.
+        let l = ListenerDefaults::new(None, &unset);
+        assert_eq!(l.default, well_known);
+        assert!(l.check(&wk).is_ok());
+        assert_eq!(l.normalize(Some(wk.clone())), None);
+        assert_eq!(
+            l.normalize(Some("/tmp/x.sock".into())),
+            Some("/tmp/x.sock".into())
+        );
+
+        // prod selected: prod is offered the well-known address…
+        let l = ListenerDefaults::new(Some("prod"), &prod);
+        assert_eq!(l.default, well_known);
+        assert!(l.check(&wk).is_ok());
+        // …and mia.toml yields: it may not claim it, and is told why.
+        let l = ListenerDefaults::new(None, &prod);
+        assert_eq!(l.default, crate::config::yielded_helper_socket());
+        assert!(l.check(&wk).is_err());
+        assert!(l.check("").is_ok());
+        assert!(l.note.contains("`prod`"), "{}", l.note);
+
+        // The rendered placeholder is the address the daemon would bind.
+        let out = render(&Settings::default(), None, Some("prod"));
+        let expected = format!(
+            "#socket = '{}'",
+            crate::config::yielded_helper_socket().display()
+        );
+        assert!(out.contains(&expected), "{out}");
+    }
+
+    #[test]
     fn default_socket_is_environment_scoped() {
         // The default-environment socket is unsuffixed; a selector suffixes it
         // so two daemons don't bind the same path.
-        let default = default_socket(None);
-        let staging = default_socket(Some("staging"));
+        let default = default_socket(None, None);
+        let staging = default_socket(Some("staging"), None);
         assert_ne!(default, staging);
         assert!(staging.contains("staging"));
         // The wizard suggests exactly what the daemon binds when unset.
@@ -1295,7 +1466,7 @@ mod tests {
     fn render_writes_the_helper_switch_only_when_off() {
         // Default (on): a commented placeholder; the file parses as enabled
         // and serves the default socket.
-        let on = render(&Settings::default(), None);
+        let on = render(&Settings::default(), None, None);
         assert!(on.contains("\n#enable = true\n"), "{on}");
         let parsed = Config::from_toml(&on).unwrap();
         assert!(parsed.helper_enabled());
@@ -1308,13 +1479,13 @@ mod tests {
             helper_enable: Some(true),
             ..Settings::default()
         };
-        assert_eq!(render(&s, None), on);
+        assert_eq!(render(&s, None, None), on);
         // Off: written as an active key, and the file parses as disabled.
         let s = Settings {
             helper_enable: Some(false),
             ..Settings::default()
         };
-        let off = render(&s, None);
+        let off = render(&s, None, None);
         assert!(off.contains("\nenable = false\n"), "{off}");
         let parsed = Config::from_toml(&off).unwrap();
         assert!(!parsed.helper_enabled());
@@ -1325,7 +1496,7 @@ mod tests {
     fn render_environment_scopes_the_socket_placeholder() {
         // With a selector and no explicit socket, the commented placeholder
         // carries the env-suffixed default.
-        let out = render(&Settings::default(), Some("staging"));
+        let out = render(&Settings::default(), Some("staging"), None);
         assert!(out.contains("staging"), "{out}");
     }
 
@@ -1346,7 +1517,7 @@ mod tests {
             carried: Carried::from_existing(&existing),
             ..Settings::default()
         };
-        let out = render(&s, None);
+        let out = render(&s, None, None);
         let back = Config::from_toml(&out).expect("rendered TOML parses");
         assert_eq!(back.helper.socket_gid.as_deref(), Some("991"));
         assert_eq!(back.helper.require_authenticode, Some(false));
@@ -1355,7 +1526,7 @@ mod tests {
         assert_eq!(back.status, existing.status);
         assert_eq!(back.attestation.backend, crate::config::AttestBackend::Tpm);
         // Nothing carried ⇒ none of the extra tables appear.
-        let plain = render(&Settings::default(), None);
+        let plain = render(&Settings::default(), None, None);
         assert!(!plain.contains("[status]") && !plain.contains("[attestation.tpm]"));
         assert!(plain.contains("#backend = 'auto'"));
     }

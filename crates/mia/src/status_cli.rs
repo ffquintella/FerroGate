@@ -317,6 +317,8 @@ pub fn not_running_snapshots(environment: Option<&str>) -> Vec<StatusSnapshot> {
                 message: crate::status::message_for(code).to_string(),
             }),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            // A stopped agent serves no address.
+            default_address: false,
         })
         .collect()
 }
@@ -385,6 +387,9 @@ pub fn render_human(snapshots: &[StatusSnapshot], now: i64) -> String {
             s.state.as_str(),
             human_duration(now - s.since)
         );
+        if s.default_address {
+            out.push_str("  helper:       serves the well-known default helper address\n");
+        }
         if let Some(e) = &s.last_error {
             let _ = writeln!(out, "  problem:      {} ({})", e.message, e.code);
         }
@@ -519,10 +524,15 @@ mod tests {
         s.last_error = None;
         s.crl_age_secs = Some(42);
         s.cmis_node = Some("cmis1:8443".into());
-        let out = render_human(&[s], unix_now());
+        let out = render_human(&[s.clone()], unix_now());
         assert!(out.contains("[prod] healthy"));
         assert!(out.contains("crl age:      42s"));
         assert!(out.contains("cmis node:    cmis1:8443"));
+        // Only the environment on the well-known address is marked.
+        assert!(!out.contains("well-known"));
+        s.default_address = true;
+        let out = render_human(&[s], unix_now());
+        assert!(out.contains("helper:       serves the well-known default helper address"));
     }
 
     #[test]

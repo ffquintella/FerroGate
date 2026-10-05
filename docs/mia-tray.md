@@ -31,6 +31,28 @@ the worst state, and **Open status**, **Setup…**, **Logs…**, **Run self-test
 and **Quit**. A `last_error.code` the tray does not know (a newer daemon) is
 shown generically, with "Run self-test" offered.
 
+**The default environment.** The environment that serves the helper API's
+well-known address — `mia.sock` / `\\.\pipe\ferrogate-mia`, the one local
+applications reach without configuration (see
+[the default environment](mia.md#default-environment-who-serves-the-well-known-address))
+— is marked **[default address]** in its submenu title and in the Status
+window, with a "Helper API: serves the well-known default address" line. Every
+other environment's submenu and Status block offer:
+
+- **Set as default environment** (a named environment) —
+  `mia default-environment set <env>`;
+- **Use mia.toml as default** (the `mia.toml` environment) —
+  `mia default-environment clear`.
+
+Both need administrator approval and change `environments.toml` in the system
+config directory; the agent applies the change when it restarts, so the tray
+then says to restart the service (Recovery → **Restart the service**). Until
+the restart the marker stays where the agent actually serves the address. No
+action is offered while the agent is not reachable, for the environment that
+already has the address, or for an environment named `default` (reserved). The
+marker comes from the daemon's `default_address` field; an older agent does not
+send it, so nothing is marked.
+
 **Notifications** fire only on transitions that need a human — healthy → any
 degraded/broken/absent state, entering `svid_expiring`, entering `crl_stale` —
 never for the state the tray starts in. Each (environment, kind) is
@@ -90,6 +112,8 @@ or typed text.
 | Start / stop / restart the service | Linux `systemctl start\|stop\|restart mia.service`; macOS `launchctl bootstrap system …/com.ferrogate.mia.plist` / `bootout system/com.ferrogate.mia` / `kickstart -k system/com.ferrogate.mia`; Windows `mia service start\|stop`, `Restart-Service -Name mia` | administrator |
 | Resync the allowlist | `mia resync-allowlist --reload [-e <env>]` | administrator |
 | Re-fetch the enrollment key | `mia refresh-key [-e <env>]` | administrator |
+| Set as default environment | `mia default-environment set <env>` (for the default `mia.toml` environment: `mia default-environment clear`) | administrator |
+| Use mia.toml as default | `mia default-environment clear` | administrator |
 | Apply the configuration (system file) | `mia setup --apply <draft> --json [-e <env>] [--reload] [--fetch-enrollment-key]` | administrator |
 
 "Administrator" means the platform's consent prompt; the tray never sees, asks

@@ -94,11 +94,18 @@ pub enum Action {
     ResyncAllowlist,
     /// `mia refresh-key` (admin).
     RefreshKey,
+    /// `mia default-environment set <env>` (admin): hand the helper API's
+    /// well-known address to `<env>`. For the `mia.toml` environment (no
+    /// name) it is `mia default-environment clear` — the same outcome.
+    SetDefaultEnvironment,
+    /// `mia default-environment clear` (admin): `mia.toml` serves the
+    /// well-known address again.
+    ClearDefaultEnvironment,
 }
 
 impl Action {
     /// Every action, in display order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::RunSelfTest,
         Self::ShowMachineId,
         Self::ShowStatus,
@@ -107,6 +114,8 @@ impl Action {
         Self::ServiceRestart,
         Self::ResyncAllowlist,
         Self::RefreshKey,
+        Self::SetDefaultEnvironment,
+        Self::ClearDefaultEnvironment,
     ];
 
     /// Read-only actions run as the user; the rest need consent.
@@ -118,7 +127,9 @@ impl Action {
             | Self::ServiceStop
             | Self::ServiceRestart
             | Self::ResyncAllowlist
-            | Self::RefreshKey => Privilege::Admin,
+            | Self::RefreshKey
+            | Self::SetDefaultEnvironment
+            | Self::ClearDefaultEnvironment => Privilege::Admin,
         }
     }
 
@@ -127,7 +138,21 @@ impl Action {
     pub fn takes_environment(self) -> bool {
         matches!(
             self,
-            Self::RunSelfTest | Self::ShowStatus | Self::ResyncAllowlist | Self::RefreshKey
+            Self::RunSelfTest
+                | Self::ShowStatus
+                | Self::ResyncAllowlist
+                | Self::RefreshKey
+                | Self::SetDefaultEnvironment
+        )
+    }
+
+    /// Whether a successful run only takes effect when the service restarts
+    /// (the default environment is read at startup).
+    #[must_use]
+    pub fn applies_on_restart(self) -> bool {
+        matches!(
+            self,
+            Self::SetDefaultEnvironment | Self::ClearDefaultEnvironment
         )
     }
 
@@ -143,6 +168,8 @@ impl Action {
             Self::ServiceRestart => Msg::ActionServiceRestart,
             Self::ResyncAllowlist => Msg::ActionResyncAllowlist,
             Self::RefreshKey => Msg::ActionRefreshKey,
+            Self::SetDefaultEnvironment => Msg::ActionSetDefaultEnvironment,
+            Self::ClearDefaultEnvironment => Msg::ActionClearDefaultEnvironment,
         }
     }
 
@@ -283,6 +310,19 @@ pub fn invocation(action: Action, env: Option<&EnvName>, os: Os) -> Invocation {
             let mut a = strings(&["refresh-key"]);
             env_args(&mut a, env);
             (Program::Mia, a)
+        }
+        // The name is a positional argument here; an `EnvName` never starts
+        // with `-`, so `mia` cannot read it as an option.
+        (Action::SetDefaultEnvironment, _) => match env {
+            Some(e) => {
+                let mut a = strings(&["default-environment", "set"]);
+                a.push(e.as_str().to_string());
+                (Program::Mia, a)
+            }
+            None => (Program::Mia, strings(&["default-environment", "clear"])),
+        },
+        (Action::ClearDefaultEnvironment, _) => {
+            (Program::Mia, strings(&["default-environment", "clear"]))
         }
         (Action::ServiceStart, Os::Linux) => {
             (Program::Systemctl, strings(&["start", "mia.service"]))
@@ -1260,6 +1300,85 @@ mod tests {
         }
         let long = "a".repeat(mia_status_proto::MAX_ENVIRONMENT_LEN + 1);
         assert!(EnvName::parse(&long).is_err());
+    }
+
+    #[test]
+    fn default_environment_actions_are_fixed_elevated_command_lines() {
+        let prod = EnvName::parse("prod").unwrap();
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
+            let set = invocation(Action::SetDefaultEnvironment, Some(&prod), os);
+            assert_eq!(set.program, Program::Mia);
+            assert_eq!(set.args, ["default-environment", "set", "prod"]);
+            assert_eq!(set.privilege, Privilege::Admin);
+            assert_eq!(set.limits, Limits::ELEVATED);
+            assert_eq!(set.purpose, Msg::ActionSetDefaultEnvironment);
+            // "Set as default" for mia.toml (no name) is a clear.
+            let to_main = invocation(Action::SetDefaultEnvironment, None, os);
+            assert_eq!(to_main.args, ["default-environment", "clear"]);
+            // Clear never takes a name, even when one is offered.
+            let clear = invocation(Action::ClearDefaultEnvironment, Some(&prod), os);
+            assert_eq!(clear.args, ["default-environment", "clear"]);
+            assert_eq!(clear.privilege, Privilege::Admin);
+        }
+        assert!(Action::SetDefaultEnvironment.takes_environment());
+        assert!(!Action::ClearDefaultEnvironment.takes_environment());
+        assert!(Action::SetDefaultEnvironment.applies_on_restart());
+        assert!(Action::ClearDefaultEnvironment.applies_on_restart());
+        assert!(!Action::ServiceRestart.applies_on_restart());
+
+        // Through each consent wrapper the name stays one argv item.
+        let t = tools(true);
+        let mia = t.mia.clone().unwrap().path.display().to_string();
+        let inv = invocation(Action::SetDefaultEnvironment, Some(&prod), Os::Linux);
+        let s = spec(&inv, Os::Linux, &t).unwrap();
+        assert_eq!(s.program, PathBuf::from(PKEXEC));
+        assert_eq!(
+            os_args(&s),
+            [mia.as_str(), "default-environment", "set", "prod"]
+        );
+        let s = spec(&inv, Os::MacOs, &t).unwrap();
+        assert_eq!(
+            os_args(&s)[16..],
+            [
+                prompt_text(&inv).as_str(),
+                mia.as_str(),
+                "default-environment",
+                "set",
+                "prod"
+            ]
+        );
+        let s = spec(&inv, Os::Windows, &t).unwrap();
+        assert_eq!(
+            s.env[1],
+            (
+                WIN_ARGS_VAR.to_string(),
+                OsString::from("default-environment set prod")
+            )
+        );
+        // An untrusted mia is never elevated for it.
+        assert_eq!(
+            spec(&inv, Os::Linux, &tools(false)),
+            Err(ActionError::MiaUntrusted)
+        );
+        // Names that could inject an option, a second argument or shell
+        // syntax never become an EnvName, so never reach the command line.
+        for bad in [
+            "prod --json",
+            "prod;id",
+            "$(id)",
+            "`id`",
+            "--output",
+            "-e",
+            "a\"b",
+            "a'b",
+            "prod\nclear",
+        ] {
+            assert_eq!(
+                EnvName::parse(bad),
+                Err(ActionError::BadEnvironment),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

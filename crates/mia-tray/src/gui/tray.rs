@@ -382,6 +382,13 @@ impl TrayController {
                     None => Msg::ErrorUnexpectedOutput.text(lang).to_string(),
                 }
             }
+            Ok(r) if r.outcome == Outcome::Succeeded && done.action.applies_on_restart() => {
+                format!(
+                    "{}. {}",
+                    r.outcome.label().text(lang),
+                    Msg::NoteRestartToApply.text(lang)
+                )
+            }
             Ok(r) => r.outcome.label().text(lang).to_string(),
             Err(e) => e.message().text(lang).to_string(),
         };

@@ -286,6 +286,7 @@ struct EnvStatus {
     crl: Option<Arc<CrlCache>>,
     allowlist: AllowlistLoad,
     x509_store: Option<StoreBackend>,
+    default_address: bool,
     last_state: Option<AgentState>,
     since: i64,
 }
@@ -322,6 +323,7 @@ impl StatusHandle {
                 crl: None,
                 allowlist: AllowlistLoad::Missing,
                 x509_store: None,
+                default_address: false,
                 last_state: None,
                 since: now,
             })),
@@ -354,6 +356,12 @@ impl StatusHandle {
     /// Record the backend actually used (after `auto` is resolved).
     pub fn set_attest_backend(&self, backend: crate::config::AttestBackend) {
         self.with(|s| s.attest_backend = wire_backend(backend));
+    }
+
+    /// Whether this environment serves the well-known default helper address
+    /// (it is the host's default environment and binds that address).
+    pub fn set_default_address(&self, serves: bool) {
+        self.with(|s| s.default_address = serves);
     }
 
     /// An attestation attempt started.
@@ -454,6 +462,7 @@ impl StatusHandle {
                 x509_store: s.x509_store,
                 last_error,
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                default_address: s.default_address,
             }
         })
     }
