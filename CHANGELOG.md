@@ -25,6 +25,23 @@ record them.
 
 ## [Unreleased]
 
+### Added
+
+- Add `mia allowlist-diagnose` to explain why a local caller is or is not permitted by the host's signed allowlist (S32)
+  A caller the allowlist refuses only saw an opaque `permission_denied`.
+  `mia allowlist-diagnose (--exe <path> | --sha384 <hex>) [--uid <n>]
+  [-c <config> | -e <env>] [--json]` replays the allowlist decision offline.
+  It checks the allowlist file, `allowlist.key`, the signature, validity and
+  trust domain, an entry for the uid (ADR-0002), an entry for the binary hash,
+  and the verdict of the helper's own `permits()` check. It stops at the first
+  blocking cause with a remediation hint. When the hash is not listed, it shows
+  the listed binaries by their first 12 hex characters, so a hash left stale by
+  an upgrade stands out. `--exe` hashes through the same `bin_sha384` the
+  helper's authenticators now share, and `mia`'s own binary is reported as
+  self-trusted. The command is read-only and contacts neither CMIS nor the
+  daemon. It never prints key material. It exits `0` permitted, `1` denied or
+  `2` on a usage or I/O error.
+
 ## [0.26.0] - 2026-10-06
 
 ### Added

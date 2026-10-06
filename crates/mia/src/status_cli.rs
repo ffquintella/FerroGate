@@ -379,7 +379,8 @@ fn ima_blocks_startup() -> bool {
     false
 }
 
-fn unix_now() -> i64 {
+/// The current time, Unix seconds (`0` if the clock is before the epoch).
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -480,7 +481,7 @@ fn relative(delta: i64) -> String {
 }
 
 /// A compact duration: `42s`, `5m`, `3h12m`, `2d4h`.
-fn human_duration(secs: i64) -> String {
+pub(crate) fn human_duration(secs: i64) -> String {
     let secs = secs.max(0);
     match secs {
         s if s < 60 => format!("{s}s"),

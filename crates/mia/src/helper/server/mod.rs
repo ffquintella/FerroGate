@@ -181,12 +181,10 @@ impl<A: CallerAuth> Shared<A> {
 ///
 /// Computed at startup, before any hardening sandbox can cut off access to the
 /// executable. Returns `None` on any failure to resolve or read the path; the
-/// self-trust shortcut is then simply inert.
+/// self-trust shortcut is then simply inert. Shared with `mia
+/// allowlist-diagnose` via [`crate::helper::auth::running_exe_sha384`].
 fn running_exe_sha() -> Option<[u8; 48]> {
-    use sha2::{Digest, Sha384};
-    let path = std::env::current_exe().ok()?;
-    let bytes = std::fs::read(path).ok()?;
-    Some(Sha384::digest(&bytes).into())
+    crate::helper::auth::running_exe_sha384()
 }
 
 /// A cheap, clonable handle that swaps the live allowlist while the server is

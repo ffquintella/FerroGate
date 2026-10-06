@@ -75,7 +75,9 @@ caller's identity from kernel-attested sources:
    (`allowlist-<env>.cbor` for a named environment) beside the system
    `mia.toml`; the verification key `allowlist.key` has no default, and
    without it every caller is denied — see
-   [mia.md](mia.md#allowlist-default-location).
+   [mia.md](mia.md#allowlist-default-location). To learn why a given caller
+   is refused, run `mia allowlist-diagnose --exe <path> --uid <uid>` (see
+   [allowlist-provisioning.md](allowlist-provisioning.md#diagnosing-a-refused-caller-mia-allowlist-diagnose)).
 
    The on-disk artefact is a CBOR `SignedAllowlist`: a canonical-CBOR
    `AllowlistDoc` body (`trust_domain`, `issued_at`, `not_after`, `entries`)

@@ -197,6 +197,32 @@ pub fn cross_check_ima(
     }
 }
 
+/// `SHA-384` of a caller binary's image bytes — the allowlist's `bin_sha`.
+///
+/// Every platform authenticator hashes the caller's image with this, as do the
+/// daemon's self-trust probe ([`running_exe_sha384`]) and the offline
+/// `mia allowlist-diagnose`, so an operator's diagnosis computes exactly the
+/// digest the helper API matches against the allowlist. (On Linux the helper
+/// additionally requires this digest to equal the IMA measurement.)
+#[must_use]
+pub fn bin_sha384(image: &[u8]) -> [u8; 48] {
+    use sha2::{Digest as _, Sha384};
+    Sha384::digest(image).into()
+}
+
+/// [`bin_sha384`] of this process's own executable, or `None` when its path or
+/// bytes cannot be read.
+///
+/// The daemon computes it once at startup as its self-trust hash (see
+/// `docs/helper-api.md`, "`mia` self-trust"): a caller whose `bin_sha` equals
+/// it is `mia` itself and is permitted without consulting the allowlist.
+#[must_use]
+pub fn running_exe_sha384() -> Option<[u8; 48]> {
+    let path = std::env::current_exe().ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    Some(bin_sha384(&bytes))
+}
+
 /// Result of a failed [`cross_check_ima`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MismatchOutcome {
@@ -211,8 +237,7 @@ pub use windows_auth::WindowsCallerAuth;
 
 #[cfg(windows)]
 mod windows_auth {
-    use super::{AuthError, CallerAuth, CallerIdentity, PeerCred};
-    use sha2::{Digest, Sha384};
+    use super::{bin_sha384, AuthError, CallerAuth, CallerIdentity, PeerCred};
 
     /// The production Windows caller authenticator.
     ///
@@ -259,7 +284,7 @@ mod windows_auth {
             let path = ferro_winauth::process_image_path(pid)
                 .map_err(|_| AuthError::ImageUnreadable { partial })?;
             let bytes = std::fs::read(&path).map_err(|_| AuthError::ImageUnreadable { partial })?;
-            let bin_sha: [u8; 48] = Sha384::digest(&bytes).into();
+            let bin_sha = bin_sha384(&bytes);
 
             let uid = ferro_winauth::process_user_rid(pid)
                 .map_err(|_| AuthError::ImageUnreadable { partial })?;
@@ -288,8 +313,7 @@ pub use macos_auth::MacCallerAuth;
 
 #[cfg(target_os = "macos")]
 mod macos_auth {
-    use super::{AuthError, CallerAuth, CallerIdentity, PeerCred};
-    use sha2::{Digest, Sha384};
+    use super::{bin_sha384, AuthError, CallerAuth, CallerIdentity, PeerCred};
 
     /// The macOS caller authenticator: `getpeereid`/`LOCAL_PEERPID` peer
     /// credentials plus an on-disk image hash.
@@ -329,7 +353,7 @@ mod macos_auth {
             let path = libproc::proc_pid::pidpath(pid_i32)
                 .map_err(|_| AuthError::ExeUnreadable { partial })?;
             let bytes = std::fs::read(&path).map_err(|_| AuthError::ExeUnreadable { partial })?;
-            let bin_sha: [u8; 48] = Sha384::digest(&bytes).into();
+            let bin_sha = bin_sha384(&bytes);
 
             Ok(CallerIdentity {
                 pid,
@@ -346,8 +370,7 @@ pub use linux::ImaCallerAuth;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{AuthError, CallerAuth, CallerIdentity, MismatchOutcome, PeerCred};
-    use sha2::{Digest, Sha384};
+    use super::{bin_sha384, AuthError, CallerAuth, CallerIdentity, MismatchOutcome, PeerCred};
     use std::path::PathBuf;
 
     /// Default location of the IMA runtime measurement log.
@@ -424,7 +447,7 @@ mod linux {
             // running process was loaded from, even if the on-disk name moved.
             let contents =
                 std::fs::read(&exe_link).map_err(|_| AuthError::ExeUnreadable { partial })?;
-            let disk_sha: [u8; 48] = Sha384::digest(&contents).into();
+            let disk_sha = bin_sha384(&contents);
 
             // IMA not enforced on this host: trust the hash of the loaded binary
             // (read through /proc/<pid>/exe) without a measurement-log cross-check.
@@ -532,6 +555,17 @@ mod tests {
         assert_eq!(
             cross_check_ima(&h, "/usr/bin/foo", "").unwrap_err(),
             MismatchOutcome::Missing
+        );
+    }
+
+    /// `bin_sha384` is plain file-content SHA-384 (FIPS 180-2 "abc" vector), so
+    /// it matches `openssl dgst -sha384` and `ferrogate allowlist --bin`.
+    #[test]
+    fn bin_sha384_is_file_content_sha384() {
+        assert_eq!(
+            hex::encode(bin_sha384(b"abc")),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+             8086072ba1e7cc2358baeca134c825a7"
         );
     }
 

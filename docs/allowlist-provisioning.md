@@ -193,6 +193,46 @@ or parse, the daemon stays up but logs a fail-closed line ending in
 `helper API denies all callers (fail closed)` — it never crashes over trust
 problems, so the helper socket remains bound and the deny is diagnosable.
 
+### Diagnosing a refused caller: `mia allowlist-diagnose`
+
+A caller the allowlist does not admit only sees `permission_denied` (the audit
+log records `not-allowlisted`). `mia allowlist-diagnose` replays the allowlist
+half of that decision offline for one caller and says why:
+
+```console
+$ sudo mia allowlist-diagnose --exe /usr/bin/foo --uid 1001
+$ sudo mia allowlist-diagnose --sha384 <hex> -e staging --json
+```
+
+It checks, in order, and stops at the first blocking cause with a remediation
+hint: (1) the allowlist body (`allowlist.path` or its default), (2)
+`allowlist.key`, (3) the signature, (4) validity and trust domain, (5) an entry
+admitting the uid (entries may omit the uid, ADR-0002), (6) an entry covering
+the binary hash, and (7) the verdict of the same `permits()` check the helper
+runs. When no entry covers the binary, it lists the binaries that are
+allowlisted by their first 12 hex characters, so a hash left stale by an
+upgrade stands out. Files are read and verified exactly as the daemon reads
+them.
+
+- `--exe <path>` hashes the file as the helper hashes a caller (SHA-384 of the
+  executable). For a script, pass its interpreter: the kernel runs the
+  interpreter, so that is what the helper sees. `--sha384 <hex>` takes a
+  precomputed hash instead.
+- `--uid <n>` defaults to the uid running the command. On Windows the uid is
+  the user SID's RID.
+- `--config` / `--environment` select the configuration as for `mia test`.
+  `--json` prints one document with a stable `cause` code.
+- `mia`'s own binary is reported as self-trusted: the daemon permits it without
+  the allowlist.
+
+Exit status: `0` permitted, `1` denied (the cause is reported), `2` usage or
+I/O error. The command is read-only. It never contacts CMIS or the daemon, and
+it writes nothing. It prints only the caller's own hash, 12-character prefixes
+of listed hashes, uids and the key's short fingerprint, never key material.
+The allowlist is often readable by root only, so run it with `sudo`. It covers
+the allowlist gate only: caller authentication (IMA, Authenticode), the host
+SVID and the CRL are exercised by `mia test`.
+
 ### Unattended / configuration management
 
 `mia setup` requires a TTY. For automated provisioning, either deliver
@@ -224,6 +264,7 @@ so `mia allowlist-key fetch --reload` needs no restart either. (Windows has no
 | `allowlist verification failed: bad signature` (daemon serves deny-all) | wrong `allowlist.key`, or an allowlist signed by a different/rotated issuer (e.g. a CMIS redeploy changed the enrollment key) | Compare `mia allowlist-key show` with `ferrogate enrollment-key`; then `sudo mia allowlist-key fetch --rotate --expect-fingerprint <hex>` and `mia resync-allowlist --reload` |
 | `allowlist verification failed: expired` / `too old` (daemon serves deny-all) | `not_after` passed, or older than `max_age_secs` | Re-issue a fresh allowlist; check clock skew; restart the daemon |
 | fetch fails with a TLS/pin error | wrong or missing SPKI pin, unreachable endpoint | Re-verify the pin out of band; confirm the endpoint |
+| one caller gets `permission_denied` (audit reason `not-allowlisted`) while the allowlist loads | its uid or binary hash is not listed, e.g. a stale hash after an upgrade or a script whose interpreter is what runs | `sudo mia allowlist-diagnose --exe <path> --uid <uid>` names the cause and the `ferrogate allowlist add` entry to fix it |
 
 ## Storage & authorization
 

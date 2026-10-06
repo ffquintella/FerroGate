@@ -31,6 +31,10 @@
 /// verifies the signed caller allowlist).
 pub mod allowlist_key;
 
+/// `mia allowlist-diagnose`: explain, read-only and offline, why a local
+/// caller (uid + binary) is or is not permitted by the signed allowlist.
+pub mod allowlist_diagnose;
+
 pub mod audit_client;
 pub mod client;
 

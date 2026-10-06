@@ -86,6 +86,52 @@ fn seed(uid: Option<u32>) -> UidScope {
     }
 }
 
+/// Which uids a folded allowlist rule admits — the read-only form of a rule's
+/// uid gate, as exposed by [`Allowlist::rules`] for operator diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleUids {
+    /// Any uid (an entry with `uid = None`, ADR-0002).
+    Any,
+    /// Only these uids, ascending and distinct.
+    Only(Vec<u32>),
+}
+
+impl RuleUids {
+    /// Does this rule admit `uid`?
+    #[must_use]
+    pub fn admits(&self, uid: u32) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Only(uids) => uids.binary_search(&uid).is_ok(),
+        }
+    }
+}
+
+impl From<&UidScope> for RuleUids {
+    fn from(scope: &UidScope) -> Self {
+        match scope {
+            UidScope::Any => Self::Any,
+            UidScope::Only(uids) => {
+                let mut uids: Vec<u32> = uids.iter().copied().collect();
+                uids.sort_unstable();
+                Self::Only(uids)
+            }
+        }
+    }
+}
+
+/// One folded rule of a verified allowlist: a binary (or any binary) and the
+/// uids allowed to run it. Several entries for the same binary fold into one
+/// rule, exactly as [`Allowlist::permits`] sees them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowRule {
+    /// The binary hash the rule pins, or `None` for the any-binary wildcard
+    /// (`bin_sha = "*"`).
+    pub bin_sha: Option<[u8; 48]>,
+    /// The uids the rule admits.
+    pub uids: RuleUids,
+}
+
 /// Does `scope` admit `uid`?
 fn scope_admits(scope: Option<&UidScope>, uid: u32) -> bool {
     match scope {
@@ -183,6 +229,34 @@ impl Allowlist {
     #[must_use]
     pub fn entry_count(&self) -> usize {
         self.members.len() + usize::from(self.any_bin.is_some())
+    }
+
+    /// The folded rules this allowlist enforces: the any-binary wildcard (if
+    /// any) first, then one rule per pinned binary hash in ascending hash
+    /// order. A read-only view for operator diagnostics (`mia
+    /// allowlist-diagnose`); the helper API decides with [`Self::permits`],
+    /// which admits a caller exactly when some rule's binary is the caller's
+    /// (or the wildcard) and its [`RuleUids`] admits the caller's uid.
+    #[must_use]
+    pub fn rules(&self) -> Vec<AllowRule> {
+        let mut pinned: Vec<AllowRule> = self
+            .members
+            .iter()
+            .map(|(sha, scope)| AllowRule {
+                bin_sha: Some(*sha),
+                uids: scope.into(),
+            })
+            .collect();
+        pinned.sort_unstable_by_key(|rule| rule.bin_sha);
+        self.any_bin
+            .as_ref()
+            .map(|scope| AllowRule {
+                bin_sha: None,
+                uids: scope.into(),
+            })
+            .into_iter()
+            .chain(pinned)
+            .collect()
     }
 }
 
@@ -555,6 +629,59 @@ mod tests {
         assert!(al.permits(9, &[0xAA; 48])); // pinned uid+hash
         assert!(!al.permits(9, &[0xBB; 48])); // uid 9 not wildcard
         assert!(!al.permits(8, &[0xAA; 48])); // uid 8 listed nowhere
+    }
+
+    /// `rules()` folds entries exactly as `permits()` does: a caller passes
+    /// precisely when some rule covers its binary and admits its uid.
+    #[test]
+    fn rules_mirror_permits() {
+        let (sk, pk) = keypair();
+        let mut d = doc(1000);
+        d.entries = vec![
+            AllowEntry {
+                uid: Some(8),
+                bin_sha: hex::encode([0xBB; 48]),
+            },
+            AllowEntry {
+                uid: Some(7),
+                bin_sha: hex::encode([0xBB; 48]),
+            },
+            AllowEntry {
+                uid: None,
+                bin_sha: hex::encode([0xAA; 48]),
+            },
+            AllowEntry {
+                uid: Some(5),
+                bin_sha: BIN_SHA_WILDCARD.to_string(),
+            },
+        ];
+        let al = Allowlist::load(&signed_bytes(&d, &sk), &pk, 1000, 86_400).unwrap();
+        assert_eq!(
+            al.rules(),
+            vec![
+                AllowRule {
+                    bin_sha: None,
+                    uids: RuleUids::Only(vec![5]),
+                },
+                AllowRule {
+                    bin_sha: Some([0xAA; 48]),
+                    uids: RuleUids::Any,
+                },
+                AllowRule {
+                    bin_sha: Some([0xBB; 48]),
+                    uids: RuleUids::Only(vec![7, 8]),
+                },
+            ]
+        );
+        let rules = al.rules();
+        for uid in [0, 5, 7, 8, 9] {
+            for sha in [[0xAA; 48], [0xBB; 48], [0xCC; 48]] {
+                let by_rules = rules
+                    .iter()
+                    .any(|r| r.bin_sha.is_none_or(|pinned| pinned == sha) && r.uids.admits(uid));
+                assert_eq!(by_rules, al.permits(uid, &sha), "uid {uid}");
+            }
+        }
     }
 
     #[test]

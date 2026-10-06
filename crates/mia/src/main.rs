@@ -105,6 +105,9 @@ fn main() -> anyhow::Result<()> {
         Some("allowlist-key") => return mia::allowlist_key::run(&args[1..]),
         // Deprecated alias: `allowlist-key fetch --rotate --yes`.
         Some("refresh-key") => return mia::allowlist_key::run_refresh_key(&args[1..]),
+        // Explain why a caller is (not) allowlisted. Read-only and offline;
+        // exits 0 permitted, 1 denied, 2 usage/IO error.
+        Some("allowlist-diagnose") => std::process::exit(mia::allowlist_diagnose::run(&args[1..])),
         // Print this host's fingerprint-derived machine identity (the
         // `host/<uuid>` CMIS keys its allowlist and host SVID under). Read-only
         // and offline — no config, no CMIS, no daemon contact.
@@ -608,6 +611,8 @@ fn print_usage() {
          \x20 allowlist-key     fetch (root) or show allowlist.key, the CMIS enrollment\n\
          \x20                   key that verifies the signed allowlist\n\
          \x20 refresh-key       deprecated: allowlist-key fetch --rotate --yes\n\
+         \x20 allowlist-diagnose  explain why a caller (uid + binary) is or is not\n\
+         \x20                   permitted by the signed allowlist (read-only)\n\
          \x20 resync-allowlist  re-fetch this host's signed allowlist from CMIS\n\
          \x20 machine-id        print this host's fingerprint-derived machine identity\n\
          \x20 x509-svid         inspect the machine-bound X.509-SVID store\n\
