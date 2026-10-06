@@ -81,17 +81,51 @@ sdk_stage "$STAGE" publish
 
 # ── Publish ──────────────────────────────────────────────────────────────────
 #
-# `--workspace` publishes every member in dependency order in a single pass, and
-# verifies each packaged crate against its locally staged dependencies rather
-# than waiting for the registry index to catch up between uploads. Already
-# published versions are skipped, so a re-run after a partial failure is safe.
+# Dry run: `--workspace` packages every member in dependency order and verifies
+# each against its locally staged dependencies, so nothing has to exist in the
+# registry yet.
+#
+# Real publish: one crate at a time, in dependency order (SDK_CRATES). A
+# single `--workspace` pass is not re-runnable — cargo aborts with "already
+# exists" on the first crate a previous attempt uploaded, and it gives up when
+# the registry index lags behind an upload ("timeout while waiting for published
+# dependencies"). Publishing per crate lets a re-run skip what is already
+# there and retry a crate whose dependency is not indexed yet.
 #
 # `--allow-dirty` refers to the staged copy under target/, which is git-ignored
 # and therefore always "untracked" from git's point of view. It does not relax
 # any check on the repository sources.
-PUBLISH_ARGS=(publish --workspace --registry "$SDK_REGISTRY" --allow-dirty)
+PUBLISH_ATTEMPTS="${SDK_PUBLISH_ATTEMPTS:-12}"
+PUBLISH_RETRY_SLEEP="${SDK_PUBLISH_RETRY_SLEEP:-20}"
+
+# publish_crate NAME — upload one crate. Returns 0 when it was uploaded or the
+# exact version already exists; retries while a dependency is not yet indexed.
+publish_crate() {
+  local name="$1" attempt=1 out status
+  while :; do
+    set +e
+    out="$(cargo publish -p "$name" --registry "$SDK_REGISTRY" --allow-dirty 2>&1)"
+    status=$?
+    set -e
+    printf '%s\n' "$out"
+    if [ "$status" -eq 0 ]; then
+      return 0
+    fi
+    if printf '%s' "$out" | grep -q "already exists"; then
+      echo "==> ${name} v${VERSION} is already published — skipping."
+      return 0
+    fi
+    if [ "$attempt" -ge "$PUBLISH_ATTEMPTS" ]; then
+      echo "ERROR: ${name} v${VERSION} was not published after ${attempt} attempts." >&2
+      return 1
+    fi
+    echo "==> ${name}: publish failed (attempt ${attempt}/${PUBLISH_ATTEMPTS}); the registry index may lag — retrying in ${PUBLISH_RETRY_SLEEP}s." >&2
+    attempt=$((attempt + 1))
+    sleep "$PUBLISH_RETRY_SLEEP"
+  done
+}
+
 if [ "$DRY_RUN" -eq 1 ]; then
-  PUBLISH_ARGS+=(--dry-run)
   echo "==> Dry run: packaging and verifying ${SDK_NAME} v${VERSION} (nothing is uploaded)"
 else
   echo "==> Publishing ${SDK_NAME} v${VERSION} to registry '${SDK_REGISTRY}'"
@@ -99,7 +133,13 @@ else
 fi
 
 cd "$STAGE"
-cargo "${PUBLISH_ARGS[@]}"
+if [ "$DRY_RUN" -eq 1 ]; then
+  cargo publish --workspace --registry "$SDK_REGISTRY" --allow-dirty --dry-run
+else
+  for crate in "${SDK_CRATES[@]}"; do
+    publish_crate "$crate"
+  done
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "==> Dry run OK — ${#SDK_CRATES[@]} crates package and verify cleanly."

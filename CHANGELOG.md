@@ -25,6 +25,13 @@ record them.
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-10-06
+
+### Fixed
+
+- Make `scripts/publish-sdk.sh` re-runnable: publish the SDK crates one at a time, skip a version the registry already has and retry while a dependency is not yet indexed, instead of aborting a single `--workspace` pass on `already exists` or an index timeout (S32)
+  The v0.27.0 release published only part of the SDK to the registry; v0.27.1 supersedes it.
+
 ## [0.27.0] - 2026-10-06
 
 ### Added
@@ -2670,7 +2677,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.27.0...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.27.1...HEAD
+[0.27.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.27.1
 [0.27.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.27.0
 [0.26.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.26.0
 [0.25.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.25.0
