@@ -25,6 +25,8 @@ record them.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-10-06
+
 ### Security
 
 - Make the Windows MIA configuration directory administrator-only and refuse files a non-administrator could have written (S12, S29)
@@ -2563,7 +2565,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.24.0...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.25.0...HEAD
+[0.25.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.25.0
 [0.24.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.24.0
 [0.23.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.23.1
 [0.23.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.23.0
