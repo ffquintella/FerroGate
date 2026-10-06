@@ -130,7 +130,7 @@ pub fn hand_over_dir(
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{harden, ima_enforced, prepare_runtime_paths};
+pub use linux::{harden, ima_enforced, prepare_runtime_paths, state_owner};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -183,6 +183,20 @@ mod linux {
                 "service user {SERVICE_USER} not found; create it or set FERROGATE_RUN_AS_UID/GID"
             )
         })
+    }
+
+    /// The `(uid, gid)` that files created for the daemon *before* the
+    /// privilege drop must be handed to — e.g. a machine key migrated into the
+    /// state directory ([`crate::machine_key::migrate_legacy_files`]) — or
+    /// `None` when no drop follows (hardening skipped, or not root), in which
+    /// case the creating process already is the right owner. Resolves the same
+    /// target as [`prepare_runtime_paths`] and [`harden`].
+    pub fn state_owner() -> anyhow::Result<Option<(u32, u32)>> {
+        if env_flag_set("FERROGATE_SKIP_HARDENING") || !ferro_harden::is_root() {
+            return Ok(None);
+        }
+        let run_as = resolve_run_as()?;
+        Ok(Some((run_as.uid, run_as.gid)))
     }
 
     /// Prepare, as root, the directories the daemon will write to *after* it

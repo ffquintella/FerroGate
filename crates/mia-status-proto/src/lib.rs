@@ -423,6 +423,12 @@ pub mod error_codes {
     pub const PIN_MISMATCH: &str = "pin_mismatch";
     /// The TPM (or the selected TPM-class backend) is unavailable.
     pub const TPM_UNAVAILABLE: &str = "tpm_unavailable";
+    /// The host's machine key (or SVID seed) exists but cannot be used —
+    /// wrong owner or mode, unreadable, not a regular file, refused by the
+    /// Windows trust check, or not openable on this host — and the agent
+    /// refuses to replace it. An operator must repair or restore the file; the
+    /// daemon log names the file and the fix.
+    pub const MACHINE_KEY_REFUSED: &str = "machine_key_refused";
     /// IMA appraisal is required but not enforced.
     pub const IMA_DISABLED: &str = "ima_disabled";
     /// The cached CRL is stale or absent.

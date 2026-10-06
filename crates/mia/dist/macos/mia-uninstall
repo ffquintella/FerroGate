@@ -1,0 +1,104 @@
+#!/bin/sh
+# Uninstall FerroGate MIA from macOS (installed by the .pkg as
+# /usr/local/bin/mia-uninstall).
+#
+# By default this removes the programs — the daemon and tray launchd jobs, the
+# binaries, the tray app, the default-config templates and the package
+# receipt — and KEEPS this host's configuration and identity:
+#
+#   /Library/Application Support/FerroGate   mia*.toml, environments.toml,
+#                                             allowlist*, host-key.bin,
+#                                             svid-seed.bin, x509-svid.sealed
+#   /etc/ferrogate                            mia.env
+#   /var/log/ferrogate                        logs
+#
+# host-key.bin is this machine's identity. CMIS pins its public key to the
+# hardware fingerprint the first time the host attests and refuses any other
+# key for that fingerprint from then on, so a reinstall that loses the file
+# leaves the host without an SVID until a CMIS operator clears the pin.
+# Keeping it is what lets an uninstall + reinstall come back as the same host.
+#
+# --purge also deletes the directories above — configuration, machine key,
+# SVID seed, sealed SVID, logs — and the ferrogate-status group. It is
+# irreversible; use it only to retire the machine or to re-enroll it from
+# scratch (after the CMIS operator has cleared its key pin).
+#
+# Usage: sudo mia-uninstall [--purge]
+#
+# FERROGATE_UNINSTALL_ROOT (tests only): prefix every path with this
+# directory and skip launchctl, pkgutil and dscl. Never set it otherwise.
+set -eu
+
+PURGE=0
+for arg in "$@"; do
+  case "$arg" in
+    --purge) PURGE=1 ;;
+    -h|--help)
+      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "mia-uninstall: unknown argument: $arg (usage: mia-uninstall [--purge])" >&2
+      exit 2
+      ;;
+  esac
+done
+
+ROOT="${FERROGATE_UNINSTALL_ROOT:-}"
+LIVE=1
+[ -z "$ROOT" ] || LIVE=0
+
+if [ "$LIVE" = 1 ] && [ "$(id -u)" != 0 ]; then
+  echo "mia-uninstall: must run as root (sudo mia-uninstall)" >&2
+  exit 1
+fi
+
+LABEL=com.ferrogate.mia
+TRAY_LABEL=com.ferrogate.mia-tray
+CONFIG_DIR="$ROOT/Library/Application Support/FerroGate"
+
+# ── Stop the jobs ────────────────────────────────────────────────────────────
+if [ "$LIVE" = 1 ]; then
+  launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
+  CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+  case "$CONSOLE_USER" in
+    ""|root|loginwindow) ;;
+    *)
+      CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
+      [ -z "$CONSOLE_UID" ] || launchctl bootout "gui/$CONSOLE_UID/$TRAY_LABEL" >/dev/null 2>&1 || true
+      ;;
+  esac
+fi
+
+# ── Remove the programs ──────────────────────────────────────────────────────
+# Every target is a fixed path the package installed; `rm -f` / `rm -rf` on a
+# symbolic link removes the link, never what it points to.
+rm -f "$ROOT/Library/LaunchDaemons/$LABEL.plist"
+rm -f "$ROOT/Library/LaunchAgents/$TRAY_LABEL.plist"
+rm -f "$ROOT/usr/local/bin/mia" "$ROOT/usr/local/bin/mia-tray"
+rm -rf "$ROOT/Applications/FerroGate MIA.app"
+rm -rf "$ROOT/usr/local/share/ferrogate"
+rm -rf "$ROOT/var/run/ferrogate"
+if [ "$LIVE" = 1 ]; then
+  pkgutil --forget "$LABEL" >/dev/null 2>&1 || true
+fi
+
+# ── Configuration and identity ───────────────────────────────────────────────
+if [ "$PURGE" = 1 ]; then
+  echo "mia-uninstall: --purge: deleting the configuration, the machine key and the SVID seed."
+  echo "  This host's identity is gone; CMIS will refuse a new key for this machine until"
+  echo "  its operator clears the old key pin."
+  rm -rf "$CONFIG_DIR" "$ROOT/etc/ferrogate" "$ROOT/var/log/ferrogate"
+  if [ "$LIVE" = 1 ]; then
+    dscl . -delete /Groups/ferrogate-status >/dev/null 2>&1 || true
+  fi
+else
+  echo "mia-uninstall: kept the configuration and this host's identity:"
+  echo "  $CONFIG_DIR (machine key host-key.bin, svid-seed.bin, configuration)"
+  echo "  $ROOT/etc/ferrogate and $ROOT/var/log/ferrogate"
+  echo "  Reinstalling the package picks them up again. 'mia-uninstall --purge' deletes them."
+fi
+
+rm -f "$ROOT/usr/local/bin/mia-uninstall"
+echo "FerroGate MIA uninstalled."
+exit 0

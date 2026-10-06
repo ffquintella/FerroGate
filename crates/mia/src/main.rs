@@ -921,9 +921,11 @@ fn state_dir() -> std::path::PathBuf {
 }
 
 /// Resolve where the persistent machine signing key lives — in the service
-/// [`state_dir`] (e.g. `/var/lib/ferrogate/host-key.bin` on Linux).
+/// [`state_dir`] (e.g. `/var/lib/ferrogate/host-key.bin` on Linux). Its
+/// lifecycle — open, refuse, migrate, create only when none exists — is
+/// [`mia::machine_key`]'s.
 fn host_key_path() -> std::path::PathBuf {
-    state_dir().join("host-key.bin")
+    mia::machine_key::StateFile::MachineKey.path_in(&state_dir())
 }
 
 /// Resolve where this host's persistent SVID seed lives — beside the machine
@@ -932,8 +934,15 @@ fn host_key_path() -> std::path::PathBuf {
 /// under the *same* key and keeps the same child-signing `kid` — and thus the
 /// same JWKS entry on CMIS — instead of rotating it every boot.
 fn svid_seed_path() -> std::path::PathBuf {
-    state_dir().join("svid-seed.bin")
+    mia::machine_key::StateFile::SvidSeed.path_in(&state_dir())
 }
+
+/// Set once this process has created a machine key because none existed
+/// anywhere: if CMIS then refuses the host, the likeliest cause is that it
+/// pinned an earlier key for this fingerprint (a key rebind), and the log says
+/// so instead of leaving the operator to guess.
+static MACHINE_KEY_CREATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The machine fingerprint, collected once *before* the privilege drop (the DMI
 /// serials it hashes are root-only) and reused by attestation afterwards.
@@ -989,7 +998,15 @@ fn prepare_and_harden(
     // still root (on Linux, before the drop) so ownership never blocks it.
     let store = mia::credstore::store_path();
     let (key, seed) = (host_key_path(), svid_seed_path());
-    mia::credstore::restrict_secret_files([key.as_path(), seed.as_path(), store.as_path()]);
+    let legacy: Vec<std::path::PathBuf> = mia::machine_key::StateFile::ALL
+        .iter()
+        .flat_map(|f| f.legacy_paths())
+        .collect();
+    mia::credstore::restrict_secret_files(
+        [key.as_path(), seed.as_path(), store.as_path()]
+            .into_iter()
+            .chain(legacy.iter().map(std::path::PathBuf::as_path)),
+    );
 
     let prepare_status = |cfg: mia::status_server::StatusEndpointConfig| {
         let path = cfg.path.clone();
@@ -1021,6 +1038,21 @@ fn prepare_and_harden(
         // status group traverse to the socket.
         let prepared = status.and_then(prepare_status);
         mia::hardening::prepare_runtime_paths(&dirs)?;
+        // Carry a machine key / seed an older release kept in /etc/ferrogate
+        // into the state directory, handed to the service user — while still
+        // root, because afterwards the legacy file is unreadable and `chown`
+        // is forbidden. Never fatal: a file left behind is refused (not
+        // replaced) when the bootstrap tries to use it.
+        let owner = mia::hardening::state_owner()?;
+        mia::machine_key::migrate_legacy_files(&state_dir(), owner);
+        // Re-seal a pre-F16 plaintext key by atomic replace now: after the
+        // drop `rename` is forbidden, so the bootstrap only reads it.
+        let fingerprint = prefetched_facts().map(ferro_machineid::MachineFacts::fingerprint);
+        mia::machine_key::reseal_machine_key(
+            &state_dir(),
+            fingerprint.as_ref().map(|f| f.as_bytes().as_slice()),
+            owner,
+        );
         if let Some(p) = &prepared {
             mia::status_server::grant_group_traverse(p);
         }
@@ -1033,71 +1065,20 @@ fn prepare_and_harden(
         tracing::debug!(
             "hardening profile (seccomp/mlockall/privilege-drop) applies on Linux only"
         );
+        // No former state location exists on macOS / Windows today; this keeps
+        // a future move from minting a fresh key instead of migrating.
+        mia::machine_key::migrate_legacy_files(&state_dir(), None);
+        let fingerprint = prefetched_facts().map(ferro_machineid::MachineFacts::fingerprint);
+        mia::machine_key::reseal_machine_key(
+            &state_dir(),
+            fingerprint.as_ref().map(|f| f.as_bytes().as_slice()),
+            None,
+        );
         let prepared = status.and_then(prepare_status);
         if let Some(p) = &prepared {
             mia::status_server::grant_group_traverse(p);
         }
         Ok(prepared)
-    }
-}
-
-/// Load the persistent 32-byte SVID seed, generating and persisting a fresh one
-/// (`0600`) if the file is absent or malformed. The seed is a subordinate secret
-/// — anyone who can read it already has the machine key beside it — so it is
-/// stored with the same protection as `host-key.bin` rather than separately
-/// sealed.
-fn load_or_create_svid_seed(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
-    use getrandom::SysRng;
-    use rand_core::{Rng as _, UnwrapErr};
-
-    // A seed another local user could have planted or changed is refused
-    // (Windows; `mia::system_dir`) and never overwritten: the caller falls back
-    // to an ephemeral key.
-    match mia::system_dir::read_trusted(path) {
-        Ok(bytes) => {
-            if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                return Ok(seed);
-            }
-            tracing::warn!(
-                path = %path.display(),
-                "SVID seed file has the wrong length; regenerating (the child-signing kid will change once)"
-            );
-        }
-        // Absent on first boot — create it. Any other error (e.g. permission
-        // denied) is propagated so we never overwrite an unreadable seed.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let mut seed = [0u8; 32];
-    UnwrapErr(SysRng).fill_bytes(&mut seed);
-    write_secret_file(path, &seed)?;
-    Ok(seed)
-}
-
-/// Write `bytes` to `path` as an owner-only (`0600`) secret, creating or
-/// truncating the file.
-///
-/// On Unix the mode is applied by `open(2)` at creation, so the bytes are never
-/// briefly world-readable *and* no separate `chmod` is needed — the hardened
-/// seccomp profile deliberately forbids `chmod` (see `ferro-harden`), so a
-/// post-write `set_permissions` would be killed with `SIGSYS` once the daemon
-/// has dropped privileges.
-fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
     }
 }
 
@@ -1131,23 +1112,40 @@ async fn bootstrap_host_svid_host_key(
         return None;
     };
     let key_path = host_key_path();
-    // A machine key another local user could have planted is never used.
-    if let Err(e) = mia::system_dir::check_trusted_file(&key_path) {
-        tracing::error!(error = %e, path = %key_path.display(), "refusing the machine signing key");
-        status.attest_failed(AttestFailure::Other);
-        return None;
-    }
     // Seal the software key at rest to the hardware fingerprint: a key file
     // copied to another host won't decrypt there (its fingerprint differs). This
     // is clone resistance bound to machine identity, not a hardware root of
     // trust — see docs/features/F16.
-    let key = match ferro_sep::SoftwareMachineKey::open_or_create_sealed(
+    //
+    // CMIS pins this key's public half on first contact, so an existing key is
+    // only ever opened. One that cannot be used (wrong owner or mode,
+    // unreadable, planted, sealed to another fingerprint, stranded at a legacy
+    // location) fails closed with the fix in the log; a key is created only
+    // when none exists anywhere (`mia::machine_key`).
+    let key = match mia::machine_key::open_or_create_machine_key(
         &key_path,
-        facts.fingerprint().as_bytes(),
+        Some(facts.fingerprint().as_bytes()),
     ) {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::error!(error = %e, path = %key_path.display(), "cannot open machine signing key");
+        Ok(opened) => {
+            if opened.created {
+                MACHINE_KEY_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    path = %key_path.display(),
+                    fingerprint = %facts.fingerprint().to_hex(),
+                    "no machine signing key existed; created a new one. This is a new host \
+                     identity: if CMIS enrolled this machine before, it will refuse this key as a \
+                     key rebind — restore the original host-key.bin instead"
+                );
+            }
+            opened.key
+        }
+        Err(mia::machine_key::KeyError::Refused(refusal)) => {
+            tracing::error!(path = %key_path.display(), "{refusal}");
+            status.attest_failed(AttestFailure::MachineKey);
+            return None;
+        }
+        Err(e @ mia::machine_key::KeyError::CreateFailed(_)) => {
+            tracing::error!(error = %e, path = %key_path.display(), "cannot create the machine signing key");
             status.attest_failed(AttestFailure::Other);
             return None;
         }
@@ -1171,12 +1169,24 @@ async fn bootstrap_host_svid_host_key(
     status.set_cmis_node(&endpoint);
     // Recover (or first-boot create) the persistent SVID seed so the composite
     // key — and therefore the child-signing kid and its JWKS entry — is stable
-    // across restarts. If the seed cannot be persisted we fall back to an
-    // ephemeral key: minting still works, the kid just rotates as it did before.
+    // across restarts. An existing seed that cannot be used is refused, never
+    // overwritten (fail closed). Only when there was none and a new one cannot
+    // be persisted do we fall back to an ephemeral key: minting still works,
+    // the kid just rotates on restart.
     let seed_path = svid_seed_path();
-    let seed = match load_or_create_svid_seed(&seed_path) {
-        Ok(s) => Some(s),
-        Err(e) => {
+    let seed = match mia::machine_key::load_or_create_seed(&seed_path) {
+        Ok(s) => {
+            if matches!(s, mia::machine_key::Seed::Created(_)) {
+                tracing::info!(path = %seed_path.display(), "created the persistent SVID seed");
+            }
+            Some(*s.bytes())
+        }
+        Err(mia::machine_key::SeedError::Refused(refusal)) => {
+            tracing::error!(path = %seed_path.display(), "{refusal}");
+            status.attest_failed(AttestFailure::MachineKey);
+            return None;
+        }
+        Err(e @ mia::machine_key::SeedError::CreateFailed(_)) => {
             tracing::warn!(
                 error = %e,
                 path = %seed_path.display(),
@@ -1185,17 +1195,36 @@ async fn bootstrap_host_svid_host_key(
             None
         }
     };
-    let attested =
-        match mia::client::run_attest_host_key(&mut client, facts, &key, dpop_jkt, seed.as_ref())
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(error = %e, "host-key attestation failed");
-                status.attest_failed(AttestFailure::from_attest_error(&e, false));
-                return None;
+    let attested = match mia::client::run_attest_host_key(
+        &mut client,
+        facts,
+        &key,
+        dpop_jkt,
+        seed.as_ref(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "host-key attestation failed");
+            let failure = AttestFailure::from_attest_error(&e, false);
+            if failure == AttestFailure::NotEnrolled
+                && MACHINE_KEY_CREATED.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::error!(
+                    path = %key_path.display(),
+                    fingerprint = %facts.fingerprint().to_hex(),
+                    "CMIS refused this host, and this agent created its machine key at this \
+                     start. If the machine was enrolled before, CMIS has pinned the earlier key \
+                     for this fingerprint and refuses the new one as a key rebind: restore the \
+                     original host-key.bin (and svid-seed.bin) from a backup, or have the CMIS \
+                     operator clear this host's key pin"
+                );
             }
-        };
+            status.attest_failed(failure);
+            return None;
+        }
+    };
 
     tracing::info!(
         spiffe_id = %attested.bundle.spiffe_id,
@@ -1816,22 +1845,15 @@ fn maybe_spawn_propose_task(
     // Open the same machine key the host-key bootstrap uses. It is sealed to the
     // hardware fingerprint when one is available (matching `bootstrap_host_svid_host_key`);
     // a host with no fingerprint (e.g. the TPM backend) falls back to the plaintext key.
+    // Same lifecycle as the bootstrap: open what exists, refuse (never
+    // replace) what cannot be used, create only when none exists anywhere.
     let key_path = host_key_path();
-    if let Err(e) = mia::system_dir::check_trusted_file(&key_path) {
-        tracing::error!(error = %e, "refusing the machine key; not proposing");
-        return;
-    }
-    let key = match prefetched_facts() {
-        Some(facts) => ferro_sep::SoftwareMachineKey::open_or_create_sealed(
-            &key_path,
-            facts.fingerprint().as_bytes(),
-        ),
-        None => ferro_sep::SoftwareMachineKey::open_or_create(&key_path),
-    };
-    let key = match key {
-        Ok(k) => k,
+    let fingerprint = prefetched_facts().map(ferro_machineid::MachineFacts::fingerprint);
+    let seal = fingerprint.as_ref().map(|f| f.as_bytes().as_slice());
+    let key = match mia::machine_key::open_or_create_machine_key(&key_path, seal) {
+        Ok(opened) => opened.key,
         Err(e) => {
-            tracing::error!(error = %e, "cannot open machine key; not proposing");
+            tracing::error!(error = %e, path = %key_path.display(), "cannot use the machine key; not proposing");
             return;
         }
     };

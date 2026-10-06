@@ -248,42 +248,110 @@ impl SoftwareMachineKey {
         seal_secret: &[u8],
     ) -> Result<Self, SepError> {
         if let Some(bytes) = read_key_file(path)? {
-            return Self::load_sealed(path, &bytes, seal_secret);
+            return Self::load_sealed(path, &bytes, seal_secret, true);
         }
+        if let Some(key) = Self::create_sealed(path, seal_secret)? {
+            return Ok(key);
+        }
+        // Another opener won the race: use the key it persisted.
+        let bytes = read_key_file(path)?.ok_or_else(|| {
+            SepError::Io(format!("{} vanished while being created", path.display()))
+        })?;
+        Self::load_sealed(path, &bytes, seal_secret, true)
+    }
+
+    /// Generate a new key and persist it **sealed** to `seal_secret` at
+    /// `path`, only if nothing is there: `Ok(None)` when a file already exists
+    /// (it is never truncated, followed or replaced). The file is created
+    /// exclusively with mode [`KEY_FILE_MODE`]; a write that fails part-way
+    /// removes the partial file this call created.
+    ///
+    /// # Errors
+    /// [`SepError::KeyGen`] on RNG or key-derivation failure, [`SepError::Io`]
+    /// on any other filesystem error.
+    pub fn create_sealed(
+        path: &std::path::Path,
+        seal_secret: &[u8],
+    ) -> Result<Option<Self>, SepError> {
         let key = Self::generate()?;
         let scalar = Zeroizing::new(key.to_bytes());
         let blob = seal_scalar(&scalar, seal_secret)?;
         match create_key_file(path, &blob) {
-            Ok(()) => Ok(key),
-            // Another opener won the race: use the key it persisted.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let bytes = read_key_file(path)?.ok_or_else(|| {
-                    SepError::Io(format!("{} vanished while being created", path.display()))
-                })?;
-                Self::load_sealed(path, &bytes, seal_secret)
-            }
+            Ok(()) => Ok(Some(key)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(e) => Err(SepError::Io(format!("create {}: {e}", path.display()))),
         }
     }
 
+    /// [`Self::create_sealed`] for a plain (unsealed) scalar file.
+    ///
+    /// # Errors
+    /// As [`Self::create_sealed`].
+    pub fn create_plain(path: &std::path::Path) -> Result<Option<Self>, SepError> {
+        let key = Self::generate()?;
+        let scalar = Zeroizing::new(key.to_bytes());
+        match create_key_file(path, scalar.as_slice()) {
+            Ok(()) => Ok(Some(key)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(SepError::Io(format!("create {}: {e}", path.display()))),
+        }
+    }
+
+    /// Load an **existing** sealed key from `path`; never creates one.
+    ///
+    /// The counterpart of [`Self::open_or_create_sealed`] for a caller that
+    /// has already established that a key file exists and must not be
+    /// replaced: if the file has vanished in the meantime this fails instead of
+    /// minting a new identity. The same permission repair applies, but the
+    /// file is **never rewritten**: a pre-F16 plaintext scalar is loaded as it
+    /// is (the in-place re-seal truncates first, so a crash part-way would
+    /// destroy the only copy of the pinned key). Re-seal such a file with an
+    /// atomic replace instead — see [`is_unsealed_scalar`].
+    ///
+    /// # Errors
+    /// [`SepError::Io`] if the file is absent or cannot be read (or made
+    /// owner-only), and [`SepError::Malformed`] if it is not a sealed key or
+    /// fails to decrypt (wrong host or corruption).
+    pub fn open_sealed(path: &std::path::Path, seal_secret: &[u8]) -> Result<Self, SepError> {
+        let bytes = read_key_file(path)?
+            .ok_or_else(|| SepError::Io(format!("{}: no machine key file", path.display())))?;
+        Self::load_sealed(path, &bytes, seal_secret, false)
+    }
+
+    /// Load an **existing** plaintext key from `path`; never creates one.
+    ///
+    /// The open-only counterpart of [`Self::open_or_create`].
+    ///
+    /// # Errors
+    /// [`SepError::Io`] if the file is absent or cannot be read (or made
+    /// owner-only), and [`SepError::Malformed`] if it is not a raw scalar.
+    pub fn open_existing(path: &std::path::Path) -> Result<Self, SepError> {
+        let bytes = read_key_file(path)?
+            .ok_or_else(|| SepError::Io(format!("{}: no machine key file", path.display())))?;
+        Self::from_bytes(&bytes)
+    }
+
     /// Decode the contents of an existing sealed key file read from `path`,
-    /// migrating a pre-F16 plaintext scalar in place.
+    /// migrating a pre-F16 plaintext scalar in place when `reseal_in_place`.
     fn load_sealed(
         path: &std::path::Path,
         bytes: &[u8],
         seal_secret: &[u8],
+        reseal_in_place: bool,
     ) -> Result<Self, SepError> {
         // Seamless upgrade: a pre-F16 file is the raw 32-byte scalar with no
-        // magic. Load it, then re-seal in place so the *same* key (and thus the
-        // pubkey CMIS has pinned) is preserved — regenerating would change the
-        // identity and be rejected at enrollment.
-        if bytes.len() == 32 && bytes[0..4] != SEAL_MAGIC {
+        // magic. Load it, then (if asked) re-seal in place so the *same* key
+        // (and thus the pubkey CMIS has pinned) is preserved — regenerating
+        // would change the identity and be rejected at enrollment.
+        if is_unsealed_scalar(bytes) {
             let key = Self::from_bytes(bytes)?;
-            let scalar = Zeroizing::new(key.to_bytes());
-            if let Ok(blob) = seal_scalar(&scalar, seal_secret) {
-                // Best-effort: if the re-seal write fails the daemon still runs
-                // this session; it just re-migrates next start.
-                let _ = rewrite_key_file(path, &blob);
+            if reseal_in_place {
+                let scalar = Zeroizing::new(key.to_bytes());
+                if let Ok(blob) = seal_scalar(&scalar, seal_secret) {
+                    // Best-effort: if the re-seal write fails the daemon still
+                    // runs this session; it just re-migrates next start.
+                    let _ = rewrite_key_file(path, &blob);
+                }
             }
             return Ok(key);
         }
@@ -308,6 +376,16 @@ impl MachineKey for SoftwareMachineKey {
         let sig: Signature = self.signing.sign(message);
         Ok(sig.to_der().as_bytes().to_vec())
     }
+}
+
+/// Whether `bytes` — the contents of a machine-key file — are a pre-F16
+/// plaintext 32-byte scalar rather than a sealed envelope. Such a file still
+/// opens ([`SoftwareMachineKey::open_sealed`] loads it as is); a caller that
+/// can replace files atomically should re-seal it with [`seal_bytes`] (empty
+/// purpose) and swap it in.
+#[must_use]
+pub fn is_unsealed_scalar(bytes: &[u8]) -> bool {
+    bytes.len() == 32 && bytes[0..4] != SEAL_MAGIC
 }
 
 // ---- Key-file permissions -------------------------------------------------
@@ -416,8 +494,14 @@ fn create_key_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
         opts.mode(KEY_FILE_MODE);
     }
     let mut f = opts.open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        // The exclusive open proves this call created the file: remove the
+        // partial copy rather than leave a torn key a later start would trip on.
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Overwrite the existing key file at `path` with `bytes`, making it owner-only
@@ -751,6 +835,54 @@ mod tests {
         assert!(
             matches!(result, Err(SepError::Malformed(_))),
             "a different seal secret must fail to decrypt"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_only_constructors_never_create_a_key() {
+        // A caller that knows a key must already exist uses the open-only
+        // constructors; an absent file is an error, never a fresh identity.
+        let path = seal_scratch("open-only");
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            SoftwareMachineKey::open_sealed(&path, b"fingerprint"),
+            Err(SepError::Io(_))
+        ));
+        assert!(matches!(
+            SoftwareMachineKey::open_existing(&path),
+            Err(SepError::Io(_))
+        ));
+        assert!(!path.exists(), "an open-only call must not create the file");
+
+        let created = SoftwareMachineKey::open_or_create_sealed(&path, b"fingerprint").unwrap();
+        let reopened = SoftwareMachineKey::open_sealed(&path, b"fingerprint").unwrap();
+        assert_eq!(created.public_spki_der(), reopened.public_spki_der());
+        // A create-only call never touches an existing file.
+        let before = std::fs::read(&path).unwrap();
+        assert!(SoftwareMachineKey::create_sealed(&path, b"fingerprint")
+            .unwrap()
+            .is_none());
+        assert!(SoftwareMachineKey::create_plain(&path).unwrap().is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_sealed_loads_a_pre_f16_key_without_rewriting_it() {
+        // The in-place re-seal truncates first; the strict opener must not
+        // risk the only copy of a pinned key, so it loads it as it is.
+        let path = seal_scratch("legacy-open-only");
+        let _ = std::fs::remove_file(&path);
+        let legacy = SoftwareMachineKey::generate().unwrap();
+        create_key_file(&path, &legacy.to_bytes()).unwrap();
+        assert!(is_unsealed_scalar(&std::fs::read(&path).unwrap()));
+        let opened = SoftwareMachineKey::open_sealed(&path, b"fingerprint").unwrap();
+        assert_eq!(legacy.public_spki_der(), opened.public_spki_der());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            legacy.to_bytes(),
+            "untouched"
         );
         let _ = std::fs::remove_file(&path);
     }

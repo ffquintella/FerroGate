@@ -100,6 +100,11 @@ pub mod seal;
 /// TPM-sealed where there is a TPM, machine-key sealed everywhere else.
 pub mod credstore;
 
+/// The on-disk lifecycle of the machine key and SVID seed: open what exists,
+/// refuse (never replace) what cannot be used, migrate what moved, create
+/// only when nothing exists anywhere.
+pub mod machine_key;
+
 /// In-process software **virtual TPM** for TPM-less dev/test hosts (macOS,
 /// Windows, CI). INSECURE — never for production. Behind the off-by-default
 /// `virtual-tpm` cargo feature; cross-platform (no TSS2 stack needed).

@@ -194,8 +194,11 @@ key private, so all three state secrets (`host-key.bin`, `svid-seed.bin`,
   `warn` with the old mode. `ferro-sep` repeats the check whenever it opens the
   machine key, and refuses a key file it cannot make owner-only. The macOS
   package's postinstall does the same repair at upgrade.
-- The pre-F16 migration (plaintext scalar re-sealed in place) rewrites only an
-  owner-only file.
+- The pre-F16 migration (plaintext scalar re-sealed to the fingerprint) runs
+  at daemon start while still privileged and replaces the file atomically
+  (sealed copy written beside it, verified, then renamed over it), so a crash
+  never leaves a torn key. The unprivileged attestation path only reads such a
+  file.
 
 Up to 0.22.0, `host-key.bin` was created with the process umask (`0644`). On
 macOS that meant any local user could read it and recover the machine key. If a
@@ -204,6 +207,41 @@ exposed. Tightening the mode does not undo a copy that was already made.
 Rotating the key needs a new CMIS binding as well as a new file, because CMIS
 pins `H ↔ pubkey` and rejects a rebind (`HostKeyRebindRejected`). No documented
 procedure clears that binding yet.
+
+#### The key is an identity: it is never silently replaced
+
+Because CMIS pins the machine key's public half on first contact and refuses
+any other key for the same fingerprint from then on, a host that mints a new
+key while the pinned one still exists — or could be restored — is locked out
+(status `host_rejected`) until a CMIS operator intervenes. MIA
+therefore treats `host-key.bin` and `svid-seed.bin` as follows
+(`mia::machine_key`):
+
+| What is at `<state-dir>` | What MIA does |
+|---|---|
+| a regular, owner-only file owned by root or the state directory's owner, readable, that opens on this host | opens it; never rewrites it |
+| a file that is a symlink or not a regular file, group/other-accessible, owned by anyone else, unreadable, refused by the Windows trust check, the wrong length, or sealed to another fingerprint | **refuses it (fail closed)** and leaves it untouched: no SVID, status code `machine_key_refused`, and an `error` log naming the file and the fix (e.g. `chown`/`chmod 0600`, restore from backup) |
+| nothing, but the file is at a former location (Linux before 0.20.19: `/etc/ferrogate`) | the daemon moves it at start while still root — exclusive copy, `0600`, handed to `_ferrogate`, verified, then the old copy removed — and uses it; if the move fails it refuses rather than mint |
+| no key, but `svid-seed.bin` is still there (it is only ever created after the key, so the key was lost) | **refuses** to create a key: restore `host-key.bin` from backup, or — only for a deliberate re-enrollment after the CMIS operator cleared the pin — delete the seed too |
+| nothing anywhere | creates it exclusively (`O_EXCL`, `0600`) and logs at `warn` that a new host identity was created |
+
+A refused file is retried at every re-attestation (every 5 minutes), so
+repairing ownership or mode is enough — no restart is needed. If CMIS then
+refuses a host whose key this agent created at the same start, the log says
+that the likeliest cause is a key rebind and that the original `host-key.bin`
+should be restored from backup.
+
+Installs, upgrades and uninstalls never create, replace or delete these
+files: the Debian/RPM packages do not own `/var/lib/ferrogate`, the Windows
+installers do not own `%ProgramData%\FerroGate`, and the macOS package ships
+its default configuration as templates in `/usr/local/share/ferrogate` (copied
+into place only where no file exists), so its receipt owns neither
+`/etc/ferrogate` nor `/Library/Application Support/FerroGate`. On macOS,
+`sudo mia-uninstall` removes the programs and keeps the configuration and the
+identity; `sudo mia-uninstall --purge` deletes them too, which is only right
+when the machine is retired or is to be re-enrolled after the CMIS operator has
+cleared its key pin. Do not delete `/Library/Application Support/FerroGate` by
+hand to "reset" an install.
 
 ## Configuration
 

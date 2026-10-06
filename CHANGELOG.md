@@ -25,6 +25,41 @@ record them.
 
 ## [Unreleased]
 
+### Fixed
+
+- Never regenerate, overwrite or delete an existing MIA machine key or SVID seed; fail closed with an operator-facing fix instead (S15, S16, S29)
+  CMIS pins the machine key's public half to the hardware fingerprint on first
+  contact and refuses any other key for it (`key-rebind`), so a host that mints
+  a new `host-key.bin` while the pinned one exists is stranded without an SVID.
+  The new `mia::machine_key` module decides every use of `host-key.bin` and
+  `svid-seed.bin`: a usable file is opened and never rewritten; a file that
+  exists but cannot be used (symlink or not a regular file, group/other
+  access, foreign owner, unreadable, refused by the Windows trust check, wrong
+  length, sealed to another fingerprint) is refused and left untouched, with
+  the new status code `machine_key_refused` and an error log naming the file
+  and the fix; a file stranded at a former location (Linux `/etc/ferrogate`,
+  before 0.20.19 — that move used to mint a fresh key) is migrated by the
+  privileged startup; a key is created only when none exists anywhere — not
+  even an SVID seed, which is only ever created after the key and so proves a
+  lost one — and that is logged as a new host identity. A wrong-length SVID seed is no longer
+  silently regenerated. The allowlist-propose task follows the same rules
+  instead of creating a key of its own. `ferro-sep` gains the open-only
+  `SoftwareMachineKey::open_sealed` / `open_existing` (which never rewrite the
+  file) and the create-only `create_sealed` / `create_plain`; a partly written
+  new key file is removed instead of left torn, and a pre-F16 plaintext key is
+  re-sealed at privileged start by atomic replace instead of the truncating
+  in-place rewrite. Behaviour change: a
+  symlinked `host-key.bin`/`svid-seed.bin` is now refused.
+- Stop the macOS package from overwriting `mia.env` / `mia.toml` on upgrade and from owning the directory that holds the machine key (S29)
+  The `.pkg` payload installed `/etc/ferrogate/mia.env` and
+  `/Library/Application Support/FerroGate/mia.toml`, so every upgrade reset the
+  operator's configuration, and the receipt listed the state directory, so
+  receipt-driven removal deleted `host-key.bin`. The defaults now ship as
+  templates in `/usr/local/share/ferrogate`, which postinstall copies only
+  where no file exists. The package now installs `mia-uninstall`, which
+  removes the programs and keeps the configuration and machine identity unless
+  given `--purge`.
+
 ## [0.25.0] - 2026-10-06
 
 ### Security

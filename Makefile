@@ -334,7 +334,8 @@ else ifeq ($(MIA_OS),macos)
 	  $$SUDO rm -f /Library/LaunchDaemons/$(MIA_LABEL).plist; \
 	  $$SUDO rm -f "$(BINDIR)/$(MIA_BIN)"
 	@echo "==> removed launchd job and $(BINDIR)/$(MIA_BIN)"
-	@echo "    Config, logs, and the socket are left in place (run 'sudo mia setup --clean' to drop the config)."
+	@echo "    Config, logs, the socket and the machine key (host-key.bin, svid-seed.bin) are left in place:"
+	@echo "    CMIS has pinned the key, so a reinstall must find it ('sudo mia setup --clean' drops only the config)."
 else
 	@echo "==> deregistering systemd unit mia.service"
 	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
@@ -495,13 +496,21 @@ ifneq ($(MIA_TRAY),0)
 endif
 	rm -rf $(MACOS_PKG_ROOT)
 	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/bin
-	install -d -m 0755 $(MACOS_PKG_ROOT)/etc/ferrogate
-	install -d -m 0755 "$(MACOS_PKG_ROOT)/Library/Application Support/FerroGate"
+	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/share/ferrogate
 	install -d -m 0755 $(MACOS_PKG_ROOT)/Library/LaunchDaemons
 	install -m 0755 target/release/$(PKG_CRATE) $(MACOS_PKG_ROOT)/usr/local/bin/$(PKG_CRATE)
-	install -m 0640 $(MACOS_DIST)/mia.env $(MACOS_PKG_ROOT)/etc/ferrogate/mia.env
-	# The TOML config goes to the macOS system config path (where mia discovers it).
-	install -m 0640 $(MACOS_DIST)/mia.toml "$(MACOS_PKG_ROOT)/Library/Application Support/FerroGate/mia.toml"
+	# The uninstaller keeps the configuration and the machine identity unless
+	# given --purge (see the script).
+	install -m 0755 $(MACOS_DIST)/macos/mia-uninstall $(MACOS_PKG_ROOT)/usr/local/bin/mia-uninstall
+	# The default configs ship as templates, NOT into /etc/ferrogate or
+	# /Library/Application Support/FerroGate: a payload file there would
+	# overwrite the operator's mia.env / mia.toml on every upgrade, and a
+	# payload directory there would make the package receipt own the
+	# directory holding host-key.bin, so receipt-driven removal would delete
+	# the machine identity CMIS has pinned. postinstall copies each template
+	# only where no file exists yet.
+	install -m 0644 $(MACOS_DIST)/mia.env $(MACOS_PKG_ROOT)/usr/local/share/ferrogate/mia.env.default
+	install -m 0644 $(MACOS_DIST)/mia.toml $(MACOS_PKG_ROOT)/usr/local/share/ferrogate/mia.toml.default
 	install -m 0644 $(MACOS_DIST)/com.ferrogate.mia.plist $(MACOS_PKG_ROOT)/Library/LaunchDaemons/$(MACOS_PKG_ID).plist
 ifneq ($(MIA_TRAY),0)
 	# The tray as an app bundle in /Applications (Finder, Launchpad, Login

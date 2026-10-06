@@ -47,7 +47,14 @@ pub enum AttestFailure {
     /// The TPM-class backend is selected but unusable (no TPM, no EK cert,
     /// device busy, evidence failure, backend not built in).
     TpmUnavailable,
-    /// Anything else (protocol error, local key problem).
+    /// The host's machine key or SVID seed exists but cannot be used (wrong
+    /// owner or mode, unreadable, not a regular file, refused by the Windows
+    /// trust check, does not open on this host, or stranded at a legacy
+    /// location). The agent refuses it rather than replacing it — CMIS has
+    /// pinned the key's public half — so an operator must repair or restore
+    /// the file. See [`crate::machine_key`].
+    MachineKey,
+    /// Anything else (protocol error, an unexpected local problem).
     Other,
 }
 
@@ -196,7 +203,14 @@ fn failure_state(f: AttestFailure) -> (AgentState, Option<ErrorSummary>) {
         AttestFailure::NotEnrolled => (AgentState::NotEnrolled, error_codes::HOST_REJECTED),
         AttestFailure::PinMismatch => (AgentState::PinMismatch, error_codes::PIN_MISMATCH),
         AttestFailure::TpmUnavailable => (AgentState::TpmUnavailable, error_codes::TPM_UNAVAILABLE),
-        // Retrying forever, like an unreachable CMIS; the code says why.
+        // Retrying forever, like an unreachable CMIS; the code says why. A
+        // refused machine key keeps the state an unexpected local problem has
+        // always had (no new wire state for older clients to choke on) and
+        // names the problem through its own code.
+        AttestFailure::MachineKey => (
+            AgentState::CmisUnreachable,
+            error_codes::MACHINE_KEY_REFUSED,
+        ),
         AttestFailure::Other => (AgentState::CmisUnreachable, error_codes::ATTESTATION_FAILED),
     };
     (state, Some(summary(code)))
@@ -221,6 +235,10 @@ pub fn message_for(code: &str) -> &'static str {
         }
         error_codes::PIN_MISMATCH => "the CMIS certificate does not match the configured SPKI pin",
         error_codes::TPM_UNAVAILABLE => "the selected TPM attestation backend is unavailable",
+        error_codes::MACHINE_KEY_REFUSED => {
+            "the machine key or SVID seed exists but cannot be used; the agent will not \
+             replace it (CMIS has pinned it) — repair or restore the file named in the agent log"
+        }
         error_codes::IMA_DISABLED => {
             "IMA appraisal is required but not enforced; the agent refuses to start"
         }
@@ -576,6 +594,7 @@ mod tests {
             (AttestFailure::NotEnrolled, AgentState::NotEnrolled),
             (AttestFailure::PinMismatch, AgentState::PinMismatch),
             (AttestFailure::TpmUnavailable, AgentState::TpmUnavailable),
+            (AttestFailure::MachineKey, AgentState::CmisUnreachable),
             (AttestFailure::Other, AgentState::CmisUnreachable),
         ] {
             let mut o = h.clone();
@@ -632,6 +651,18 @@ mod tests {
             );
             assert_eq!(reached.contains(&s), !client_side, "{s:?}");
         }
+    }
+
+    #[test]
+    fn a_refused_machine_key_has_its_own_code_and_fixed_message() {
+        // The operator must see "fix the key file", not a generic attestation
+        // failure: the agent will never replace the key on its own.
+        let (state, err) = failure_state(AttestFailure::MachineKey);
+        let err = err.unwrap();
+        assert_eq!(state, AgentState::CmisUnreachable);
+        assert_eq!(err.code, error_codes::MACHINE_KEY_REFUSED);
+        assert_ne!(err.message, message_for("no-such-code"));
+        assert!(err.message.contains("will not"), "{}", err.message);
     }
 
     #[test]

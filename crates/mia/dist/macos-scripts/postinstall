@@ -11,6 +11,28 @@ set -eu
 install -d -m 0750 /var/run/ferrogate
 install -d -m 0750 /var/log/ferrogate
 
+# ── Configuration and state directories ──────────────────────────────────────
+# Neither directory nor anything in it is part of the payload: a payload file
+# would overwrite the operator's configuration on every upgrade, and a payload
+# directory would make the receipt own the directory that holds the machine
+# key host-key.bin and the SVID seed — so receipt-driven removal would delete
+# the identity CMIS has pinned to this machine. Create each directory if it is
+# missing and copy a default configuration only where none exists. Nothing
+# that is already there is replaced, moved or deleted, on install or upgrade.
+CONFIG_DIR="/Library/Application Support/FerroGate"
+TEMPLATES=/usr/local/share/ferrogate
+[ -d /etc/ferrogate ] || install -d -m 0755 -o root -g wheel /etc/ferrogate
+[ -d "$CONFIG_DIR" ] || install -d -m 0755 -o root -g wheel "$CONFIG_DIR"
+# $1 template, $2 target: copied 0640 root:wheel only if nothing (not even a
+# dangling symlink) is at the target.
+seed_config() {
+  if [ ! -e "$2" ] && [ ! -L "$2" ] && [ -f "$1" ]; then
+    install -m 0640 -o root -g wheel "$1" "$2"
+  fi
+}
+seed_config "$TEMPLATES/mia.env.default" /etc/ferrogate/mia.env
+seed_config "$TEMPLATES/mia.toml.default" "$CONFIG_DIR/mia.toml"
+
 # ── Status group (feature F18) ───────────────────────────────────────────────
 # Members of `ferrogate-status` may read the agent's read-only status endpoint
 # (mia-tray, `mia status`). dscl groups are not listed in /etc/group, so the
@@ -39,7 +61,6 @@ STATUS_GID="$(dscl . -read "/Groups/$STATUS_GROUP" PrimaryGroupID | awk '{print 
 # in the directory (e.g. `mia setup --environment homolog` writing
 # mia-homolog.toml) inherit the directory's group. The files stay 0640, so
 # only root and group members can read them; the directory stays 0755.
-CONFIG_DIR="/Library/Application Support/FerroGate"
 if [ -d "$CONFIG_DIR" ] && [ -n "$STATUS_GID" ]; then
   chgrp "$STATUS_GID" "$CONFIG_DIR"
   for f in "$CONFIG_DIR"/mia*.toml; do
@@ -55,7 +76,9 @@ fi
 # its umask, leaving it 0644, and on macOS any user can read the hardware
 # fingerprint the key is sealed to. Make every one owner-only now, without
 # waiting for the daemon (which does the same at start). Symlinks are skipped
-# so the chmod never lands outside the directory.
+# so the chmod never lands outside the directory. The files themselves are
+# never created, replaced or removed here: only the daemon creates them, and
+# only when none exists (see mia::machine_key).
 if [ -d "$CONFIG_DIR" ]; then
   for f in host-key.bin svid-seed.bin x509-svid.sealed; do
     [ -f "$CONFIG_DIR/$f" ] && [ ! -L "$CONFIG_DIR/$f" ] || continue
@@ -114,6 +137,7 @@ if [ -f "$TRAY_AGENT" ] && [ -n "$CONSOLE_USER" ]; then
 fi
 
 echo "FerroGate MIA installed."
+echo "  Uninstall: sudo mia-uninstall (keeps the configuration and this host's machine key; --purge deletes them)."
 echo "  Status readers (mia-tray, mia status): group $STATUS_GROUP (gid $STATUS_GID)${CONSOLE_USER:+, including $CONSOLE_USER from their next login}."
 case "$DAEMON_STATE" in
   restarted)
