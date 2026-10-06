@@ -32,7 +32,7 @@
 //! its per-environment default — and whether it verifies against
 //! `allowlist.key`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -77,7 +77,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let failures = runtime.block_on(run_checks(&config, &opts.audience));
+    let failures = runtime.block_on(run_checks(&config, source.as_deref(), &opts.audience));
 
     if opts.json {
         let report = JSON_SINK
@@ -279,7 +279,11 @@ enum ServerCrl {
 
 /// Execute the checks in order, reporting as it goes. Returns the names of
 /// the checks that failed (empty ⇒ all passed).
-async fn run_checks(config: &Config, audience: &str) -> Vec<&'static str> {
+async fn run_checks(
+    config: &Config,
+    config_path: Option<&Path>,
+    audience: &str,
+) -> Vec<&'static str> {
     let mut failures: Vec<&str> = Vec::new();
 
     // 1. configuration ----------------------------------------------------
@@ -367,7 +371,7 @@ async fn run_checks(config: &Config, audience: &str) -> Vec<&'static str> {
     }
 
     // 5. helper token mint -------------------------------------------------
-    if !check_mint(config, audience, server_crl).await {
+    if !check_mint(config, config_path, audience, server_crl).await {
         failures.push("helper token mint");
     }
 
@@ -751,6 +755,8 @@ async fn run_mint_exchange<S>(
     label: &str,
     audience: &str,
     server_crl: ServerCrl,
+    config: &Config,
+    config_path: Option<&Path>,
 ) -> bool
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -816,7 +822,11 @@ where
                 let _ = write!(detail, " (retry after {secs}s)");
             }
             report(label, "FAIL", &detail);
-            hints(&mint_failure_advice(code, server_crl));
+            if code == ErrorCode::NoHostSvid {
+                explain_no_host_svid(config, config_path);
+            } else {
+                hints(&mint_failure_advice(code, server_crl));
+            }
             false
         }
     }
@@ -843,7 +853,12 @@ fn mint_target(config: &Config) -> Result<std::path::PathBuf, (String, Vec<Strin
 
 /// Step 5 (Unix): connect the helper UDS, then run the mint exchange.
 #[cfg(unix)]
-async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
+async fn check_mint(
+    config: &Config,
+    config_path: Option<&Path>,
+    audience: &str,
+    server_crl: ServerCrl,
+) -> bool {
     let label = "[5/5] helper token mint";
     let socket = match mint_target(config) {
         Ok(socket) => socket,
@@ -867,7 +882,7 @@ async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> b
         }
     };
 
-    run_mint_exchange(stream, label, audience, server_crl).await
+    run_mint_exchange(stream, label, audience, server_crl, config, config_path).await
 }
 
 /// Remediation hints for a failed connect to the helper socket.
@@ -906,7 +921,12 @@ fn socket_connect_advice(kind: std::io::ErrorKind) -> Vec<String> {
 
 /// Step 5 (Windows): connect the helper named pipe, then run the mint exchange.
 #[cfg(windows)]
-async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> bool {
+async fn check_mint(
+    config: &Config,
+    config_path: Option<&Path>,
+    audience: &str,
+    server_crl: ServerCrl,
+) -> bool {
     let label = "[5/5] helper token mint";
     let socket = match mint_target(config) {
         Ok(socket) => socket,
@@ -932,7 +952,7 @@ async fn check_mint(config: &Config, audience: &str, server_crl: ServerCrl) -> b
         }
     };
 
-    run_mint_exchange(stream, label, audience, server_crl).await
+    run_mint_exchange(stream, label, audience, server_crl, config, config_path).await
 }
 
 /// Remediation hints for a failed connect to the helper named pipe.
@@ -978,7 +998,12 @@ fn pipe_connect_advice(e: &std::io::Error) -> Vec<String> {
 // Must mirror the other signatures (the caller awaits it), so it stays `async`.
 #[cfg(not(any(unix, windows)))]
 #[allow(clippy::unused_async)]
-async fn check_mint(_config: &Config, _audience: &str, _server_crl: ServerCrl) -> bool {
+async fn check_mint(
+    _config: &Config,
+    _config_path: Option<&Path>,
+    _audience: &str,
+    _server_crl: ServerCrl,
+) -> bool {
     report(
         "[5/5] helper token mint",
         "FAIL",
@@ -1057,13 +1082,7 @@ fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
              re-fetch the key with `mia setup` and restart the daemon."
                 .to_string(),
         ],
-        ErrorCode::NoHostSvid => vec![
-            "The daemon holds no host SVID, so it cannot mint anything. Attestation to CMIS \
-             failed or has not completed — the daemon log should show 'host SVID obtained' at \
-             startup; if it does not, check the daemon's own CMIS connectivity and attestation \
-             errors."
-                .to_string(),
-        ],
+        ErrorCode::NoHostSvid => vec![GENERIC_NO_HOST_SVID_HINT.to_string()],
         ErrorCode::MalformedRequest => vec![
             "The daemon rejected the request as malformed — this points at a bug or a protocol \
              mismatch between this binary and the running daemon; align their versions."
@@ -1080,6 +1099,216 @@ fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
              around this timestamp ('mint-failed')."
                 .to_string(),
         ],
+    }
+}
+
+/// The hint for a `NoHostSvid` refusal when the daemon's own status could not
+/// be read (socket unreachable, permission denied, timeout, unknown
+/// environment) — the generic cause list.
+#[cfg(any(unix, windows, test))]
+const GENERIC_NO_HOST_SVID_HINT: &str =
+    "The daemon holds no host SVID, so it cannot mint anything. Attestation to CMIS \
+     failed or has not completed — the daemon log should show 'host SVID obtained' at \
+     startup; if it does not, check the daemon's own CMIS connectivity and attestation \
+     errors.";
+
+/// How long to wait for the daemon's status reply before giving up and
+/// printing the generic hint (the same bound `mia status` puts on its socket).
+#[cfg(any(unix, windows))]
+const STATUS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest daemon-supplied string kept in a hint or note.
+#[cfg(any(unix, windows, test))]
+const DAEMON_TEXT_MAX: usize = 200;
+
+/// What the running daemon's status endpoint reported for the environment
+/// under test: its state and the stable problem code and fixed message behind
+/// it. Carries no secrets (the status payload never does).
+#[cfg(any(unix, windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonReport {
+    /// The agent state (`not_enrolled`, `attesting`, …).
+    state: String,
+    /// The stable problem code (`host_rejected`, …), if the daemon named one.
+    code: Option<String>,
+    /// The daemon's fixed human message for the problem.
+    message: Option<String>,
+}
+
+#[cfg(any(unix, windows, test))]
+impl DaemonReport {
+    /// Summarise a snapshot. The text crosses a local socket, so control
+    /// characters are dropped and the length capped before it can reach the
+    /// terminal.
+    fn from_snapshot(s: &mia_status_proto::StatusSnapshot) -> Self {
+        let clean = |t: &str| -> String {
+            t.chars()
+                .filter(|c| !c.is_control())
+                .take(DAEMON_TEXT_MAX)
+                .collect()
+        };
+        Self {
+            state: clean(s.state.as_str()),
+            code: s.last_error.as_ref().map(|e| clean(&e.code)),
+            message: s.last_error.as_ref().map(|e| clean(&e.message)),
+        }
+    }
+
+    /// The `daemon state` / `daemon problem` lines recorded as the step's notes.
+    fn notes(&self) -> Vec<String> {
+        let mut lines = vec![format!("        daemon state:   {}", self.state)];
+        if let (Some(message), Some(code)) = (&self.message, &self.code) {
+            lines.push(format!("        daemon problem: {message} ({code})"));
+        }
+        lines
+    }
+}
+
+/// Ask the running daemon for its status for `config`'s environment. Best
+/// effort: `None` when the endpoint is absent, not readable by this user,
+/// does not serve the environment, answers oddly, or does not answer within
+/// [`STATUS_QUERY_TIMEOUT`] — the caller then keeps the generic hint.
+#[cfg(any(unix, windows))]
+fn fetch_daemon_report(config: &Config) -> Option<DaemonReport> {
+    use mia_status_proto::{StatusReq, StatusRequest, StatusResponse};
+
+    let endpoint = config.status_socket();
+    let req = StatusRequest::Status(StatusReq {
+        environment: Some(
+            config
+                .environment()
+                .unwrap_or(crate::status::DEFAULT_ENVIRONMENT_LABEL)
+                .to_string(),
+        ),
+    });
+    // The query is blocking and (on Windows) has no read deadline of its own,
+    // so run it on a detached thread the self-test can abandon.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("selftest-status".into())
+        .spawn(move || {
+            let _ = tx.send(crate::status_cli::query(&endpoint, &req).ok());
+        })
+        .ok()?;
+    match rx.recv_timeout(STATUS_QUERY_TIMEOUT).ok()?? {
+        StatusResponse::Status(snapshots) => snapshots.first().map(DaemonReport::from_snapshot),
+        _ => None,
+    }
+}
+
+/// Report the hints (and notes) for a `NoHostSvid` refusal: ask the daemon
+/// why it holds no host SVID, falling back to the generic hint when it cannot
+/// be asked.
+#[cfg(any(unix, windows))]
+fn explain_no_host_svid(config: &Config, config_path: Option<&Path>) {
+    let daemon = fetch_daemon_report(config);
+    if let Some(d) = &daemon {
+        for line in d.notes() {
+            note_after(&line);
+        }
+    }
+    let config_has_cmis = matches!(CmisResolver::from_config(&config.cmis), Ok(Some(_)));
+    hints(&no_host_svid_advice(
+        daemon.as_ref(),
+        config_has_cmis,
+        config_path,
+        crate::setup::restart_hint(),
+    ));
+}
+
+/// Turn the daemon's reported problem into the hint for a `NoHostSvid`
+/// refusal. Pure: `daemon` is `None` when its status could not be read (the
+/// generic hint), `config_has_cmis` says whether *this* self-test's
+/// configuration names a CMIS source, and `restart` is the platform's
+/// service-restart command.
+#[cfg(any(unix, windows, test))]
+fn no_host_svid_advice(
+    daemon: Option<&DaemonReport>,
+    config_has_cmis: bool,
+    config_path: Option<&Path>,
+    restart: &str,
+) -> Vec<String> {
+    let generic = || GENERIC_NO_HOST_SVID_HINT.to_string();
+    let Some(d) = daemon else {
+        return vec![generic()];
+    };
+    // Most states share their name with their problem code; prefer the code.
+    let key = d.code.as_deref().unwrap_or(d.state.as_str());
+    match key {
+        "cmis_not_configured" if config_has_cmis => {
+            let at = config_path.map_or_else(
+                || "this self-test's configuration".to_string(),
+                |p| p.display().to_string(),
+            );
+            vec![format!(
+                "The running daemon has no CMIS source but {at} does — it was started before \
+                 the configuration was written. CMIS/attestation settings are applied only at \
+                 startup (a reload does not re-apply them), so restart it, not reload: {restart}"
+            )]
+        }
+        "cmis_not_configured" => vec![
+            "Neither the running daemon nor this configuration names a CMIS source. Run \
+             `mia setup` (or set cmis.endpoint / cmis.srv), then restart the daemon, which reads \
+             CMIS settings only at startup: "
+                .to_string()
+                + restart,
+        ],
+        "cmis_misconfigured" => vec![format!(
+            "The daemon refuses its CMIS configuration (both cmis.endpoint and cmis.srv set, or \
+             an invalid cmis.spki_pin). Fix the [cmis] section, then restart the daemon (CMIS \
+             settings are not reloaded): {restart}"
+        )],
+        "host_rejected" | "not_enrolled" => vec![
+            "CMIS refused this host: it is not enrolled. Send the fingerprint from `mia \
+             machine-id --verbose` to the CMIS operator to add it to the fleet manifest \
+             (`fleet-manifest add --machine <fingerprint-hex>`, re-sign, deploy to CMIS); the \
+             daemon retries on its own once the host is enrolled."
+                .to_string(),
+        ],
+        "cmis_unreachable" => vec![
+            "The daemon cannot reach CMIS and keeps retrying. If step 2 passed for this user, \
+             the daemon's own view differs (service account, proxy, firewall, DNS, or an \
+             outdated cmis.* it loaded at startup — restart it if the config changed): check the \
+             daemon log for the dial error."
+                .to_string(),
+        ],
+        "pin_mismatch" => vec![format!(
+            "The CMIS certificate served to the daemon does not match its cmis.spki_pin — \
+             typically a certificate rotation. Re-fetch the pin with `mia setup`, then restart \
+             the daemon (pins are not reloaded): {restart}"
+        )],
+        "tpm_unavailable" => vec![
+            "The daemon selected a TPM attestation backend but the TPM is unavailable to it. \
+             Check the TPM device and the daemon's access to it, or set attestation.backend to \
+             `auto` / `host-key` and restart the daemon."
+                .to_string(),
+        ],
+        "attestation_failed" => vec![
+            "The daemon's attestation to CMIS failed and it keeps retrying; the daemon log names \
+             the error."
+                .to_string(),
+        ],
+        "attesting" => vec![
+            "The daemon is still attesting and has no host SVID yet; wait a few seconds and \
+             re-run `mia test`. If it persists, check the daemon log."
+                .to_string(),
+        ],
+        "healthy" => vec![
+            "The daemon reports this environment healthy yet refused with no host SVID — the \
+             helper socket this test dialled may be served by a different environment or daemon \
+             (compare helper.socket with `mia status`)."
+                .to_string(),
+        ],
+        _ => {
+            let problem = match (&d.message, &d.code) {
+                (Some(m), Some(c)) => format!(", problem: {m} ({c})"),
+                _ => String::new(),
+            };
+            vec![
+                format!("The daemon reports state `{}`{problem}.", d.state),
+                generic(),
+            ]
+        }
     }
 }
 
@@ -1559,7 +1788,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let failures = rt.block_on(run_checks(&Config::default(), DEFAULT_AUDIENCE));
+        let failures = rt.block_on(run_checks(&Config::default(), None, DEFAULT_AUDIENCE));
         let r = JSON_SINK.with(|sink| sink.borrow_mut().take()).unwrap();
         assert!(failures.contains(&"configuration"));
         assert!(r
@@ -1675,5 +1904,107 @@ mod tests {
         assert_eq!(a, key_fp(&[0x01u8; 32]), "deterministic");
         assert_ne!(a, b, "different keys => different fingerprints");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    fn daemon(state: &str, code: Option<&str>) -> DaemonReport {
+        DaemonReport {
+            state: state.to_string(),
+            code: code.map(str::to_string),
+            message: code.map(|c| format!("message for {c}")),
+        }
+    }
+
+    #[test]
+    fn no_host_svid_stale_daemon_config_says_restart() {
+        let d = daemon("not_configured", Some("cmis_not_configured"));
+        let path = Path::new("/etc/ferrogate/mia.toml");
+        let advice = no_host_svid_advice(Some(&d), true, Some(path), "RESTART-CMD").join("\n");
+        assert!(advice.contains("no CMIS source but /etc/ferrogate/mia.toml does"));
+        assert!(advice.contains("restart"));
+        assert!(advice.contains("RESTART-CMD"));
+        // Without a CMIS source in this config either, restarting alone is
+        // not the fix.
+        let advice = no_host_svid_advice(Some(&d), false, Some(path), "RESTART-CMD").join("\n");
+        assert!(advice.contains("Neither the running daemon nor this configuration"));
+    }
+
+    #[test]
+    fn no_host_svid_host_rejected_points_at_enrollment() {
+        for d in [
+            daemon("not_enrolled", Some("host_rejected")),
+            daemon("not_enrolled", None),
+        ] {
+            let advice = no_host_svid_advice(Some(&d), true, None, "r").join("\n");
+            assert!(advice.contains("mia machine-id --verbose"), "{advice}");
+            assert!(advice.contains("not enrolled"));
+            assert!(advice.contains("fleet manifest"));
+        }
+    }
+
+    #[test]
+    fn no_host_svid_specific_codes_get_specific_hints() {
+        let pin = no_host_svid_advice(
+            Some(&daemon("pin_mismatch", Some("pin_mismatch"))),
+            true,
+            None,
+            "R",
+        )
+        .join("\n");
+        assert!(pin.contains("spki_pin") && pin.contains('R'));
+        let tpm = no_host_svid_advice(
+            Some(&daemon("tpm_unavailable", Some("tpm_unavailable"))),
+            true,
+            None,
+            "R",
+        )
+        .join("\n");
+        assert!(tpm.contains("TPM"));
+        let net = no_host_svid_advice(
+            Some(&daemon("cmis_unreachable", Some("cmis_unreachable"))),
+            true,
+            None,
+            "R",
+        )
+        .join("\n");
+        assert!(net.contains("cannot reach CMIS"));
+    }
+
+    #[test]
+    fn no_host_svid_unknown_code_keeps_problem_text_and_generic_hint() {
+        let d = daemon("crl_stale", Some("some_future_code"));
+        let advice = no_host_svid_advice(Some(&d), true, None, "r");
+        assert_eq!(advice.len(), 2);
+        assert!(advice[0].contains("message for some_future_code (some_future_code)"));
+        assert!(advice[0].contains("crl_stale"));
+        assert_eq!(advice[1], GENERIC_NO_HOST_SVID_HINT);
+    }
+
+    #[test]
+    fn no_host_svid_without_daemon_status_is_the_generic_hint() {
+        assert_eq!(
+            no_host_svid_advice(None, true, None, "r"),
+            vec![GENERIC_NO_HOST_SVID_HINT.to_string()]
+        );
+        assert_eq!(
+            mint_failure_advice(ErrorCode::NoHostSvid, ServerCrl::Unknown),
+            vec![GENERIC_NO_HOST_SVID_HINT.to_string()]
+        );
+    }
+
+    #[test]
+    fn daemon_report_carries_state_and_problem_and_strips_control_chars() {
+        let mut snap = crate::status_cli::not_running_snapshots(Some("prod")).remove(0);
+        snap.state = mia_status_proto::AgentState::NotEnrolled;
+        snap.last_error = Some(mia_status_proto::ErrorSummary {
+            code: "host_rejected".into(),
+            message: "refused\x1b[31m host".into(),
+        });
+        let r = DaemonReport::from_snapshot(&snap);
+        assert_eq!(r.state, "not_enrolled");
+        assert_eq!(r.code.as_deref(), Some("host_rejected"));
+        assert_eq!(r.message.as_deref(), Some("refused[31m host"));
+        let notes = r.notes();
+        assert!(notes[0].contains("not_enrolled"));
+        assert!(notes[1].contains("(host_rejected)"));
     }
 }
