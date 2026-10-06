@@ -32,6 +32,11 @@ pub mod client;
 /// The TOML configuration file and its merge with the environment.
 pub mod config;
 
+/// The system configuration directory as a trust boundary: on Windows it is
+/// kept administrator-only, and trust-relevant files in it are refused unless
+/// only SYSTEM and Administrators can change them.
+pub mod system_dir;
+
 /// The host-wide default environment: which environment serves the helper
 /// API's well-known address (`environments.toml` /
 /// `FERROGATE_DEFAULT_ENVIRONMENT`).

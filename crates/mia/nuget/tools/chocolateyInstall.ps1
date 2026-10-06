@@ -81,12 +81,100 @@ $packageArgs = @{
 }
 Install-ChocolateyInstallPackage @packageArgs
 
+# 3b. Make %ProgramData%\FerroGate administrator-only. The LocalSystem service
+#     trusts what it finds there (configuration, environments.toml, allowlist
+#     body and key, its machine key) and writes its log below it; left to
+#     inherit %ProgramData%'s DACL, BUILTIN\Users could plant files or a `logs`
+#     junction there and read the machine key. The service does this itself at
+#     every start; running the same code here (mia::system_dir::prepare) makes
+#     the install fail loudly instead. It creates the directory with the final
+#     descriptor in one step (owner Administrators, protected DACL granting only
+#     SYSTEM and Administrators), or locks an existing one through a handle that
+#     never follows a junction, then refuses any reparse point below it and locks
+#     every subdirectory that is not administrator-only.
+$miaExe = Join-Path $installDir 'mia.exe'
+Write-Host 'Securing the MIA configuration directory...'
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $miaExe service secure-config
+    if ($LASTEXITCODE -ne 0) {
+        throw "mia.exe service secure-config failed with exit code $LASTEXITCODE; $env:ProgramData\FerroGate is not administrator-only."
+    }
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+$configDir = Join-Path $env:ProgramData 'FerroGate'
+$icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+
+# 3c. Files already in the directory keep their owners; the service refuses
+#     any that SYSTEM or Administrators do not own. On Windows clients a file an
+#     elevated administrator wrote (e.g. `mia setup` with an older release) is
+#     owned by that administrator's own account: hand those — owner a direct
+#     member of the local Administrators group — to the group and reset their
+#     ACL to the directory's. Anything else was created by a non-administrator:
+#     it is listed, never adopted. Review and delete it. `secure-config` has
+#     already refused any reparse point below the directory, so nothing here is
+#     reached through a link.
+$trustedOwners = @('S-1-5-18', 'S-1-5-32-544')
+$adminSids = @()
+try {
+    $adminSids = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.SID.Value })
+} catch {
+    Write-Warning "Could not list the local Administrators group ($($_.Exception.Message)); existing files are not adopted."
+}
+Get-ChildItem -LiteralPath $configDir -Recurse -Force -File -Attributes !ReparsePoint -ErrorAction SilentlyContinue | ForEach-Object {
+    $path = $_.FullName
+    try {
+        $owner = (Get-Acl -LiteralPath $path).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        Write-Warning "Could not read the owner of ${path}: $($_.Exception.Message). The mia service will refuse it until it is fixed."
+        return
+    }
+    if ($trustedOwners -contains $owner) { return }
+    # A file with several names shares its owner and DACL with a file
+    # elsewhere: never adopt it (the service refuses it anyway).
+    # (Stderr is not redirected under ErrorActionPreference=Stop; see step 1.)
+    $fsutil = Join-Path $env:SystemRoot 'System32\fsutil.exe'
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $names = @(& $fsutil hardlink list $path)
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($names.Count -gt 1) {
+        Write-Warning "$path has $($names.Count) hard links: the mia service will refuse it. Delete it and write the file again."
+        return
+    }
+    if ($adminSids -contains $owner) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $icacls $path /setowner '*S-1-5-32-544' *> $null
+            $adopted = $LASTEXITCODE -eq 0
+            if ($adopted) {
+                & $icacls $path /reset *> $null
+                $adopted = $LASTEXITCODE -eq 0
+            }
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+        if ($adopted) {
+            Write-Host "Handed $path (owned by administrator $owner) to Administrators."
+        } else {
+            Write-Warning "Could not hand $path to Administrators; the mia service will refuse it."
+        }
+    } else {
+        Write-Warning "$path is owned by $owner, not SYSTEM or Administrators: the mia service will refuse it. Delete it unless you know where it came from (to keep it: icacls `"$path`" /setowner *S-1-5-32-544 and icacls `"$path`" /reset)."
+    }
+}
+
 # 4. Verify the MSI actually registered the service, and repair if it did not.
 #    ServiceInstall in the MSI is non-vital, so Windows Installer can report
 #    success while CreateService failed (e.g. a stale service still marked for
 #    deletion). mia.exe ships its own registration (`mia service install`,
 #    identical parameters), so use it as the authoritative fallback.
-$miaExe = Join-Path $installDir 'mia.exe'
 if (-not (Get-Service -Name 'mia' -ErrorAction SilentlyContinue)) {
     Write-Warning "The MSI did not register the 'mia' service (see $msiLog); registering it via mia.exe..."
     $prevEap = $ErrorActionPreference

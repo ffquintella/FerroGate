@@ -907,10 +907,14 @@ impl Config {
         Ok((Self::default(), None))
     }
 
-    /// Parse a TOML configuration file from `path`.
+    /// Parse a TOML configuration file from `path`. A file in the system
+    /// configuration directory that a non-administrator could have written is
+    /// refused ([`crate::system_dir::check_trusted_file`]; Windows only).
     fn from_path(path: &Path) -> anyhow::Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let bytes = crate::system_dir::read_trusted(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let text = String::from_utf8(bytes)
+            .with_context(|| format!("reading {}: not valid UTF-8", path.display()))?;
         Self::from_toml(&text)
     }
 

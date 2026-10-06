@@ -35,6 +35,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Security_WinTrust",
+    # CreateDirectoryW and the open flags for the administrator-only
+    # configuration directory (`file_security`).
+    "Win32_Storage_FileSystem",
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]

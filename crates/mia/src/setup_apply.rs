@@ -514,7 +514,9 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
             "the directory of --output ({}) does not exist",
             parent.display()
         );
-        std::fs::create_dir_all(parent)
+        // On Windows the system configuration directory is created
+        // administrator-only (`crate::system_dir`).
+        crate::system_dir::create_dir_all(parent)
             .with_context(|| format!("creating {} ({ELEVATION_HINT})", parent.display()))?;
     }
     let who = invoker(parent)?;
@@ -894,7 +896,7 @@ fn stage_with(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
+    crate::system_dir::create_dir_all(parent)
         .with_context(|| format!("creating {} ({ELEVATION_HINT})", parent.display()))?;
     let previous = match std::fs::symlink_metadata(target) {
         Ok(m) if m.file_type().is_symlink() => anyhow::bail!(
@@ -973,6 +975,12 @@ fn stage_with(
     file.sync_all()
         .with_context(|| format!("flushing {}", tmp.display()))?;
     drop(file);
+    // Windows: a file an elevated administrator creates is owned by their own
+    // account, which the daemon refuses in the system configuration
+    // directory; hand the fresh temp file to Administrators before it
+    // replaces the target. A no-op elsewhere and outside that directory.
+    crate::system_dir::claim(&tmp)
+        .with_context(|| format!("writing {} ({ELEVATION_HINT})", target.display()))?;
     Ok(staged)
 }
 

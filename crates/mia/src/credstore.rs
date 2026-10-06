@@ -381,13 +381,15 @@ pub fn store(
 ///
 /// Every other outcome is an error: the credential is returned only when it
 /// unseals on this machine, still verifies as an X.509-SVID at `now`, and its
-/// stored key matches the certificate.
+/// stored key matches the certificate. On Windows a store in the system
+/// configuration directory that a non-administrator could have written is
+/// refused before it is read ([`crate::system_dir::check_trusted_file`]).
 pub fn load(
     path: &Path,
     sealer: &mut Sealer<'_>,
     now: i64,
 ) -> Result<Option<LoadedCredential>, StoreError> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match crate::system_dir::read_trusted(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(StoreError::Io(format!("read {}: {e}", path.display()))),

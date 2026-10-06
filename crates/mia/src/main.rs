@@ -151,6 +151,21 @@ fn main() -> anyhow::Result<()> {
 fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
     let config_source = parse_daemon_flags(args)?;
 
+    // The Windows service (`LocalSystem`) makes the system configuration
+    // directory administrator-only before it reads anything from it — and
+    // before the log file below creates it — so no local user can plant a
+    // configuration, allowlist or key for it to load (see `mia::system_dir`).
+    // Elsewhere, and for a foreground run, this is a no-op: the per-file
+    // checks still refuse anything a non-administrator could have written.
+    let system_dir = if service_log {
+        Some(
+            mia::system_dir::prepare()
+                .map_err(|e| anyhow::anyhow!("securing the configuration directory: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     // An explicit selection (`--config`, `--environment`, or `$FERROGATE_CONFIG`)
     // serves exactly that one configuration. Otherwise the daemon serves *every*
     // discovered environment (`mia.toml` + `mia-<env>.toml`), attesting to each
@@ -215,6 +230,7 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
         component = "mia",
         "FerroGate Machine Identity Agent"
     );
+    log_system_dir(system_dir.as_ref());
     // Which environment owns the well-known helper address, and why.
     tracing::info!(
         default_environment = %selection.label(),
@@ -404,6 +420,35 @@ fn parse_daemon_flags(args: &[String]) -> anyhow::Result<mia::config::ConfigSour
     Ok(source)
 }
 
+/// Log what [`mia::system_dir::prepare`] found at service start (it runs before
+/// the subscriber exists). A repaired directory is a `warn`: until then any
+/// local user could create files in it.
+fn log_system_dir(prepared: Option<&mia::system_dir::Prepared>) {
+    use mia::system_dir::Prepared;
+    let dir = mia::config::system_config_path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    match prepared {
+        None | Some(Prepared::Unmanaged) => {}
+        Some(Prepared::Created) => tracing::info!(
+            dir = %dir.display(),
+            "created the configuration directory administrator-only (SYSTEM and Administrators)"
+        ),
+        Some(Prepared::AlreadyRestricted) => tracing::debug!(
+            dir = %dir.display(),
+            "configuration directory is administrator-only"
+        ),
+        Some(Prepared::Repaired { reason }) => tracing::warn!(
+            dir = %dir.display(),
+            %reason,
+            "the configuration directory was not administrator-only; replaced its owner and DACL \
+             (SYSTEM and Administrators only). Files other users created in it stay refused: \
+             review and delete them"
+        ),
+    }
+}
+
 /// Resolve the tracing writer: a log file under `%ProgramData%\FerroGate\logs`
 /// (no ANSI) when running as a Windows service, otherwise stdout (ANSI on).
 fn log_writer(
@@ -416,13 +461,12 @@ fn log_writer(
         let dir = mia::config::system_config_path()
             .parent()
             .map_or_else(|| std::path::PathBuf::from("logs"), |p| p.join("logs"));
-        std::fs::create_dir_all(&dir)
+        mia::system_dir::create_dir_all(&dir)
             .with_context(|| format!("creating service log directory {}", dir.display()))?;
         let path = dir.join("mia.log");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        // Judged before the service writes to it: never through a junction,
+        // symbolic link or hard link, and only in an administrator-only file.
+        let file = mia::system_dir::open_log(&path)
             .with_context(|| format!("opening service log file {}", path.display()))?;
         Ok((BoxMakeWriter::new(std::sync::Mutex::new(file)), false))
     } else {
@@ -463,21 +507,49 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
             println!("started the 'mia' service.");
             Ok(())
         }
+        // Make %ProgramData%\FerroGate administrator-only, exactly as the
+        // service does at start (`mia::system_dir::prepare`). The installers
+        // run it, and so can an administrator; it needs elevation.
+        Some("secure-config") => {
+            let dir = mia::config::system_config_path()
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default();
+            match mia::system_dir::prepare()
+                .with_context(|| format!("securing {}", dir.display()))?
+            {
+                mia::system_dir::Prepared::Created => {
+                    println!("created {} administrator-only.", dir.display());
+                }
+                mia::system_dir::Prepared::Repaired { reason } => println!(
+                    "made {} administrator-only again ({reason}). Files other users created \
+                     there are still refused: review and delete them.",
+                    dir.display()
+                ),
+                mia::system_dir::Prepared::AlreadyRestricted
+                | mia::system_dir::Prepared::Unmanaged => {
+                    println!("{} is administrator-only.", dir.display());
+                }
+            }
+            Ok(())
+        }
         Some("stop") => {
             ferro_winauth::service::stop()?;
             println!("stopped the 'mia' service.");
             Ok(())
         }
         Some(other) => anyhow::bail!(
-            "unknown service subcommand: {other}\n\nusage: mia service <install|uninstall|start|stop>"
+            "unknown service subcommand: {other}\n\nusage: mia service <install|uninstall|start|stop|secure-config>"
         ),
         None => {
             println!(
-                "usage: mia service <install|uninstall|start|stop>\n\n\
+                "usage: mia service <install|uninstall|start|stop|secure-config>\n\n\
                  Manage the mia Windows service so it runs in the background and\n\
                  `Restart-Service mia` works. `install` registers an auto-start\n\
                  LocalSystem service that runs `mia service run` (used internally\n\
-                 by the Service Control Manager)."
+                 by the Service Control Manager). `secure-config` makes\n\
+                 %ProgramData%\\FerroGate administrator-only, as the service does\n\
+                 at every start (needs an elevated prompt)."
             );
             Ok(())
         }
@@ -978,7 +1050,10 @@ fn load_or_create_svid_seed(path: &std::path::Path) -> std::io::Result<[u8; 32]>
     use getrandom::SysRng;
     use rand_core::{Rng as _, UnwrapErr};
 
-    match std::fs::read(path) {
+    // A seed another local user could have planted or changed is refused
+    // (Windows; `mia::system_dir`) and never overwritten: the caller falls back
+    // to an ephemeral key.
+    match mia::system_dir::read_trusted(path) {
         Ok(bytes) => {
             if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
                 return Ok(seed);
@@ -1056,6 +1131,12 @@ async fn bootstrap_host_svid_host_key(
         return None;
     };
     let key_path = host_key_path();
+    // A machine key another local user could have planted is never used.
+    if let Err(e) = mia::system_dir::check_trusted_file(&key_path) {
+        tracing::error!(error = %e, path = %key_path.display(), "refusing the machine signing key");
+        status.attest_failed(AttestFailure::Other);
+        return None;
+    }
     // Seal the software key at rest to the hardware fingerprint: a key file
     // copied to another host won't decrypt there (its fingerprint differs). This
     // is clone resistance bound to machine identity, not a hardware root of
@@ -1661,16 +1742,21 @@ async fn maybe_fetch_allowlist(
 
 /// Write the signed allowlist CBOR to `path`, creating parent dirs. The body is
 /// integrity-protected by its signature (not secret), so `0644` like the key.
+/// On Windows a missing system configuration directory is created
+/// administrator-only, and a body written there replaces the old file with one
+/// owned by Administrators (`mia::system_dir::write_file`), so the daemon
+/// trusts it on the next load.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn write_allowlist_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     use anyhow::Context as _;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
+            mia::system_dir::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    mia::system_dir::write_file(path, bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1731,6 +1817,10 @@ fn maybe_spawn_propose_task(
     // hardware fingerprint when one is available (matching `bootstrap_host_svid_host_key`);
     // a host with no fingerprint (e.g. the TPM backend) falls back to the plaintext key.
     let key_path = host_key_path();
+    if let Err(e) = mia::system_dir::check_trusted_file(&key_path) {
+        tracing::error!(error = %e, "refusing the machine key; not proposing");
+        return;
+    }
     let key = match prefetched_facts() {
         Some(facts) => ferro_sep::SoftwareMachineKey::open_or_create_sealed(
             &key_path,

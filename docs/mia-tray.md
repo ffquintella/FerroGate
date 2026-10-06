@@ -181,7 +181,11 @@ are held and counted).
   `/var/log/ferrogate/mia.log` (macOS), Notepad on
   `%ProgramData%\FerroGate\logs\mia.log` (Windows), `journalctl -u mia -f` in a
   terminal (Linux). Reading the journal needs membership in `systemd-journal`
-  or `adm`; the tray says so and never elevates for it.
+  or `adm`; the tray says so and never elevates for it. On Windows the
+  configuration directory, logs included, is readable by SYSTEM and
+  Administrators only; an administrator can let users read the log with
+  `icacls "%ProgramData%\FerroGate\logs" /grant *S-1-5-32-545:(OI)(CI)RX` (see
+  "Configuration directory permissions" in [mia.md](mia.md)).
 - **Save diagnostics bundle…** writes, where you choose (`0600`), a plain-text
   file with the status snapshots, the latest `mia test --json` result (run now
   if there was none) and the last 500 log records — only what the tray already

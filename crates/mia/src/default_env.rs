@@ -286,7 +286,9 @@ pub fn render_environments_file(environment: Option<&str>) -> anyhow::Result<Str
 
 /// Read and parse the environments file: `Ok(None)` when it does not exist;
 /// an error when it exists but is not a regular file, exceeds
-/// [`MAX_ENVIRONMENTS_FILE_BYTES`], cannot be read, or does not parse.
+/// [`MAX_ENVIRONMENTS_FILE_BYTES`], cannot be read, does not parse, or — on
+/// Windows — could have been written by a non-administrator
+/// ([`crate::system_dir::check_trusted_file`]).
 fn read_environments_file(path: &Path) -> anyhow::Result<Option<EnvironmentsFile>> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
@@ -295,7 +297,8 @@ fn read_environments_file(path: &Path) -> anyhow::Result<Option<EnvironmentsFile
     };
     anyhow::ensure!(meta.is_file(), "{} is not a regular file", path.display());
     let mut text = String::new();
-    std::fs::File::open(path)
+    // Refused (Windows) when a non-administrator could have written it.
+    crate::system_dir::open_trusted(path)
         .and_then(|f| {
             f.take(MAX_ENVIRONMENTS_FILE_BYTES + 1)
                 .read_to_string(&mut text)

@@ -244,14 +244,20 @@ pub fn load_classified(
 /// `ECONNREFUSED` instead of a diagnosable deny, and the stale pinned key that
 /// commonly causes this (CMIS enrollment-key change) needs operator
 /// re-provisioning either way. Only an unexpected I/O failure (not
-/// `NotFound`) reading either file is returned as an error.
+/// `NotFound`) reading either file is returned as an error — including, on
+/// Windows, a file in the system configuration directory that a
+/// non-administrator could have written (`PermissionDenied`, see
+/// [`crate::system_dir::check_trusted_file`]).
 pub fn load_at_startup(
     path: &std::path::Path,
     key_path: &std::path::Path,
     now: i64,
     max_age_secs: i64,
 ) -> std::io::Result<Option<Allowlist>> {
-    let bytes = match std::fs::read(path) {
+    // Both files are refused (an I/O error, `PermissionDenied`) when they sit
+    // in the system configuration directory and a non-administrator could
+    // have written them (Windows; see `crate::system_dir`).
+    let bytes = match crate::system_dir::read_trusted(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // CMIS may have no allowlist for this host and none was ever
@@ -266,7 +272,7 @@ pub fn load_at_startup(
         }
         Err(e) => return Err(e),
     };
-    let key_bytes = match std::fs::read(key_path) {
+    let key_bytes = match crate::system_dir::read_trusted(key_path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::error!(

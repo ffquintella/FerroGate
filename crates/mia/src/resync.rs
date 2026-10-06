@@ -316,7 +316,8 @@ fn refresh_key(config: &Config) -> anyhow::Result<()> {
     // body was signed by the old key) — the operator then runs resync-allowlist
     // to pull a body signed by the new key.
     let path = config.allowlist_path();
-    match std::fs::read(&path) {
+    // Judged as the daemon judges it (`crate::system_dir`, Windows).
+    match crate::system_dir::read_trusted(&path) {
         Ok(bytes) => verify_after_write(&bytes, key_path, config.allowlist_max_age()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             println!("note: no allowlist at {} yet.", path.display());
@@ -340,7 +341,7 @@ fn verify_after_write(bytes: &[u8], key_path: &Path, max_age_secs: i64) {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
 
-    let key_bytes = match std::fs::read(key_path) {
+    let key_bytes = match crate::system_dir::read_trusted(key_path) {
         Ok(b) => b,
         Err(e) => {
             println!(
@@ -380,15 +381,18 @@ fn verify_after_write(bytes: &[u8], key_path: &Path, max_age_secs: i64) {
 }
 
 /// Write the signed allowlist CBOR to `path`, creating parent dirs. The body is
-/// integrity-protected by its signature (not secret), so `0644`.
+/// integrity-protected by its signature (not secret), so `0644`. On Windows,
+/// inside the system configuration directory, the result is owned by
+/// Administrators so the daemon trusts it (`crate::system_dir::write_file`).
 fn write_allowlist_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
+            crate::system_dir::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    crate::system_dir::write_file(path, bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

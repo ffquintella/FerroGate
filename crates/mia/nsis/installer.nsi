@@ -5,9 +5,10 @@
 ;   /DBINDIR=path     directory holding the built mia.exe
 ;   /DOUTFILE=path    output path for the generated setup .exe
 ;
-; The installer drops mia.exe under "Program Files\FerroGate\MIA", adds that
-; directory to the system PATH, and registers an entry under Add/Remove
-; Programs. MIA is configured via environment variables (see docs/mia.md); on
+; The installer drops mia.exe under "Program Files\FerroGate\MIA", makes
+; %ProgramData%\FerroGate administrator-only (`mia service secure-config`), adds
+; the install directory to the system PATH, and registers an entry under
+; Add/Remove Programs. MIA is configured via environment variables (see docs/mia.md); on
 ; Windows the helper API is exposed over a named pipe.
 
 Unicode true
@@ -111,6 +112,27 @@ Section "FerroGate MIA" SecMia
   SetRegView 64
   SetOutPath "$INSTDIR"
   File "${BINDIR}\mia.exe"
+
+  ; Make %ProgramData%\FerroGate administrator-only before the service is
+  ; registered or started. The LocalSystem service trusts what it finds there
+  ; (configuration, environments.toml, allowlist body and key, its machine
+  ; key) and writes its log below it; left to inherit %ProgramData%'s DACL,
+  ; BUILTIN\Users could plant files or a `logs` junction there and read the
+  ; machine key. `mia service secure-config` runs the code the service runs
+  ; at every start (mia::system_dir::prepare): it creates the directory with
+  ; the final descriptor in one step (owner Administrators, protected DACL:
+  ; SYSTEM and Administrators only), or locks an existing one through a handle
+  ; that never follows a junction; it then refuses any reparse point below it
+  ; and locks every subdirectory that is not administrator-only. Files other
+  ; users created there keep their owner and stay refused by the service
+  ; (see docs/mia.md). Any failure aborts the installation.
+  DetailPrint "Securing the MIA configuration directory..."
+  nsExec::ExecToLog '"$INSTDIR\mia.exe" service secure-config'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "Could not make %ProgramData%\FerroGate administrator-only ('mia service secure-config' exited with $0; see the details). The installation is aborted." /SD IDOK
+    Abort
+  ${EndIf}
 
   WriteRegStr HKLM "${APP_REG_KEY}" "InstallDir" "$INSTDIR"
 

@@ -16,11 +16,17 @@
 //!   with a DACL restricting access to one local group (which may connect but
 //!   not create pipe instances — see [`pipe_acl`]);
 //! - [`open_client_pipe`] — open a pipe client with exactly the access that
-//!   DACL grants and `SECURITY_IDENTIFICATION`.
+//!   DACL grants and `SECURITY_IDENTIFICATION`;
+//! - [`open_no_follow`], [`object_info`], [`security_of`], [`read_security`],
+//!   [`create_admin_only_dir`], [`set_admin_only`] and
+//!   [`set_administrators_owner`] — read and set, through one handle that never
+//!   follows a reparse point, the owner and DACL of the MIA's
+//!   administrator-only system configuration directory and the files in it,
+//!   judged by the pure policy in [`file_acl`].
 //!
-//! Everything except the pure [`pipe_acl`] constants is `#[cfg(windows)]`; on
-//! other platforms the crate is otherwise empty so it can sit in the workspace
-//! and be a `cfg(windows)` dependency of `mia`.
+//! Everything except the pure [`pipe_acl`] and [`file_acl`] modules is
+//! `#[cfg(windows)]`; on other platforms the crate is otherwise empty so it can
+//! sit in the workspace and be a `cfg(windows)` dependency of `mia`.
 
 #![allow(unsafe_code)]
 // this crate is the Windows FFI boundary by design
@@ -37,6 +43,16 @@ pub use imp::{
 };
 
 pub mod pipe_acl;
+
+pub mod file_acl;
+
+#[cfg(windows)]
+mod file_security;
+#[cfg(windows)]
+pub use file_security::{
+    create_admin_only_dir, object_info, open_no_follow, read_security, security_of, set_admin_only,
+    set_administrators_owner,
+};
 
 // Windows Service Control Manager integration for the `mia` daemon. Lives here
 // because `windows-service`'s service-main macro expands to `unsafe` glue and

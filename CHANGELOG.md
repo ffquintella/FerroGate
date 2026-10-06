@@ -25,6 +25,60 @@ record them.
 
 ## [Unreleased]
 
+### Security
+
+- Make the Windows MIA configuration directory administrator-only and refuse files a non-administrator could have written (S12, S29)
+  `%ProgramData%\FerroGate` was created with a plain `create_dir_all`, so it
+  inherited `%ProgramData%`'s DACL: `BUILTIN\Users` could create files and
+  folders in it, owned what they created, and could read everything in it.
+  The `LocalSystem` service trusts that directory without being told where to
+  look, so any local user could plant `mia-<env>.toml`, `environments.toml`,
+  an allowlist body (verified, but able to deny every caller or replay an
+  older signed body) or a machine key or SVID seed for it to load, and could
+  read the machine key, which on Windows has no file mode to protect it. The
+  directory is now owner `BUILTIN\Administrators` with a protected DACL that
+  grants only SYSTEM and Administrators full control
+  (`O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`). Before it reads anything or
+  opens its log, the service creates the directory with that descriptor in
+  one step, or locks an existing one. It then walks everything below it,
+  refusing any reparse point and locking every subdirectory that is not
+  administrator-only (a user could otherwise pre-create `logs` as a junction
+  and have SYSTEM write its log elsewhere). Only after that does it re-derive
+  inherited ACEs. Every object is opened without following reparse points and
+  judged and changed through that same handle. The Chocolatey package and the
+  NSIS installer run the same code (`mia service secure-config`, new) on every
+  install and upgrade and abort on failure. Before loading a configuration
+  file, `environments.toml`, the allowlist body or key, the machine key, the
+  SVID seed or the sealed X.509-SVID store from inside the directory, `mia`
+  refuses the file when it or a directory above it is owned by anyone but
+  SYSTEM or Administrators, has a NULL DACL, is a reparse point or a
+  hard-linked file, or grants anyone else a write right. The bytes are read
+  from the handle that was judged. The log file is opened and judged the same
+  way. The ACL parsing and decision are pure and unit-tested in
+  `ferro-winauth::file_acl`; the FFI lives in `ferro-winauth`, so `mia` stays
+  `forbid(unsafe_code)`. Linux and macOS are unchanged.
+  - **Behaviour:** a file in the directory that SYSTEM or Administrators do not
+    own is refused, even after the service repairs the directory, because a
+    planted file cannot be told from an intended one. A refused configuration
+    or `environments.toml` stops the service; a refused default allowlist body
+    or key denies every caller. A reparse point anywhere below the directory,
+    or a junction, link or foreign-owned file at `logs\mia.log`, stops the
+    service. `mia setup`, `mia default-environment`,
+    `mia resync-allowlist`, `mia refresh-key` and `allowlist.fetch` now write
+    Administrators-owned files and need an elevated prompt. Unprivileged users
+    can no longer read the directory, so the tray's **Open full log**,
+    `mia test` and `mia setup --dump` of the system configuration need
+    elevation on Windows; `mia status` falls back to the default endpoint.
+  - **Action:** on upgrade, files written by an elevated administrator with an
+    older `mia` are owned by that administrator's account. The Chocolatey
+    package hands those whose owner is a direct member of the local
+    Administrators group to the group and lists the rest. Elsewhere, review
+    each refused file and either delete it or run
+    `icacls "<file>" /setowner *S-1-5-32-544` and `icacls "<file>" /reset`.
+    Under the default `%ProgramData%` DACL the machine key was readable by
+    every local user until now: treat it as exposed and rotate it with its
+    CMIS binding.
+
 ## [0.24.0] - 2026-10-05
 
 ### Added

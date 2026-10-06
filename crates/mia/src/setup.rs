@@ -779,11 +779,15 @@ pub(crate) fn fetch_enrollment_key_to(
 
     if let Some(parent) = key_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
+            crate::system_dir::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    std::fs::write(key_path, &key).with_context(|| format!("writing {}", key_path.display()))?;
+    // On Windows, inside the system configuration directory, the key is
+    // written to a fresh Administrators-owned file that replaces the old one,
+    // so the daemon trusts it (`crate::system_dir::write_file`).
+    crate::system_dir::write_file(key_path, &key)
+        .with_context(|| format!("writing {}", key_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

@@ -176,7 +176,10 @@ hardware fingerprint `H` (F16). The 32-byte seed the composite SVID key is
 derived from lives beside it in `svid-seed.bin`. `<state-dir>` is
 `/var/lib/ferrogate` on Linux (`0750`, owned by `_ferrogate`) and the system
 config directory elsewhere. On macOS that is
-`/Library/Application Support/FerroGate`, which is `0755`.
+`/Library/Application Support/FerroGate`, which is `0755`. On Windows it is
+`%ProgramData%\FerroGate`, where there is no file mode: the directory's
+administrator-only DACL is what keeps these files private (see
+[Configuration directory permissions](#configuration-directory-permissions)).
 
 The seal stops a copied file from opening on another machine. It does **not**
 stop a local user on the same machine: the fingerprint inputs are not secret,
@@ -241,6 +244,7 @@ mia service install     # register an auto-start LocalSystem service (needs admi
 mia service start
 mia service stop
 mia service uninstall
+mia service secure-config  # make %ProgramData%\FerroGate administrator-only (needs admin)
 Restart-Service mia      # once installed
 ```
 
@@ -278,6 +282,117 @@ lets the agent talk to its own daemon. Token minting additionally needs a host
 SVID, which on Windows comes from host-key attestation
 ([`ferro-machineid`](../crates/ferro-machineid) collects the SMBIOS/disk
 fingerprint); a host that CMIS has not enrolled is refused `no_host_svid`.
+
+#### Configuration directory permissions
+
+The service trusts what it finds in `%ProgramData%\FerroGate` without being
+told where to look: the discovered `mia.toml` / `mia-<env>.toml`,
+`environments.toml`, the default allowlist body `allowlist[-<env>].cbor`,
+usually `allowlist.key`, and — because the state directory is the
+configuration directory on Windows — the machine key `host-key.bin`,
+`svid-seed.bin` and `x509-svid.sealed`. A folder created under
+`%ProgramData%` inherits a DACL that lets `BUILTIN\Users` create files and
+folders in it (and owns what they create) and lets every user read it. Up to
+0.24.0 the directory was created that way, so any local user could plant a
+configuration, an environment selection, an allowlist body (still verified
+against `allowlist.key`, but able to deny every caller or replay an older
+signed body within `max_age`) or a machine key for the `LocalSystem` service to
+load, and could read the machine key, which on Windows has no file mode to
+protect it.
+
+The directory is now **administrator-only**: owner `BUILTIN\Administrators`, a
+protected DACL (nothing inherited from `%ProgramData%`) granting `SYSTEM` and
+`BUILTIN\Administrators` full control, inherited by everything below it, and no
+other principal — not `Users`, `Authenticated Users` or `CREATOR OWNER`, not
+even read access. In SDDL: `O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`.
+
+- **Service start.** Before it reads anything — and before it opens its log —
+  the service makes the directory administrator-only (`mia::system_dir`). It
+  opens every object without following reparse points and judges and changes
+  it through that same handle, so a directory swapped for a junction is never
+  what gets changed:
+  1. a missing directory is created with that descriptor in one step; an
+     existing one that is not administrator-only gets that owner and DACL
+     (on the directory alone, for now);
+  2. everything below it is walked: a symbolic link, junction or other
+     reparse point anywhere refuses the start, and every subdirectory that is
+     not administrator-only — for example a `logs` folder a user created
+     before the install — is locked the same way;
+  3. only then are the inherited ACEs of the files below each locked
+     directory re-derived. Their owners and explicit ACEs are left alone.
+
+  A repair is logged as a `warn` naming each directory and why. A failed
+  repair, or a reparse point, stops the service.
+- **Installers.** The Chocolatey package and the legacy NSIS installer run the
+  same code with `mia service secure-config` (elevated) on every install and
+  upgrade, and abort if it fails. The bare MSI cannot run commands (`wixl`);
+  there the service does it at its first start. An administrator can run
+  `mia service secure-config` at any time to repair the directory; prefer it
+  to `icacls` sequences such as `/reset` followed by `/inheritance:r`, which
+  briefly re-open the directory to `Users` in between.
+- **Every load.** Before reading a configuration file, `environments.toml`, the
+  allowlist body or key, the machine key, the SVID seed or the sealed
+  X.509-SVID store **inside that directory**, `mia` refuses the file
+  (`PermissionDenied`) when the file — or any directory between it and
+  `%ProgramData%\FerroGate` — is owned by anyone but `SYSTEM` or
+  `BUILTIN\Administrators`, has a NULL DACL, is a reparse point, is a file
+  with more than one hard link, or has an ACE that grants anyone else a write
+  right (`FILE_WRITE_DATA`/`ADD_FILE`,
+  `FILE_APPEND_DATA`/`ADD_SUBDIRECTORY`, `FILE_WRITE_EA`,
+  `FILE_WRITE_ATTRIBUTES`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`,
+  `WRITE_OWNER`, or a generic right that maps to one). Deny ACEs and
+  inherit-only ACEs are ignored; an ACE type it does not recognise that carries
+  a write right is refused. The file is opened without following a reparse
+  point, judged through that handle and read from it, so nothing can be
+  swapped in between; a guarding directory that does not exist is `NotFound`.
+  The service's `logs\mia.log` is opened the same way and refused under the
+  same rules (a junction, link, hard link or foreign-owned file there stops
+  the service). The outcome follows the existing fail-closed rules:
+  a refused configuration or `environments.toml` stops the service; a refused
+  default allowlist body or key denies every caller (an explicit
+  `allowlist.path` stops it, as any read error does); a refused machine key
+  disables host-key attestation; a refused SVID seed is never overwritten and
+  an ephemeral key is used. Paths named explicitly **outside** the directory
+  (`--config`, `allowlist.path`, `allowlist.key`) and the per-user directory
+  are not judged.
+- **Writers.** On Windows clients a file an elevated administrator creates is
+  owned by their own account, which the check refuses. `mia setup` (wizard and
+  `--apply`), `mia default-environment`, `mia resync-allowlist`,
+  `mia refresh-key` and the daemon's `allowlist.fetch` therefore write a fresh
+  file owned by `BUILTIN\Administrators` and rename it over the target. They
+  need an elevated prompt, and run the same preparation as the service first:
+  a missing directory is created administrator-only and an existing one is
+  checked and repaired, or refused when the prompt is not elevated.
+
+A file someone else created stays refused, by design: the service cannot tell
+a planted file from an intended one. The error names the file, its owner or
+the offending ACE. If you did not put the file there, delete it. To keep a file
+you created yourself (for example one copied in with Explorer, or written by an
+older `mia` before this change), review it, then:
+
+```powershell
+icacls "$env:ProgramData\FerroGate\mia.toml" /setowner *S-1-5-32-544
+icacls "$env:ProgramData\FerroGate\mia.toml" /reset
+```
+
+On upgrade the Chocolatey package does this for files whose owner is a direct
+member of the local Administrators group, and lists every other foreign-owned
+file without touching it. To inspect the directory, run
+`icacls "$env:ProgramData\FerroGate"`: it should list only
+`NT AUTHORITY\SYSTEM:(OI)(CI)(F)` and `BUILTIN\Administrators:(OI)(CI)(F)`.
+
+Unprivileged users can no longer read anything in the directory, matching the
+`0640` configuration and `0600` secrets on Linux. `mia status` falls back to
+the default status endpoint as it does on Linux; `mia test`, `mia setup --dump`
+of the system configuration and the tray's **Open full log** (Notepad on
+`logs\mia.log`) need an elevated prompt. To let users read the log file only:
+
+```powershell
+icacls "$env:ProgramData\FerroGate\logs" /grant *S-1-5-32-545:(OI)(CI)RX
+```
+
+This grant does not affect the checks above, which only look at write rights
+and at the directories that hold trusted files.
 
 ### Configuration file
 
@@ -848,6 +963,18 @@ scripts. It runs four checks in order:
    (`helper.socket`, else the platform default above), reporting the minted
    token or interpreting the refusal. It fails only if the helper API is
    switched off (`helper.enable = false`) or the daemon cannot be reached.
+   When the daemon refuses with `NoHostSvid` (it holds no host SVID), the
+   test asks the running daemon for its status (the same endpoint as
+   `mia status`, 5 s bound) and turns the reported problem into a specific
+   hint, also recording the daemon's `state` / `problem` as the step's notes:
+   `cmis_not_configured` while the test's own config names a CMIS source means
+   the daemon was started before the config was written (CMIS/attestation
+   settings need a restart, not a reload); `host_rejected` / `not_enrolled`
+   means the host is not enrolled (send the fingerprint from
+   `mia machine-id --verbose` to the CMIS operator); `cmis_unreachable`,
+   `pin_mismatch`, `tpm_unavailable` and others get their own hint, and an
+   unknown code is shown verbatim. If the status endpoint cannot be read
+   (absent, permission denied, timeout) the generic hint is printed instead.
 
 Informational lines, never failures, also report the attestation backend, the
 default environment and the **allowlist**: the body the daemon loads
