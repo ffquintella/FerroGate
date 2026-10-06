@@ -518,13 +518,16 @@ fn prompt_all(
                         )
                         .prompt()?;
                 if fetch {
-                    match fetch_enrollment_key_to(&resolver, Path::new(key_path)) {
-                        Ok(()) => println!("  ✓ wrote {key_path}"),
+                    match install_enrollment_key(&resolver, Path::new(key_path)) {
+                        Ok(done) => println!("  ✓ {done}"),
                         Err(e) => {
                             // Non-fatal: keep configuring; the operator can retry
                             // or place the key out of band.
-                            println!("  ! could not fetch the key: {e:#}");
-                            println!("    (continuing — provide {key_path} another way)");
+                            println!("  ! could not install the key: {e:#}");
+                            println!(
+                                "    (continuing — later: sudo mia allowlist-key fetch, or \
+                                 provide {key_path} another way)"
+                            );
                         }
                     }
                 }
@@ -759,42 +762,58 @@ pub(crate) fn allowlist_path_setting(
     answer.filter(|v| Path::new(v) != default)
 }
 
-/// Fetch the CMIS enrollment public key over pinned TLS and write it to
-/// `key_path` (composite concat bytes). Spins a short-lived current-thread
-/// runtime since the wizard is otherwise synchronous. Shared with the
-/// non-interactive `mia refresh-key` command ([`crate::resync`]).
-pub(crate) fn fetch_enrollment_key_to(
+/// Fetch the CMIS enrollment public key over the pinned channel and install
+/// it at `key_path` for the interactive wizard, through the same validated,
+/// atomic and audited path as `mia allowlist-key fetch`
+/// ([`crate::allowlist_key`]). The wizard's "fetch now?" answer is the
+/// consent for a first install; replacing a *different* installed key needs a
+/// second, explicit confirmation (default: no), showing both fingerprints.
+/// Returns what was done, for the wizard to print.
+fn install_enrollment_key(
     resolver: &crate::endpoint::CmisResolver,
     key_path: &Path,
-) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("building runtime")?;
-    let key = rt.block_on(async {
-        // Resolve + dial with fail-over, then fetch over the chosen channel.
-        let (_, mut client) = resolver.connect().await?;
-        crate::client::fetch_enrollment_key(&mut client).await
-    })?;
-
-    if let Some(parent) = key_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            crate::system_dir::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+) -> anyhow::Result<String> {
+    use crate::allowlist_key::{self as ak, Change, Refusal};
+    let (_, fetched) = ak::fetch_key(resolver)?;
+    let plan = match ak::plan(key_path, &fetched, None, false) {
+        Ok(plan) => plan,
+        Err(e) => {
+            let Some(Refusal::Differs {
+                installed,
+                fetched: served,
+                ..
+            }) = e.downcast_ref::<Refusal>()
+            else {
+                return Err(e);
+            };
+            println!("  {} holds a different enrollment key:", key_path.display());
+            println!("    installed: {installed}");
+            println!("    CMIS:      {served}");
+            let replace = Confirm::new("Replace the installed key with the one CMIS serves?")
+                .with_default(false)
+                .with_help_message(
+                    "only if CMIS rotated its key — compare with `ferrogate enrollment-key`",
+                )
+                .prompt()?;
+            anyhow::ensure!(replace, "kept the installed key; nothing written");
+            ak::plan(key_path, &fetched, None, true)?
         }
-    }
-    // On Windows, inside the system configuration directory, the key is
-    // written to a fresh Administrators-owned file that replaces the old one,
-    // so the daemon trusts it (`crate::system_dir::write_file`).
-    crate::system_dir::write_file(key_path, &key)
-        .with_context(|| format!("writing {}", key_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        // Public key material — world-readable is fine.
-        let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o644));
-    }
-    Ok(())
+    };
+    ak::commit(&plan)?;
+    let fp = plan.fingerprint();
+    Ok(match plan.change() {
+        Change::New => format!("installed {} — fingerprint {fp}", key_path.display()),
+        Change::Unchanged => format!(
+            "{} already holds this key — fingerprint {fp}",
+            key_path.display()
+        ),
+        Change::Rotate { previous } => format!(
+            "replaced {} ({} → {}) — fingerprint {fp}",
+            key_path.display(),
+            ak::short(previous),
+            ak::short(fp)
+        ),
+    })
 }
 
 /// The platform-appropriate service-restart hint shown after writing (Linux).

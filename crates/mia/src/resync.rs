@@ -1,5 +1,5 @@
-//! On-demand re-sync of a host's CMIS trust material — the two client commands
-//! `mia resync-allowlist` and `mia refresh-key`.
+//! On-demand re-sync of a host's CMIS trust material — the client commands
+//! `mia resync-allowlist`, `mia --resync` and `mia --reload`.
 //!
 //! - **`resync-allowlist`** re-fetches this host's signed caller allowlist. The
 //!   daemon fetches it once at startup (when `allowlist.fetch` is set); this
@@ -9,17 +9,16 @@
 //!   [`Config::allowlist_path`](crate::config::Config::allowlist_path)),
 //!   and verifies it against the locally pinned enrollment key so the operator
 //!   gets immediate, authoritative feedback.
-//! - **`refresh-key`** re-fetches the CMIS **enrollment key** (the public key
-//!   that signs allowlists) and writes it to `allowlist.key`. This is the
-//!   non-interactive equivalent of the `mia setup` key fetch — the fix when CMIS
-//!   was redeployed with a new issuer key and the pinned key no longer verifies.
+//! - The **enrollment key** that signs allowlists (`allowlist.key`) is
+//!   installed by `mia allowlist-key fetch` ([`crate::allowlist_key`]); the
+//!   former `mia refresh-key` is now a deprecated alias for it.
 //!
-//! The two compose: after a CMIS redeploy, `refresh-key` then `resync-allowlist`
-//! re-establishes both halves of the allowlist trust chain. The daemon reads the
-//! enrollment key only at startup (so `refresh-key` needs a restart), but
-//! `resync-allowlist --reload` signals the running daemon (SIGHUP) to swap in
-//! the new allowlist live — no restart, no helper-socket downtime. Without
-//! `--reload`, the command prints the platform restart hint.
+//! The two compose: after a CMIS key rotation, `allowlist-key fetch --rotate`
+//! then `resync-allowlist` re-establishes both halves of the allowlist trust
+//! chain. `resync-allowlist --reload` (or `mia --reload`) signals the running
+//! daemon (SIGHUP) to re-read the key and the body live — no restart, no
+//! helper-socket downtime. Without `--reload`, the command prints the platform
+//! restart hint.
 //!
 //! Like `mia setup`/`mia test`, these are client commands: no hardening profile,
 //! no TPM, plain terminal output (no tracing).
@@ -34,7 +33,6 @@ use crate::config::Config;
 
 const USAGE_RESYNC: &str =
     "usage: mia resync-allowlist [--config <path> | --environment <env>] [--reload]";
-const USAGE_REFRESH: &str = "usage: mia refresh-key [--config <path> | --environment <env>]";
 const USAGE_RELOAD: &str = "usage: mia --reload";
 
 /// Run the top-level `mia --reload` command: signal the running agent (SIGHUP)
@@ -127,14 +125,12 @@ pub fn run_resync(args: &[String]) -> anyhow::Result<()> {
     runtime.block_on(resync(&config, true))
 }
 
-/// Run the `mia refresh-key` subcommand. `args` is everything after
-/// `refresh-key` on the command line.
+/// Run the deprecated `mia refresh-key` subcommand: forwards to
+/// [`crate::allowlist_key::run_refresh_key`] (`mia allowlist-key fetch
+/// --rotate --yes`), which is root-only, validated, atomic and audited.
+#[deprecated(note = "use mia::allowlist_key::run_refresh_key (`mia allowlist-key fetch`)")]
 pub fn run_refresh_key(args: &[String]) -> anyhow::Result<()> {
-    let Some(config) = load(args, USAGE_REFRESH, print_help_refresh, "enrollment-key refresh")?
-    else {
-        return Ok(()); // --help printed
-    };
-    refresh_key(&config)
+    crate::allowlist_key::run_refresh_key(args)
 }
 
 /// Parse the shared `[--config <path>]` / `--help` options and load the config,
@@ -223,7 +219,8 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
         Some(key_path) => verify_after_write(&bytes, key_path, config.allowlist_max_age()),
         None => println!(
             "note: allowlist.key is not configured, so the body was written unverified; the \
-             daemon will deny all callers until a verification key is set (`mia setup`)."
+             daemon will deny all callers until a verification key is set and installed \
+             (`mia setup`, then `sudo mia allowlist-key fetch`)."
         ),
     }
 
@@ -292,51 +289,11 @@ pub(crate) fn send_reload() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fetch the CMIS enrollment key and write it to `allowlist.key`, then report
-/// whether the allowlist already on disk verifies under it.
-fn refresh_key(config: &Config) -> anyhow::Result<()> {
-    let resolver = crate::endpoint::CmisResolver::from_config(&config.cmis)?
-        .context("cmis is not configured (set cmis.endpoint or cmis.srv); run `mia setup`")?;
-    // The key is the allowlist's trust anchor and has no default: it must be
-    // named explicitly before anything is fetched into it.
-    let key_path = config
-        .allowlist_key()
-        .context("allowlist.key is not configured; nowhere to write the key (run `mia setup`)")?;
-    println!();
-
-    // Reuse the wizard's fetch+write (pinned TLS, writes the composite concat
-    // bytes 0644). It dials over its own short-lived runtime, with fail-over
-    // across the resolver's candidates.
-    crate::setup::fetch_enrollment_key_to(&resolver, key_path)
-        .context("fetching the enrollment key from CMIS")?;
-    println!("✓ fetched and wrote {}", key_path.display());
-
-    // If an allowlist is already present, report whether it verifies under the
-    // *new* key. After a CMIS key rotation it typically will NOT (the on-disk
-    // body was signed by the old key) — the operator then runs resync-allowlist
-    // to pull a body signed by the new key.
-    let path = config.allowlist_path();
-    // Judged as the daemon judges it (`crate::system_dir`, Windows).
-    match crate::system_dir::read_trusted(&path) {
-        Ok(bytes) => verify_after_write(&bytes, key_path, config.allowlist_max_age()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("note: no allowlist at {} yet.", path.display());
-        }
-        Err(e) => println!("note: could not read {} ({e}).", path.display()),
-    }
-
-    println!(
-        "\nNext: `mia resync-allowlist` to pull a freshly-signed allowlist, then restart:  {}",
-        crate::setup::restart_hint()
-    );
-    Ok(())
-}
-
 /// Verify the freshly fetched allowlist against the locally pinned enrollment
 /// key, reporting the outcome. Non-fatal: a verification failure still leaves
 /// the body on disk (it is the daemon that fails closed), but the operator is
 /// told exactly why the daemon would reject it.
-fn verify_after_write(bytes: &[u8], key_path: &Path, max_age_secs: i64) {
+pub(crate) fn verify_after_write(bytes: &[u8], key_path: &Path, max_age_secs: i64) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
@@ -346,7 +303,7 @@ fn verify_after_write(bytes: &[u8], key_path: &Path, max_age_secs: i64) {
         Err(e) => {
             println!(
                 "⚠ could not read allowlist.key {} ({e}); the daemon will deny all callers until \
-                 the key is present — fetch it with `mia setup`.",
+                 the key is present — install it with `sudo mia allowlist-key fetch`.",
                 key_path.display()
             );
             return;
@@ -356,7 +313,8 @@ fn verify_after_write(bytes: &[u8], key_path: &Path, max_age_secs: i64) {
         Ok(k) => k,
         Err(e) => {
             println!(
-                "⚠ allowlist.key {} is unparseable ({e}); re-fetch it with `mia setup`.",
+                "⚠ allowlist.key {} is unparseable ({e}); replace it with `sudo mia \
+                 allowlist-key fetch --rotate`.",
                 key_path.display()
             );
             return;
@@ -373,8 +331,9 @@ fn verify_after_write(bytes: &[u8], key_path: &Path, max_age_secs: i64) {
         Err(e) => {
             println!("⚠ the daemon would REJECT this allowlist: {e}");
             println!(
-                "  CMIS most likely rotated its enrollment key — re-fetch it (`mia setup`) and \
-                 run `mia resync-allowlist` again."
+                "  CMIS most likely rotated its enrollment key — compare `mia allowlist-key show` \
+                 with `ferrogate enrollment-key`, re-fetch it (`sudo mia allowlist-key fetch \
+                 --rotate`) and run `mia resync-allowlist` again."
             );
         }
     }
@@ -447,26 +406,5 @@ fn print_help_reload() {
          \n\
          options:\n\
          \x20 -h, --help   show this help"
-    );
-}
-
-fn print_help_refresh() {
-    println!(
-        "mia refresh-key — re-fetch the CMIS enrollment key into allowlist.key\n\
-         \n\
-         {USAGE_REFRESH}\n\
-         \n\
-         Dials CMIS over the pinned channel, fetches the enrollment public key (the\n\
-         key that signs allowlists), and writes it to allowlist.key — the\n\
-         non-interactive equivalent of the `mia setup` key fetch. Use it after a\n\
-         CMIS redeploy changed the issuer key; then run `mia resync-allowlist` to\n\
-         pull an allowlist signed by the new key, and restart the daemon.\n\
-         \n\
-         options:\n\
-         \x20 -c, --config <path>   TOML config file (default: the system config;\n\
-         \x20                       environment variables override it)\n\
-         \x20 -e, --environment <env>  select mia-<env>.toml from the standard config\n\
-         \x20                       locations instead of mia.toml; excludes --config\n\
-         \x20 -h, --help            show this help"
     );
 }

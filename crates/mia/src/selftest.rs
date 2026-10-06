@@ -580,8 +580,9 @@ async fn check_cluster_identity(resolver: &CmisResolver) -> bool {
              build that kept a per-node local seed — unify it (install the leader's \
              /var/lib/ferrogate/issuer/issuer.seed on the others and restart) or upgrade."
                 .to_string(),
-            "After unifying, re-pin and re-fetch on every enrolled host: `mia refresh-key` then \
-             `mia resync-allowlist` (add `-e <env>` for a named environment)."
+            "After unifying, re-pin and re-fetch on every enrolled host: `sudo mia allowlist-key \
+             fetch --rotate` then `mia resync-allowlist` (add `-e <env>` for a named \
+             environment)."
                 .to_string(),
         ]);
         false
@@ -1498,8 +1499,12 @@ fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<Str
             "warn",
             format!("{body}; allowlist.key is not set, so every caller is denied (fail closed)"),
             vec![
-                "Set allowlist.key to the CMIS enrollment public key (it has no default): \
-                 `mia setup` can fetch it over the pinned channel."
+                "Set allowlist.key to the path of the CMIS enrollment public key (it has no \
+                 default) with `mia setup`, which can also fetch it over the pinned channel."
+                    .to_string(),
+                "Or, once the path is set, install the key non-interactively as root: `sudo mia \
+                 allowlist-key fetch --expect-fingerprint <hex>` — <hex> is what \
+                 `ferrogate enrollment-key` prints on CMIS."
                     .to_string(),
             ],
         );
@@ -1527,7 +1532,9 @@ fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<Str
                 key.display()
             ),
             vec![
-                "Re-fetch the enrollment key (`mia refresh-key`), then the allowlist \
+                "Install or re-fetch the enrollment key (`sudo mia allowlist-key fetch`; add \
+                 --rotate to replace a different installed key, after comparing `mia \
+                 allowlist-key show` with `ferrogate enrollment-key`), then the allowlist \
                  (`mia resync-allowlist`)."
                     .to_string(),
             ],
@@ -1692,6 +1699,12 @@ mod tests {
         );
         assert!(detail.contains("allowlist.key is not set"), "{detail}");
         assert!(advice.iter().any(|h| h.contains("allowlist.key")));
+        assert!(
+            advice
+                .iter()
+                .any(|h| h.contains("mia allowlist-key fetch --expect-fingerprint")),
+            "{advice:?}"
+        );
 
         // An explicit, verifiable allowlist is reported verbatim and verified.
         let dir = std::env::temp_dir().join(format!("mia-selftest-al-{}", std::process::id()));

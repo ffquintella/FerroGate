@@ -396,7 +396,8 @@ even read access. In SDDL: `O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`.
 - **Writers.** On Windows clients a file an elevated administrator creates is
   owned by their own account, which the check refuses. `mia setup` (wizard and
   `--apply`), `mia default-environment`, `mia resync-allowlist`,
-  `mia refresh-key` and the daemon's `allowlist.fetch` therefore write a fresh
+  `mia allowlist-key fetch` (and its deprecated alias `mia refresh-key`) and
+  the daemon's `allowlist.fetch` therefore write a fresh
   file owned by `BUILTIN\Administrators` and rename it over the target. They
   need an elevated prompt, and run the same preparation as the service first:
   a missing directory is created administrator-only and an existing one is
@@ -464,7 +465,7 @@ mia setup --environment staging        # write mia-staging.toml (composes with -
 ```
 
 The selector accepts every command that reads or writes the config (`mia`,
-`setup`, `test`, `resync-allowlist`, `refresh-key`). The name must be a safe
+`setup`, `test`, `resync-allowlist`, `allowlist-key`, `refresh-key`). The name must be a safe
 filename component (letters, digits, `.`, `-`, `_`). It is **mutually exclusive
 with `--config`/`--output`**, which name one exact file; it only changes which
 file the standard discovery (step 3) looks for, leaving `$FERROGATE_CONFIG` and
@@ -626,7 +627,7 @@ non-socket file at the path is refused, never deleted.
 Like the helper socket, the signed allowlist **body** has a per-platform,
 per-environment default. When neither `allowlist.path` nor
 `FERROGATE_ALLOWLIST` is set (a blank value counts as unset), the daemon,
-`mia test`, `mia setup`, `mia resync-allowlist` and `mia refresh-key` all
+`mia test`, `mia setup`, `mia resync-allowlist` and `mia allowlist-key` all
 resolve the same file through `mia::config::default_allowlist_path`, beside the
 system `mia.toml`:
 
@@ -656,6 +657,60 @@ fail-closed rules:
   explicit `allowlist.path` that cannot be read still stops it, as before.
 
 `mia test` prints the resolved body (marked `(default)`) and whether it verifies.
+
+#### Installing `allowlist.key`: `mia allowlist-key`
+
+Nothing installs the key by itself — not the daemon, not the installers, not
+the helper or status socket. The daemon only *reads* it (at startup and on a
+SIGHUP reload). An operator or a provisioning script installs it, as root:
+
+```sh
+# On CMIS (or any host with the CMIS SPKI pin): the value to expect.
+ferrogate enrollment-key                     # 96 hex digits (SHA-384)
+ferrogate enrollment-key --format flag       # --expect-fingerprint <hex>
+
+# On the host, once allowlist.key names a path (mia setup, or [allowlist] key = "…"):
+sudo mia allowlist-key fetch --expect-fingerprint <hex> --reload
+mia allowlist-key show                       # path + fingerprint, no privileges
+```
+
+`mia allowlist-key fetch [-c <config> | -e <env>] [--expect-fingerprint <hex>]
+[--yes] [--rotate] [--reload]`:
+
+- **Root only** (Windows: an elevated prompt, with `allowlist.key` inside
+  `%ProgramData%\FerroGate`, whose administrator-only ACL enforces it). On Unix
+  the key's directory must also be root-owned and not group/other-writable.
+  The check runs before any network traffic.
+- **Pinned channel only**: CMIS is dialed through the configured endpoint or
+  SRV record with `cmis.spki_pin` over hybrid-PQC TLS. There is no unpinned
+  fallback, and the reply must parse as a composite public key.
+- **Consent**: `--expect-fingerprint <hex>` checks the fetched key against the
+  value from `ferrogate enrollment-key` and aborts, writing nothing, on a
+  mismatch. `--yes` accepts the key fetched over the pinned channel without a
+  comparison. On a terminal the command otherwise shows the fingerprint and
+  asks (default: no). A non-interactive run with neither flag writes nothing.
+- **Never silently replaced**: an identical installed key is left alone (no
+  write, no audit record). A *different* installed key is refused, with both
+  fingerprints shown, unless you pass `--rotate`.
+- **Atomic and audited**: temp file, `fsync`, rename, mode `0644` (public
+  material that the Linux daemon re-reads as its service user on a reload),
+  owned by root. A symlinked or non-regular target is refused. Before the
+  rename, a `ConfigChanged` record is appended to `config-audit.jsonl` beside
+  the key. It carries key names only: `allowlist.key:enrollment-key`, or
+  `allowlist.key:enrollment-key:rotated` for a rotation. Only fingerprints are
+  ever printed.
+- Afterwards it reports whether the allowlist body on disk verifies under the
+  new key. `--reload` signals the running agent (SIGHUP) to pick it up live.
+
+`mia refresh-key` is now a **deprecated alias** for `mia allowlist-key fetch
+--rotate --yes`. It keeps its old meaning (replace the key after a CMIS key
+rotation, without a prompt; the `mia-tray` "Re-fetch the enrollment key" action
+runs it elevated), but it gains every check above. Unlike before, it needs
+root, and on Windows a key path inside `%ProgramData%\FerroGate`.
+
+After a CMIS key rotation: compare `mia allowlist-key show` with
+`ferrogate enrollment-key`, then run `sudo mia allowlist-key fetch --rotate
+--expect-fingerprint <new hex>` and `mia resync-allowlist --reload`.
 
 #### Default environment: who serves the well-known address
 
@@ -850,9 +905,12 @@ Options:
 
 When you configure an allowlist *and* have supplied a CMIS endpoint + SPKI pin,
 the wizard offers to **fetch the enrollment public key from CMIS** (the
-`GetEnrollmentKey` RPC, over the pinned hybrid-PQC TLS channel) and write it to
-your `allowlist.key`. This is the key that signs the allowlist, so the agent can
-verify it. The signed allowlist *body* itself (the CBOR at `allowlist.path`) is
+`GetEnrollmentKey` RPC, over the pinned hybrid-PQC TLS channel) and install it at
+your `allowlist.key`. It uses the same validated, atomic and audited writer as
+[`mia allowlist-key fetch`](#installing-allowlistkey-mia-allowlist-key) and
+prints the fingerprint. If a *different* key is already installed, it shows both
+fingerprints and asks before replacing it (default: no). This is the key that
+signs the allowlist, so the agent can verify it. The signed allowlist *body* itself (the CBOR at `allowlist.path`) is
 also issued and served by CMIS per host: an operator stores it with
 `ferrogate allowlist set` and the body is fetched with the `GetAllowlist` RPC,
 keyed by the host's EK-derived UUID. The wizard additionally offers to enable

@@ -111,7 +111,7 @@ or typed text.
 | Show status | `mia status --json [-e <env>]` | user |
 | Start / stop / restart the service | Linux `systemctl start\|stop\|restart mia.service`; macOS `launchctl bootstrap system …/com.ferrogate.mia.plist` / `bootout system/com.ferrogate.mia` / `kickstart -k system/com.ferrogate.mia`; Windows `mia service start\|stop`, `Restart-Service -Name mia` | administrator |
 | Resync the allowlist | `mia resync-allowlist --reload [-e <env>]` | administrator |
-| Re-fetch the enrollment key | `mia refresh-key [-e <env>]` | administrator |
+| Re-fetch the enrollment key | `mia refresh-key [-e <env>]` (deprecated alias of `mia allowlist-key fetch --rotate --yes`: pinned channel, audited, fingerprint printed) | administrator |
 | Set as default environment | `mia default-environment set <env>` (for the default `mia.toml` environment: `mia default-environment clear`) | administrator |
 | Use mia.toml as default | `mia default-environment clear` | administrator |
 | Apply the configuration (system file) | `mia setup --apply <draft> --json [-e <env>] [--reload] [--fetch-enrollment-key]` | administrator |

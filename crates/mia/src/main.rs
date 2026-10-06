@@ -99,7 +99,12 @@ fn main() -> anyhow::Result<()> {
         // into the running agent live (SIGHUP) — the one-shot, no-restart resync.
         // It is `resync-allowlist` with the reload always on.
         Some("--resync") => return mia::resync::run_resync(&args[1..]),
-        Some("refresh-key") => return mia::resync::run_refresh_key(&args[1..]),
+        // Install / inspect allowlist.key, the CMIS enrollment key that verifies
+        // the signed allowlist. Root only, pinned channel only, never replaces a
+        // different key without --rotate; the daemon itself never fetches it.
+        Some("allowlist-key") => return mia::allowlist_key::run(&args[1..]),
+        // Deprecated alias: `allowlist-key fetch --rotate --yes`.
+        Some("refresh-key") => return mia::allowlist_key::run_refresh_key(&args[1..]),
         // Print this host's fingerprint-derived machine identity (the
         // `host/<uuid>` CMIS keys its allowlist and host SVID under). Read-only
         // and offline — no config, no CMIS, no daemon contact.
@@ -600,7 +605,9 @@ fn print_usage() {
          \x20                   environment (mia.toml + mia-<env>.toml) at once,\n\
          \x20                   each on its own helper socket\n\
          \x20 setup             interactive wizard that writes the agent's config file\n\
-         \x20 refresh-key       re-fetch the CMIS enrollment key into allowlist.key\n\
+         \x20 allowlist-key     fetch (root) or show allowlist.key, the CMIS enrollment\n\
+         \x20                   key that verifies the signed allowlist\n\
+         \x20 refresh-key       deprecated: allowlist-key fetch --rotate --yes\n\
          \x20 resync-allowlist  re-fetch this host's signed allowlist from CMIS\n\
          \x20 machine-id        print this host's fingerprint-derived machine identity\n\
          \x20 x509-svid         inspect the machine-bound X.509-SVID store\n\

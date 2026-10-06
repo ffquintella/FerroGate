@@ -26,6 +26,11 @@
 
 #![forbid(unsafe_code)]
 
+/// `mia allowlist-key fetch | show`: the privileged, pinned-channel-only,
+/// audited installer of `allowlist.key` (the CMIS enrollment key that
+/// verifies the signed caller allowlist).
+pub mod allowlist_key;
+
 pub mod audit_client;
 pub mod client;
 

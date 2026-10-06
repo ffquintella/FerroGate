@@ -647,6 +647,20 @@ struct Invoker {
 /// euid without `unsafe`. `dir` is the directory about to be written anyway.
 #[cfg(unix)]
 fn invoker(dir: &Path) -> anyhow::Result<Invoker> {
+    let euid = probe_euid(dir)?;
+    Ok(Invoker {
+        euid,
+        elevated: euid == 0,
+    })
+}
+
+/// The effective uid of this process, learned by creating (and removing) a
+/// private probe file in `dir` — no libc call, so no `unsafe`. Fails when
+/// `dir` is not writable by this process, with the setup elevation hint.
+/// Shared with `mia allowlist-key fetch` ([`crate::allowlist_key`]), which
+/// maps that failure onto its own "run as root" refusal.
+#[cfg(unix)]
+pub(crate) fn probe_euid(dir: &Path) -> anyhow::Result<u32> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     let probe = dir.join(format!(
         ".mia-setup-probe-{}-{:016x}",
@@ -664,11 +678,7 @@ fn invoker(dir: &Path) -> anyhow::Result<Invoker> {
     drop(file);
     std::fs::remove_file(&probe)
         .with_context(|| format!("removing the probe file {}", probe.display()))?;
-    let euid = euid.with_context(|| format!("inspecting {}", probe.display()))?;
-    Ok(Invoker {
-        euid,
-        elevated: euid == 0,
-    })
+    euid.with_context(|| format!("inspecting {}", probe.display()))
 }
 
 /// Windows: elevation cannot be ruled out cheaply, so assume it.

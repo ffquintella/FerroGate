@@ -149,9 +149,20 @@ case "$DAEMON_STATE" in
     echo "    sudo launchctl bootstrap system $DAEMON_PLIST"
     ;;
   *)
-    echo "  1. Edit /etc/ferrogate/mia.env"
-    echo "  2. sudo launchctl load -w $DAEMON_PLIST"
+    echo "  Next steps:"
+    echo "  1. Configure: sudo mia setup   (CMIS endpoint + SPKI pin, and the allowlist.key path;"
+    echo "     or edit $CONFIG_DIR/mia.toml / /etc/ferrogate/mia.env)"
+    echo "  2. Install the allowlist key:  sudo mia allowlist-key fetch --expect-fingerprint <hex>"
+    echo "     (<hex>: run \`ferrogate enrollment-key\` against CMIS)"
+    echo "  3. sudo launchctl load -w $DAEMON_PLIST"
     ;;
 esac
+# The installer never fetches or trusts the allowlist key itself: until an
+# administrator installs it (above), the agent denies every local caller.
+if ! grep -qs '^[[:space:]]*key[[:space:]]*=' "$CONFIG_DIR/mia.toml" \
+   && ! grep -qs '^[[:space:]]*FERROGATE_ALLOWLIST_KEY=' /etc/ferrogate/mia.env; then
+  echo "  Allowlist: allowlist.key is not set, so every local caller is denied (fail closed)."
+  echo "    Set it with: sudo mia setup   then: sudo mia allowlist-key fetch --expect-fingerprint <hex>"
+fi
 
 exit 0

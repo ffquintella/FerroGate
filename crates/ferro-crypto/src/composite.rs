@@ -254,6 +254,21 @@ impl CompositePublicKey {
         out
     }
 
+    /// The key's fingerprint: the lowercase-hex SHA-384 (96 characters) of its
+    /// [`Self::to_concat_bytes`] encoding.
+    ///
+    /// This is the one definition both sides of an out-of-band comparison use:
+    /// `ferrogate enrollment-key` prints it for the CMIS enrollment key, and
+    /// `mia allowlist-key fetch` prints it (and checks
+    /// `--expect-fingerprint`) for the key it installs as `allowlist.key`.
+    /// A fingerprint identifies public material only; it reveals nothing
+    /// secret.
+    #[must_use]
+    pub fn fingerprint_hex(&self) -> String {
+        use sha2::{Digest as _, Sha384};
+        hex::encode(Sha384::digest(self.to_concat_bytes()))
+    }
+
     /// Parse a public key from `ed25519(32) || mldsa65(1952)`.
     pub fn from_concat_bytes(bytes: &[u8]) -> Result<Self, CompositeError> {
         if bytes.len() != COMPOSITE_PK_LEN {
@@ -659,6 +674,23 @@ mod tests {
         let (_sk_a, pk_a) = CompositeSecretKey::from_seed(&[1u8; 32]);
         let (_sk_b, pk_b) = CompositeSecretKey::from_seed(&[2u8; 32]);
         assert_ne!(pk_a.to_concat_bytes(), pk_b.to_concat_bytes());
+    }
+
+    #[test]
+    fn fingerprint_is_the_sha384_of_the_concat_encoding() {
+        use sha2::{Digest as _, Sha384};
+        let (_sk_a, pk_a) = CompositeSecretKey::from_seed(&[1u8; 32]);
+        let (_sk_b, pk_b) = CompositeSecretKey::from_seed(&[2u8; 32]);
+        let fp = pk_a.fingerprint_hex();
+        assert_eq!(fp.len(), 96);
+        assert!(fp
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(fp, hex::encode(Sha384::digest(pk_a.to_concat_bytes())));
+        // Stable across a round trip through the wire encoding, distinct per key.
+        let again = CompositePublicKey::from_concat_bytes(&pk_a.to_concat_bytes()).unwrap();
+        assert_eq!(again.fingerprint_hex(), fp);
+        assert_ne!(pk_b.fingerprint_hex(), fp);
     }
 
     #[test]

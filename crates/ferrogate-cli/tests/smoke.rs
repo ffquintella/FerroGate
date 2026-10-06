@@ -446,3 +446,67 @@ async fn plaintext_http_status_still_works() {
         "unexpected status output: {stdout}"
     );
 }
+
+#[tokio::test]
+async fn enrollment_key_prints_the_issuer_fingerprint_over_pinned_tls() {
+    let (chain, key, pin, _cert_pem) = make_identity();
+    let server_config =
+        ferro_crypto::transport::server_config(ProviderMode::HybridOnly, chain, key).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = build_state().await;
+    // The value `mia allowlist-key fetch` computes for the same key.
+    let expected = state.issuer.public_key().fingerprint_hex();
+    let incoming = cmis::transport::tls_incoming(listener, server_config);
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(MachineIdentitySvc::new(state).into_server())
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    for (format, want) in [
+        ("hex", expected.clone()),
+        ("flag", format!("--expect-fingerprint {expected}")),
+    ] {
+        let out = Command::new(ferrogate_bin())
+            .args([
+                "--endpoint",
+                &format!("https://{addr}"),
+                "--spki-pin",
+                &pin.to_hex(),
+                "enrollment-key",
+                "--format",
+                format,
+            ])
+            .output()
+            .await
+            .expect("run ferrogate");
+        assert!(
+            out.status.success(),
+            "enrollment-key --format {format} must succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want);
+    }
+}
+
+#[tokio::test]
+async fn enrollment_key_rejects_a_bad_format_before_dialing() {
+    // No server at all: the argument error must come first.
+    let out = Command::new(ferrogate_bin())
+        .args([
+            "--endpoint",
+            "http://127.0.0.1:9",
+            "enrollment-key",
+            "--format",
+            "pem",
+        ])
+        .output()
+        .await
+        .expect("run ferrogate");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--format needs a value"), "{stderr}");
+}

@@ -277,6 +277,21 @@ pub fn claim(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Whether `path` lies strictly inside the system configuration directory
+/// ([`crate::config::system_config_dir`]), compared as [`guarding_dirs`] does
+/// (lexically, case-insensitively, after making `path` absolute).
+///
+/// On Windows that directory is administrator-only ([`prepare`]) and a file
+/// written in it must be handed to Administrators ([`claim`]), so only an
+/// elevated process can change what is there: `mia allowlist-key fetch`
+/// ([`crate::allowlist_key`]) relies on this to refuse a non-elevated install,
+/// since elevation cannot otherwise be read without `unsafe`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_inside_system_dir(path: &Path) -> bool {
+    std::path::absolute(path)
+        .is_ok_and(|p| guarding_dirs(&crate::config::system_config_dir(), &p).is_some())
+}
+
 /// The directories that guard `path` inside `system_dir`, outermost
 /// (`system_dir` itself) first and `path`'s parent last, or `None` when `path`
 /// is not strictly inside `system_dir`.
@@ -957,6 +972,21 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_inside_system_dir_is_strict_and_lexical() {
+        let system = crate::config::system_config_dir();
+        assert!(is_inside_system_dir(&system.join("allowlist.pub")));
+        assert!(is_inside_system_dir(&system.join("sub").join("k.pub")));
+        assert!(
+            !is_inside_system_dir(&system),
+            "the directory itself is not inside"
+        );
+        assert!(!is_inside_system_dir(
+            &system.join("..").join("elsewhere.pub")
+        ));
+        assert!(!is_inside_system_dir(&std::env::temp_dir().join("k.pub")));
+    }
 
     #[test]
     fn guarding_dirs_lists_every_directory_from_the_system_dir_down() {

@@ -155,7 +155,33 @@ fn run_inner(args: &[String]) -> anyhow::Result<i32> {
     };
 
     print(&snapshots, opts.json)?;
+    if !opts.json {
+        if let Some(hint) = allowlist_key_hint(&config, &snapshots) {
+            eprintln!("\n{hint}");
+        }
+    }
     Ok(exit_code(&snapshots))
+}
+
+/// A hint for when an environment denies every caller for lack of a
+/// verifiable allowlist and the loaded configuration names no
+/// `allowlist.key`: the trust anchor has no default and the agent never
+/// fetches it by itself, so an operator has to install it.
+#[must_use]
+pub fn allowlist_key_hint(config: &Config, snapshots: &[StatusSnapshot]) -> Option<String> {
+    let denied = snapshots.iter().any(|s| {
+        matches!(
+            s.state,
+            AgentState::AllowlistMissing | AgentState::AllowlistInvalid
+        )
+    });
+    (denied && config.allowlist_key().is_none()).then(|| {
+        "hint: allowlist.key is not set in this configuration (it has no default), so every \
+         caller is denied. Set its path (`mia setup`), then install the CMIS enrollment key as \
+         root: `sudo mia allowlist-key fetch --expect-fingerprint <hex>` (<hex>: `ferrogate \
+         enrollment-key` on CMIS). `mia test` explains further."
+            .to_owned()
+    })
 }
 
 /// The configuration that names the endpoint. An explicit `--config` must
@@ -503,6 +529,22 @@ mod tests {
             exit_code(&[snap(AgentState::Healthy), snap(AgentState::CrlStale)]),
             EXIT_UNHEALTHY
         );
+    }
+
+    #[test]
+    fn a_missing_allowlist_key_gets_a_fetch_hint() {
+        let unset = Config::from_toml("").unwrap();
+        let set = Config::from_toml("[allowlist]\nkey = \"/etc/ferrogate/allowlist.pub\"").unwrap();
+        let denied = [
+            snap(AgentState::Healthy),
+            snap(AgentState::AllowlistMissing),
+        ];
+        let hint = allowlist_key_hint(&unset, &denied).expect("hint");
+        assert!(hint.contains("sudo mia allowlist-key fetch"), "{hint}");
+        assert!(allowlist_key_hint(&unset, &[snap(AgentState::AllowlistInvalid)]).is_some());
+        // A configured key, or nobody denied: nothing to say.
+        assert!(allowlist_key_hint(&set, &denied).is_none());
+        assert!(allowlist_key_hint(&unset, &[snap(AgentState::Healthy)]).is_none());
     }
 
     #[test]

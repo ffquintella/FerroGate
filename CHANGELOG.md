@@ -25,6 +25,55 @@ record them.
 
 ## [Unreleased]
 
+### Added
+
+- Add `mia allowlist-key fetch | show` to install and inspect `allowlist.key` on demand, root-only and over the pinned channel (S32)
+  `allowlist.key`, the CMIS enrollment key that verifies the signed caller
+  allowlist, has no default, and nothing installed it on a fresh machine
+  except the interactive `mia setup`. `sudo mia allowlist-key fetch` now does
+  it non-interactively. It runs as root only (Windows: an elevated prompt, with
+  the key inside `%ProgramData%\FerroGate`), and on Unix only into a root-owned
+  directory that is not group/other-writable. The check runs before any
+  network traffic. The key is fetched only over the SPKI-pinned hybrid-PQC
+  channel (no unpinned fallback) and must parse as a composite public key.
+  `--expect-fingerprint <hex>` verifies it and writes nothing on a mismatch;
+  without that flag, `--yes` or a terminal confirmation is required. An
+  identical installed key is a no-op. A different one is refused unless you
+  pass `--rotate`. The key is written atomically (`0644` public material,
+  root-owned, symlinks refused) with a `ConfigChanged` record
+  (`allowlist.key:enrollment-key[:rotated]`, names only) in the local audit
+  journal before the rename. Only fingerprints are printed, and `--reload`
+  applies the key live. `mia allowlist-key show` prints the installed key's
+  path and fingerprint. The daemon still never fetches or trusts a key by
+  itself, and no socket can trigger a fetch.
+- Add `ferrogate enrollment-key [--format hex|flag]` to print the CMIS enrollment key's SHA-384 fingerprint (S32)
+  This is the CMIS-side value an operator compares with the fingerprint
+  `mia allowlist-key fetch` prints, or passes to it as `--expect-fingerprint`.
+  Both sides use the new `CompositePublicKey::fingerprint_hex` in
+  `ferro-crypto`.
+
+### Changed
+
+- Route every `allowlist.key` write in the interactive wizard through the validated, atomic, audited installer (S32)
+  The `mia setup` key fetch and `mia refresh-key` used a plain truncating
+  write. That write followed a symlink at the target, did not check that the
+  reply was a key, recorded no audit event, and silently replaced a different
+  key. The wizard now uses the `allowlist-key` installer and prints the
+  fingerprint. It asks before replacing a different installed key (default:
+  no). `mia test`, `mia status` and the `resync-allowlist` messages now point
+  to `mia allowlist-key fetch`. The macOS installer prints the next steps (it
+  never fetches the key itself).
+
+### Deprecated
+
+- Deprecate `mia refresh-key` in favour of `mia allowlist-key fetch` (S32)
+  `mia refresh-key` is now an alias for `mia allowlist-key fetch --rotate --yes`.
+  It keeps its meaning (replace the key, without a prompt, as the `mia-tray`
+  action runs it), but it gains the checks above. Behaviour change: it now
+  needs root, and on Windows a key path inside `%ProgramData%\FerroGate`. The
+  library function `mia::resync::run_refresh_key` is deprecated and forwards
+  to `mia::allowlist_key::run_refresh_key`.
+
 ### Fixed
 
 - Never regenerate, overwrite or delete an existing MIA machine key or SVID seed; fail closed with an operator-facing fix instead (S15, S16, S29)
