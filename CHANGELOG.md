@@ -25,6 +25,8 @@ record them.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-10-06
+
 ### Added
 
 - Add `mia allowlist-key fetch | show` to install and inspect `allowlist.key` on demand, root-only and over the pinned channel (S32)
@@ -2649,7 +2651,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.25.0...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.26.0...HEAD
+[0.26.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.26.0
 [0.25.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.25.0
 [0.24.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.24.0
 [0.23.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.23.1
