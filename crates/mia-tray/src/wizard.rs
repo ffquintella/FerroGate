@@ -894,13 +894,13 @@ mod tests {
     #[test]
     fn enrollment_key_fetch_requires_a_destination_in_the_draft() {
         let mut values = Values::default();
-        assert!(validate_for_apply(&values, false).is_empty());
+        assert_eq!(validate_for_apply(&values, false), []);
         assert_eq!(
             validate_for_apply(&values, true),
             [(Field::AllowlistKey, Msg::ValKeyRequiredForFetch)]
         );
         values.set(Field::AllowlistKey, "/etc/ferrogate/allowlist.pub");
-        assert!(validate_for_apply(&values, true).is_empty());
+        assert_eq!(validate_for_apply(&values, true), []);
         let draft = render(&values);
         let doc: toml::Table = toml::from_str(&draft).unwrap();
         assert_eq!(
