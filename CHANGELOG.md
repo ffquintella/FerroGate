@@ -29,13 +29,13 @@ record them.
 
 ### Added
 
-- Add an optional CMIS enrollment-key fingerprint field to the MIA tray setup
-  wizard, passing the existing `mia setup --fetch-enrollment-key
-  --expect-fingerprint` integrity check before it writes the fetched public key
-  (S18, S32). Operators can enter the 96-character SHA-384 fingerprint printed
-  by `ferrogate enrollment-key`; the value is validated locally and passed only
-  to the elevated `mia` command. A mismatch leaves the destination key file
-  unchanged, and the fingerprint is not persisted or included in error messages.
+- Add enrollment-key fingerprint confirmation and public-key pasting to the MIA
+  tray setup wizard (S18, S32). Operators can fetch the key over the pinned CMIS
+  channel or paste the public-only value from `ferrogate enrollment-key
+  --format public-key`; an optional 96-character SHA-384 fingerprint confirms
+  either path. MIA validates and installs the key through its atomic, audited
+  writer. The pasted value stays in the private setup draft and is not saved to
+  `mia.toml`; a mismatch leaves the destination key file unchanged.
 - Let `mia allowlist-key fetch` set an unset `allowlist.key` itself, and add `mia test --fix` to go from "every caller is denied" to working in one command (S32)
   `mia test` warned that `allowlist.key` is not set, and `sudo mia
   allowlist-key fetch` then failed until the operator hand-edited `mia.toml`.
