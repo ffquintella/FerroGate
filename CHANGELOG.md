@@ -25,6 +25,17 @@ record them.
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-10-07
+
+### Fixed
+
+- Keep a successful MIA tray Apply successful without immediately starting a
+  second privileged config read (S18, S32). On Linux, `pkexec` authorizes each
+  request separately; cancelling the post-Apply reload had replaced the
+  success state with a permission-looking failure. The tray now retains the
+  accepted values, refreshes agent status, and requests fresh authorization
+  only when the operator chooses **Load** again.
+
 ## [0.28.0] - 2026-10-07
 
 ### Added
@@ -2722,7 +2733,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.28.0...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.28.1...HEAD
+[0.28.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.1
 [0.28.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.0
 [0.27.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.27.1
 [0.27.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.27.0

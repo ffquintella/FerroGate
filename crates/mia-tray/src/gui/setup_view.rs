@@ -5,8 +5,10 @@
 //! prompt where elevated output can be captured) → edit with local validation
 //! → "Check with mia" (`--check` on a private `0600` draft) → "Apply" (enabled
 //! only for exactly the draft `mia` accepted; `--apply --user` directly, or
-//! the system file through the OS consent prompt) → reload the configuration
-//! to show the change. The tray never writes the configuration itself.
+//! the system file through the OS consent prompt) → retain the applied
+//! values and refresh agent status. The tray never writes the configuration
+//! itself. A later explicit Load re-reads the protected system file through a
+//! fresh administrator-consent prompt.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,6 +39,8 @@ struct ApplyDone {
     report: Option<ApplyReport>,
     problems: Vec<(String, String)>,
     details: String,
+    /// The exact form values rendered into the applied draft.
+    values: Values,
 }
 
 #[derive(Default)]
@@ -79,12 +83,15 @@ fn load(shared: &Shared, scope: Scope, env: Option<&EnvName>) -> Result<Loaded, 
     };
     let os = shared.os.ok_or_else(|| failed("unsupported platform"))?;
     let inv = dump_invocation(scope, env, os);
-    let spec = actions::spec(&inv, os, &shared.tools).map_err(|e| failed(&e.to_string()))?;
-    let out = run_bounded(spec.command(), inv.limits).map_err(|e| failed(&e.to_string()))?;
-    let effective = parse_dump(&out)?;
+    // Use the common runner for the first load so authorization cancellation,
+    // refusal and exit status are recorded with the same purpose-only logging
+    // as Apply. Command output is still never logged.
+    let result = actions::run(&inv, os, &shared.tools).map_err(|e| failed(&e.to_string()))?;
+    let effective = parse_dump(&result.captured)?;
     let file_only = if effective.override_vars.is_empty() {
         None
     } else {
+        let spec = actions::spec(&inv, os, &shared.tools).map_err(|e| failed(&e.to_string()))?;
         let mut cmd = spec.command();
         for var in &effective.override_vars {
             cmd.env_remove(var);
@@ -134,7 +141,7 @@ impl SetupView {
     }
 
     /// Collect finished jobs; `true` after a successful apply.
-    pub(crate) fn poll(&mut self, ctx: &egui::Context, shared: &Shared) -> bool {
+    pub(crate) fn poll(&mut self, _ctx: &egui::Context, _shared: &Shared) -> bool {
         if let Some(result) = take(&mut self.load_job) {
             match result {
                 Ok(loaded) => {
@@ -164,15 +171,51 @@ impl SetupView {
             }
         }
         if let Some(done) = take(&mut self.apply_job) {
-            let ok = matches!(done.outcome, Ok(Outcome::Succeeded));
-            self.applied = Some(done);
-            if ok {
-                // Reload: the wizard now shows what was written.
-                self.start_load(ctx, shared);
-                return true;
-            }
+            return self.finish_apply(done);
         }
         false
+    }
+
+    /// Record a completed apply without starting another privileged command.
+    ///
+    /// Linux polkit grants each `pkexec` request separately. Re-reading the
+    /// root-owned configuration immediately after a successful apply therefore
+    /// caused a second prompt; cancelling or missing that prompt replaced the
+    /// success state with a permission-looking load failure. The successful
+    /// `mia setup --apply --json` response identifies the written file, and
+    /// `done.values` is the exact draft it accepted. The explicit Load button
+    /// remains the boundary for a fresh read.
+    fn finish_apply(&mut self, done: ApplyDone) -> bool {
+        let succeeded = matches!(done.outcome, Ok(Outcome::Succeeded));
+        if succeeded {
+            if let Some(loaded) = &mut self.loaded {
+                loaded.exists = true;
+                loaded.values = done.values.clone();
+                for field in Field::ALL {
+                    if !loaded.overridden.contains_key(&field) {
+                        loaded.effective.set(field, done.values.get(field));
+                    }
+                }
+            } else if let Some(report) = &done.report {
+                if !report.path.is_empty() {
+                    self.loaded = Some(Loaded {
+                        path: report.path.clone(),
+                        exists: true,
+                        values: done.values.clone(),
+                        effective: done.values.clone(),
+                        overridden: BTreeMap::new(),
+                    });
+                }
+            }
+            self.values = done.values.clone();
+            // The public key is transient input and was consumed by `mia`.
+            // Clearing it also prevents an accidental second import.
+            self.enrollment_public_key.clear();
+            self.expected_key_fingerprint.clear();
+            self.checked = None;
+        }
+        self.applied = Some(done);
+        succeeded
     }
 
     fn start_check(&mut self, ctx: &egui::Context, shared: &Shared) {
@@ -227,6 +270,7 @@ impl SetupView {
         };
         let os = shared.os;
         let tools = Arc::clone(&shared.tools);
+        let applied_values = self.values.clone();
         self.applied = None;
         self.apply_job = Some(Job::spawn(Some(ctx.clone()), move || {
             let fail = |m: Msg| ApplyDone {
@@ -234,6 +278,7 @@ impl SetupView {
                 report: None,
                 problems: Vec::new(),
                 details: String::new(),
+                values: applied_values.clone(),
             };
             let Some(os) = os else {
                 return fail(Msg::ErrorUnsupported);
@@ -263,6 +308,7 @@ impl SetupView {
                             .unwrap_or_default()
                     },
                     details: crate::text::output_text(&r.captured.stderr),
+                    values: applied_values,
                 },
             }
         }));
@@ -533,69 +579,73 @@ impl SetupView {
         }
         ui.label(RichText::new(help.text(lang)).small().weak());
         if f == Field::AllowlistKey {
-            let response = ui.checkbox(&mut self.fetch_key, Msg::SetupFetchKey.text(lang));
-            if response.changed() && self.fetch_key && read_only.is_none() {
-                self.enrollment_public_key.clear();
-                if let Some(path) = self.loaded.as_ref().map(|loaded| loaded.path.as_str()) {
-                    self.values
-                        .ensure_allowlist_key_destination(std::path::Path::new(path));
-                }
-            }
-            ui.label(RichText::new(Msg::FieldEnrollmentPublicKey.text(lang)).strong());
-            let can_paste = self.scope == Scope::System && !self.fetch_key;
-            let response = ui.add_enabled(
-                can_paste,
-                egui::TextEdit::multiline(&mut self.enrollment_public_key)
-                    .char_limit(MAX_ENROLLMENT_PUBLIC_KEY_LEN)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
-            if response.changed() && !self.enrollment_public_key.trim().is_empty() {
-                if let Some(path) = self.loaded.as_ref().map(|loaded| loaded.path.as_str()) {
-                    self.values
-                        .ensure_allowlist_key_destination(std::path::Path::new(path));
-                }
-            }
-            ui.label(
-                RichText::new(Msg::HelpEnrollmentPublicKey.text(lang))
-                    .small()
-                    .weak(),
-            );
-            if self.scope != Scope::System && !self.enrollment_public_key.trim().is_empty() {
-                ui.colored_label(
-                    color32(IconColor::Red),
-                    Msg::EnrollmentPublicKeySystemOnly.text(lang),
-                );
-            } else if validate_enrollment_public_key(&self.enrollment_public_key).is_err() {
-                ui.colored_label(
-                    color32(IconColor::Red),
-                    Msg::ValEnrollmentPublicKey.text(lang),
-                );
-            }
-            if self.fetch_key || !self.enrollment_public_key.trim().is_empty() {
-                ui.label(RichText::new(Msg::FieldEnrollmentKeyFingerprint.text(lang)).strong());
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.expected_key_fingerprint)
-                        .char_limit(MAX_ANSWER_LEN)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.label(
-                    RichText::new(Msg::HelpEnrollmentKeyFingerprint.text(lang))
-                        .small()
-                        .weak(),
-                );
-                if !self.expected_key_fingerprint.trim().is_empty()
-                    && EnrollmentKeyFingerprint::parse(&self.expected_key_fingerprint).is_err()
-                {
-                    ui.colored_label(
-                        color32(IconColor::Red),
-                        Msg::ValEnrollmentKeyFingerprint.text(lang),
-                    );
-                }
-            }
+            self.allowlist_key_ui(ui, lang, read_only.is_some());
         }
         for (_, m) in errors.iter().filter(|(ef, _)| *ef == f) {
             ui.colored_label(color32(IconColor::Red), m.text(lang));
+        }
+    }
+
+    fn allowlist_key_ui(&mut self, ui: &mut egui::Ui, lang: Lang, read_only: bool) {
+        let response = ui.checkbox(&mut self.fetch_key, Msg::SetupFetchKey.text(lang));
+        if response.changed() && self.fetch_key && !read_only {
+            self.enrollment_public_key.clear();
+            if let Some(path) = self.loaded.as_ref().map(|loaded| loaded.path.as_str()) {
+                self.values
+                    .ensure_allowlist_key_destination(std::path::Path::new(path));
+            }
+        }
+        ui.label(RichText::new(Msg::FieldEnrollmentPublicKey.text(lang)).strong());
+        let can_paste = self.scope == Scope::System && !self.fetch_key;
+        let response = ui.add_enabled(
+            can_paste,
+            egui::TextEdit::multiline(&mut self.enrollment_public_key)
+                .char_limit(MAX_ENROLLMENT_PUBLIC_KEY_LEN)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        if response.changed() && !self.enrollment_public_key.trim().is_empty() {
+            if let Some(path) = self.loaded.as_ref().map(|loaded| loaded.path.as_str()) {
+                self.values
+                    .ensure_allowlist_key_destination(std::path::Path::new(path));
+            }
+        }
+        ui.label(
+            RichText::new(Msg::HelpEnrollmentPublicKey.text(lang))
+                .small()
+                .weak(),
+        );
+        if self.scope != Scope::System && !self.enrollment_public_key.trim().is_empty() {
+            ui.colored_label(
+                color32(IconColor::Red),
+                Msg::EnrollmentPublicKeySystemOnly.text(lang),
+            );
+        } else if validate_enrollment_public_key(&self.enrollment_public_key).is_err() {
+            ui.colored_label(
+                color32(IconColor::Red),
+                Msg::ValEnrollmentPublicKey.text(lang),
+            );
+        }
+        if self.fetch_key || !self.enrollment_public_key.trim().is_empty() {
+            ui.label(RichText::new(Msg::FieldEnrollmentKeyFingerprint.text(lang)).strong());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.expected_key_fingerprint)
+                    .char_limit(MAX_ANSWER_LEN)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.label(
+                RichText::new(Msg::HelpEnrollmentKeyFingerprint.text(lang))
+                    .small()
+                    .weak(),
+            );
+            if !self.expected_key_fingerprint.trim().is_empty()
+                && EnrollmentKeyFingerprint::parse(&self.expected_key_fingerprint).is_err()
+            {
+                ui.colored_label(
+                    color32(IconColor::Red),
+                    Msg::ValEnrollmentKeyFingerprint.text(lang),
+                );
+            }
         }
     }
 }
@@ -639,5 +689,53 @@ fn apply_result_ui(ui: &mut egui::Ui, lang: Lang, done: &ApplyDone) {
                     .show(ui, |ui| ui.label(RichText::new(&done.details).monospace()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_apply_keeps_values_without_a_second_privileged_load() {
+        let mut view = SetupView {
+            editable: true,
+            enrollment_public_key: "transient-public-key".to_string(),
+            expected_key_fingerprint: "fingerprint".to_string(),
+            loaded: Some(Loaded {
+                path: "/etc/ferrogate/mia.toml".to_string(),
+                exists: false,
+                ..Loaded::default()
+            }),
+            ..SetupView::default()
+        };
+        let mut values = Values::default();
+        values.set(Field::Log, "mia=debug");
+        let done = ApplyDone {
+            outcome: Ok(Outcome::Succeeded),
+            report: Some(ApplyReport {
+                path: "/etc/ferrogate/mia.toml".to_string(),
+                changed_keys: vec!["log".to_string()],
+                ..ApplyReport::default()
+            }),
+            problems: Vec::new(),
+            details: String::new(),
+            values: values.clone(),
+        };
+
+        assert!(view.finish_apply(done));
+        assert!(
+            view.load_job.is_none(),
+            "success must not launch another pkexec"
+        );
+        assert!(view.editable);
+        assert_eq!(view.values, values);
+        assert_eq!(view.loaded.as_ref().map(|l| l.exists), Some(true));
+        assert!(view.enrollment_public_key.is_empty());
+        assert!(view.expected_key_fingerprint.is_empty());
+        assert!(matches!(
+            view.applied.as_ref().map(|d| &d.outcome),
+            Some(Ok(Outcome::Succeeded))
+        ));
     }
 }

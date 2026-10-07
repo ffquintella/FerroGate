@@ -170,8 +170,10 @@ return its output, so on Windows elevated actions report only their outcome.
    changing the scope or environment selector disables Check and Apply until
    that file is loaded.
 4. **Apply** runs `mia setup --apply` — directly for the per-user file, through
-   the consent prompt for the system file — and then reloads the configuration
-   so the change is visible. `--reload` (signal the running agent) and
+   the consent prompt for the system file — then keeps the accepted values on
+   screen and refreshes agent status. It does not immediately start a second
+   privileged read of the root-owned file; **Load** is the explicit boundary
+   for that fresh consent prompt. `--reload` (signal the running agent) and
    `--fetch-enrollment-key` (fetched inside the elevated `mia`, over the pinned
    channel) or a pasted public key are options. The paste field accepts the
    base64url value from `ferrogate enrollment-key --format public-key`. The
