@@ -25,6 +25,22 @@ record them.
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-10-07
+
+### Added
+
+- Let the Linux `ferrogate-operators` group manage only the MIA systemd service (S31)
+  Debian and `make mia-install` now provision a dedicated group with a Polkit
+  rule restricted to start, stop, and restart actions on `mia.service`. System
+  configuration changes remain behind the existing administrator authorization.
+
+### Fixed
+
+- Keep workspace Clippy clean for the MIA credential and setup code (S31)
+  Rename ambiguous sealed-key bindings, simplify optional enrollment-key
+  validation, and split setup application reporting into a helper without
+  changing the configuration write or audit behavior.
+
 ## [0.28.1] - 2026-10-07
 
 ### Fixed
@@ -2733,7 +2749,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.28.1...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.28.2...HEAD
+[0.28.2]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.2
 [0.28.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.1
 [0.28.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.0
 [0.27.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.27.1

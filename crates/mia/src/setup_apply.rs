@@ -491,16 +491,14 @@ fn validate_enrollment_public_key(
         .and_then(|bytes| {
             ferro_crypto::composite::CompositePublicKey::from_concat_bytes(&bytes).ok()
         });
-    match parsed {
-        Some(key) => Some(key.to_concat_bytes()),
-        None => {
-            errors.push(DraftError::new(
-                "enrollment_public_key",
-                "must be the base64url public key printed by `ferrogate enrollment-key --format public-key`",
-            ));
-            None
-        }
+    if let Some(key) = parsed {
+        return Some(key.to_concat_bytes());
     }
+    errors.push(DraftError::new(
+        "enrollment_public_key",
+        "must be the base64url public key printed by `ferrogate enrollment-key --format public-key`",
+    ));
+    None
 }
 
 /// A draft that does not mention `helper.enable` keeps the target file's
@@ -512,12 +510,10 @@ fn keep_helper_switch(settings: &mut Settings, existing: &Config) {
     }
 }
 
+type LoadedDraft = (Settings, Option<Vec<u8>>, std::fs::Metadata);
+
 /// Read, parse and validate a draft (see [`parse_draft`] for `detailed`).
-fn load_draft(
-    path: &Path,
-    apply: bool,
-    detailed: bool,
-) -> Result<(Settings, Option<Vec<u8>>, std::fs::Metadata), Vec<DraftError>> {
+fn load_draft(path: &Path, apply: bool, detailed: bool) -> Result<LoadedDraft, Vec<DraftError>> {
     let (text, meta) = read_draft(path, apply).map_err(|e| vec![e])?;
     let draft = parse_draft(&text, detailed).map_err(|e| vec![e])?;
     let (settings, enrollment_public_key) = validate(draft)?;
@@ -596,6 +592,15 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
          standard path (optionally with --environment or --user) instead"
     );
 
+    apply_validated_draft(draft, opts, target, who)
+}
+
+fn apply_validated_draft(
+    draft: &Path,
+    opts: &Opts,
+    target: PathBuf,
+    who: Invoker,
+) -> anyhow::Result<()> {
     let (mut settings, enrollment_public_key, draft_meta) =
         match load_draft(draft, true, !who.elevated) {
             Ok(v) => v,
@@ -680,6 +685,26 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
             Ok(())
         }
     });
+    report_apply_result(
+        opts,
+        &target,
+        draft,
+        &keys,
+        draft_deleted,
+        installed_key,
+        reloaded,
+    )
+}
+
+fn report_apply_result(
+    opts: &Opts,
+    target: &Path,
+    draft: &Path,
+    keys: &[String],
+    draft_deleted: bool,
+    installed_key: Option<anyhow::Result<PathBuf>>,
+    reloaded: Option<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     let error = match (&installed_key, &reloaded) {
         (Some(Err(e)), _) | (_, Some(Err(e))) => Some(format!("{e:#}")),
         _ => None,

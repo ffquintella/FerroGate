@@ -493,12 +493,12 @@ fn protect(sealer: &mut Sealer<'_>) -> Result<Protection, StoreError> {
         #[cfg(target_os = "linux")]
         Sealer::Tpm(engine) => {
             let dpk = fresh_dpk();
-            let sealed = crate::seal::seal_secret(engine, &dpk)
+            let sealed_key = crate::seal::seal_secret(engine, &dpk)
                 .map_err(|e| StoreError::Unseal(format!("TPM seal: {e}")))?;
             Ok(Protection {
                 secret: dpk,
-                tpm_public: Some(sealed.public),
-                tpm_private: Some(sealed.private),
+                tpm_public: Some(sealed_key.public),
+                tpm_private: Some(sealed_key.private),
                 sep_wrapped: None,
             })
         }
@@ -544,8 +544,8 @@ fn recover(sealer: &mut Sealer<'_>, file: &SealedFile) -> Result<Zeroizing<Vec<u
                     ))
                 }
             };
-            let sealed = crate::seal::SealedKey { public, private };
-            crate::seal::unseal_secret(engine, &sealed)
+            let sealed_key = crate::seal::SealedKey { public, private };
+            crate::seal::unseal_secret(engine, &sealed_key)
                 .map(Zeroizing::new)
                 // The expected failure after a boot-state change: the TPM
                 // refuses the policy, so the credential stays unreadable.

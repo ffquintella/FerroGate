@@ -170,7 +170,7 @@ fn issued_credential(now: i64) -> X509Credential {
 
     let issuer = Issuer::generate("kid-swtpm", "ferrogate.test").unwrap();
     let (host_secret, host_public) = CompositeSecretKey::from_seed(&[0x5a; 32]);
-    let issued = issuer
+    let credential = issuer
         .issue(
             &IssueParams {
                 ek_cert_sha384: [0x11; 48],
@@ -185,7 +185,7 @@ fn issued_credential(now: i64) -> X509Credential {
         )
         .unwrap();
     X509Credential {
-        leaf_der: issued.x509.unwrap().leaf_der,
+        leaf_der: credential.x509.unwrap().leaf_der,
         bundle_der: issuer.x509_ca().unwrap().to_vec(),
         key_pkcs8: host_secret.to_ed25519_pkcs8_der(),
     }
