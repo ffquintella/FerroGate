@@ -877,17 +877,19 @@ mod tests {
     fn enrollment_key_fetch_gets_an_environment_scoped_destination() {
         let mut default = Values::default();
         assert!(default.ensure_allowlist_key_destination(Path::new("/etc/ferrogate/mia.toml")));
+        // `Path::join` uses the platform separator, so compare as paths.
         assert_eq!(
-            default.get(Field::AllowlistKey),
-            "/etc/ferrogate/allowlist.pub"
+            Path::new(default.get(Field::AllowlistKey)),
+            Path::new("/etc/ferrogate/allowlist.pub")
         );
         assert!(!default.ensure_allowlist_key_destination(Path::new("/elsewhere/mia.toml")));
 
         let mut named = Values::default();
         assert!(named.ensure_allowlist_key_destination(Path::new("/etc/ferrogate/mia-prod.toml")));
+        // `Path::join` uses the platform separator, so compare as paths.
         assert_eq!(
-            named.get(Field::AllowlistKey),
-            "/etc/ferrogate/allowlist-prod.pub"
+            Path::new(named.get(Field::AllowlistKey)),
+            Path::new("/etc/ferrogate/allowlist-prod.pub")
         );
     }
 
