@@ -1215,8 +1215,9 @@ fn render_carried_tail(out: &mut String, c: &Carried) {
 
 /// A TOML *basic* string (`"…"`) with the required escapes — used for values
 /// carried over from an existing file, which (unlike wizard answers) may hold
-/// any character.
-fn basic_str(v: &str) -> String {
+/// any character. Shared with the `allowlist.key` autofix
+/// ([`crate::allowlist_key::config_fix`]).
+pub(crate) fn basic_str(v: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(v.len() + 2);
     out.push('"');

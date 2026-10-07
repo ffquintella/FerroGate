@@ -177,9 +177,10 @@ pub fn allowlist_key_hint(config: &Config, snapshots: &[StatusSnapshot]) -> Opti
     });
     (denied && config.allowlist_key().is_none()).then(|| {
         "hint: allowlist.key is not set in this configuration (it has no default), so every \
-         caller is denied. Set its path (`mia setup`), then install the CMIS enrollment key as \
-         root: `sudo mia allowlist-key fetch --expect-fingerprint <hex>` (<hex>: `ferrogate \
-         enrollment-key` on CMIS). `mia test` explains further."
+         caller is denied. Set it and install the CMIS enrollment key in one step, as root: \
+         `sudo mia test --fix` (asks for the fingerprint) or `sudo mia allowlist-key fetch \
+         --expect-fingerprint <hex>` (<hex>: `ferrogate enrollment-key` on CMIS). `mia test` \
+         explains further."
             .to_owned()
     })
 }

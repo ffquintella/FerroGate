@@ -669,8 +669,10 @@ SIGHUP reload). An operator or a provisioning script installs it, as root:
 ferrogate enrollment-key                     # 96 hex digits (SHA-384)
 ferrogate enrollment-key --format flag       # --expect-fingerprint <hex>
 
-# On the host, once allowlist.key names a path (mia setup, or [allowlist] key = "…"):
+# On the host (if allowlist.key is unset, fetch also names it in mia.toml):
 sudo mia allowlist-key fetch --expect-fingerprint <hex> --reload
+sudo mia allowlist-key fetch --reload        # on a terminal: asks for <hex>
+sudo mia test --fix                          # the same, from the self-test
 mia allowlist-key show                       # path + fingerprint, no privileges
 ```
 
@@ -684,11 +686,29 @@ mia allowlist-key show                       # path + fingerprint, no privileges
 - **Pinned channel only**: CMIS is dialed through the configured endpoint or
   SRV record with `cmis.spki_pin` over hybrid-PQC TLS. There is no unpinned
   fallback, and the reply must parse as a composite public key.
-- **Consent**: `--expect-fingerprint <hex>` checks the fetched key against the
-  value from `ferrogate enrollment-key` and aborts, writing nothing, on a
-  mismatch. `--yes` accepts the key fetched over the pinned channel without a
-  comparison. On a terminal the command otherwise shows the fingerprint and
-  asks (default: no). A non-interactive run with neither flag writes nothing.
+- **Consent, before any network traffic**: `--expect-fingerprint <hex>` checks
+  the fetched key against the value from `ferrogate enrollment-key` and aborts,
+  writing nothing, on a mismatch. Without the flag, on a terminal, the command
+  asks for that fingerprint (96 hex digits, validated as typed; Esc aborts) and
+  verifies the fetched key against it the same way. `--yes` accepts the key
+  fetched over the pinned channel without a comparison (kept for `mia
+  refresh-key` and the tray; not recommended). A non-interactive run with
+  neither flag fails closed before dialing CMIS: nothing is fetched or written,
+  and there is no trust-on-first-use path.
+- **Unset `allowlist.key`**: `fetch` names the key file itself instead of
+  failing — `allowlist.pub` (`allowlist-<env>.pub`) in the system configuration
+  directory, the path `mia setup` suggests. It edits the configuration file it
+  loaded surgically: one `key = "…"` line below the existing `[allowlist]`
+  header, or a new `[allowlist]` table when there is none (never a second
+  one); comments and every other key are kept, and the result must parse and
+  differ by `allowlist.key` alone. The edit is written only after the key was
+  fetched and accepted (a mismatch writes neither file), only by root into a
+  root-owned directory, atomically (`0640`, owner kept, symlinks refused), with
+  a `ConfigChanged { keys: ["allowlist.key"] }` audit record, and is abandoned
+  if the file changed meanwhile. It is not a load-time default: the daemon
+  still has none. Dotted keys, an inline `allowlist` table, a blank `key`, or a
+  blank `FERROGATE_ALLOWLIST_KEY` are refused with the line to add by hand.
+  `mia refresh-key` still requires a configured path.
 - **Never silently replaced**: an identical installed key is left alone (no
   write, no audit record). A *different* installed key is refused, with both
   fingerprints shown, unless you pass `--rotate`.
@@ -1047,7 +1067,13 @@ $ mia test
 
 A non-interactive diagnostic that exercises the full path a local application
 depends on and exits non-zero if any step fails, so it can gate provisioning
-scripts. It runs four checks in order:
+scripts. `sudo mia test --fix` first repairs a missing `allowlist.key`: when it
+is unset or names a file that does not exist, it runs `mia allowlist-key fetch
+--reload` (root only; asks for the enrollment-key fingerprint on the terminal;
+names the key file in the configuration when unset — see "Installing
+`allowlist.key`"), then runs the checks. An installed key is never replaced
+(that is `fetch --rotate`), and `--fix` cannot be combined with `--json`. It
+runs four checks in order:
 
 1. **configuration** — a CMIS source (a static `endpoint`, or an `srv` record)
    and a valid SPKI pin resolve from the usual config-file/environment

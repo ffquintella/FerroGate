@@ -36,6 +36,39 @@ record them.
   by `ferrogate enrollment-key`; the value is validated locally and passed only
   to the elevated `mia` command. A mismatch leaves the destination key file
   unchanged, and the fingerprint is not persisted or included in error messages.
+- Let `mia allowlist-key fetch` set an unset `allowlist.key` itself, and add `mia test --fix` to go from "every caller is denied" to working in one command (S32)
+  `mia test` warned that `allowlist.key` is not set, and `sudo mia
+  allowlist-key fetch` then failed until the operator hand-edited `mia.toml`.
+  `fetch` now names the key file itself: `allowlist.pub` (`allowlist-<env>.pub`)
+  in the system configuration directory, the path `mia setup` suggests. It
+  edits the configuration file it loaded surgically. It inserts one `key = "…"`
+  line below the existing `[allowlist]` header, or appends an `[allowlist]`
+  table when there is none, never a second one. Comments and every other key
+  are kept, and the edit must parse and differ by `allowlist.key` alone. It is
+  written only after the key was fetched over the pinned channel and accepted:
+  a fingerprint mismatch writes neither the key nor the configuration. Only
+  root writes it, into a root-owned directory that is not group/other-writable
+  (Windows: inside `%ProgramData%\FerroGate`), through the wizard's atomic
+  write (`0640`, owner kept, symlinks refused). A `ConfigChanged` record with
+  key names only (`allowlist.key`) goes to the local audit journal before the
+  rename. The edit is abandoned if the file changed while the key was being
+  fetched. Dotted keys, an inline `allowlist` table, a blank `key` or a blank
+  `FERROGATE_ALLOWLIST_KEY` are refused with the line to add by hand. This is
+  not a load-time default: `allowlist.key` still has none, and the deprecated
+  `mia refresh-key` still requires a configured path. `sudo mia test --fix`
+  runs `mia allowlist-key fetch --reload` when `allowlist.key` is unset or names
+  a missing file, then runs the self-test. It never replaces an installed key
+  and cannot be combined with `--json`. The `mia test`, `mia status`, `mia
+  allowlist-diagnose` and macOS installer hints now name both commands.
+- Ask for the enrollment-key fingerprint when `mia allowlist-key fetch` runs on a terminal without `--expect-fingerprint` (S32)
+  The prompt takes what `ferrogate enrollment-key` prints on CMIS, validates it
+  as typed (96 hex digits, never echoed in errors), and the fetched key is then
+  verified against it exactly as against the flag. Esc aborts with nothing
+  fetched or written. Behaviour change: this replaces the old "show the
+  fingerprint, then confirm" prompt, and consent is now resolved before any
+  network traffic. A non-interactive run with neither `--expect-fingerprint`
+  nor `--yes` fails closed before dialing CMIS (it used to fail after the
+  fetch), with no trust-on-first-use path. `--yes` keeps working.
 
 ## [0.27.1] - 2026-10-06
 

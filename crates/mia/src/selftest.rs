@@ -59,6 +59,21 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         return Ok(()); // --help printed
     };
 
+    // `--fix` first, so the report below reflects what it changed. A failed
+    // fix (refused, aborted, mismatched) wrote nothing; the self-test still
+    // runs and the command still exits non-zero.
+    let fix_failed = if opts.fix {
+        println!("FerroGate MIA self-test --fix: allowlist.key\n");
+        crate::allowlist_key::run_fix(opts.config.as_deref(), opts.environment.as_deref())
+            .map_err(|e| {
+                println!("--fix: {e:#}\n");
+                e
+            })
+            .err()
+    } else {
+        None
+    };
+
     let (config, source) = Config::load(opts.config.as_deref(), opts.environment.as_deref())?;
     if opts.json {
         JSON_SINK.with(|sink| *sink.borrow_mut() = Some(JsonReport::default()));
@@ -97,6 +112,9 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         if failures.is_empty() {
             println!("all checks passed — the helper API is emitting tokens.");
         }
+    }
+    if let Some(e) = fix_failed {
+        anyhow::bail!("--fix did not complete ({e:#}); see above");
     }
     if failures.is_empty() {
         Ok(())
@@ -195,6 +213,10 @@ struct Opts {
     audience: String,
     /// `--json`: one machine-readable document instead of the human report.
     json: bool,
+    /// `--fix`: before the checks, install a missing `allowlist.key` (and name
+    /// it in the configuration file when unset) — `mia allowlist-key fetch`,
+    /// root only, interactive. Excludes `json`.
+    fix: bool,
 }
 
 impl Opts {
@@ -205,6 +227,7 @@ impl Opts {
         let mut environment = None;
         let mut audience = DEFAULT_AUDIENCE.to_string();
         let mut json = false;
+        let mut fix = false;
         let mut it = args.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -227,20 +250,27 @@ impl Opts {
                     audience.clone_from(aud);
                 }
                 "--json" => json = true,
+                "--fix" => fix = true,
                 other => anyhow::bail!("unknown argument: {other}\n\n{USAGE}"),
             }
         }
+        anyhow::ensure!(
+            !(fix && json),
+            "--fix is interactive (it may ask for the enrollment-key fingerprint) and cannot be \
+             combined with --json\n\n{USAGE}"
+        );
         Ok(Some(Self {
             config,
             environment,
             audience,
             json,
+            fix,
         }))
     }
 }
 
-const USAGE: &str =
-    "usage: mia test [--config <path> | --environment <env>] [--audience <aud>] [--json]";
+const USAGE: &str = "usage: mia test [--config <path> | --environment <env>] [--audience <aud>] \
+     [--json | --fix]";
 
 fn print_help() {
     println!(
@@ -261,6 +291,11 @@ fn print_help() {
          \x20 -a, --audience <aud>    audience for the test token (default {DEFAULT_AUDIENCE})\n\
          \x20     --json              print the results as one JSON document (same exit\n\
          \x20                         status)\n\
+         \x20     --fix               first install a missing allowlist.key, as root: when\n\
+         \x20                         it is unset or not installed, run `mia allowlist-key\n\
+         \x20                         fetch --reload` (names allowlist[-<env>].pub in the\n\
+         \x20                         config file if unset; asks for the enrollment-key\n\
+         \x20                         fingerprint). Interactive; excludes --json\n\
          \x20 -h, --help              show this help"
     );
 }
@@ -1499,12 +1534,17 @@ fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<Str
             "warn",
             format!("{body}; allowlist.key is not set, so every caller is denied (fail closed)"),
             vec![
-                "Set allowlist.key to the path of the CMIS enrollment public key (it has no \
-                 default) with `mia setup`, which can also fetch it over the pinned channel."
-                    .to_string(),
-                "Or, once the path is set, install the key non-interactively as root: `sudo mia \
-                 allowlist-key fetch --expect-fingerprint <hex>` — <hex> is what \
-                 `ferrogate enrollment-key` prints on CMIS."
+                format!(
+                    "Fix it in one step, as root: `sudo mia test --fix` (or `sudo mia \
+                     allowlist-key fetch`) sets allowlist.key to {} in the configuration file \
+                     and installs the CMIS enrollment key over the pinned channel, after asking \
+                     for its fingerprint — what `ferrogate enrollment-key` prints on CMIS.",
+                    crate::allowlist_key::config_fix::suggested_key_path(config.environment())
+                        .display()
+                ),
+                "Non-interactively: `sudo mia allowlist-key fetch --expect-fingerprint <hex>` \
+                 (it sets allowlist.key the same way). Or choose the path yourself with `mia \
+                 setup`; allowlist.key deliberately has no default."
                     .to_string(),
             ],
         );
@@ -1532,10 +1572,10 @@ fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<Str
                 key.display()
             ),
             vec![
-                "Install or re-fetch the enrollment key (`sudo mia allowlist-key fetch`; add \
-                 --rotate to replace a different installed key, after comparing `mia \
-                 allowlist-key show` with `ferrogate enrollment-key`), then the allowlist \
-                 (`mia resync-allowlist`)."
+                "Install or re-fetch the enrollment key (`sudo mia test --fix` installs a \
+                 missing one; `sudo mia allowlist-key fetch --rotate` replaces a different \
+                 installed key, after comparing `mia allowlist-key show` with `ferrogate \
+                 enrollment-key`), then the allowlist (`mia resync-allowlist`)."
                     .to_string(),
             ],
         ),
@@ -1705,6 +1745,13 @@ mod tests {
                 .any(|h| h.contains("mia allowlist-key fetch --expect-fingerprint")),
             "{advice:?}"
         );
+        // The one-step remedy, naming the path it would set.
+        let suggested = crate::allowlist_key::config_fix::suggested_key_path(None);
+        assert!(
+            advice.iter().any(|h| h.contains("sudo mia test --fix")
+                && h.contains(&suggested.display().to_string())),
+            "{advice:?}"
+        );
 
         // An explicit, verifiable allowlist is reported verbatim and verified.
         let dir = std::env::temp_dir().join(format!("mia-selftest-al-{}", std::process::id()));
@@ -1815,6 +1862,22 @@ mod tests {
     fn parse_rejects_unknown_flags() {
         let args = vec!["--bogus".to_string()];
         assert!(Opts::parse(&args).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_fix_but_not_with_json() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let opts = Opts::parse(&args(&["--fix", "-e", "prod"]))
+            .unwrap()
+            .unwrap();
+        assert!(opts.fix && !opts.json);
+        assert_eq!(opts.environment.as_deref(), Some("prod"));
+        assert!(
+            !Opts::parse(&args(&[])).unwrap().unwrap().fix,
+            "off by default"
+        );
+        let err = Opts::parse(&args(&["--fix", "--json"])).err().unwrap();
+        assert!(format!("{err:#}").contains("--json"), "{err:#}");
     }
 
     #[test]

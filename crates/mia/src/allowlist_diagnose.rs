@@ -727,10 +727,10 @@ fn read_files(
             }
         );
         let hints = vec![
-            "Name the CMIS enrollment public key file as allowlist.key (`mia setup`, or \
-             [allowlist] key = \"…\"), then install it as root: `sudo mia allowlist-key fetch \
-             --expect-fingerprint <hex>` — <hex> is what `ferrogate enrollment-key` prints on \
-             CMIS."
+            "As root, `sudo mia allowlist-key fetch --expect-fingerprint <hex>` (or, on a \
+             terminal, `sudo mia test --fix`, which asks for <hex>) names the key file as \
+             allowlist.key and installs the CMIS enrollment key — <hex> is what `ferrogate \
+             enrollment-key` prints on CMIS. Or choose the path with `mia setup`."
                 .to_owned(),
         ];
         return Ok(deny(checks, Cause::KeyNotConfigured, detail, hints));

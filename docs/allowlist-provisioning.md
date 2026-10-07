@@ -239,9 +239,11 @@ SVID and the CRL are exercised by `mia test`.
 `allowlist.key` (and the allowlist body) to the host through your
 configuration-management channel and point the TOML/`FERROGATE_*` config at them
 — the key is public, so any integrity-preserving channel is fine — or, once the
-`[cmis]` endpoint and pin and the `allowlist.key` path are configured, run
+`[cmis]` endpoint and pin are configured, run
 **`sudo mia allowlist-key fetch --expect-fingerprint <hex>`** to install
-`allowlist.key` (`<hex>` is what `ferrogate enrollment-key` prints on CMIS) and
+`allowlist.key` (`<hex>` is what `ferrogate enrollment-key` prints on CMIS; if
+`allowlist.key` is unset it also names `allowlist.pub` in the system
+configuration directory in `mia.toml`, after the key verifies) and
 **`mia resync-allowlist --reload`** to fetch the signed body. Both are TTY-free
 and exit non-zero on failure, so they gate cleanly in provisioning scripts.
 `allowlist-key fetch` is root-only, uses only the pinned channel, writes nothing
@@ -260,7 +262,7 @@ so `mia allowlist-key fetch --reload` needs no restart either. (Windows has no
 | Symptom | Cause | Remedy |
 |---------|-------|--------|
 | `allowlist key file missing` / `unparseable` (daemon serves deny-all) | `allowlist.key` set but the key file is missing or corrupt | Install it with `sudo mia allowlist-key fetch` (or `mia setup`), deliver it out of band, or remove the `[allowlist]` keys to start fail-closed |
-| `no allowlist verification key configured` (daemon serves deny-all) | `allowlist.key` unset; the body path is the default | Set `allowlist.key` (`mia setup`), then install the key: `sudo mia allowlist-key fetch --expect-fingerprint <hex>`; `mia test` shows the resolved body path |
+| `no allowlist verification key configured` (daemon serves deny-all) | `allowlist.key` unset; the body path is the default | `sudo mia test --fix` (asks for the fingerprint) or `sudo mia allowlist-key fetch --expect-fingerprint <hex>`: both set `allowlist.key` and install the key; `mia test` shows the resolved body path |
 | `allowlist verification failed: bad signature` (daemon serves deny-all) | wrong `allowlist.key`, or an allowlist signed by a different/rotated issuer (e.g. a CMIS redeploy changed the enrollment key) | Compare `mia allowlist-key show` with `ferrogate enrollment-key`; then `sudo mia allowlist-key fetch --rotate --expect-fingerprint <hex>` and `mia resync-allowlist --reload` |
 | `allowlist verification failed: expired` / `too old` (daemon serves deny-all) | `not_after` passed, or older than `max_age_secs` | Re-issue a fresh allowlist; check clock skew; restart the daemon |
 | fetch fails with a TLS/pin error | wrong or missing SPKI pin, unreachable endpoint | Re-verify the pin out of band; confirm the endpoint |

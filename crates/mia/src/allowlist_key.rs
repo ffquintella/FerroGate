@@ -26,9 +26,18 @@
 //!   [`crate::endpoint::CmisResolver`], which needs `cmis.spki_pin` and dials
 //!   with the hybrid-PQC-only provider. There is no unpinned fallback.
 //! - **Validated**: the reply must parse as a composite public key.
-//! - **Explicit consent**: `--expect-fingerprint <hex>` (verified, the
-//!   recommended non-interactive form), `--yes`, or a confirmation prompt on
-//!   a terminal. Without one of them nothing is written.
+//! - **Explicit consent, before any network traffic** ([`consent`]):
+//!   `--expect-fingerprint <hex>` (verified, the recommended non-interactive
+//!   form); on a terminal, a prompt for that same fingerprint, verified the
+//!   same way; or `--yes` (no comparison). A non-interactive run with neither
+//!   flag fails closed: nothing is fetched or written, never trust on first
+//!   use.
+//! - **`allowlist.key` named on demand** ([`config_fix`]): when it is not set,
+//!   `fetch` (not the deprecated `refresh-key`) sets it to
+//!   `<system config dir>/allowlist[-<env>].pub` in the configuration file —
+//!   a surgical, verified, atomic and audited edit, made only after the key
+//!   was fetched and accepted, and only by root. It is never a load-time
+//!   default.
 //! - **Never silently replaced** ([`plan`]): an identical key is a no-op (no
 //!   write, no audit record); a different key is refused unless `--rotate`.
 //! - **Atomic and audited** ([`commit`]): temp file + `fsync` + rename via
@@ -43,6 +52,11 @@
 //! The daemon never runs any of this: it only *reads* `allowlist.key` (at
 //! startup and on a SIGHUP reload) and never fetches or trusts a key by
 //! itself, and neither the helper nor the status socket can trigger a fetch.
+//! `mia test --fix` ([`run_fix`]) runs the same `fetch` when the key is unset
+//! or not installed.
+
+pub mod config_fix;
+pub mod consent;
 
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -52,6 +66,8 @@ use ferro_crypto::composite::CompositePublicKey;
 
 use crate::config::Config;
 use crate::endpoint::CmisResolver;
+
+use self::config_fix::ConfigFix;
 
 /// The mode `allowlist.key` is written with: world-readable. It is public
 /// material whose integrity — not secrecy — matters, and it must stay readable
@@ -104,7 +120,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         "fetch" => match parse(rest, true)? {
-            Some(opts) => fetch(&opts),
+            Some(opts) => fetch(&opts, KeyPath::SetIfUnset),
             None => Ok(()),
         },
         "show" => match parse(rest, false)? {
@@ -131,7 +147,52 @@ pub fn run_refresh_key(args: &[String]) -> anyhow::Result<()> {
     );
     opts.rotate = true;
     opts.yes = true;
-    fetch(&opts)
+    // It replaces a configured key; it never names one (that needs `fetch`).
+    fetch(&opts, KeyPath::Configured)
+}
+
+/// Run the `allowlist.key` part of `mia test --fix`: when `allowlist.key` is
+/// not set, or names a file that does not exist yet, run `mia allowlist-key
+/// fetch --reload` for the same configuration — root only, the fingerprint
+/// asked for on the terminal (or the run fails closed), the path set in the
+/// configuration file when unset ([`config_fix`]). An installed key is left
+/// alone: replacing it is an explicit `fetch --rotate`.
+///
+/// # Errors
+///
+/// As `mia allowlist-key fetch`; nothing is written on an error.
+pub fn run_fix(config: Option<&Path>, environment: Option<&str>) -> anyhow::Result<()> {
+    let (loaded, _) = Config::load(config, environment)?;
+    if let Some(key) = loaded.allowlist_key() {
+        if std::fs::symlink_metadata(key).is_ok() {
+            println!(
+                "--fix: allowlist.key ({}) is set and installed; nothing to fix there (after a \
+                 CMIS key rotation: sudo mia allowlist-key fetch --rotate --expect-fingerprint \
+                 <hex>)\n",
+                key.display()
+            );
+            return Ok(());
+        }
+    }
+    let opts = Opts {
+        config: config.map(Path::to_path_buf),
+        environment: environment.map(str::to_owned),
+        reload: true,
+        ..Opts::default()
+    };
+    let outcome = fetch(&opts, KeyPath::SetIfUnset);
+    println!();
+    outcome
+}
+
+/// Whether `fetch` may name `allowlist.key` itself when it is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPath {
+    /// `allowlist.key` must already be configured (`mia refresh-key`).
+    Configured,
+    /// Set it to [`config_fix::suggested_key_path`] when unset
+    /// (`mia allowlist-key fetch`, `mia test --fix`).
+    SetIfUnset,
 }
 
 /// Parsed options. `expect`, `yes`, `rotate` and `reload` exist for `fetch`
@@ -198,17 +259,28 @@ fn parse(args: &[String], fetch: bool) -> anyhow::Result<Option<Opts>> {
 ///
 /// When the value is not a full hex SHA-384 fingerprint.
 pub fn parse_fingerprint(input: &str) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        input.len() <= MAX_ARG_LEN,
-        "--expect-fingerprint is too long"
-    );
+    normalize_fingerprint(input)
+        .map_err(|problem| anyhow::anyhow!("--expect-fingerprint {problem}"))
+}
+
+/// The core of [`parse_fingerprint`], shared with the interactive prompt
+/// ([`consent`]): the normalised fingerprint, or what is wrong with `input`
+/// (a predicate phrase, never quoting it).
+fn normalize_fingerprint(input: &str) -> Result<String, String> {
+    if input.len() > MAX_ARG_LEN {
+        return Err(format!(
+            "is too long: it must be the full {FINGERPRINT_HEX_LEN}-character hex SHA-384 \
+             fingerprint printed by `ferrogate enrollment-key`"
+        ));
+    }
     let hex = input.trim();
-    anyhow::ensure!(
-        hex.len() == FINGERPRINT_HEX_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit()),
-        "--expect-fingerprint must be the full {FINGERPRINT_HEX_LEN}-character hex SHA-384 \
-         fingerprint printed by `ferrogate enrollment-key` (got {} characters)",
-        hex.len()
-    );
+    if hex.len() != FINGERPRINT_HEX_LEN || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "must be the full {FINGERPRINT_HEX_LEN}-character hex SHA-384 fingerprint printed by \
+             `ferrogate enrollment-key` (got {} characters)",
+            hex.chars().count()
+        ));
+    }
     Ok(hex.to_ascii_lowercase())
 }
 
@@ -381,14 +453,43 @@ pub fn commit(plan: &Plan) -> anyhow::Result<()> {
     .with_context(|| format!("installing {}", plan.path.display()))
 }
 
+/// Carry out an accepted [`Plan`] and, when `allowlist.key` was unset, the
+/// [`ConfigFix`] naming it: the key first ([`commit`]), then the
+/// configuration ([`ConfigFix::commit`]), each atomic and audited. A key that
+/// [`plan`] refused never gets here, so a refusal (a fingerprint mismatch
+/// included) leaves both files untouched. Returns the configuration keys
+/// changed (empty without a fix).
+///
+/// Either failure leaves the host failing closed — a configured path without
+/// the key, or a key no configuration names — and a re-run completes it.
+fn apply(plan: &Plan, fix: Option<&ConfigFix>) -> anyhow::Result<Vec<String>> {
+    if let Some(fix) = fix {
+        anyhow::ensure!(
+            fix.key_path() == plan.path(),
+            "internal: the configuration fix names a different key file"
+        );
+    }
+    commit(plan)?;
+    match fix {
+        Some(fix) => fix.commit(),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// `allowlist.key` must be absolute, without `..`, and name a file.
 fn check_key_path(key_path: &Path) -> anyhow::Result<()> {
+    check_target_path(key_path, "allowlist.key")
+}
+
+/// A privileged write target (`what` names it in errors) must be absolute,
+/// without `..`, and name a file.
+fn check_target_path(path: &Path, what: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        key_path.is_absolute()
-            && !key_path.components().any(|c| c == Component::ParentDir)
-            && key_path.file_name().is_some(),
-        "allowlist.key ({}) must be an absolute file path without `..`",
-        key_path.display()
+        path.is_absolute()
+            && !path.components().any(|c| c == Component::ParentDir)
+            && path.file_name().is_some(),
+        "{what} ({}) must be an absolute file path without `..`",
+        path.display()
     );
     Ok(())
 }
@@ -452,20 +553,31 @@ fn describe(installed: &[u8]) -> String {
 ///
 /// The refusal, naming the fix.
 pub fn require_privileged(key_path: &Path) -> anyhow::Result<()> {
-    check_key_path(key_path)?;
-    let dir = key_path
+    require_privileged_at(key_path, "allowlist.key")
+}
+
+/// [`require_privileged`] for any file that names or holds the allowlist
+/// trust anchor — `allowlist.key` itself, or the configuration file the
+/// [`config_fix`] edits. `what` names it in errors.
+///
+/// # Errors
+///
+/// The refusal, naming the fix.
+pub fn require_privileged_at(path: &Path, what: &str) -> anyhow::Result<()> {
+    check_target_path(path, what)?;
+    let dir = path
         .parent()
-        .context("allowlist.key has no directory")?;
-    require_privileged_in(dir, key_path)
+        .with_context(|| format!("{what} has no directory"))?;
+    require_privileged_in(dir, path, what)
 }
 
 #[cfg(unix)]
-fn require_privileged_in(dir: &Path, _key_path: &Path) -> anyhow::Result<()> {
+fn require_privileged_in(dir: &Path, _path: &Path, what: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(dir).with_context(|| {
         format!(
-            "the directory of allowlist.key ({}) is missing; create it (root-owned, 0755) or \
-             point allowlist.key into the configuration directory",
+            "the directory of {what} ({}) is missing; create it (root-owned, 0755) or point \
+             {what} into the configuration directory",
             dir.display()
         )
     })?;
@@ -491,18 +603,18 @@ fn unix_verdict(euid: Option<u32>, dir: &Path, dir_uid: u32, dir_mode: u32) -> a
 }
 
 #[cfg(windows)]
-fn require_privileged_in(_dir: &Path, key_path: &Path) -> anyhow::Result<()> {
+fn require_privileged_in(_dir: &Path, path: &Path, what: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
-        crate::system_dir::is_inside_system_dir(key_path),
-        "on Windows, allowlist.key is installed only inside {} — where administrator rights \
-         are enforced — so point allowlist.key there and run this from an elevated prompt",
+        crate::system_dir::is_inside_system_dir(path),
+        "on Windows, {what} is written only inside {} — where administrator rights are \
+         enforced — so place it there and run this from an elevated prompt",
         crate::config::system_config_dir().display()
     );
     Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn require_privileged_in(_dir: &Path, _key_path: &Path) -> anyhow::Result<()> {
+fn require_privileged_in(_dir: &Path, _path: &Path, _what: &str) -> anyhow::Result<()> {
     anyhow::bail!("allowlist-key fetch is not supported on this platform")
 }
 
@@ -552,25 +664,50 @@ pub async fn fetch_key_async(resolver: &CmisResolver) -> anyhow::Result<(String,
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 
-/// `mia allowlist-key fetch`.
-fn fetch(opts: &Opts) -> anyhow::Result<()> {
+/// `mia allowlist-key fetch` (and `refresh-key`, `mia test --fix`).
+///
+/// Order matters: every local check — the key path, the configuration fix
+/// when `allowlist.key` is unset, privileges, the CMIS settings — and the
+/// consent ([`consent::resolve`]) come before any network traffic; the
+/// fetched key is then planned ([`plan`]: validated, checked against the
+/// expected fingerprint, compared with what is installed) before anything is
+/// written ([`apply`]).
+fn fetch(opts: &Opts, key_path_rule: KeyPath) -> anyhow::Result<()> {
     let (config, source) = Config::load(opts.config.as_deref(), opts.environment.as_deref())?;
     println!(
         "FerroGate allowlist-key fetch (mia {})",
         env!("CARGO_PKG_VERSION")
     );
     print_source(source.as_deref());
-    let key_path = configured_key(&config, source.as_deref())?;
+    let (key_path, fix) = resolve_key_path(&config, source.as_deref(), key_path_rule)?;
     check_key_path(&key_path)?;
     println!("key:    {}", key_path.display());
+    if let Some(fix) = &fix {
+        println!(
+            "        allowlist.key is not set: it will be set to this path in {} once the key \
+             is verified",
+            fix.config_path().display()
+        );
+    }
     note_env_overrides();
 
-    // Privilege first: an unprivileged run never reaches the network.
+    // Privilege first: an unprivileged run never reaches the prompt or the
+    // network.
     require_privileged(&key_path)?;
+    if let Some(fix) = &fix {
+        require_privileged_at(fix.config_path(), "the configuration file")?;
+    }
     let resolver = CmisResolver::from_config(&config.cmis)?.context(
         "cmis is not configured (set cmis.endpoint or cmis.srv, and cmis.spki_pin); run \
          `mia setup`",
     )?;
+    let consent = consent::resolve(
+        opts.expect.as_deref(),
+        opts.yes,
+        consent::stdin_is_terminal(),
+        consent::prompt_fingerprint,
+    )?;
+
     let (endpoint, fetched) = fetch_key(&resolver)?;
     if resolver.is_srv() {
         println!(
@@ -581,35 +718,27 @@ fn fetch(opts: &Opts) -> anyhow::Result<()> {
         println!("cmis:   {endpoint} (pinned hybrid-PQC TLS)");
     }
 
-    let plan = plan(&key_path, &fetched, opts.expect.as_deref(), opts.rotate)?;
+    let plan = plan(&key_path, &fetched, consent.expected(), opts.rotate)?;
     println!(
         "\nenrollment key fingerprint (SHA-384):\n  {}",
         plan.fingerprint()
     );
-    if opts.expect.is_some() {
-        println!("  ✓ matches --expect-fingerprint");
+    if consent.expected().is_some() {
+        println!("  ✓ matches {}", consent.source());
     } else {
         println!(
-            "  compare it with `ferrogate enrollment-key` on CMIS (or pass \
-             --expect-fingerprint <hex> to have it checked)"
+            "  ! accepted without a comparison (--yes) — compare it with `ferrogate \
+             enrollment-key` on CMIS"
         );
     }
 
-    match plan.change() {
-        Change::Unchanged => {
-            println!(
-                "\n✓ {} already holds this key; nothing written.",
-                key_path.display()
-            );
-            report_body(&config, &key_path);
-            return Ok(());
-        }
-        Change::New | Change::Rotate { .. } => consent(&plan, opts)?,
-    }
-
-    commit(&plan)?;
+    let changed = apply(&plan, fix.as_ref())?;
     let journal = crate::audit_client::local_journal_for(&key_path);
     match plan.change() {
+        Change::Unchanged => println!(
+            "\n✓ {} already holds this key; it was not rewritten.",
+            key_path.display()
+        ),
         Change::Rotate { previous } => println!(
             "\n✓ rotated {}: {} → {} (audit: {})",
             key_path.display(),
@@ -617,15 +746,26 @@ fn fetch(opts: &Opts) -> anyhow::Result<()> {
             short(plan.fingerprint()),
             journal.display()
         ),
-        _ => println!(
+        Change::New => println!(
             "\n✓ installed {} (fingerprint {}; audit: {})",
             key_path.display(),
             short(plan.fingerprint()),
             journal.display()
         ),
     }
+    if let Some(fix) = &fix {
+        println!(
+            "✓ set allowlist.key in {} (changed: {}; audit: {})",
+            fix.config_path().display(),
+            changed.join(", "),
+            crate::audit_client::local_journal_for(fix.config_path()).display()
+        );
+    }
     report_body(&config, &key_path);
 
+    if *plan.change() == Change::Unchanged && fix.is_none() {
+        return Ok(());
+    }
     if opts.reload {
         crate::resync::signal_reload();
     } else {
@@ -637,41 +777,45 @@ fn fetch(opts: &Opts) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Require explicit consent for a write: `--expect-fingerprint` (already
-/// verified by [`plan`]) or `--yes`, else a prompt on a terminal. A
-/// non-interactive run without either writes nothing.
-fn consent(plan: &Plan, opts: &Opts) -> anyhow::Result<()> {
-    if opts.expect.is_some() || opts.yes {
-        return Ok(());
+/// Where the key goes: the configured `allowlist.key`, or — when it is unset
+/// and `rule` allows — [`config_fix::suggested_key_path`] together with the
+/// planned [`ConfigFix`] that names it in the configuration file `source`.
+fn resolve_key_path(
+    config: &Config,
+    source: Option<&Path>,
+    rule: KeyPath,
+) -> anyhow::Result<(PathBuf, Option<ConfigFix>)> {
+    if let Some(key) = config.allowlist_key() {
+        return Ok((key.to_path_buf(), None));
     }
-    anyhow::ensure!(
-        std::io::IsTerminal::is_terminal(&std::io::stdin()),
-        "no consent to install the allowlist trust anchor: pass --expect-fingerprint <hex> (the \
-         value `ferrogate enrollment-key` prints on CMIS; recommended) or --yes; nothing written"
-    );
-    let question = match plan.change() {
-        Change::Rotate { previous } => format!(
-            "Replace the installed key {} with this one ({})?",
-            short(previous),
-            short(plan.fingerprint())
+    if rule == KeyPath::Configured {
+        anyhow::bail!(not_configured(config, source));
+    }
+    let from_env = crate::config::env_overridden(crate::config::EnvOverrideScope::Full, |v| {
+        std::env::var(v).ok()
+    })
+    .into_iter()
+    .find(|o| o.key == "allowlist.key");
+    if let Some(o) = from_env {
+        anyhow::bail!(
+            "allowlist.key comes from ${} in this environment, which is blank; set it there (or \
+             unset it) — the configuration file is not edited while an environment variable \
+             overrides it",
+            o.var
+        );
+    }
+    let config_path = source.context(
+        "allowlist.key is not set and no configuration file was found to set it in; write one \
+         first with `mia setup` (it can also fetch the key), or set FERROGATE_ALLOWLIST_KEY",
+    )?;
+    let key_path = config_fix::suggested_key_path(config.environment());
+    match config_fix::plan(config_path, &key_path)? {
+        Some(fix) => Ok((key_path, Some(fix))),
+        None => anyhow::bail!(
+            "{} sets allowlist.key, yet it resolved to nothing; check $FERROGATE_ALLOWLIST_KEY \
+             and the file",
+            config_path.display()
         ),
-        _ => format!(
-            "Install this key ({}) as {}?",
-            short(plan.fingerprint()),
-            plan.path().display()
-        ),
-    };
-    let answer = inquire::Confirm::new(&question)
-        .with_default(false)
-        .with_help_message("compare the fingerprint above with `ferrogate enrollment-key` on CMIS")
-        .prompt();
-    match answer {
-        Ok(true) => Ok(()),
-        Ok(false)
-        | Err(
-            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
-        ) => anyhow::bail!("not confirmed; nothing written"),
-        Err(e) => Err(e.into()),
     }
 }
 
@@ -710,15 +854,14 @@ fn configured_key(config: &Config, source: Option<&Path>) -> anyhow::Result<Path
 
 /// Why there is nothing to install into: `allowlist.key` has no default.
 fn not_configured(config: &Config, source: Option<&Path>) -> String {
-    let name = config.environment().map_or_else(
-        || "allowlist.pub".to_owned(),
-        |env| format!("allowlist-{env}.pub"),
-    );
-    let suggested = crate::config::system_config_dir().join(name);
+    let suggested = config_fix::suggested_key_path(config.environment());
     format!(
-        "allowlist.key is not set{} — it deliberately has no default. Name the file first, then \
-         re-run: `mia setup` (it can also fetch the key), or add under [allowlist]:  key = \"{}\"",
+        "allowlist.key is not set{} — it deliberately has no default. `sudo mia allowlist-key \
+         fetch` sets it to \"{}\" and installs the key in one step (it asks for the \
+         enrollment-key fingerprint, or takes --expect-fingerprint <hex>); or use `mia setup`, or \
+         add under [allowlist]:  key = \"{}\"",
         source.map_or_else(String::new, |p| format!(" in {}", p.display())),
+        suggested.display(),
         suggested.display()
     )
 }
@@ -776,16 +919,22 @@ fn print_help() {
          {USAGE}\n\
          \n\
          fetch  Dial CMIS over the pinned hybrid-PQC channel (cmis.spki_pin; no\n\
-         \x20      unpinned fallback), fetch the enrollment key, print its SHA-384\n\
+         \x20      unpinned fallback), fetch the enrollment key, verify its SHA-384\n\
          \x20      fingerprint and install it at the configured allowlist.key —\n\
          \x20      atomically, mode 0644, root-owned, with an audit record. Needs\n\
          \x20      root (Windows: an elevated prompt, key inside %ProgramData%\\FerroGate).\n\
          \x20      An identical installed key is left alone; a different one is\n\
-         \x20      refused unless --rotate. Nothing is written without consent:\n\
-         \x20      --expect-fingerprint, --yes, or a confirmation prompt.\n\
+         \x20      refused unless --rotate. The fingerprint to expect comes from\n\
+         \x20      --expect-fingerprint or, on a terminal, a prompt; a mismatch writes\n\
+         \x20      nothing. Without either (and without --yes) nothing is fetched.\n\
+         \x20      If allowlist.key is not set, fetch sets it in the config file to\n\
+         \x20      allowlist[-<env>].pub in the system config directory, once the key\n\
+         \x20      is verified (atomic, audited; the [allowlist] table is created once\n\
+         \x20      if absent, comments are kept).\n\
          show   Print the installed key's path and fingerprint (no privileges).\n\
          \n\
-         Compare the fingerprint with `ferrogate enrollment-key` run against CMIS.\n\
+         The fingerprint is what `ferrogate enrollment-key` prints on CMIS.\n\
+         `mia test --fix` runs fetch when allowlist.key is unset or not installed.\n\
          \n\
          options:\n\
          \x20 -c, --config <path>        TOML config file (default: the system config;\n\
@@ -793,7 +942,8 @@ fn print_help() {
          \x20 -e, --environment <env>    use mia-<env>.toml; excludes --config\n\
          \x20     --expect-fingerprint <hex>  (fetch) install only if the fetched key has\n\
          \x20                            this 96-hex-digit fingerprint; no prompt\n\
-         \x20 -y, --yes                  (fetch) install without a prompt (no comparison)\n\
+         \x20 -y, --yes                  (fetch) install without any comparison (not\n\
+         \x20                            recommended; prefer --expect-fingerprint)\n\
          \x20     --rotate               (fetch) allow replacing a different installed key\n\
          \x20     --reload               (fetch) signal the running agent to reload (SIGHUP)\n\
          \x20 -h, --help                 show this help"
@@ -1074,5 +1224,154 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("allowlist.pub"), "{err}");
+        assert!(err.contains("sudo mia allowlist-key fetch"), "{err}");
+    }
+
+    /// A scratch `mia.toml` without `allowlist.key`, and the fix that names
+    /// `allowlist.pub` beside it.
+    fn unset_config(dir: &Path) -> (PathBuf, PathBuf, ConfigFix) {
+        let config = dir.join("mia.toml");
+        std::fs::write(
+            &config,
+            "# operator comment\n[cmis]\nendpoint = 'https://cmis.example:8443'\n\n[allowlist]\n\
+             #key = '/etc/ferrogate/allowlist.pub'\nmax_age_secs = 3600\n",
+        )
+        .unwrap();
+        let key_path = dir.join("allowlist.pub");
+        let fix = config_fix::plan(&config, &key_path).unwrap().unwrap();
+        (config, key_path, fix)
+    }
+
+    fn config_records(journal: &[String]) -> usize {
+        journal
+            .iter()
+            .filter(|l| l.contains("\"allowlist.key\"]"))
+            .count()
+    }
+
+    #[test]
+    fn autofix_with_a_mismatched_fingerprint_writes_neither_key_nor_config() {
+        let dir = scratch("autofix-mismatch");
+        let (config, key_path, _fix) = unset_config(&dir);
+        let before = std::fs::read(&config).unwrap();
+        let (bytes, _) = key(20);
+        let (_, other_fp) = key(21);
+
+        // `plan` refuses before `apply` is ever reached.
+        let err = plan(&key_path, &bytes, Some(&other_fp), false).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<Refusal>(),
+            Some(Refusal::FingerprintMismatch { .. })
+        ));
+        assert!(!key_path.exists());
+        assert_eq!(std::fs::read(&config).unwrap(), before, "config untouched");
+        assert_eq!(
+            journal_lines(&config),
+            Vec::<String>::new(),
+            "nothing audited"
+        );
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autofix_installs_the_key_then_names_it_once_and_is_idempotent() {
+        let dir = scratch("autofix-ok");
+        let (config, key_path, fix) = unset_config(&dir);
+        let (bytes, fp) = key(22);
+
+        let p = plan(&key_path, &bytes, Some(&fp), false).unwrap();
+        assert_eq!(p.change(), &Change::New);
+        assert_eq!(apply(&p, Some(&fix)).unwrap(), vec!["allowlist.key"]);
+        assert_eq!(std::fs::read(&key_path).unwrap(), bytes);
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.starts_with("# operator comment\n"), "comments kept");
+        assert_eq!(text.matches("[allowlist]").count(), 1, "{text}");
+        let loaded = Config::from_toml(&text).unwrap();
+        assert_eq!(loaded.allowlist_key(), Some(key_path.as_path()));
+        assert_eq!(loaded.allowlist.max_age_secs, Some(3600));
+        let journal = journal_lines(&config);
+        assert_eq!(journal.len(), 2, "key install + config change: {journal:?}");
+        assert_eq!(config_records(&journal), 1);
+        assert!(journal
+            .iter()
+            .all(|l| !l.contains(&fp[..SHORT_FINGERPRINT_LEN])));
+
+        // A second run: the key is configured and identical — nothing to fix,
+        // nothing written, nothing audited.
+        assert!(config_fix::plan(&config, &key_path).unwrap().is_none());
+        let again = plan(&key_path, &bytes, Some(&fp), false).unwrap();
+        assert_eq!(again.change(), &Change::Unchanged);
+        assert_eq!(apply(&again, None).unwrap(), Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+        assert_eq!(journal_lines(&config).len(), 2);
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autofix_names_an_already_installed_identical_key_without_rewriting_it() {
+        let dir = scratch("autofix-unchanged");
+        let (config, key_path, fix) = unset_config(&dir);
+        let (bytes, fp) = key(23);
+        commit(&plan(&key_path, &bytes, None, false).unwrap()).unwrap();
+        let installed_at = std::fs::metadata(&key_path).unwrap().modified().unwrap();
+
+        let p = plan(&key_path, &bytes, Some(&fp), false).unwrap();
+        assert_eq!(p.change(), &Change::Unchanged);
+        assert_eq!(apply(&p, Some(&fix)).unwrap(), vec!["allowlist.key"]);
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().modified().unwrap(),
+            installed_at
+        );
+        let loaded = Config::from_toml(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded.allowlist_key(), Some(key_path.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fix_for_another_key_file_is_refused() {
+        let dir = scratch("autofix-other");
+        let (config, _key_path, fix) = unset_config(&dir);
+        let before = std::fs::read(&config).unwrap();
+        let (bytes, _) = key(24);
+        let elsewhere = dir.join("other.pub");
+        let p = plan(&elsewhere, &bytes, None, false).unwrap();
+        assert!(apply(&p, Some(&fix)).is_err());
+        assert!(!elsewhere.exists());
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_key_path_is_named_only_by_fetch_and_only_in_a_config_file() {
+        let dir = scratch("resolve");
+        let (config_path, _, _) = unset_config(&dir);
+        let config = Config::from_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        // `refresh-key` keeps refusing an unset key.
+        let err = resolve_key_path(&config, Some(&config_path), KeyPath::Configured).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("allowlist.key is not set"),
+            "{err:#}"
+        );
+        // No configuration file: nothing to edit.
+        assert!(resolve_key_path(&config, None, KeyPath::SetIfUnset).is_err());
+        // `fetch`: the suggested path, with a planned (unwritten) fix.
+        let (key_path, fix) =
+            resolve_key_path(&config, Some(&config_path), KeyPath::SetIfUnset).unwrap();
+        assert_eq!(key_path, config_fix::suggested_key_path(None));
+        assert_eq!(fix.unwrap().config_path(), config_path);
+        assert!(
+            journal_lines(&config_path).is_empty(),
+            "planning writes nothing"
+        );
+
+        // A configured key is used as is, with no fix.
+        let set = Config::from_toml("[allowlist]\nkey = '/k/allowlist.pub'\n").unwrap();
+        let (key_path, fix) = resolve_key_path(&set, None, KeyPath::Configured).unwrap();
+        assert_eq!(key_path, Path::new("/k/allowlist.pub"));
+        assert!(fix.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
