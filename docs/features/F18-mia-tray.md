@@ -216,7 +216,9 @@ keep working against newer daemons.
    signals the daemon to reload (`--reload`).
 6. The "fetch enrollment key from CMIS" step runs inside the elevated `mia`
    (`--apply --fetch-enrollment-key`), not in the tray, so the pinned TLS dial
-   and the key write stay in one place.
+   and the key write stay in one place. An optional textual fingerprint is
+   passed as `--expect-fingerprint <hex>` and checked before anything is
+   written, matching `mia allowlist-key fetch`.
 
 ### Recovery actions
 

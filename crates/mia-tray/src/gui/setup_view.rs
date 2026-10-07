@@ -16,16 +16,16 @@ use super::job::{take, Job};
 use super::status_view::color32;
 use super::Shared;
 use crate::actions::{
-    self, apply_invocation, check_invocation, dump_invocation, ApplyOptions, EnvName, Outcome,
-    Scope,
+    self, apply_invocation, check_invocation, dump_invocation, ApplyOptions,
+    EnrollmentKeyFingerprint, EnvName, Outcome, Scope,
 };
 use crate::client::Observation;
 use crate::i18n::{fill, Lang, Msg};
 use crate::model::{IconColor, WizardStep};
 use crate::process::run_bounded;
 use crate::wizard::{
-    combine, draft_base_dir, parse_apply, parse_check, parse_dump, render, validate, write_draft,
-    ApplyReport, CheckReport, Field, LoadError, Loaded, Step, Values, BACKEND_CHOICES,
+    combine, draft_base_dir, parse_apply, parse_check, parse_dump, render, validate_for_apply,
+    write_draft, ApplyReport, CheckReport, Field, LoadError, Loaded, Step, Values, BACKEND_CHOICES,
     MAX_ANSWER_LEN,
 };
 
@@ -57,6 +57,7 @@ pub(crate) struct SetupView {
     applied: Option<ApplyDone>,
     reload: bool,
     fetch_key: bool,
+    expected_key_fingerprint: String,
     /// The file the editable values belong to — (scope, environment) as
     /// loaded. Check / Apply are disabled while the selector differs, and
     /// Apply always writes this target, never the current selection.
@@ -195,12 +196,26 @@ impl SetupView {
         let Some((scope, env)) = self.target.clone() else {
             return;
         };
+        let expected_enrollment_key_fingerprint = if self.fetch_key {
+            let text = self.expected_key_fingerprint.trim();
+            if text.is_empty() {
+                None
+            } else {
+                let Ok(fingerprint) = EnrollmentKeyFingerprint::parse(text) else {
+                    return;
+                };
+                Some(fingerprint)
+            }
+        } else {
+            None
+        };
         let text = render(&self.values);
         let opts = ApplyOptions {
             scope,
             environment: env,
             reload: self.reload && scope == Scope::System,
             fetch_enrollment_key: self.fetch_key,
+            expected_enrollment_key_fingerprint,
         };
         let os = shared.os;
         let tools = Arc::clone(&shared.tools);
@@ -314,7 +329,7 @@ impl SetupView {
         }
         ui.separator();
 
-        let errors = validate(&self.values);
+        let field_errors = validate_for_apply(&self.values, self.fetch_key);
         let overridden: BTreeMap<Field, String> = self
             .loaded
             .as_ref()
@@ -342,7 +357,7 @@ impl SetupView {
                                 .into_iter()
                                 .filter(|f| f.step() == step && f.applies_here())
                             {
-                                self.field_ui(ui, lang, f, &overridden, &effective, &errors);
+                                self.field_ui(ui, lang, f, &overridden, &effective, &field_errors);
                             }
                         });
                 }
@@ -354,8 +369,13 @@ impl SetupView {
                 self.scope == Scope::System,
                 egui::Checkbox::new(&mut self.reload, Msg::SetupReload.text(lang)),
             );
-            ui.checkbox(&mut self.fetch_key, Msg::SetupFetchKey.text(lang));
         });
+        // Field edits and the fetch checkbox happen inside the scroll area, so
+        // recompute before enabling Check / Apply in this same frame.
+        let errors = validate_for_apply(&self.values, self.fetch_key);
+        let fingerprint_error = self.fetch_key
+            && !self.expected_key_fingerprint.trim().is_empty()
+            && EnrollmentKeyFingerprint::parse(&self.expected_key_fingerprint).is_err();
         let selected = env.clone().ok().map(|e| (self.scope, e));
         let on_target = selected.is_some() && selected == self.target;
         if !on_target {
@@ -370,7 +390,8 @@ impl SetupView {
             .as_ref()
             .is_some_and(|(text, r)| r.ok && *text == rendered);
         ui.horizontal(|ui| {
-            let can_check = errors.is_empty() && self.check_job.is_none() && on_target;
+            let can_check =
+                errors.is_empty() && !fingerprint_error && self.check_job.is_none() && on_target;
             if ui
                 .add_enabled(can_check, egui::Button::new(Msg::SetupCheck.text(lang)))
                 .clicked()
@@ -380,8 +401,11 @@ impl SetupView {
             if self.check_job.is_some() {
                 ui.spinner();
             }
-            let can_apply =
-                errors.is_empty() && checked_ok && self.apply_job.is_none() && on_target;
+            let can_apply = errors.is_empty()
+                && !fingerprint_error
+                && checked_ok
+                && self.apply_job.is_none()
+                && on_target;
             let mut apply =
                 ui.add_enabled(can_apply, egui::Button::new(Msg::SetupApply.text(lang)));
             if self.scope == Scope::System {
@@ -394,7 +418,7 @@ impl SetupView {
                 ui.spinner();
             }
         });
-        if !errors.is_empty() {
+        if !errors.is_empty() || fingerprint_error {
             ui.colored_label(red, Msg::SetupFixErrors.text(lang));
         } else if !checked_ok && self.apply_job.is_none() && self.applied.is_none() {
             ui.label(RichText::new(Msg::SetupNeedsCheck.text(lang)).weak());
@@ -489,6 +513,36 @@ impl SetupView {
             ui.label(RichText::new(fill(Msg::SetupReadOnly.text(lang), &[("var", var)])).weak());
         }
         ui.label(RichText::new(help.text(lang)).small().weak());
+        if f == Field::AllowlistKey {
+            let response = ui.checkbox(&mut self.fetch_key, Msg::SetupFetchKey.text(lang));
+            if response.changed() && self.fetch_key && read_only.is_none() {
+                if let Some(path) = self.loaded.as_ref().map(|loaded| loaded.path.as_str()) {
+                    self.values
+                        .ensure_allowlist_key_destination(std::path::Path::new(path));
+                }
+            }
+            if self.fetch_key {
+                ui.label(RichText::new(Msg::FieldEnrollmentKeyFingerprint.text(lang)).strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.expected_key_fingerprint)
+                        .char_limit(MAX_ANSWER_LEN)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label(
+                    RichText::new(Msg::HelpEnrollmentKeyFingerprint.text(lang))
+                        .small()
+                        .weak(),
+                );
+                if !self.expected_key_fingerprint.trim().is_empty()
+                    && EnrollmentKeyFingerprint::parse(&self.expected_key_fingerprint).is_err()
+                {
+                    ui.colored_label(
+                        color32(IconColor::Red),
+                        Msg::ValEnrollmentKeyFingerprint.text(lang),
+                    );
+                }
+            }
+        }
         for (_, m) in errors.iter().filter(|(ef, _)| *ef == f) {
             ui.colored_label(color32(IconColor::Red), m.text(lang));
         }

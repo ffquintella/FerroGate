@@ -979,7 +979,8 @@ These back the `mia-tray` graphical wizard (feature F18) and need no TTY:
   on any problem). Error text is the wizard's own; `--json` prints
   `{"ok": …, "errors": [{"key": …, "message": …}]}`.
 - `mia setup --apply <draft> [--user | --output <path> | -e <env>] [--reload]
-  [--fetch-enrollment-key] [--json]` — validate the draft, then write the same
+  [--fetch-enrollment-key [--expect-fingerprint <hex>]] [--json]` — validate
+  the draft, then write the same
   file the interactive wizard would write for the same answers (byte for
   byte), audit `ConfigChanged`, and delete the draft (unprivileged runs only —
   an elevated run leaves it for its owner to remove, since deleting by path as
@@ -989,7 +990,10 @@ These back the `mia-tray` graphical wizard (feature F18) and need no TTY:
   configuration describes, inside this (possibly elevated) process — only over
   pinned TLS (never `http://`), only into an absolute path without `..` (when
   elevated: beside the configuration file), only if the reply parses as a
-  composite public key, written atomically and audited. `--json` prints one
+  composite public key, written atomically and audited. The optional
+  `--expect-fingerprint <hex>` accepts the 96-character text printed by
+  `ferrogate enrollment-key` and writes nothing when the fetched key differs.
+  `--json` prints one
   object: `ok`, `path`, `changed_keys`, `draft_deleted`, `enrollment_key`,
   `reloaded`, `error`.
 - `mia setup --dump [--json] [--user | --output <path> | -e <env>]` — the

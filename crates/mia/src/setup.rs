@@ -1327,7 +1327,8 @@ fn clean_config(path: &Path, force: bool) -> anyhow::Result<()> {
 
 const USAGE: &str =
     "usage: mia setup [--user] [--environment <env>] [--output <path>] [--force] [--clean]\n\
-     \x20      mia setup --check <draft> | --apply <draft> [--reload] [--fetch-enrollment-key] | --dump [--json]";
+     \x20      mia setup --check <draft> | --apply <draft> [--reload]\n\
+     \x20                [--fetch-enrollment-key [--expect-fingerprint <hex>]] | --dump [--json]";
 
 fn print_help() {
     println!(
@@ -1364,6 +1365,8 @@ fn print_help() {
          \x20   --reload            then signal the running agent to reload\n\
          \x20   --fetch-enrollment-key  then fetch the CMIS enrollment key into\n\
          \x20                       allowlist.key over the pinned channel\n\
+         \x20   --expect-fingerprint <hex>  require that fetch to match the 96-hex\n\
+         \x20                       fingerprint from `ferrogate enrollment-key`\n\
          \x20 --dump                print the effective values, the file path and which\n\
          \x20                       keys come from environment variables\n\
          \x20 --json                machine-readable output for --check/--apply/--dump\n",

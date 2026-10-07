@@ -244,7 +244,7 @@ messages! {
     SetupCheckRejected => "mia rejected the draft:", "O mia rejeitou o rascunho:";
     SetupApply => "Apply", "Aplicar";
     SetupReload => "Reload the agent after applying", "Recarregar o agente após aplicar";
-    SetupFetchKey => "Fetch the enrollment key from CMIS", "Obter a chave de registro do CMIS";
+    SetupFetchKey => "Fetch the enrollment public key from CMIS into this file", "Obter a chave pública de registro do CMIS e salvar neste arquivo";
     SetupApplied => "Configuration written.", "Configuração gravada.";
     SetupTargetChanged => "The selected file differs from the one loaded: load it before checking or applying.", "O arquivo selecionado é diferente do carregado: carregue-o antes de verificar ou aplicar.";
     SetupNeedsCheck => "Check the draft with mia before applying.", "Verifique o rascunho com o mia antes de aplicar.";
@@ -270,8 +270,10 @@ messages! {
     HelpHelperWindowsGroup => "Local group allowed to open the helper pipe, e.g. FerroGateClients.", "Grupo local autorizado a abrir o pipe do helper, por exemplo FerroGateClients.";
     FieldAllowlistPath => "Allowlist file", "Arquivo da lista de permissões";
     HelpAllowlistPath => "Path of the signed caller allowlist; leave blank for the platform default.", "Caminho da lista de permissões assinada; deixe em branco para usar o padrão da plataforma.";
-    FieldAllowlistKey => "Enrollment public key", "Chave pública de registro";
-    HelpAllowlistKey => "Path of the CMIS enrollment key that verifies the allowlist; no default — without it every caller is denied.", "Caminho da chave de registro do CMIS que verifica a lista de permissões; sem padrão — sem ela todo chamador é negado.";
+    FieldAllowlistKey => "Enrollment public key file (destination)", "Arquivo da chave pública de registro (destino)";
+    HelpAllowlistKey => "Path where the CMIS enrollment public key is stored or will be fetched; without it every caller is denied.", "Caminho onde a chave pública de registro do CMIS está ou será salva; sem ela todo chamador é negado.";
+    FieldEnrollmentKeyFingerprint => "Expected enrollment key fingerprint (text)", "Fingerprint esperado da chave de registro (texto)";
+    HelpEnrollmentKeyFingerprint => "Optional 96-character hex fingerprint printed by `ferrogate enrollment-key`; when set, nothing is written unless the fetched key matches.", "Fingerprint hexadecimal opcional de 96 caracteres exibido por `ferrogate enrollment-key`; quando preenchido, nada é gravado se a chave obtida não corresponder.";
     FieldAllowlistMaxAge => "Allowlist maximum age (seconds)", "Idade máxima da lista de permissões (segundos)";
     HelpAllowlistMaxAge => "Oldest allowlist accepted, in seconds; blank for the default.", "Lista de permissões mais antiga aceita, em segundos; em branco para o padrão.";
     FieldAllowlistFetch => "Fetch the allowlist from CMIS at startup", "Obter a lista de permissões do CMIS ao iniciar";
@@ -295,6 +297,8 @@ messages! {
     ValEndpointSrvExclusive => "set either the endpoint or the SRV record, not both", "defina o endpoint ou o registro SRV, não ambos";
     ValPinRequired => "required with an https:// endpoint or an SRV record", "obrigatório com um endpoint https:// ou um registro SRV";
     ValKeyRequired => "required whenever the allowlist file is set", "obrigatório sempre que o arquivo da lista de permissões for definido";
+    ValKeyRequiredForFetch => "choose a destination file to fetch the enrollment key", "escolha um arquivo de destino para obter a chave de registro";
+    ValEnrollmentKeyFingerprint => "must be the full 96-character hex fingerprint printed by `ferrogate enrollment-key`", "deve ser o fingerprint hexadecimal completo de 96 caracteres exibido por `ferrogate enrollment-key`";
     ValDraftTooLarge => "the draft is larger than 64 KiB", "o rascunho é maior que 64 KiB";
 
     LogsLevel => "Level", "Nível";

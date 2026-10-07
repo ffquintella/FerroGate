@@ -114,7 +114,7 @@ or typed text.
 | Re-fetch the enrollment key | `mia refresh-key [-e <env>]` (deprecated alias of `mia allowlist-key fetch --rotate --yes`: pinned channel, audited, fingerprint printed) | administrator |
 | Set as default environment | `mia default-environment set <env>` (for the default `mia.toml` environment: `mia default-environment clear`) | administrator |
 | Use mia.toml as default | `mia default-environment clear` | administrator |
-| Apply the configuration (system file) | `mia setup --apply <draft> --json [-e <env>] [--reload] [--fetch-enrollment-key]` | administrator |
+| Apply the configuration (system file) | `mia setup --apply <draft> --json [-e <env>] [--reload] [--fetch-enrollment-key [--expect-fingerprint <hex>]]` | administrator |
 
 "Administrator" means the platform's consent prompt; the tray never sees, asks
 for or stores a password:
@@ -164,8 +164,11 @@ return its output, so on Windows elevated actions report only their outcome.
    the consent prompt for the system file — and then reloads the configuration
    so the change is visible. `--reload` (signal the running agent) and
    `--fetch-enrollment-key` (fetched inside the elevated `mia`, over the pinned
-   channel) are options. The tray removes its private directory afterwards,
-   including the draft an elevated `mia` deliberately leaves to its owner.
+   channel) are options. When fetching, the screen also accepts the optional
+   96-character fingerprint printed by `ferrogate enrollment-key`; `mia`
+   writes nothing when the fetched key differs. The tray removes its private
+   directory afterwards, including the draft an elevated `mia` deliberately
+   leaves to its owner.
 
 ### Log viewer
 

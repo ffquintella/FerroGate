@@ -257,6 +257,37 @@ impl EnvName {
     }
 }
 
+/// A validated SHA-384 fingerprint of the CMIS enrollment public key.
+///
+/// This is public key metadata, accepted in the same 96-character hexadecimal
+/// form printed by `ferrogate enrollment-key` and consumed by
+/// `mia allowlist-key fetch --expect-fingerprint`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollmentKeyFingerprint(String);
+
+impl EnrollmentKeyFingerprint {
+    /// Validate and normalise a textual enrollment-key fingerprint.
+    pub fn parse(input: &str) -> Result<Self, ActionError> {
+        const SHA384_HEX_LEN: usize = 96;
+        let value = input.trim();
+        if input.len() > 256
+            || value.len() != SHA384_HEX_LEN
+            || !value.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(ActionError::BadOptions(
+                "invalid enrollment-key fingerprint",
+            ));
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    /// The normalised lowercase hexadecimal fingerprint.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One fixed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
@@ -386,6 +417,8 @@ pub struct ApplyOptions {
     pub reload: bool,
     /// `--fetch-enrollment-key`.
     pub fetch_enrollment_key: bool,
+    /// `--expect-fingerprint <hex>` for the fetched enrollment key.
+    pub expected_enrollment_key_fingerprint: Option<EnrollmentKeyFingerprint>,
 }
 
 /// Longest path argument accepted.
@@ -442,12 +475,17 @@ pub fn check_invocation(draft: &Path) -> Result<Invocation, ActionError> {
 }
 
 /// `mia setup --apply <draft> --json [--user] [-e <env>] [--reload]
-/// [--fetch-enrollment-key]` — as the user for [`Scope::User`], elevated for
-/// [`Scope::System`].
+/// [--fetch-enrollment-key [--expect-fingerprint <hex>]]` — as the user for
+/// [`Scope::User`], elevated for [`Scope::System`].
 pub fn apply_invocation(draft: &Path, opts: &ApplyOptions) -> Result<Invocation, ActionError> {
     if opts.reload && opts.scope == Scope::User {
         return Err(ActionError::BadOptions(
             "--reload signals the system service",
+        ));
+    }
+    if opts.expected_enrollment_key_fingerprint.is_some() && !opts.fetch_enrollment_key {
+        return Err(ActionError::BadOptions(
+            "--expect-fingerprint requires --fetch-enrollment-key",
         ));
     }
     let mut args = vec![
@@ -465,6 +503,10 @@ pub fn apply_invocation(draft: &Path, opts: &ApplyOptions) -> Result<Invocation,
     }
     if opts.fetch_enrollment_key {
         args.push("--fetch-enrollment-key".into());
+    }
+    if let Some(fingerprint) = &opts.expected_enrollment_key_fingerprint {
+        args.push("--expect-fingerprint".into());
+        args.push(fingerprint.as_str().to_string());
     }
     let (privilege, limits) = match opts.scope {
         Scope::System => (Privilege::Admin, Limits::ELEVATED),
@@ -1401,12 +1443,26 @@ mod tests {
             environment: Some(EnvName::parse("prod").unwrap()),
             reload: true,
             fetch_enrollment_key: true,
+            expected_enrollment_key_fingerprint: Some(
+                EnrollmentKeyFingerprint::parse(
+                    "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F",
+                )
+                .unwrap(),
+            ),
         };
         let inv = apply_invocation(&draft, &system).unwrap();
         assert_eq!(inv.privilege, Privilege::Admin);
         assert_eq!(
             inv.args[3..],
-            ["--json", "-e", "prod", "--reload", "--fetch-enrollment-key"]
+            [
+                "--json",
+                "-e",
+                "prod",
+                "--reload",
+                "--fetch-enrollment-key",
+                "--expect-fingerprint",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+            ]
         );
         assert!(!inv.args.contains(&"--output".to_string()));
 
@@ -1418,8 +1474,32 @@ mod tests {
             }
         )
         .is_err());
+        assert!(apply_invocation(
+            &draft,
+            &ApplyOptions {
+                expected_enrollment_key_fingerprint: Some(
+                    EnrollmentKeyFingerprint::parse(&"a".repeat(96)).unwrap(),
+                ),
+                ..ApplyOptions::default()
+            }
+        )
+        .is_err());
         let dump = dump_invocation(Scope::User, None);
         assert_eq!(dump.args, ["setup", "--dump", "--json", "--user"]);
+    }
+
+    #[test]
+    fn enrollment_key_fingerprint_is_strict_and_normalised() {
+        let upper = "A".repeat(96);
+        assert_eq!(
+            EnrollmentKeyFingerprint::parse(&format!("  {upper}  "))
+                .unwrap()
+                .as_str(),
+            "a".repeat(96)
+        );
+        assert!(EnrollmentKeyFingerprint::parse("abcd").is_err());
+        assert!(EnrollmentKeyFingerprint::parse(&"g".repeat(96)).is_err());
+        assert!(EnrollmentKeyFingerprint::parse(&"a".repeat(257)).is_err());
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //!
 //! - `mia setup --check <draft>` — validate a draft without writing anything.
 //! - `mia setup --apply <draft> [--user | --output <path> | -e <env>]
-//!   [--reload] [--fetch-enrollment-key] [--json]` — validate, then write the
+//!   [--reload] [--fetch-enrollment-key [--expect-fingerprint <hex>]]
+//!   [--json]` — validate, then write the
 //!   configuration file atomically and record a `ConfigChanged` audit event.
 //! - `mia setup --dump [--json] [--user | --output <path> | -e <env>]` — the
 //!   effective configuration, the file it came from, and which keys are
@@ -51,7 +52,8 @@ pub const MAX_DRAFT_BYTES: usize = 64 * 1024;
 
 const USAGE: &str = "usage: mia setup --check <draft> [--json]\n\
      \x20      mia setup --apply <draft> [--user | --output <path> | --environment <env>]\n\
-     \x20                [--reload] [--fetch-enrollment-key] [--json]\n\
+     \x20                [--reload] [--fetch-enrollment-key [--expect-fingerprint <hex>]]\n\
+     \x20                [--json]\n\
      \x20      mia setup --dump [--json] [--user | --output <path> | --environment <env>]";
 
 /// Run a non-interactive `mia setup` mode. `args` is everything after
@@ -84,6 +86,8 @@ struct Opts {
     environment: Option<String>,
     reload: bool,
     fetch_key: bool,
+    /// Normalised fingerprint expected for the fetched enrollment key.
+    expect_fingerprint: Option<String>,
 }
 
 impl Opts {
@@ -97,6 +101,7 @@ impl Opts {
             Ok(())
         };
         let (mut json, mut user, mut reload, mut fetch_key) = (false, false, false, false);
+        let mut expect_fingerprint = None;
         let mut output = None;
         let mut environment = None;
         let mut it = args.iter();
@@ -117,6 +122,12 @@ impl Opts {
                 "-u" | "--user" => user = true,
                 "--reload" => reload = true,
                 "--fetch-enrollment-key" => fetch_key = true,
+                "--expect-fingerprint" => {
+                    let value = it
+                        .next()
+                        .context("--expect-fingerprint requires a hex fingerprint argument")?;
+                    expect_fingerprint = Some(crate::allowlist_key::parse_fingerprint(value)?);
+                }
                 "-o" | "--output" => {
                     output = Some(PathBuf::from(
                         it.next().context("--output requires a path argument")?,
@@ -138,8 +149,14 @@ impl Opts {
             "--output and --environment are mutually exclusive\n\n{USAGE}"
         );
         anyhow::ensure!(
-            matches!(mode, Mode::Apply(_)) || !(reload || fetch_key),
-            "--reload and --fetch-enrollment-key apply only to --apply\n\n{USAGE}"
+            matches!(mode, Mode::Apply(_))
+                || !(reload || fetch_key || expect_fingerprint.is_some()),
+            "--reload, --fetch-enrollment-key and --expect-fingerprint apply only to \
+             --apply\n\n{USAGE}"
+        );
+        anyhow::ensure!(
+            expect_fingerprint.is_none() || fetch_key,
+            "--expect-fingerprint requires --fetch-enrollment-key\n\n{USAGE}"
         );
         Ok(Some(Self {
             mode,
@@ -149,6 +166,7 @@ impl Opts {
             environment,
             reload,
             fetch_key,
+            expect_fingerprint,
         }))
     }
 
@@ -562,9 +580,15 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
             }
         };
 
-    let fetched = opts
-        .fetch_key
-        .then(|| fetch_enrollment_key(&settings, &target, who, by_uid));
+    let fetched = opts.fetch_key.then(|| {
+        fetch_enrollment_key(
+            &settings,
+            &target,
+            who,
+            by_uid,
+            opts.expect_fingerprint.as_deref(),
+        )
+    });
     let reloaded = opts.reload.then(|| {
         if opts.json {
             crate::resync::send_reload()
@@ -703,6 +727,7 @@ fn fetch_enrollment_key(
     target: &Path,
     who: Invoker,
     by_uid: u32,
+    expected_fingerprint: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     use std::path::Component;
     let key_path = PathBuf::from(
@@ -742,17 +767,13 @@ fn fetch_enrollment_key(
         .enable_all()
         .build()
         .context("building runtime")?;
-    let key = rt
+    let fetched = rt
         .block_on(async {
             let (_, mut client) = resolver.connect().await?;
             crate::client::fetch_enrollment_key(&mut client).await
         })
         .context("fetching the enrollment key from CMIS")?;
-    ferro_crypto::composite::CompositePublicKey::from_concat_bytes(&key).map_err(|e| {
-        anyhow::anyhow!(
-            "CMIS returned something that is not a composite public key ({e}); nothing written"
-        )
-    })?;
+    let key = validate_fetched_enrollment_key(&fetched, expected_fingerprint)?;
     let staged = stage(&key_path, &key, KEY_MODE)?;
     staged.commit(&AuditEvent::ConfigChanged {
         path: key_path.display().to_string(),
@@ -760,6 +781,30 @@ fn fetch_enrollment_key(
         keys: vec!["allowlist.key:enrollment-key".to_string()],
     })?;
     Ok(key_path)
+}
+
+/// Parse a fetched enrollment key, verify an optional operator-provided
+/// fingerprint, and return the canonical binary encoding written to disk.
+fn validate_fetched_enrollment_key(
+    fetched: &[u8],
+    expected_fingerprint: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    let key =
+        ferro_crypto::composite::CompositePublicKey::from_concat_bytes(fetched).map_err(|e| {
+            anyhow::anyhow!(
+                "CMIS returned something that is not a composite public key ({e}); nothing written"
+            )
+        })?;
+    if let Some(expected) = expected_fingerprint {
+        let actual = key.fingerprint_hex();
+        anyhow::ensure!(
+            actual == expected,
+            "the fetched key fingerprint does not match --expect-fingerprint; nothing written — \
+             check cmis.spki_pin / the CMIS endpoint and compare with `ferrogate enrollment-key` \
+             on CMIS"
+        );
+    }
+    Ok(key.to_concat_bytes())
 }
 
 /// Decide whether the draft may be applied and on whose behalf, returning the
@@ -1260,6 +1305,7 @@ mod tests {
             environment: None,
             reload: false,
             fetch_key: false,
+            expect_fingerprint: None,
         }
     }
 
@@ -1398,25 +1444,47 @@ mod tests {
         let mut s = base();
         s.cmis_endpoint = Some("http://cmis.example.com:8080".into());
         s.cmis_spki_pin = None;
-        let e = fetch_enrollment_key(&s, &target, who, 1000).unwrap_err();
+        let e = fetch_enrollment_key(&s, &target, who, 1000, None).unwrap_err();
         assert!(format!("{e:#}").contains("pinned"), "{e:#}");
         // Relative or `..` destinations are refused.
         let mut s = base();
         s.allowlist_key = Some("allowlist.pub".into());
-        assert!(fetch_enrollment_key(&s, &target, who, 1000).is_err());
+        assert!(fetch_enrollment_key(&s, &target, who, 1000, None).is_err());
         let mut s = base();
         s.allowlist_key = Some(dir.join("../escape.pub").display().to_string());
-        assert!(fetch_enrollment_key(&s, &target, who, 1000).is_err());
+        assert!(fetch_enrollment_key(&s, &target, who, 1000, None).is_err());
         // Elevated, the key must sit beside the configuration file.
         let mut s = base();
         s.allowlist_key = Some("/tmp/elsewhere/allowlist.pub".into());
-        let e = fetch_enrollment_key(&s, &target, who, 1000).unwrap_err();
+        let e = fetch_enrollment_key(&s, &target, who, 1000, None).unwrap_err();
         assert!(
             format!("{e:#}").contains("beside the configuration"),
             "{e:#}"
         );
         assert!(!dir.join("allowlist.pub").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetched_enrollment_key_must_match_the_text_fingerprint() {
+        let (_, public) = ferro_crypto::composite::CompositeSecretKey::from_seed(&[7_u8; 32]);
+        let bytes = public.to_concat_bytes();
+        let fingerprint = public.fingerprint_hex();
+        assert_eq!(
+            validate_fetched_enrollment_key(&bytes, Some(&fingerprint)).unwrap(),
+            bytes
+        );
+
+        let wrong = "0".repeat(crate::allowlist_key::FINGERPRINT_HEX_LEN);
+        let error = validate_fetched_enrollment_key(&bytes, Some(&wrong)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("does not match --expect-fingerprint"),
+            "{error:#}"
+        );
+        assert!(!message.contains(&fingerprint), "{message}");
+        assert!(!message.contains(&wrong), "{message}");
+        assert!(validate_fetched_enrollment_key(b"not a key", None).is_err());
     }
 
     #[test]
@@ -1482,6 +1550,15 @@ mod tests {
         let a = |v: &[&str]| Opts::parse(&v.iter().map(ToString::to_string).collect::<Vec<_>>());
         assert!(a(&["--check", "x", "--apply", "y"]).is_err());
         assert!(a(&["--dump", "--reload"]).is_err());
+        assert!(a(&["--apply", "x", "--expect-fingerprint", PIN]).is_err());
+        assert!(a(&[
+            "--apply",
+            "x",
+            "--fetch-enrollment-key",
+            "--expect-fingerprint",
+            "abcd",
+        ])
+        .is_err());
         assert!(a(&["--apply", "x", "-e", "prod", "-o", "/tmp/x"]).is_err());
         assert!(a(&["--apply", "x", "-e", "../etc"]).is_err());
         assert!(a(&["--json"]).is_err()); // no mode
@@ -1491,11 +1568,14 @@ mod tests {
             "--user",
             "--reload",
             "--fetch-enrollment-key",
+            "--expect-fingerprint",
+            PIN,
         ])
         .unwrap()
         .unwrap();
         assert_eq!(o.mode, Mode::Apply(PathBuf::from("d.toml")));
         assert!(o.user && o.reload && o.fetch_key);
+        assert_eq!(o.expect_fingerprint.as_deref(), Some(PIN));
     }
 
     #[test]

@@ -214,6 +214,22 @@ impl Values {
         self.0.insert(f, v.into());
     }
 
+    /// Fill a blank `allowlist.key` with a path beside `config_path`.
+    ///
+    /// `mia.toml` maps to `allowlist.pub`; a named `mia-<env>.toml` maps to
+    /// `allowlist-<env>.pub`. Existing operator input is never replaced.
+    /// Returns `true` when a destination was added.
+    pub fn ensure_allowlist_key_destination(&mut self, config_path: &Path) -> bool {
+        if !self.get(Field::AllowlistKey).is_empty() {
+            return false;
+        }
+        let Some(path) = suggested_allowlist_key_path(config_path) else {
+            return false;
+        };
+        self.set(Field::AllowlistKey, path);
+        true
+    }
+
     /// A boolean field.
     #[must_use]
     pub fn flag(&self, f: Field) -> bool {
@@ -420,6 +436,41 @@ pub fn validate(values: &Values) -> Vec<(Field, Msg)> {
         errs.push((Field::AllowlistKey, Msg::ValKeyRequired));
     }
     errs
+}
+
+/// Validate a draft together with the apply-time enrollment-key fetch option.
+///
+/// `mia setup --check` validates only the draft. The separate
+/// `--fetch-enrollment-key` option additionally needs `allowlist.key` to name
+/// the destination file, so the graphical wizard checks that condition before
+/// starting an apply.
+#[must_use]
+pub fn validate_for_apply(values: &Values, fetch_enrollment_key: bool) -> Vec<(Field, Msg)> {
+    let mut errs = validate(values);
+    if fetch_enrollment_key
+        && values.get(Field::AllowlistKey).is_empty()
+        && !errs.iter().any(|(field, _)| *field == Field::AllowlistKey)
+    {
+        errs.push((Field::AllowlistKey, Msg::ValKeyRequiredForFetch));
+    }
+    errs
+}
+
+fn suggested_allowlist_key_path(config_path: &Path) -> Option<String> {
+    let config_name = config_path.file_name()?.to_str()?;
+    let suffix = config_name.strip_prefix("mia")?.strip_suffix(".toml")?;
+    if !suffix.is_empty() && !suffix.starts_with('-') {
+        return None;
+    }
+    let key_name = format!("allowlist{suffix}.pub");
+    let path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(key_name)
+        .display()
+        .to_string();
+    validate_field(Field::AllowlistKey, &path).ok()?;
+    Some(path)
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────────
@@ -820,6 +871,42 @@ mod tests {
         let mut v = Values::default();
         v.set(Field::CmisEndpoint, "http://dev:1");
         assert!(validate(&v).is_empty(), "plain http needs no pin");
+    }
+
+    #[test]
+    fn enrollment_key_fetch_gets_an_environment_scoped_destination() {
+        let mut default = Values::default();
+        assert!(default.ensure_allowlist_key_destination(Path::new("/etc/ferrogate/mia.toml")));
+        assert_eq!(
+            default.get(Field::AllowlistKey),
+            "/etc/ferrogate/allowlist.pub"
+        );
+        assert!(!default.ensure_allowlist_key_destination(Path::new("/elsewhere/mia.toml")));
+
+        let mut named = Values::default();
+        assert!(named.ensure_allowlist_key_destination(Path::new("/etc/ferrogate/mia-prod.toml")));
+        assert_eq!(
+            named.get(Field::AllowlistKey),
+            "/etc/ferrogate/allowlist-prod.pub"
+        );
+    }
+
+    #[test]
+    fn enrollment_key_fetch_requires_a_destination_in_the_draft() {
+        let mut values = Values::default();
+        assert!(validate_for_apply(&values, false).is_empty());
+        assert_eq!(
+            validate_for_apply(&values, true),
+            [(Field::AllowlistKey, Msg::ValKeyRequiredForFetch)]
+        );
+        values.set(Field::AllowlistKey, "/etc/ferrogate/allowlist.pub");
+        assert!(validate_for_apply(&values, true).is_empty());
+        let draft = render(&values);
+        let doc: toml::Table = toml::from_str(&draft).unwrap();
+        assert_eq!(
+            doc["allowlist"]["key"].as_str(),
+            Some("/etc/ferrogate/allowlist.pub")
+        );
     }
 
     #[test]
