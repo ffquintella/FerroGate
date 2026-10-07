@@ -63,10 +63,10 @@ fn usage() -> &'static str {
      \x20 bump-epoch [reason]              advance the RIM policy epoch (mass re-attest)\n\
      \x20 allowlist <subcommand> ...       manage per-host signed caller allowlists\n\
      \x20                                  (run `ferrogate allowlist help` for details)\n\
-     \x20 enrollment-key [--format hex|flag]  print the SHA-384 fingerprint of the\n\
-     \x20                                  CMIS enrollment key (allowlist signer); hosts\n\
-     \x20                                  verify it with `mia allowlist-key fetch\n\
-     \x20                                  --expect-fingerprint <hex>`\n\
+     \x20 enrollment-key [--format hex|flag|public-key]\n\
+     \x20                                  print the SHA-384 fingerprint of the CMIS\n\
+     \x20                                  enrollment key, or its public-only base64url\n\
+     \x20                                  encoding for the MIA setup GUI\n\
      \x20 spki-pin [--format hex|env|flag] print the CMIS SPKI pin from its cert\n\
      \x20                                  (--tls-cert / $FERROGATE_CMIS_TLS_CERT); no\n\
      \x20                                  connection is made\n\
@@ -116,7 +116,12 @@ async fn run() -> anyhow::Result<()> {
 
     // `allowlist` help works without a connection, so short-circuit before the
     // dial when the operator only wants the subcommand reference.
-    if command == "allowlist" && matches!(rest.first().map(String::as_str), None | Some("help" | "-h" | "--help")) {
+    if command == "allowlist"
+        && matches!(
+            rest.first().map(String::as_str),
+            None | Some("help" | "-h" | "--help")
+        )
+    {
         println!("{}", allowlist::usage());
         return Ok(());
     }
@@ -313,24 +318,27 @@ fn pin_from_cert(cert_path: &str) -> anyhow::Result<SpkiPin> {
 
 /// Output form of `enrollment-key`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FingerprintFormat {
+enum EnrollmentKeyFormat {
     /// The bare 96-hex-digit fingerprint.
     Hex,
     /// `--expect-fingerprint <hex>`, ready to paste after `mia allowlist-key fetch`.
     Flag,
+    /// Base64url-without-padding of the composite public key's concat encoding.
+    PublicKey,
 }
 
-/// Parse `enrollment-key [--format hex|flag]`.
-fn enrollment_key_format(args: &[String]) -> anyhow::Result<FingerprintFormat> {
-    let mut format = FingerprintFormat::Hex;
+/// Parse `enrollment-key [--format hex|flag|public-key]`.
+fn enrollment_key_format(args: &[String]) -> anyhow::Result<EnrollmentKeyFormat> {
+    let mut format = EnrollmentKeyFormat::Hex;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--format" | "-f" => {
                 format = match it.next().map(String::as_str) {
-                    Some("hex") => FingerprintFormat::Hex,
-                    Some("flag") => FingerprintFormat::Flag,
-                    _ => anyhow::bail!("--format needs a value: hex or flag"),
+                    Some("hex") => EnrollmentKeyFormat::Hex,
+                    Some("flag") => EnrollmentKeyFormat::Flag,
+                    Some("public-key") => EnrollmentKeyFormat::PublicKey,
+                    _ => anyhow::bail!("--format needs a value: hex, flag or public-key"),
                 };
             }
             other => anyhow::bail!("unknown enrollment-key argument: {other}"),
@@ -339,11 +347,18 @@ fn enrollment_key_format(args: &[String]) -> anyhow::Result<FingerprintFormat> {
     Ok(format)
 }
 
-/// Render an enrollment-key fingerprint in `format`.
-fn render_fingerprint(fingerprint: &str, format: FingerprintFormat) -> String {
+/// Render the requested public enrollment-key representation.
+fn render_enrollment_key(key: &CompositePublicKey, format: EnrollmentKeyFormat) -> String {
+    use base64::Engine as _;
+
     match format {
-        FingerprintFormat::Hex => fingerprint.to_owned(),
-        FingerprintFormat::Flag => format!("--expect-fingerprint {fingerprint}"),
+        EnrollmentKeyFormat::Hex => key.fingerprint_hex(),
+        EnrollmentKeyFormat::Flag => {
+            format!("--expect-fingerprint {}", key.fingerprint_hex())
+        }
+        EnrollmentKeyFormat::PublicKey => {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.to_concat_bytes())
+        }
     }
 }
 
@@ -351,10 +366,12 @@ fn render_fingerprint(fingerprint: &str, format: FingerprintFormat) -> String {
 /// ([`CompositePublicKey::fingerprint_hex`]) of the key CMIS signs caller
 /// allowlists with — the CMIS-side value an operator compares with what
 /// `mia allowlist-key fetch` prints on a host, or passes to it as
-/// `--expect-fingerprint`. Only the fingerprint is printed, never the key.
+/// `--expect-fingerprint`. `--format public-key` prints only the public concat
+/// encoding for pasting into MIA setup; private key material is never returned
+/// by this RPC or handled here.
 async fn enrollment_key(
     client: &mut MachineIdentityClient<Channel>,
-    format: FingerprintFormat,
+    format: EnrollmentKeyFormat,
 ) -> anyhow::Result<()> {
     let resp = client
         .get_enrollment_key(GetEnrollmentKeyRequest {})
@@ -364,7 +381,7 @@ async fn enrollment_key(
     let key = CompositePublicKey::from_concat_bytes(&resp.public_key).map_err(|e| {
         anyhow::anyhow!("CMIS returned something that is not a composite public key: {e}")
     })?;
-    println!("{}", render_fingerprint(&key.fingerprint_hex(), format));
+    println!("{}", render_enrollment_key(&key, format));
     Ok(())
 }
 
@@ -401,7 +418,10 @@ async fn list_svids(client: &mut MachineIdentityClient<Channel>) -> anyhow::Resu
         println!();
         println!("  spiffe_id:    {}", s.spiffe_id);
         if !s.hostname.is_empty() {
-            println!("  hostname:     {} (self-reported, display only)", s.hostname);
+            println!(
+                "  hostname:     {} (self-reported, display only)",
+                s.hostname
+            );
         }
         println!("  cert_sha:     {}", s.cert_sha);
         println!("  issued_at:    {} (unix)", s.issued_at);

@@ -417,7 +417,7 @@ pub struct ApplyOptions {
     pub reload: bool,
     /// `--fetch-enrollment-key`.
     pub fetch_enrollment_key: bool,
-    /// `--expect-fingerprint <hex>` for the fetched enrollment key.
+    /// `--expect-fingerprint <hex>` for a fetched or pasted enrollment key.
     pub expected_enrollment_key_fingerprint: Option<EnrollmentKeyFingerprint>,
 }
 
@@ -441,19 +441,38 @@ pub fn checked_path_arg(path: &Path) -> Result<String, ActionError> {
     Ok(s.to_string())
 }
 
-/// `mia setup --dump --json [--user] [-e <env>]` (user).
+/// `mia setup --dump --json --editable [--user] [-e <env>]`.
+///
+/// System configuration is read through the administrator-consent mechanism
+/// on platforms whose elevation wrapper can return stdout. Windows keeps the
+/// unprivileged read because a UAC child cannot return its output to the tray.
+/// Per-user configuration is always read as the user.
 #[must_use]
-pub fn dump_invocation(scope: Scope, env: Option<&EnvName>) -> Invocation {
-    let mut args = vec!["setup".to_string(), "--dump".into(), "--json".into()];
+pub fn dump_invocation(scope: Scope, env: Option<&EnvName>, os: Os) -> Invocation {
+    let mut args = vec![
+        "setup".to_string(),
+        "--dump".into(),
+        "--json".into(),
+        "--editable".into(),
+    ];
     if scope == Scope::User {
         args.push("--user".into());
     }
     env_args(&mut args, env);
+    let privilege = if scope == Scope::System && os != Os::Windows {
+        Privilege::Admin
+    } else {
+        Privilege::User
+    };
     Invocation {
         program: Program::Mia,
         args,
-        privilege: Privilege::User,
-        limits: Limits::QUICK,
+        privilege,
+        limits: if privilege == Privilege::Admin {
+            Limits::ELEVATED
+        } else {
+            Limits::QUICK
+        },
         purpose: Msg::SetupLoad,
     }
 }
@@ -475,17 +494,12 @@ pub fn check_invocation(draft: &Path) -> Result<Invocation, ActionError> {
 }
 
 /// `mia setup --apply <draft> --json [--user] [-e <env>] [--reload]
-/// [--fetch-enrollment-key [--expect-fingerprint <hex>]]` — as the user for
+/// [--fetch-enrollment-key] [--expect-fingerprint <hex>]` — as the user for
 /// [`Scope::User`], elevated for [`Scope::System`].
 pub fn apply_invocation(draft: &Path, opts: &ApplyOptions) -> Result<Invocation, ActionError> {
     if opts.reload && opts.scope == Scope::User {
         return Err(ActionError::BadOptions(
             "--reload signals the system service",
-        ));
-    }
-    if opts.expected_enrollment_key_fingerprint.is_some() && !opts.fetch_enrollment_key {
-        return Err(ActionError::BadOptions(
-            "--expect-fingerprint requires --fetch-enrollment-key",
         ));
     }
     let mut args = vec![
@@ -1474,18 +1488,35 @@ mod tests {
             }
         )
         .is_err());
-        assert!(apply_invocation(
+        let pasted = apply_invocation(
             &draft,
             &ApplyOptions {
                 expected_enrollment_key_fingerprint: Some(
                     EnrollmentKeyFingerprint::parse(&"a".repeat(96)).unwrap(),
                 ),
                 ..ApplyOptions::default()
-            }
+            },
         )
-        .is_err());
-        let dump = dump_invocation(Scope::User, None);
-        assert_eq!(dump.args, ["setup", "--dump", "--json", "--user"]);
+        .unwrap();
+        assert!(!pasted.args.contains(&"--fetch-enrollment-key".to_string()));
+        assert!(pasted.args.contains(&"--expect-fingerprint".to_string()));
+        let dump = dump_invocation(Scope::User, None, Os::Linux);
+        assert_eq!(dump.privilege, Privilege::User);
+        assert_eq!(
+            dump.args,
+            ["setup", "--dump", "--json", "--editable", "--user"]
+        );
+
+        let dump = dump_invocation(Scope::System, None, Os::Linux);
+        assert_eq!(dump.privilege, Privilege::Admin);
+        assert_eq!(dump.limits, Limits::ELEVATED);
+        assert_eq!(dump.args, ["setup", "--dump", "--json", "--editable"]);
+
+        let dump = dump_invocation(Scope::System, None, Os::MacOs);
+        assert_eq!(dump.privilege, Privilege::Admin);
+
+        let dump = dump_invocation(Scope::System, None, Os::Windows);
+        assert_eq!(dump.privilege, Privilege::User);
     }
 
     #[test]

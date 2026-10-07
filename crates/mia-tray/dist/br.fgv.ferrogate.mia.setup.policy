@@ -6,10 +6,11 @@
   polkit actions for the FerroGate MIA tray companion (feature F18).
 
   mia-tray runs a FIXED, closed set of mia commands elevated through pkexec:
-  "setup" in apply mode (a draft the user wrote, optionally for one
-  environment, with reload / enrollment-key fetch), "resync-allowlist" with
-  reload, "refresh-key", and "default-environment set <env>" / "clear". No
-  other program or argument is ever built.
+  "setup" in editable dump or apply mode (a draft the user wrote, optionally
+  for one environment, with reload / enrollment-key fetch),
+  "resync-allowlist" with reload, "refresh-key", and
+  "default-environment set <env>" / "clear". No other program or argument is
+  ever built.
   pkexec selects the action by the program path only, so there is one action
   per packaged location of mia, and the message shows the exact command line
   ($(command_line)) the administrator is approving, whoever asked for it. Every request needs an administrator's
@@ -24,8 +25,8 @@
   <vendor_url>https://github.com/ffquintella/FerroGate</vendor_url>
 
   <action id="br.fgv.ferrogate.mia.setup">
-    <description>Change the FerroGate machine identity agent</description>
-    <description xml:lang="pt_BR">Alterar o agente de identidade de máquina FerroGate</description>
+    <description>Read or change the FerroGate machine identity agent configuration</description>
+    <description xml:lang="pt_BR">Ler ou alterar a configuração do agente de identidade de máquina FerroGate</description>
     <message>Authentication is required to run "$(command_line)" as the super user (FerroGate MIA configuration or maintenance).</message>
     <message xml:lang="pt_BR">É necessária autenticação para executar "$(command_line)" como superusuário (configuração ou manutenção do FerroGate MIA).</message>
     <icon_name>security-high</icon_name>
@@ -39,8 +40,8 @@
 
   <!-- The same action for a `make mia-install` binary in /usr/local/bin. -->
   <action id="br.fgv.ferrogate.mia.setup.local">
-    <description>Change the FerroGate machine identity agent</description>
-    <description xml:lang="pt_BR">Alterar o agente de identidade de máquina FerroGate</description>
+    <description>Read or change the FerroGate machine identity agent configuration</description>
+    <description xml:lang="pt_BR">Ler ou alterar a configuração do agente de identidade de máquina FerroGate</description>
     <message>Authentication is required to run "$(command_line)" as the super user (FerroGate MIA configuration or maintenance).</message>
     <message xml:lang="pt_BR">É necessária autenticação para executar "$(command_line)" como superusuário (configuração ou manutenção do FerroGate MIA).</message>
     <icon_name>security-high</icon_name>

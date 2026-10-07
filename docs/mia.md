@@ -1016,11 +1016,23 @@ These back the `mia-tray` graphical wizard (feature F18) and need no TTY:
   `--json` prints one
   object: `ok`, `path`, `changed_keys`, `draft_deleted`, `enrollment_key`,
   `reloaded`, `error`.
-- `mia setup --dump [--json] [--user | --output <path> | -e <env>]` — the
+- `mia setup --dump [--json] [--editable]
+  [--user | --output <path> | -e <env>]` — the
   effective values (file + environment overlay), the file path and whether it
   exists, and which keys come from environment variables (`env_overridden`,
   e.g. `{"key": "cmis.endpoint", "var": "FERROGATE_CMIS_ENDPOINT"}`) — a wizard
   shows those read-only, since writing the file would not change them.
+  `--editable` limits `values` and `env_overridden` to the fields managed by
+  the graphical wizard, so an elevated system-file read returns no unrelated
+  status or attestation paths.
+- In the tray's **Setup → Caller allowlist** section, **Enrollment public key
+  (paste)** accepts the base64url public-key value printed by
+  `ferrogate enrollment-key --format public-key`. `mia setup --check` validates
+  it as a composite public key; administrator-approved Apply installs it
+  atomically and records the key change. The transient value is carried only
+  in the private setup draft and is never written to `mia.toml`. An optional
+  `--expect-fingerprint <hex>` confirms a pasted key against the fingerprint
+  printed by `ferrogate enrollment-key`.
 
 A **draft** is laid out like `mia.toml` but holds only the wizard's keys:
 

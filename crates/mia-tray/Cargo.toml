@@ -108,7 +108,7 @@ copyright = "FerroGate contributors"
 extended-description = """\
 Desktop companion for the FerroGate Machine Identity Agent: a tray icon that \
 shows whether the agent is healthy, a setup wizard, guided recovery and a \
-redacted log viewer. Unprivileged; holds no key material."""
+redacted log viewer. Unprivileged; holds no private key material."""
 section = "admin"
 priority = "optional"
 features = ["gui"]

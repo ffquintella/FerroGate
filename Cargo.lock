@@ -2594,6 +2594,7 @@ name = "ferrogate-cli"
 version = "0.28.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cmis",
  "ferro-attest",
  "ferro-audit",

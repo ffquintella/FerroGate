@@ -6,10 +6,12 @@
 //!   [--reload] [--fetch-enrollment-key [--expect-fingerprint <hex>]]
 //!   [--json]` — validate, then write the
 //!   configuration file atomically and record a `ConfigChanged` audit event.
-//! - `mia setup --dump [--json] [--user | --output <path> | -e <env>]` — the
-//!   effective configuration, the file it came from, and which keys are
-//!   overridden by environment variables (shown read-only by the wizard,
-//!   since writing the file would not change them).
+//! - `mia setup --dump [--json] [--editable]
+//!   [--user | --output <path> | -e <env>]` — the effective configuration,
+//!   the file it came from, and which keys are overridden by environment
+//!   variables (shown read-only by the wizard, since writing the file would
+//!   not change them). `--editable` limits values and override metadata to
+//!   the fields the graphical wizard can edit.
 //!
 //! **The draft is untrusted input.** It may be written by an unprivileged
 //! process and applied by an elevated one, so `--apply`:
@@ -41,6 +43,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use base64::Engine as _;
 use ferro_audit::AuditEvent;
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +57,8 @@ const USAGE: &str = "usage: mia setup --check <draft> [--json]\n\
      \x20      mia setup --apply <draft> [--user | --output <path> | --environment <env>]\n\
      \x20                [--reload] [--fetch-enrollment-key [--expect-fingerprint <hex>]]\n\
      \x20                [--json]\n\
-     \x20      mia setup --dump [--json] [--user | --output <path> | --environment <env>]";
+     \x20      mia setup --dump [--json] [--editable]\n\
+     \x20                [--user | --output <path> | --environment <env>]";
 
 /// Run a non-interactive `mia setup` mode. `args` is everything after
 /// `setup`.
@@ -81,12 +85,13 @@ enum Mode {
 struct Opts {
     mode: Mode,
     json: bool,
+    editable: bool,
     user: bool,
     output: Option<PathBuf>,
     environment: Option<String>,
     reload: bool,
     fetch_key: bool,
-    /// Normalised fingerprint expected for the fetched enrollment key.
+    /// Normalised fingerprint expected for the fetched or pasted enrollment key.
     expect_fingerprint: Option<String>,
 }
 
@@ -100,7 +105,8 @@ impl Opts {
             );
             Ok(())
         };
-        let (mut json, mut user, mut reload, mut fetch_key) = (false, false, false, false);
+        let (mut json, mut editable, mut user, mut reload, mut fetch_key) =
+            (false, false, false, false, false);
         let mut expect_fingerprint = None;
         let mut output = None;
         let mut environment = None;
@@ -119,6 +125,7 @@ impl Opts {
                 )))?,
                 "--dump" => set_mode(Mode::Dump)?,
                 "--json" => json = true,
+                "--editable" => editable = true,
                 "-u" | "--user" => user = true,
                 "--reload" => reload = true,
                 "--fetch-enrollment-key" => fetch_key = true,
@@ -155,12 +162,13 @@ impl Opts {
              --apply\n\n{USAGE}"
         );
         anyhow::ensure!(
-            expect_fingerprint.is_none() || fetch_key,
-            "--expect-fingerprint requires --fetch-enrollment-key\n\n{USAGE}"
+            matches!(mode, Mode::Dump) || !editable,
+            "--editable applies only to --dump\n\n{USAGE}"
         );
         Ok(Some(Self {
             mode,
             json,
+            editable,
             user,
             output,
             environment,
@@ -183,6 +191,9 @@ impl Opts {
 #[serde(default, deny_unknown_fields)]
 struct Draft {
     log: Option<String>,
+    /// Transient public-only base64url key installed during apply. It is
+    /// deliberately omitted from the rendered configuration.
+    enrollment_public_key: Option<String>,
     cmis: DraftCmis,
     helper: DraftHelper,
     allowlist: DraftAllowlist,
@@ -356,9 +367,10 @@ fn answer(
 }
 
 /// Validate a parsed draft into wizard [`Settings`] (without carried keys).
-fn validate(draft: Draft) -> Result<Settings, Vec<DraftError>> {
+fn validate(draft: Draft) -> Result<(Settings, Option<Vec<u8>>), Vec<DraftError>> {
     use crate::setup::{check_endpoint, check_literal, check_octal, check_pin, check_srv};
     let mut e = Vec::new();
+    let enrollment_public_key = validate_enrollment_public_key(draft.enrollment_public_key, &mut e);
     let pin_check = |v: &str| check_literal(v).and_then(|()| check_pin(v));
     let octal_check = |v: &str| check_literal(v).and_then(|()| check_octal(v));
     let mut s = Settings {
@@ -448,9 +460,46 @@ fn validate(draft: Draft) -> Result<Settings, Vec<DraftError>> {
         ));
     }
     if e.is_empty() {
-        Ok(s)
+        Ok((s, enrollment_public_key))
     } else {
         Err(e)
+    }
+}
+
+/// Decode and validate the transient public enrollment key without ever
+/// including its contents in an error. The canonical concat encoding is what
+/// `allowlist.key` stores and what signed allowlists verify against.
+fn validate_enrollment_public_key(
+    encoded: Option<String>,
+    errors: &mut Vec<DraftError>,
+) -> Option<Vec<u8>> {
+    let encoded = encoded?;
+    let text = encoded.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if encoded.len() > setup::MAX_ANSWER_LEN {
+        errors.push(DraftError::new(
+            "enrollment_public_key",
+            "must be the base64url public key printed by `ferrogate enrollment-key --format public-key`",
+        ));
+        return None;
+    }
+    let parsed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(text.as_bytes())
+        .ok()
+        .and_then(|bytes| {
+            ferro_crypto::composite::CompositePublicKey::from_concat_bytes(&bytes).ok()
+        });
+    match parsed {
+        Some(key) => Some(key.to_concat_bytes()),
+        None => {
+            errors.push(DraftError::new(
+                "enrollment_public_key",
+                "must be the base64url public key printed by `ferrogate enrollment-key --format public-key`",
+            ));
+            None
+        }
     }
 }
 
@@ -468,10 +517,11 @@ fn load_draft(
     path: &Path,
     apply: bool,
     detailed: bool,
-) -> Result<(Settings, std::fs::Metadata), Vec<DraftError>> {
+) -> Result<(Settings, Option<Vec<u8>>, std::fs::Metadata), Vec<DraftError>> {
     let (text, meta) = read_draft(path, apply).map_err(|e| vec![e])?;
     let draft = parse_draft(&text, detailed).map_err(|e| vec![e])?;
-    Ok((validate(draft)?, meta))
+    let (settings, enrollment_public_key) = validate(draft)?;
+    Ok((settings, enrollment_public_key, meta))
 }
 
 fn report_errors(errors: &[DraftError], json: bool) {
@@ -546,21 +596,49 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
          standard path (optionally with --environment or --user) instead"
     );
 
-    let (mut settings, draft_meta) = match load_draft(draft, true, !who.elevated) {
-        Ok(v) => v,
-        Err(errors) => {
-            report_errors(&errors, opts.json);
-            anyhow::bail!(
-                "draft rejected ({} problem(s)); nothing written",
-                errors.len()
-            );
-        }
-    };
+    let (mut settings, enrollment_public_key, draft_meta) =
+        match load_draft(draft, true, !who.elevated) {
+            Ok(v) => v,
+            Err(errors) => {
+                report_errors(&errors, opts.json);
+                anyhow::bail!(
+                    "draft rejected ({} problem(s)); nothing written",
+                    errors.len()
+                );
+            }
+        };
     let by_uid = check_draft_owner(&draft_meta, who)?;
+    anyhow::ensure!(
+        !(opts.fetch_key && enrollment_public_key.is_some()),
+        "choose either --fetch-enrollment-key or enrollment_public_key in the draft; nothing written"
+    );
+    anyhow::ensure!(
+        opts.expect_fingerprint.is_none()
+            || opts.fetch_key
+            || enrollment_public_key.is_some(),
+        "--expect-fingerprint needs --fetch-enrollment-key or enrollment_public_key in the draft; nothing written"
+    );
     let existing = setup::load_existing(&target);
     settings.carried = Carried::from_existing(&existing);
     keep_helper_switch(&mut settings, &existing);
     let rendered = render_for(&settings, opts, &target)?;
+
+    // Validate the pasted trust anchor and its destination before changing
+    // the configuration. The actual install remains after the configuration
+    // commit, matching the fetched-key flow and failing closed if its commit
+    // cannot complete.
+    let imported_plan = enrollment_public_key
+        .as_deref()
+        .map(|key| {
+            plan_imported_enrollment_key(
+                &settings,
+                &target,
+                who,
+                key,
+                opts.expect_fingerprint.as_deref(),
+            )
+        })
+        .transpose()?;
 
     let staged = stage(&target, rendered.as_bytes(), CONFIG_MODE)?;
     let keys = commit(staged, &target, &rendered, &existing, by_uid)?;
@@ -580,15 +658,20 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
             }
         };
 
-    let fetched = opts.fetch_key.then(|| {
-        fetch_enrollment_key(
+    let installed_key = if opts.fetch_key {
+        Some(fetch_enrollment_key(
             &settings,
             &target,
             who,
             by_uid,
             opts.expect_fingerprint.as_deref(),
-        )
-    });
+        ))
+    } else {
+        imported_plan.as_ref().map(|plan| {
+            crate::allowlist_key::commit(plan)?;
+            Ok(plan.path().to_path_buf())
+        })
+    };
     let reloaded = opts.reload.then(|| {
         if opts.json {
             crate::resync::send_reload()
@@ -597,7 +680,7 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
             Ok(())
         }
     });
-    let error = match (&fetched, &reloaded) {
+    let error = match (&installed_key, &reloaded) {
         (Some(Err(e)), _) | (_, Some(Err(e))) => Some(format!("{e:#}")),
         _ => None,
     };
@@ -610,7 +693,7 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
                 "path": target,
                 "changed_keys": keys,
                 "draft_deleted": draft_deleted,
-                "enrollment_key": fetched.as_ref().and_then(|r| r.as_ref().ok()),
+                "enrollment_key": installed_key.as_ref().and_then(|r| r.as_ref().ok()),
                 "reloaded": reloaded.as_ref().map(Result::is_ok),
                 "error": error,
             })
@@ -626,8 +709,11 @@ fn apply(draft: &Path, opts: &Opts) -> anyhow::Result<()> {
                 draft.display()
             );
         }
-        if let Some(Ok(path)) = &fetched {
-            println!("✓ Fetched the CMIS enrollment key into {}", path.display());
+        if let Some(Ok(path)) = &installed_key {
+            println!(
+                "✓ Installed the CMIS enrollment public key into {}",
+                path.display()
+            );
         }
         if !opts.reload {
             println!(
@@ -781,6 +867,42 @@ fn fetch_enrollment_key(
         keys: vec!["allowlist.key:enrollment-key".to_string()],
     })?;
     Ok(key_path)
+}
+
+/// Prepare a pasted public key for the same validated, atomic and audited
+/// installer used by `mia allowlist-key`. Only an elevated setup apply may
+/// import a trust anchor, and its destination is confined beside the system
+/// configuration file before [`crate::allowlist_key::plan`] examines any
+/// installed key.
+fn plan_imported_enrollment_key(
+    s: &Settings,
+    target: &Path,
+    who: Invoker,
+    key: &[u8],
+    expected_fingerprint: Option<&str>,
+) -> anyhow::Result<crate::allowlist_key::Plan> {
+    use std::path::Component;
+
+    anyhow::ensure!(
+        who.elevated,
+        "installing enrollment_public_key needs administrator privileges; nothing written"
+    );
+    let key_path = PathBuf::from(
+        s.allowlist_key
+            .as_deref()
+            .context("enrollment_public_key needs allowlist.key in the draft")?,
+    );
+    anyhow::ensure!(
+        key_path.is_absolute() && !key_path.components().any(|c| c == Component::ParentDir),
+        "allowlist.key must be an absolute path without `..` to import enrollment_public_key"
+    );
+    anyhow::ensure!(
+        key_path.parent() == Some(parent_dir(target)),
+        "when elevated, enrollment_public_key writes only beside the configuration file ({}); \
+         place allowlist.key there",
+        parent_dir(target).display()
+    );
+    crate::allowlist_key::plan(&key_path, key, expected_fingerprint, false)
 }
 
 /// Parse a fetched enrollment key, verify an optional operator-provided
@@ -1183,6 +1305,57 @@ fn flatten(
     }
 }
 
+/// The configuration values the graphical wizard can display and edit.
+///
+/// System dumps cross an administrator-consent boundary, so the tray requests
+/// this view instead of receiving unrelated status and attestation paths.
+fn editable_values(config: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "log": config.log,
+        "cmis": {
+            "endpoint": config.cmis.endpoint,
+            "srv": config.cmis.srv,
+            "spki_pin": config.cmis.spki_pin,
+        },
+        "helper": {
+            "socket": config.helper.socket,
+            "socket_mode": config.helper.socket_mode,
+            "windows_group": config.helper.windows_group,
+        },
+        "allowlist": {
+            "path": config.allowlist.path,
+            "key": config.allowlist.key,
+            "max_age_secs": config.allowlist.max_age_secs,
+            "fetch": config.allowlist.fetch,
+            "propose": config.allowlist.propose,
+        },
+        "attestation": {
+            "backend": config.attestation.backend,
+            "ima_log": config.attestation.ima_log,
+        },
+    })
+}
+
+fn editable_key(key: &str) -> bool {
+    matches!(
+        key,
+        "log"
+            | "cmis.endpoint"
+            | "cmis.srv"
+            | "cmis.spki_pin"
+            | "helper.socket"
+            | "helper.socket_mode"
+            | "helper.windows_group"
+            | "allowlist.path"
+            | "allowlist.key"
+            | "allowlist.max_age_secs"
+            | "allowlist.fetch"
+            | "allowlist.propose"
+            | "attestation.backend"
+            | "attestation.ima_log"
+    )
+}
+
 // ── --dump ───────────────────────────────────────────────────────────────────
 
 fn dump(opts: &Opts) -> anyhow::Result<()> {
@@ -1206,13 +1379,19 @@ fn dump(opts: &Opts) -> anyhow::Result<()> {
     let overridden: Vec<serde_json::Value> =
         crate::config::env_overridden(scope, |k| std::env::var(k).ok())
             .into_iter()
+            .filter(|o| !opts.editable || editable_key(o.key))
             .map(|o| serde_json::json!({ "key": o.key, "var": o.var }))
             .collect();
+    let values = if opts.editable {
+        editable_values(&config)
+    } else {
+        serde_json::to_value(&config)?
+    };
     let report = serde_json::json!({
         "path": target,
         "exists": exists,
         "environment": opts.environment,
-        "values": config,
+        "values": values,
         "env_overridden": overridden,
     });
     if opts.json {
@@ -1245,6 +1424,7 @@ fn dump(opts: &Opts) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferro_crypto::composite::CompositeSecretKey;
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mia-apply-{tag}-{}", std::process::id()));
@@ -1262,6 +1442,20 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         p
+    }
+
+    fn invoker_for_test(elevated: bool) -> Invoker {
+        #[cfg(unix)]
+        {
+            Invoker {
+                euid: u32::from(!elevated),
+                elevated,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Invoker { elevated }
+        }
     }
 
     const PIN: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f";
@@ -1300,6 +1494,7 @@ mod tests {
         Opts {
             mode: Mode::Dump,
             json: true,
+            editable: false,
             user: false,
             output: Some(output.to_path_buf()),
             environment: None,
@@ -1532,6 +1727,58 @@ mod tests {
     }
 
     #[test]
+    fn pasted_public_key_is_validated_and_installed_through_policy_writer() {
+        let dir = scratch("pasted-key");
+        let target = dir.join("mia.toml");
+        let key_path = dir.join("allowlist.pub");
+        let (_secret, public) = CompositeSecretKey::from_seed(&[42; 32]);
+        let bytes = public.to_concat_bytes();
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+        let text = format!(
+            "enrollment_public_key = '{encoded}'\n[allowlist]\nkey = '{}'\n",
+            key_path.display()
+        );
+        let draft = parse_draft(&text, true).unwrap();
+        let (settings, imported) = validate(draft).unwrap();
+        assert_eq!(imported.as_deref(), Some(bytes.as_slice()));
+
+        let plan = plan_imported_enrollment_key(
+            &settings,
+            &target,
+            invoker_for_test(true),
+            imported.as_deref().unwrap(),
+            Some(&public.fingerprint_hex()),
+        )
+        .unwrap();
+        crate::allowlist_key::commit(&plan).unwrap();
+        assert_eq!(std::fs::read(&key_path).unwrap(), bytes);
+        let audit =
+            std::fs::read_to_string(crate::audit_client::local_journal_for(&key_path)).unwrap();
+        assert!(audit.contains(crate::allowlist_key::AUDIT_KEY_INSTALLED));
+        assert!(!audit.contains(&encoded));
+
+        let error = plan_imported_enrollment_key(
+            &settings,
+            &target,
+            invoker_for_test(false),
+            imported.as_deref().unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("administrator privileges"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_pasted_public_key_is_rejected_without_echoing_it() {
+        let input = "private-looking-value-that-is-not-a-public-key";
+        let draft = parse_draft(&format!("enrollment_public_key = '{input}'\n"), true).unwrap();
+        let errors = validate(draft).unwrap_err();
+        assert_eq!(errors[0].key, "enrollment_public_key");
+        assert!(!errors[0].message.contains(input));
+    }
+
+    #[test]
     fn changed_keys_lists_names_only() {
         let old = Config::from_toml("log = 'info'\n[cmis]\nendpoint = 'https://a:1'\n").unwrap();
         let new = Config::from_toml(
@@ -1546,11 +1793,38 @@ mod tests {
     }
 
     #[test]
+    fn editable_dump_excludes_unmanaged_security_paths() {
+        let config = Config::from_toml(
+            "log = 'debug'\n\
+             [cmis]\nendpoint = 'https://cmis.example:8443'\n\
+             [helper]\nsocket_gid = '4242'\n\
+             [attestation.tpm]\nek_cert = '/protected/ek.der'\n\
+             [status]\nsocket = '/run/ferrogate/status.sock'\n",
+        )
+        .unwrap();
+        let values = editable_values(&config);
+        assert_eq!(values["log"], "debug");
+        assert_eq!(values["cmis"]["endpoint"], "https://cmis.example:8443");
+        assert!(values["helper"].get("socket_gid").is_none());
+        assert!(values["attestation"].get("tpm").is_none());
+        assert!(values.get("status").is_none());
+    }
+
+    #[test]
     fn option_parsing_enforces_exclusivity() {
         let a = |v: &[&str]| Opts::parse(&v.iter().map(ToString::to_string).collect::<Vec<_>>());
         assert!(a(&["--check", "x", "--apply", "y"]).is_err());
         assert!(a(&["--dump", "--reload"]).is_err());
-        assert!(a(&["--apply", "x", "--expect-fingerprint", PIN]).is_err());
+        assert!(a(&["--apply", "x", "--editable"]).is_err());
+        assert!(a(&["--dump", "--editable"]).unwrap().unwrap().editable);
+        assert_eq!(
+            a(&["--apply", "x", "--expect-fingerprint", PIN])
+                .unwrap()
+                .unwrap()
+                .expect_fingerprint
+                .as_deref(),
+            Some(PIN)
+        );
         assert!(a(&[
             "--apply",
             "x",

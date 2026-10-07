@@ -32,6 +32,11 @@ pub const MAX_DRAFT_BYTES: usize = 64 * 1024;
 /// Longest free-text answer (`mia`'s `MAX_ANSWER_LEN`).
 pub const MAX_ANSWER_LEN: usize = 4096;
 
+/// Longest pasted enrollment public key accepted by the tray. The current
+/// base64url composite encoding is about 2.6 KiB; the daemon performs the
+/// authoritative decode and key validation.
+pub const MAX_ENROLLMENT_PUBLIC_KEY_LEN: usize = 4096;
+
 /// The attestation backends the wizard offers.
 pub const BACKEND_CHOICES: [&str; 4] = ["auto", "tpm", "host-key", "virtual-tpm"];
 
@@ -445,15 +450,33 @@ pub fn validate(values: &Values) -> Vec<(Field, Msg)> {
 /// the destination file, so the graphical wizard checks that condition before
 /// starting an apply.
 #[must_use]
-pub fn validate_for_apply(values: &Values, fetch_enrollment_key: bool) -> Vec<(Field, Msg)> {
+pub fn validate_for_apply(values: &Values, install_enrollment_key: bool) -> Vec<(Field, Msg)> {
     let mut errs = validate(values);
-    if fetch_enrollment_key
+    if install_enrollment_key
         && values.get(Field::AllowlistKey).is_empty()
         && !errs.iter().any(|(field, _)| *field == Field::AllowlistKey)
     {
         errs.push((Field::AllowlistKey, Msg::ValKeyRequiredForFetch));
     }
     errs
+}
+
+/// Cheap local validation for the transient pasted public key. `mia setup
+/// --check` remains authoritative and parses the decoded composite key before
+/// Apply can be enabled.
+pub fn validate_enrollment_public_key(input: &str) -> Result<(), Msg> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    if input.len() > MAX_ENROLLMENT_PUBLIC_KEY_LEN
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(Msg::ValEnrollmentPublicKey);
+    }
+    Ok(())
 }
 
 fn suggested_allowlist_key_path(config_path: &Path) -> Option<String> {
@@ -477,6 +500,8 @@ fn suggested_allowlist_key_path(config_path: &Path) -> Option<String> {
 
 #[derive(Serialize)]
 struct DraftDoc {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrollment_public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     log: Option<String>,
     cmis: DraftCmis,
@@ -529,7 +554,22 @@ struct DraftAttestation {
 /// Call [`validate`] first; an unparsable max age is dropped here.
 #[must_use]
 pub fn render(values: &Values) -> String {
+    render_with_enrollment_public_key(values, None)
+}
+
+/// Render a setup draft with an optional transient enrollment public key.
+/// The elevated `mia setup --apply` consumes this value to install
+/// `allowlist.key`; it is never copied into `mia.toml`.
+#[must_use]
+pub fn render_with_enrollment_public_key(
+    values: &Values,
+    enrollment_public_key: Option<&str>,
+) -> String {
     let doc = DraftDoc {
+        enrollment_public_key: enrollment_public_key
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned),
         log: values.opt(Field::Log),
         cmis: DraftCmis {
             endpoint: values.opt(Field::CmisEndpoint),
@@ -946,6 +986,21 @@ mod tests {
         assert_eq!(
             doc["helper"]["socket"].as_str(),
             Some("x\"\n[status]\nsocket = \"/tmp/evil")
+        );
+    }
+
+    #[test]
+    fn pasted_enrollment_key_is_transient_and_locally_bounded() {
+        let values = Values::default();
+        let key = "Abc_123-xyz";
+        assert_eq!(validate_enrollment_public_key(key), Ok(()));
+        let draft = render_with_enrollment_public_key(&values, Some(key));
+        let doc: toml::Table = toml::from_str(&draft).unwrap();
+        assert_eq!(doc["enrollment_public_key"].as_str(), Some(key));
+        assert!(render(&values).find("enrollment_public_key").is_none());
+        assert!(validate_enrollment_public_key("not base64!").is_err());
+        assert!(
+            validate_enrollment_public_key(&"a".repeat(MAX_ENROLLMENT_PUBLIC_KEY_LEN + 1)).is_err()
         );
     }
 

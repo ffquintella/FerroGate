@@ -21,6 +21,7 @@
 |---|---|---|
 | `crates/mia-tray/src/actions.rs`, `crates/mia-tray/src/gui/setup_view.rs`, `crates/mia-tray/src/i18n.rs`, `crates/mia-tray/src/wizard.rs` | Campo opcional de fingerprint SHA-384, validação e passagem de `--expect-fingerprint` pela ação elevada | Permitir no tray a mesma confirmação textual da chave de registro disponível no console |
 | `crates/mia/src/setup.rs`, `crates/mia/src/setup_apply.rs` | Aceitar e validar `--expect-fingerprint` durante `mia setup --fetch-enrollment-key`; recusar escrita quando a chave recebida divergir | Preservar a integridade da chave pública de registro obtida do CMIS |
+| `crates/mia-tray/src/gui/setup_view.rs`, `crates/mia-tray/src/wizard.rs`, `crates/mia/src/setup_apply.rs`, `crates/ferrogate-cli/src/main.rs` | Campo para colar a chave pública de registro no setup gráfico; `ferrogate enrollment-key --format public-key`; validação e instalação atômica e auditada | Facilitar o provisionamento manual sem mover a chave de confiança para a configuração TOML |
 | `docs/features/F18-mia-tray.md`, `docs/mia-tray.md`, `docs/mia.md` | Atualização de comportamento e argumentos documentados | Documentar o fluxo gráfico e o comportamento de falha segura |
 | `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `docs/change-v0.28.0.md` | Bump e registro da versão | Identificar e registrar o release |
 
@@ -37,9 +38,9 @@
 |---|---|
 | Algum componente de segurança foi alterado? | Sim |
 | Quais | Provisionamento e validação da chave pública de registro do CMIS |
-| O que foi alterado | O tray aceita o fingerprint público opcional e o encaminha ao `mia`; a gravação ocorre somente se a chave obtida corresponder |
+| O que foi alterado | O tray aceita fingerprint opcional para busca ou colagem; MIA valida e instala a chave pública colada através do gravador atômico e auditado |
 | Quem solicitou | Usuário deste chat |
-| Mudanças decorrentes da alteração | Um fingerprint inválido impede aplicar a configuração; uma divergência não grava a chave |
+| Mudanças decorrentes da alteração | Chave inválida ou fingerprint divergente não é instalada; substituição de uma chave diferente continua exigindo o fluxo explícito de rotação |
 | Responsável oficial pelo versionamento do componente | Não informado |
 | **Verificação/homologação do ESI** | Pendente |
 
@@ -58,7 +59,7 @@
 | Análise de qualidade de código-fonte (SAST) | Não executada nesta mudança | — |
 | Lint automatizado (`make lint`) | Falhou por quatro avisos Clippy já presentes no HEAD anterior: `logview.rs` (`must_use_candidate`), `credstore.rs` (2 × `similar_names`) e `setup_apply.rs` (`too_many_lines`) | 2026-10-07 |
 | Testes automatizados (`make test`) | Falhou somente no encerramento intermitente de `short_chaos_run_keeps_serving_while_quorum_holds`; a repetição isolada passou | 2026-10-07 |
-| Testes focados | `cargo test -p mia-tray` (81) e `cargo test -p mia setup_apply` (14) passaram | 2026-10-07 |
+| Testes focados | `cargo test -p mia-tray --lib` (82), `cargo test -p mia setup_apply --lib` (17) e `cargo test -p ferrogate-cli enrollment_key` (2) passaram; `cargo check -p mia-tray --features gui` passou | 2026-10-07 |
 | Falhas em relatórios automatizados de segurança | Não avaliadas nesta mudança | — |
 | Verificação de segurança do ESI (obrigatória antes da produção) | Pendente | — |
 

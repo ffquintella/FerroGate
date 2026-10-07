@@ -332,7 +332,10 @@ async fn allowlist_set_show_list_get_delete_roundtrip() {
     // list — host appears
     let out = run(vec!["list".into()]).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && stdout.contains(host), "list: {stdout}");
+    assert!(
+        out.status.success() && stdout.contains(host),
+        "list: {stdout}"
+    );
 
     // get --out — writes valid signed CBOR that the MIA verifier accepts under
     // the enrollment key.
@@ -395,7 +398,10 @@ async fn allowlist_set_show_list_get_delete_roundtrip() {
     assert!(out.status.success(), "wildcard get --out must succeed");
     let signed = ferro_svid::allowlist::decode(&std::fs::read(&wpath).unwrap()).unwrap();
     let doc = ferro_svid::allowlist::decode_body(&signed.body).unwrap();
-    assert_eq!(doc.entries[0].uid, None, "wildcard entry serialises uid=None");
+    assert_eq!(
+        doc.entries[0].uid, None,
+        "wildcard entry serialises uid=None"
+    );
     let _ = std::fs::remove_file(&wpath);
 
     // delete
@@ -449,6 +455,8 @@ async fn plaintext_http_status_still_works() {
 
 #[tokio::test]
 async fn enrollment_key_prints_the_issuer_fingerprint_over_pinned_tls() {
+    use base64::Engine as _;
+
     let (chain, key, pin, _cert_pem) = make_identity();
     let server_config =
         ferro_crypto::transport::server_config(ProviderMode::HybridOnly, chain, key).unwrap();
@@ -457,6 +465,8 @@ async fn enrollment_key_prints_the_issuer_fingerprint_over_pinned_tls() {
     let state = build_state().await;
     // The value `mia allowlist-key fetch` computes for the same key.
     let expected = state.issuer.public_key().fingerprint_hex();
+    let expected_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(state.issuer.public_key().to_concat_bytes());
     let incoming = cmis::transport::tls_incoming(listener, server_config);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -469,6 +479,7 @@ async fn enrollment_key_prints_the_issuer_fingerprint_over_pinned_tls() {
     for (format, want) in [
         ("hex", expected.clone()),
         ("flag", format!("--expect-fingerprint {expected}")),
+        ("public-key", expected_public_key),
     ] {
         let out = Command::new(ferrogate_bin())
             .args([

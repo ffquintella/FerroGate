@@ -138,21 +138,30 @@ return its output, so on Windows elevated actions report only their outcome.
 
 ### Setup wizard
 
-1. **Load** runs `mia setup --dump --json` as you (`--user` for the per-user
-   file, `-e <env>` for a named environment). Keys set by environment variables
-   are shown read-only with their effective value; the draft keeps the file's
-   own value for them (read with those variables removed), so applying never
-   copies an environment value into the file. If the system file is not
-   readable by you, the wizard says so and lets you start from defaults —
-   applying then replaces only the keys the wizard manages (`--apply` keeps the
-   others).
+1. **Load** runs `mia setup --dump --json --editable` (`--user` for the
+   per-user file, `-e <env>` for a named environment). On Linux and macOS the
+   protected system file is read through the same administrator-consent
+   mechanism used by Apply; the reduced dump contains only fields this screen
+   can edit. Per-user files are read without elevation. Keys set by environment
+   variables are shown read-only with their effective value; the draft keeps
+   the file's own value for them (read with those variables removed), so
+   applying never copies an environment value into the file. On Windows, where
+   a UAC child cannot return output, an unreadable system file still offers
+   **Start from defaults**; Apply preserves keys the wizard does not manage.
 2. Every field is validated locally with `mia`'s own rules (CMIS endpoint or
    SRV record, SPKI pin, helper socket / pipe group, allowlist path, key, max
    age, `fetch` / `propose`, attestation backend, IMA log, log directive) plus
    the cross-field rules. A blank helper socket or allowlist file leaves the
    key out of the file, so `mia` uses the platform default for the
    environment; the allowlist key has no default and must be filled in for
-   any caller to be allowed.
+   any caller to be allowed. For system setup, the **Enrollment public key
+   (paste)** field accepts the public-key value from
+   `ferrogate enrollment-key --format public-key`; the value is validated and
+   installed into the selected key file by the administrator-approved `mia`
+   process. The optional fingerprint field can confirm the pasted key against
+   `ferrogate enrollment-key`'s default fingerprint output. Pasting and fetching
+   are mutually exclusive; an already installed, different key still requires
+   the explicit rotation workflow.
 3. **Check with mia** writes the draft to a fresh private directory (`0700`,
    random name, under `$XDG_RUNTIME_DIR` or the per-user temp directory) as
    `draft.toml` (`0600`, created exclusively) and runs `mia setup --check`;
@@ -164,9 +173,11 @@ return its output, so on Windows elevated actions report only their outcome.
    the consent prompt for the system file — and then reloads the configuration
    so the change is visible. `--reload` (signal the running agent) and
    `--fetch-enrollment-key` (fetched inside the elevated `mia`, over the pinned
-   channel) are options. When fetching, the screen also accepts the optional
-   96-character fingerprint printed by `ferrogate enrollment-key`; `mia`
-   writes nothing when the fetched key differs. The tray removes its private
+   channel) or a pasted public key are options. The paste field accepts the
+   base64url value from `ferrogate enrollment-key --format public-key`. The
+   screen also accepts the optional 96-character fingerprint printed by
+   `ferrogate enrollment-key`; `mia` writes nothing when the key differs. The
+   tray removes its private
    directory afterwards, including the draft an elevated `mia` deliberately
    leaves to its owner.
 

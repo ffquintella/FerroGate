@@ -195,9 +195,11 @@ keep working against newer daemons.
 
 ### Setup wizard and `mia setup --apply`
 
-1. The wizard reads the current config through `mia setup --dump --json`
-   (effective values, file path, which values come from env overrides — those
-   are shown read-only, since writing the file would not change them).
+1. The wizard reads the current config through
+   `mia setup --dump --json --editable` (effective editable values, file path,
+   which values come from env overrides — those are shown read-only, since
+   writing the file would not change them). Reading the protected system file
+   uses administrator consent on Linux/macOS; user scope remains unprivileged.
 2. Each field is validated locally *and* the whole draft is checked with
    `mia setup --check <draft>` before the user can confirm, so error text comes
    from `mia`.

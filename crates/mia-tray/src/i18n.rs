@@ -245,6 +245,9 @@ messages! {
     SetupApply => "Apply", "Aplicar";
     SetupReload => "Reload the agent after applying", "Recarregar o agente após aplicar";
     SetupFetchKey => "Fetch the enrollment public key from CMIS into this file", "Obter a chave pública de registro do CMIS e salvar neste arquivo";
+    FieldEnrollmentPublicKey => "Enrollment public key (paste)", "Chave pública de registro (colar)";
+    HelpEnrollmentPublicKey => "Optional public-only base64url value from `ferrogate enrollment-key --format public-key`. It stays in the private setup draft and is installed by administrator-approved mia; it is never saved in mia.toml.", "Valor base64url opcional, somente público, obtido com `ferrogate enrollment-key --format public-key`. Ele permanece no rascunho privado e é instalado pelo mia com aprovação do administrador; nunca é salvo no mia.toml.";
+    EnrollmentPublicKeySystemOnly => "Pasting a trust anchor is available for the system configuration only.", "A inserção de uma âncora de confiança está disponível somente para a configuração do sistema.";
     SetupApplied => "Configuration written.", "Configuração gravada.";
     SetupTargetChanged => "The selected file differs from the one loaded: load it before checking or applying.", "O arquivo selecionado é diferente do carregado: carregue-o antes de verificar ou aplicar.";
     SetupNeedsCheck => "Check the draft with mia before applying.", "Verifique o rascunho com o mia antes de aplicar.";
@@ -273,7 +276,7 @@ messages! {
     FieldAllowlistKey => "Enrollment public key file (destination)", "Arquivo da chave pública de registro (destino)";
     HelpAllowlistKey => "Path where the CMIS enrollment public key is stored or will be fetched; without it every caller is denied.", "Caminho onde a chave pública de registro do CMIS está ou será salva; sem ela todo chamador é negado.";
     FieldEnrollmentKeyFingerprint => "Expected enrollment key fingerprint (text)", "Fingerprint esperado da chave de registro (texto)";
-    HelpEnrollmentKeyFingerprint => "Optional 96-character hex fingerprint printed by `ferrogate enrollment-key`; when set, nothing is written unless the fetched key matches.", "Fingerprint hexadecimal opcional de 96 caracteres exibido por `ferrogate enrollment-key`; quando preenchido, nada é gravado se a chave obtida não corresponder.";
+    HelpEnrollmentKeyFingerprint => "Optional 96-character hex fingerprint printed by `ferrogate enrollment-key`; when set, nothing is written unless the fetched or pasted key matches.", "Fingerprint hexadecimal opcional de 96 caracteres exibido por `ferrogate enrollment-key`; quando preenchido, nada é gravado se a chave obtida ou colada não corresponder.";
     FieldAllowlistMaxAge => "Allowlist maximum age (seconds)", "Idade máxima da lista de permissões (segundos)";
     HelpAllowlistMaxAge => "Oldest allowlist accepted, in seconds; blank for the default.", "Lista de permissões mais antiga aceita, em segundos; em branco para o padrão.";
     FieldAllowlistFetch => "Fetch the allowlist from CMIS at startup", "Obter a lista de permissões do CMIS ao iniciar";
@@ -299,6 +302,7 @@ messages! {
     ValKeyRequired => "required whenever the allowlist file is set", "obrigatório sempre que o arquivo da lista de permissões for definido";
     ValKeyRequiredForFetch => "choose a destination file to fetch the enrollment key", "escolha um arquivo de destino para obter a chave de registro";
     ValEnrollmentKeyFingerprint => "must be the full 96-character hex fingerprint printed by `ferrogate enrollment-key`", "deve ser o fingerprint hexadecimal completo de 96 caracteres exibido por `ferrogate enrollment-key`";
+    ValEnrollmentPublicKey => "must be the base64url public key printed by `ferrogate enrollment-key --format public-key`", "deve ser a chave pública base64url exibida por `ferrogate enrollment-key --format public-key`";
     ValDraftTooLarge => "the draft is larger than 64 KiB", "o rascunho é maior que 64 KiB";
 
     LogsLevel => "Level", "Nível";
