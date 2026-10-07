@@ -304,6 +304,8 @@ endif
 ifeq ($(MIA_OS),linux)
 	@echo "==> installing systemd unit mia.service"
 	@SUDO=$$( [ "$$(id -u)" -eq 0 ] && echo "" || echo sudo ); \
+	  $$SUDO ./scripts/ferrogate-group.sh ferrogate-operators >/dev/null; \
+	  $$SUDO install -D -m 0644 crates/mia/dist/50-ferrogate-operators.rules /usr/share/polkit-1/rules.d/50-ferrogate-operators.rules; \
 	  GID=$$( $$SUDO ./scripts/ferrogate-group.sh $(MIA_GROUP) ); \
 	  $$SUDO sh -c "sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/$(MIA_BIN)|' $(MIA_DIST)/mia.service > /etc/systemd/system/mia.service"; \
 	  $$SUDO chmod 0644 /etc/systemd/system/mia.service; \
@@ -313,7 +315,8 @@ ifeq ($(MIA_OS),linux)
 	  $$SUDO systemctl daemon-reload; \
 	  $$SUDO systemctl enable --now mia.service \
 	    || echo "   (enable failed — configure /etc/ferrogate then: sudo systemctl enable --now mia)"; \
-	  echo "==> helper socket will be owned by group $(MIA_GROUP) (gid $$GID), mode 0660"
+	  echo "==> helper socket will be owned by group $(MIA_GROUP) (gid $$GID), mode 0660"; \
+	  echo "==> ferrogate-operators can manage mia.service (re-login for group access)"
 	@echo "==> systemd unit mia.service installed"
 	@echo "    Configure it with: sudo mia setup   (writes the system TOML the daemon reads)"
 	@command -v mia >/dev/null 2>&1 || echo "NOTE: $(BINDIR) is not on your PATH."
@@ -342,6 +345,7 @@ else
 	  $$SUDO systemctl disable --now mia.service 2>/dev/null || true; \
 	  $$SUDO rm -f /etc/systemd/system/mia.service; \
 	  $$SUDO rm -rf /etc/systemd/system/mia.service.d; \
+	  $$SUDO rm -f /usr/share/polkit-1/rules.d/50-ferrogate-operators.rules; \
 	  $$SUDO systemctl daemon-reload 2>/dev/null || true; \
 	  $$SUDO rm -f "$(BINDIR)/$(MIA_BIN)"
 	@echo "==> removed systemd unit and $(BINDIR)/$(MIA_BIN)"

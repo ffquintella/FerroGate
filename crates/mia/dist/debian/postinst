@@ -8,6 +8,7 @@ set -eu
 SERVICE_USER=_ferrogate
 CLIENT_GROUP=ferrogate-clients
 STATUS_GROUP=ferrogate-status
+OPERATORS_GROUP=ferrogate-operators
 DROPIN_DIR=/etc/systemd/system/mia.service.d
 DROPIN_FILE="$DROPIN_DIR/10-ferrogate-groups.conf"
 
@@ -83,7 +84,8 @@ configure_desktop_user() {
     usermod -aG "$STATUS_GROUP" -- "$user"
     if [ "${SUDO_USER:-}" = "$user" ]; then
         usermod -aG "$CLIENT_GROUP" -- "$user"
-        echo "ferrogate-mia: added $user to $CLIENT_GROUP and $STATUS_GROUP (effective at next login)"
+        usermod -aG "$OPERATORS_GROUP" -- "$user"
+        echo "ferrogate-mia: added $user to $CLIENT_GROUP, $OPERATORS_GROUP and $STATUS_GROUP (effective at next login)"
     else
         echo "ferrogate-mia: added $user to $STATUS_GROUP (effective at next login)"
     fi
@@ -111,6 +113,21 @@ if [ "${1:-}" = configure ]; then
     create_service_user
     create_system_group "$CLIENT_GROUP"
     create_system_group "$STATUS_GROUP"
+    create_system_group "$OPERATORS_GROUP"
+
+    # The tray's read-only diagnostics (`mia test`, `mia status`) resolve the
+    # system config before the user's config. Keep system TOMLs root-owned and
+    # non-writable by the status readers, while letting the installer-enrolled
+    # desktop users read them. Preserve the existing mode so package defaults
+    # and operator-tightened permissions are not broadened.
+    if [ -d /etc/ferrogate ]; then
+        for config_file in /etc/ferrogate/mia*.toml /etc/ferrogate/environments.toml; do
+            [ -f "$config_file" ] && [ ! -L "$config_file" ] || continue
+            if [ "$(stat -c %U "$config_file" 2>/dev/null || true)" = root ]; then
+                chgrp "$STATUS_GROUP" "$config_file"
+            fi
+        done
+    fi
 
     helper_gid=$(getent group "$CLIENT_GROUP" | cut -d: -f3)
     case "$helper_gid" in

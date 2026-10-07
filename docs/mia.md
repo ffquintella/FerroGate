@@ -796,6 +796,12 @@ sudo mia default-environment clear [--json] # mia.toml is the default again
 sudo systemctl restart mia                  # apply (launchctl kickstart -k / Restart-Service)
 ```
 
+On Linux, the installer creates the `ferrogate-operators` group and adds the
+installing account when it is known. Members can start, stop, or restart only
+`mia.service` through systemd/Polkit. Group membership takes effect after
+the next login. Editing system configuration still requires the administrator
+authorization requested by `mia setup`.
+
 `show` is read-only and needs no privileges; it fails closed exactly as the
 daemon would (an invalid file is an error, not "nothing selected"). Its
 `--json` form is `{"default_environment": "prod" | null, "label",

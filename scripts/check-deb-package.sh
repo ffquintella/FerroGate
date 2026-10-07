@@ -12,6 +12,7 @@ fi
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 dpkg-deb --control "$deb" "$work_dir/control"
+dpkg-deb -x "$deb" "$work_dir/root"
 dpkg-deb --fsys-tarfile "$deb" | tar -tf - >"$work_dir/files"
 
 require_file() {
@@ -34,7 +35,8 @@ for path in \
     /usr/lib/systemd/user/mia-tray.service \
     /usr/share/icons/hicolor/scalable/apps/ferrogate-mia.svg \
     /usr/share/icons/hicolor/256x256/apps/ferrogate-mia.png \
-    /usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy; do
+    /usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy \
+    /usr/share/polkit-1/rules.d/50-ferrogate-operators.rules; do
     require_file "$path"
 done
 
@@ -57,6 +59,11 @@ sh -n "$work_dir/control/postinst"
 sh -n "$work_dir/control/postrm"
 grep -F 'ferrogate-clients' "$work_dir/control/postinst" >/dev/null
 grep -F 'ferrogate-status' "$work_dir/control/postinst" >/dev/null
+grep -F 'ferrogate-operators' "$work_dir/control/postinst" >/dev/null
+grep -F 'chgrp "$STATUS_GROUP" "$config_file"' "$work_dir/control/postinst" >/dev/null
+grep -F '[ ! -L "$config_file" ]' "$work_dir/control/postinst" >/dev/null
+grep -F 'action.lookup("unit") === "mia.service"' "$work_dir/root/usr/share/polkit-1/rules.d/50-ferrogate-operators.rules" >/dev/null
+grep -F 'subject.isInGroup("ferrogate-operators")' "$work_dir/root/usr/share/polkit-1/rules.d/50-ferrogate-operators.rules" >/dev/null
 grep -F '_ferrogate' "$work_dir/control/postinst" >/dev/null
 grep -F 'systemctl --user restart mia-tray.service' "$work_dir/control/postinst" >/dev/null
 if grep -F '#DEBHELPER#' "$work_dir/control/postinst" >/dev/null; then

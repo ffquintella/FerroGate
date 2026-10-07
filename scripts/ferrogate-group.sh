@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 #
-# ferrogate-group.sh — create the dedicated OS group whose members may open the
-# MIA helper socket, then print its numeric gid to stdout.
+# ferrogate-group.sh — create a dedicated MIA OS group, enroll the invoking
+# user when present, then print the group's numeric gid to stdout.
 #
-# The MIA daemon runs as root and creates its helper socket as `root:<gid>` with
-# mode 0660, so only root and members of this group can connect. `mia` itself is
-# `#![forbid(unsafe_code)]` and so cannot resolve a group *name* to a gid (that
-# needs getgrnam); this installer-side helper does the resolution and the
-# daemon is handed the number via FERROGATE_HELPER_SOCKET_GID.
+# For the helper-client group, the installer passes this group's numeric gid to
+# the daemon via FERROGATE_HELPER_SOCKET_GID. The operators group is used by the
+# Linux Polkit rule to limit lifecycle control to mia.service.
 #
 # Idempotent: a second run reuses the existing group. The invoking user (taken
 # from $SUDO_USER when run under sudo) is added to the group as a convenience.
@@ -38,7 +36,7 @@ case "$uname_s" in
       done
       dscl . -create "/Groups/$GROUP"
       dscl . -create "/Groups/$GROUP" PrimaryGroupID "$gid"
-      dscl . -create "/Groups/$GROUP" RealName "FerroGate MIA helper clients"
+      dscl . -create "/Groups/$GROUP" RealName "FerroGate MIA operators"
       dscl . -create "/Groups/$GROUP" Password "*"
       log "==> created group $GROUP (gid $gid)"
     fi

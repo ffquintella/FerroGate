@@ -1,0 +1,11 @@
+// Limit delegated systemd control to the MIA unit and lifecycle actions.
+// Configuration edits still go through `mia setup` and its administrator
+// authorization policy.
+polkit.addRule(function (action, subject) {
+    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") === "mia.service" &&
+        ["start", "stop", "restart", "try-restart"].includes(action.lookup("verb")) &&
+        subject.isInGroup("ferrogate-operators")) {
+        return polkit.Result.YES;
+    }
+});
