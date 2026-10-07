@@ -25,6 +25,18 @@ record them.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-07
+
+### Added
+
+- Add an optional CMIS enrollment-key fingerprint field to the MIA tray setup
+  wizard, passing the existing `mia setup --fetch-enrollment-key
+  --expect-fingerprint` integrity check before it writes the fetched public key
+  (S18, S32). Operators can enter the 96-character SHA-384 fingerprint printed
+  by `ferrogate enrollment-key`; the value is validated locally and passed only
+  to the elevated `mia` command. A mismatch leaves the destination key file
+  unchanged, and the fingerprint is not persisted or included in error messages.
+
 ## [0.27.1] - 2026-10-06
 
 ### Fixed
@@ -2677,7 +2689,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.27.1...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.28.0...HEAD
+[0.28.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.0
 [0.27.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.27.1
 [0.27.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.27.0
 [0.26.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.26.0
