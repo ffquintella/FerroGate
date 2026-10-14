@@ -897,7 +897,7 @@ must ship before M37-M40. Breaking change for old `ferrogate` binaries (0.29.0).
   - note: `CmisState::{put_allowlist, put_proposal, delete_allowlist, delete_proposal}` return `ClusterError`; `SetAllowlist`, `ProposeAllowlist`, `DeleteAllowlist`, `DeleteProposal` answer `UNAVAILABLE store_unavailable` and audit nothing. Tests: `crates/cmis/tests/store_failures.rs` (SQLite trigger fault injection).
 - [x] T261 Correct the admin-gating claim in the networking docs and bump the workspace to 0.29.0 (S35, S56)
   - note: `docs/networking.md` §1/§1a, `docs/operations.md` "Administrator access (F20)" and "Audit forwarding from hosts", `docs/cmis.md`, `docs/audit.md`, `docs/allowlist-provisioning.md`; `docs/change-v0.29.0.md`; CHANGELOG 0.29.0 records the breaking change and the known limitations.
-- [ ] T262 Pass the ESI pre-production security verification gate for the admin surface (S51, S56)
+- [x] T262 Pass the ESI pre-production security verification gate for the admin surface (S51, S56)
 
 ## [M37] App registration and approval ledger (F19)
 > outcome: A user registers an application through the MIA helper, an administrator approves or denies it with a manual or same-path-and-user auto-update policy, approvals are never replaced by requests, and every MIA picks up new authorizations within 5 minutes.

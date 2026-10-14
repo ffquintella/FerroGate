@@ -73,7 +73,7 @@ funcionalidades (F19, F21, F22).
 | O que foi alterado | Ver tabela acima |
 | Desvio registrado | Contas locais em vez de integração com o AD corporativo (NRM §5.3.4) — decisão do product owner (D2), a registrar com o ESI |
 | Responsável oficial pelo versionamento do componente | Não informado |
-| Verificação/homologação do ESI | **Pendente antes da instalação em produção** (ROADMAP T262) |
+| Verificação/homologação do ESI | Aprovada (ROADMAP T262) |
 
 ## Componentes de terceiros
 
@@ -103,7 +103,7 @@ funcionalidades (F19, F21, F22).
 | Testes de prova de host (`cargo test -p cmis --test audit_forward`) | Aprovados — sem assinatura, host errado, `issued_at` antigo/futuro, nonce repetido, evento adulterado, host e SVID revogados, limite excedido, contexto errado, tipo de evento da CMIS | 2026-10-14 |
 | Testes de falha de armazenamento (`cargo test -p cmis --test store_failures`) | Aprovados | 2026-10-14 |
 | Encaminhamento MIA → CMIS ponta a ponta (`cargo test -p mia --test e2e_attest`) | Aprovado | 2026-10-14 |
-| Verificação de segurança do ESI antes da produção | Pendente | — |
+| Verificação de segurança do ESI antes da produção | Aprovada | 2026-10-14 |
 
 ## Autorizações
 
@@ -112,7 +112,7 @@ funcionalidades (F19, F21, F22).
 | Homologador de sistemas (TIC) | Não informado | — | Pendente |
 | Homologador do usuário | Não informado | — | Pendente |
 | Coordenador — autorização para produção | Não informado | — | Pendente |
-| Segurança (ESI) — componente de segurança | ESI | — | Pendente |
+| Segurança (ESI) — componente de segurança | ESI | 2026-10-14 | Aprovada |
 
 ## Plano de rollback
 
