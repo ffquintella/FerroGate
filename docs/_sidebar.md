@@ -15,6 +15,7 @@
   - [MIA tray companion](mia-tray.md)
   - [Helper API](helper-api.md)
   - [Allowlist provisioning](allowlist-provisioning.md)
+  - [App approval & admin access](app-approval-and-admin.md)
   - [Audit log](audit.md)
   - [Integration SDK](sdk.md)
 
@@ -49,10 +50,16 @@
   - [F14 — Root key ceremony](features/F14-root-key-ceremony.md)
   - [F17 — X.509-SVID profile](features/F17-x509-svid.md)
   - [F18 — MIA tray companion](features/F18-mia-tray.md)
+  - [F19 — App registration & approval](features/F19-app-registration-approval.md)
+  - [F20 — Admin authentication](features/F20-admin-authentication.md)
+  - [F21 — Admin TUI](features/F21-admin-tui.md)
+  - [F22 — Tray admin client](features/F22-tray-admin-client.md)
 
 - Decisions
   - [ADR index](adr/README.md)
   - [ADR-0001 — gRPC over HTTP](adr/0001-grpc-over-http-transport.md)
+  - [ADR-0004 — App approval ledger](adr/0004-app-approval-ledger.md)
+  - [ADR-0005 — Admin authentication](adr/0005-admin-authentication.md)
 
 - Process
   - [Testing](testing.md)
