@@ -136,12 +136,7 @@ pub fn run_refresh_key(args: &[String]) -> anyhow::Result<()> {
 /// Parse the shared `[--config <path>]` / `--help` options and load the config,
 /// printing a one-line banner. `Ok(None)` means `--help` was printed and the
 /// caller should exit successfully.
-fn load(
-    args: &[String],
-    usage: &str,
-    help: fn(),
-    banner: &str,
-) -> anyhow::Result<Option<Config>> {
+fn load(args: &[String], usage: &str, help: fn(), banner: &str) -> anyhow::Result<Option<Config>> {
     let mut config_path = None;
     let mut environment = None;
     let mut it = args.iter();
@@ -156,7 +151,9 @@ fn load(
                 config_path = Some(PathBuf::from(path));
             }
             "-e" | "--environment" => {
-                let env = it.next().context("--environment requires a name argument")?;
+                let env = it
+                    .next()
+                    .context("--environment requires a name argument")?;
                 environment = Some(env.clone());
             }
             other => anyhow::bail!("unknown argument: {other}\n\n{usage}"),
@@ -174,6 +171,24 @@ fn load(
 /// Fetch the signed allowlist from CMIS, write it, and verify it. When `reload`
 /// is set, signal the running agent to swap in the new body live (no restart).
 async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
+    // With the F19 sync on, the daemon keeps a host-bound, rollback-checked v2
+    // body in force and refreshes it itself: writing the unauthenticated v1
+    // body here could only roll it back. A reload asks the running agent to
+    // sync now (`SyncAllowlist`).
+    if config.allowlist_sync_enabled() {
+        println!(
+            "allowlist.sync is on: the agent syncs this host's signed allowlist from CMIS every \
+             {} s (SyncAllowlist).",
+            config.allowlist_sync_interval().as_secs()
+        );
+        if reload {
+            signal_reload();
+            println!("  The agent syncs now; `mia status` shows the generation it holds.");
+        } else {
+            println!("  Run `mia resync-allowlist --reload` (or `mia --resync`) to sync now.");
+        }
+        return Ok(());
+    }
     // `allowlist.path`, or its per-environment default — the same body the
     // daemon loads (`Config::allowlist_path`).
     let path = config.allowlist_path();
@@ -194,7 +209,10 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
     // cluster); the chosen node is reported so the operator sees which served.
     let (endpoint, mut client) = resolver.connect().await.context("connecting to CMIS")?;
     if resolver.is_srv() {
-        println!("cmis: {endpoint} (selected via SRV {})\n", resolver.describe());
+        println!(
+            "cmis: {endpoint} (selected via SRV {})\n",
+            resolver.describe()
+        );
     }
 
     let Some(bytes) = crate::client::fetch_allowlist(&mut client, &uuid)
@@ -211,9 +229,12 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
 
     // The body is integrity-protected by its CMIS signature, so a world-readable
     // file is fine (mirrors the daemon's own startup fetch).
-    write_allowlist_file(&path, &bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    println!("✓ fetched and wrote {} ({} bytes)", path.display(), bytes.len());
+    write_allowlist_file(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "✓ fetched and wrote {} ({} bytes)",
+        path.display(),
+        bytes.len()
+    );
 
     match config.allowlist_key() {
         Some(key_path) => verify_after_write(&bytes, key_path, config.allowlist_max_age()),
@@ -247,19 +268,33 @@ pub(crate) fn signal_reload() {
         );
         return;
     };
-    print!("\nSignaling the running agent to reload (SIGHUP via {}) … ", cmd[0]);
+    print!(
+        "\nSignaling the running agent to reload (SIGHUP via {}) … ",
+        cmd[0]
+    );
     match std::process::Command::new(cmd[0]).args(&cmd[1..]).status() {
         Ok(status) if status.success() => {
             println!("done.");
             println!("  The new allowlist is now live — no restart, the helper socket stayed up.");
         }
         Ok(status) => {
-            println!("failed (exit {}).", status.code().map_or_else(|| "signal".to_string(), |c| c.to_string()));
-            println!("  Load it with a restart instead:  {}", crate::setup::restart_hint());
+            println!(
+                "failed (exit {}).",
+                status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string())
+            );
+            println!(
+                "  Load it with a restart instead:  {}",
+                crate::setup::restart_hint()
+            );
         }
         Err(e) => {
             println!("could not run `{}` ({e}).", cmd[0]);
-            println!("  Load it with a restart instead:  {}", crate::setup::restart_hint());
+            println!(
+                "  Load it with a restart instead:  {}",
+                crate::setup::restart_hint()
+            );
         }
     }
 }

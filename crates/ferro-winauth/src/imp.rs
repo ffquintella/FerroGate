@@ -81,6 +81,18 @@ pub fn process_image_path(pid: u32) -> io::Result<PathBuf> {
 /// The RID (last sub-authority) of `pid`'s token user SID — the Windows
 /// analogue of a Unix uid for the allowlist.
 pub fn process_user_rid(pid: u32) -> io::Result<u32> {
+    with_process_token_user(pid, rid_from_sid)
+}
+
+/// The full string SID (`S-1-5-21-…`) of `pid`'s token user, which the
+/// allowlist v2 matches through its `sid_hash` (feature F19 §4.2). Unlike the
+/// RID it tells a local account from a domain account that share a RID.
+pub fn process_user_sid(pid: u32) -> io::Result<String> {
+    with_process_token_user(pid, sid_string)
+}
+
+/// Open `pid`'s token for query, run `f` on its user SID, and close the token.
+fn with_process_token_user<T>(pid: u32, f: impl FnOnce(PSID) -> io::Result<T>) -> io::Result<T> {
     with_process(pid, |proc| {
         let mut token: HANDLE = ptr::null_mut();
         // SAFETY: `proc` is valid; we receive the token handle by out-param.
@@ -88,14 +100,16 @@ pub fn process_user_rid(pid: u32) -> io::Result<u32> {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        let result = token_user_rid(token);
+        let result = token_user(token, f);
         // SAFETY: `token` was produced by `OpenProcessToken`.
         unsafe { CloseHandle(token) };
         result
     })
 }
 
-fn token_user_rid(token: HANDLE) -> io::Result<u32> {
+/// Run `f` on the user SID of `token`. The SID points into a buffer that
+/// lives only for the duration of the call.
+fn token_user<T>(token: HANDLE, f: impl FnOnce(PSID) -> io::Result<T>) -> io::Result<T> {
     // First call sizes the buffer (expected to fail with insufficient buffer).
     let mut needed: u32 = 0;
     // SAFETY: a null buffer with size 0 makes the call report the required
@@ -123,9 +137,9 @@ fn token_user_rid(token: HANDLE) -> io::Result<u32> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: on success `buf` begins with a valid, suitably aligned TOKEN_USER
-    // whose `User.Sid` points into the same buffer.
+    // whose `User.Sid` points into the same buffer, which outlives `f`.
     let sid: PSID = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    rid_from_sid(sid)
+    f(sid)
 }
 
 fn rid_from_sid(sid: PSID) -> io::Result<u32> {
@@ -335,9 +349,17 @@ fn lookup_group_sid_string(group: &str) -> io::Result<String> {
         return Err(io::Error::last_os_error());
     }
 
+    sid_string(sid.as_mut_ptr().cast::<c_void>())
+}
+
+/// Format a valid SID as its SDDL `S-…` string.
+fn sid_string(sid: PSID) -> io::Result<String> {
+    if sid.is_null() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "null SID"));
+    }
     let mut sid_str: *mut u16 = ptr::null_mut();
-    // SAFETY: `sid` holds a valid SID; the call allocates a string we free.
-    let ok = unsafe { ConvertSidToStringSidW(sid.as_mut_ptr().cast::<c_void>(), &mut sid_str) };
+    // SAFETY: `sid` is a valid SID; the call allocates a string we free.
+    let ok = unsafe { ConvertSidToStringSidW(sid, &mut sid_str) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }

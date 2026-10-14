@@ -1,19 +1,31 @@
 //! The signed caller allowlist — MIA-side runtime verifier.
 //!
-//! Only `(uid, bin_sha384)` pairs present in the allowlist may obtain a token.
-//! The allowlist is signed by CMIS (see [`ferro_svid::Issuer::sign_allowlist`])
+//! Only callers an entry of the allowlist admits may obtain a token. The
+//! allowlist is signed by CMIS (see [`ferro_svid::Issuer::sign_allowlist`])
 //! and re-verified here before use; verification **fails closed** — any decode,
 //! signature, or freshness error yields no usable allowlist, so the server
 //! denies every caller rather than fall back to an unauthenticated state.
 //!
+//! Two signed formats are accepted, each under its own signature context:
+//!
+//! - **v1** (`ferrogate-allowlist-v1`): `(uid, bin_sha384)` pairs, with `None`
+//!   and `"*"` wildcards (ADR-0002). Hand-provisioned and served by the
+//!   unauthenticated `GetAllowlist`.
+//! - **v2** (`ferrogate-allowlist-v2`, feature F19 §6): a host-bound compiled
+//!   view of the host's approvals, with a generation and per-entry uid,
+//!   Windows SID, path and expiry constraints. Served by the authenticated
+//!   `SyncAllowlist` and kept current by [`crate::allowlist_sync`], which also
+//!   enforces the host binding and the generation (rollback) rules.
+//!
 //! The wire model ([`AllowlistDoc`], [`SignedAllowlist`], `sign`/`encode`) lives
 //! in `ferro-svid` so CMIS and the MIA share one definition; it is re-exported
-//! here for convenience. This module owns the freshness-checked, membership-set
+//! here for convenience. This module owns the freshness-checked, indexed
 //! [`Allowlist`] that the helper API consults.
 
 use std::collections::{HashMap, HashSet};
 
 use ferro_crypto::composite::CompositePublicKey;
+use ferro_svid::allowlist_v2::{self, AllowlistV2Error};
 
 // Re-export the shared wire model so existing `mia::helper::allowlist::*` users
 // (and tests) keep working unchanged.
@@ -21,6 +33,7 @@ pub use ferro_svid::allowlist::{
     decode, encode, sign, AllowEntry, AllowlistDoc, AllowlistError, SignedAllowlist,
     ALLOWLIST_SIGNING_CONTEXT, BIN_SHA_WILDCARD,
 };
+pub use ferro_svid::allowlist_v2::{AllowEntryV2, AllowlistDocV2, ALLOWLIST_V2_FORMAT};
 
 /// Clock-skew tolerance applied to the allowlist not-before (`issued_at`)
 /// check (seconds).
@@ -44,23 +57,82 @@ enum UidScope {
     Only(HashSet<u32>),
 }
 
-/// A verified, in-memory allowlist ready for `O(1)` membership checks.
+/// The constraints of one v2 entry (F19 §6.1). Every constraint present must
+/// match.
+#[derive(Debug, Clone)]
+struct Constraint {
+    uid: Option<u32>,
+    sid_hash: Option<[u8; 32]>,
+    path_hash: Option<[u8; 32]>,
+    expires_at: Option<i64>,
+}
+
+/// A v2 body indexed for the hot path: a map lookup by binary hash, then a
+/// scan of that hash's few constraint sets.
+#[derive(Debug, Clone)]
+struct V2Index {
+    host_uuid: String,
+    generation: u64,
+    entries_digest: [u8; 48],
+    by_sha: HashMap<[u8; 48], Vec<Constraint>>,
+    /// Legacy `bin_sha = "*"` entries (legacy imports only).
+    any_bin: Vec<Constraint>,
+    /// The verified entries, for listing (`mia app list`).
+    entries: Vec<AllowEntryV2>,
+}
+
+#[derive(Debug, Clone)]
+enum Body {
+    /// Keyed by binary hash; `any_bin` is the binary-side wildcard.
+    V1 {
+        members: HashMap<[u8; 48], UidScope>,
+        any_bin: Option<UidScope>,
+    },
+    V2(V2Index),
+}
+
+/// A verified, in-memory allowlist ready for membership checks.
 ///
-/// Keyed by binary hash: a caller is permitted when its hash is present and the
-/// hash's [`UidScope`] admits the caller's uid. `Any` wins if a hash appears as
-/// both a wildcard and a pinned entry.
-///
-/// `any_bin` captures the binary-side wildcard (`bin_sha = "*"`): when set, its
-/// [`UidScope`] admits a caller regardless of its binary hash. It is folded the
-/// same way as a per-hash scope, so `(uid = None, bin_sha = "*")` becomes
-/// `Any` (admit everyone) while `(uid = Some(n), bin_sha = "*")` admits uid `n`
+/// **v1** is keyed by binary hash: a caller is permitted when its hash is
+/// present and the hash's uid scope admits the caller's uid. `Any` wins if a
+/// hash appears as both a wildcard and a pinned entry. A binary-side wildcard
+/// (`bin_sha = "*"`) is folded the same way, so `(uid = None, bin_sha = "*")`
+/// admits everyone while `(uid = Some(n), bin_sha = "*")` admits uid `n`
 /// running any binary.
+///
+/// **v2** keeps each entry's constraint set; see [`Self::permits_caller`].
 #[derive(Debug, Clone)]
 pub struct Allowlist {
     trust_domain: String,
+    issued_at: i64,
     not_after: i64,
-    members: HashMap<[u8; 48], UidScope>,
-    any_bin: Option<UidScope>,
+    body: Body,
+}
+
+/// A caller as the helper API authenticated it, for [`Allowlist::permits_caller`].
+#[derive(Debug, Clone, Copy)]
+pub struct CallerFacts<'a> {
+    /// Calling uid (Windows: the token user's RID).
+    pub uid: u32,
+    /// `SHA-384` of the calling binary.
+    pub bin_sha: &'a [u8; 48],
+    /// Canonical path of the calling executable, when resolved.
+    pub exe_path: Option<&'a str>,
+    /// Windows: the caller's full user SID, when resolved.
+    pub user_sid: Option<&'a str>,
+}
+
+impl<'a> CallerFacts<'a> {
+    /// The facts of an authenticated caller.
+    #[must_use]
+    pub fn of(id: &'a crate::helper::auth::CallerIdentity) -> Self {
+        Self {
+            uid: id.uid,
+            bin_sha: &id.bin_sha,
+            exe_path: id.exe_path.as_deref(),
+            user_sid: id.user_sid.as_deref(),
+        }
+    }
 }
 
 /// Widen `scope` to also admit `uid` (`None` is the wildcard, subsuming every
@@ -122,7 +194,8 @@ impl From<&UidScope> for RuleUids {
 
 /// One folded rule of a verified allowlist: a binary (or any binary) and the
 /// uids allowed to run it. Several entries for the same binary fold into one
-/// rule, exactly as [`Allowlist::permits`] sees them.
+/// rule, exactly as [`Allowlist::permits`] sees them for v1. For a v2 body
+/// the fold ignores the path, SID and expiry constraints (display only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowRule {
     /// The binary hash the rule pins, or `None` for the any-binary wildcard
@@ -141,8 +214,66 @@ fn scope_admits(scope: Option<&UidScope>, uid: u32) -> bool {
     }
 }
 
+/// Map a v2 verification failure onto the shared error type.
+fn v2_error(e: AllowlistV2Error) -> AllowlistError {
+    match e {
+        AllowlistV2Error::MalformedEntry => AllowlistError::MalformedEntry,
+        AllowlistV2Error::MalformedSignature => AllowlistError::MalformedSignature,
+        AllowlistV2Error::BadSignature => AllowlistError::BadSignature,
+        other => AllowlistError::Cbor(other.to_string()),
+    }
+}
+
+/// The freshness window shared by both formats. The not-before check
+/// tolerates [`ALLOWLIST_NOT_BEFORE_LEEWAY_SECS`] of forward clock skew.
+fn check_window(
+    issued_at: i64,
+    not_after: i64,
+    now: i64,
+    max_age_secs: i64,
+) -> Result<(), AllowlistError> {
+    if now < issued_at - ALLOWLIST_NOT_BEFORE_LEEWAY_SECS {
+        return Err(AllowlistError::NotYetValid);
+    }
+    if now > not_after {
+        return Err(AllowlistError::Expired);
+    }
+    if now - issued_at > max_age_secs {
+        return Err(AllowlistError::TooOld);
+    }
+    Ok(())
+}
+
+/// A lowercase-hex SHA-384 as bytes.
+fn sha_bytes(hex_sha: &str) -> Result<[u8; 48], AllowlistError> {
+    let raw = hex::decode(hex_sha).map_err(|_| AllowlistError::MalformedEntry)?;
+    raw.try_into().map_err(|_| AllowlistError::MalformedEntry)
+}
+
+impl Constraint {
+    /// Whether this constraint set admits `caller` at `now`. `path_hash` and
+    /// `sid_hash` are the caller's hashes, computed at most once per request.
+    fn admits(
+        &self,
+        caller: &CallerFacts<'_>,
+        now: i64,
+        path_hash: &mut impl FnMut() -> Option<[u8; 32]>,
+        sid_hash: &mut impl FnMut() -> Option<[u8; 32]>,
+    ) -> bool {
+        self.uid.is_none_or(|u| u == caller.uid)
+            && self.expires_at.is_none_or(|exp| now < exp)
+            && self.sid_hash.is_none_or(|want| sid_hash() == Some(want))
+            && self.path_hash.is_none_or(|want| path_hash() == Some(want))
+    }
+}
+
+/// Compute `f()` once and remember it.
+fn memo<T: Copy>(slot: &mut Option<T>, f: impl FnOnce() -> T) -> T {
+    *slot.get_or_insert_with(f)
+}
+
 impl Allowlist {
-    /// Verify and load a [`SignedAllowlist`] from its CBOR bytes.
+    /// Verify and load a [`SignedAllowlist`] from its CBOR bytes, v1 or v2.
     ///
     /// `trusted` is the CMIS enrollment public key; `now` is the reference
     /// clock; `max_age_secs` bounds how stale the file may be (`issued_at`).
@@ -150,6 +281,10 @@ impl Allowlist {
     /// [`ALLOWLIST_NOT_BEFORE_LEEWAY_SECS`] of forward clock skew so a freshly
     /// signed allowlist is not spuriously rejected. Any failure is fatal and
     /// fails closed.
+    ///
+    /// A v2 body is accepted on its signature and freshness only; its host
+    /// binding and generation are checked by the caller against what this
+    /// host holds (see [`crate::allowlist_sync`]).
     pub fn load(
         bytes: &[u8],
         trusted: &CompositePublicKey,
@@ -157,22 +292,50 @@ impl Allowlist {
         max_age_secs: i64,
     ) -> Result<Self, AllowlistError> {
         let signed = ferro_svid::allowlist::decode(bytes)?;
-        // Signature is checked before the body is parsed/trusted.
-        let doc = ferro_svid::allowlist::verify(&signed, trusted)?;
+        // Signature is checked before the body is parsed/trusted. A v2 body
+        // is signed under its own context, so it fails the v1 check as a bad
+        // signature and is then tried as v2.
+        match ferro_svid::allowlist::verify(&signed, trusted) {
+            Ok(doc) => Self::from_v1(doc, now, max_age_secs),
+            Err(AllowlistError::BadSignature) => {
+                let doc = allowlist_v2::verify_v2(&signed, trusted).map_err(v2_error)?;
+                Self::from_v2(doc, now, max_age_secs)
+            }
+            Err(e) => Err(e),
+        }
+    }
 
+    /// Verify and load a **v1** body only (the legacy `GetAllowlist` path).
+    pub fn load_v1(
+        bytes: &[u8],
+        trusted: &CompositePublicKey,
+        now: i64,
+        max_age_secs: i64,
+    ) -> Result<Self, AllowlistError> {
+        let signed = ferro_svid::allowlist::decode(bytes)?;
+        let doc = ferro_svid::allowlist::verify(&signed, trusted)?;
+        Self::from_v1(doc, now, max_age_secs)
+    }
+
+    /// Verify and load a **v2** body only (the `SyncAllowlist` path), under
+    /// the v2 signature context.
+    pub fn load_v2(
+        bytes: &[u8],
+        trusted: &CompositePublicKey,
+        now: i64,
+        max_age_secs: i64,
+    ) -> Result<Self, AllowlistError> {
+        let signed = ferro_svid::allowlist::decode(bytes)?;
+        let doc = allowlist_v2::verify_v2(&signed, trusted).map_err(v2_error)?;
+        Self::from_v2(doc, now, max_age_secs)
+    }
+
+    fn from_v1(doc: AllowlistDoc, now: i64, max_age_secs: i64) -> Result<Self, AllowlistError> {
         // Tolerate a small clock skew: CMIS may stamp `issued_at` a fraction
         // of a second ahead of this host's clock, and a strict check would
         // reject the fresh allowlist and fail closed. See
         // `ALLOWLIST_NOT_BEFORE_LEEWAY_SECS`.
-        if now < doc.issued_at - ALLOWLIST_NOT_BEFORE_LEEWAY_SECS {
-            return Err(AllowlistError::NotYetValid);
-        }
-        if now > doc.not_after {
-            return Err(AllowlistError::Expired);
-        }
-        if now - doc.issued_at > max_age_secs {
-            return Err(AllowlistError::TooOld);
-        }
+        check_window(doc.issued_at, doc.not_after, now, max_age_secs)?;
 
         let mut members: HashMap<[u8; 48], UidScope> = HashMap::with_capacity(doc.entries.len());
         let mut any_bin: Option<UidScope> = None;
@@ -186,8 +349,7 @@ impl Allowlist {
                 }
                 continue;
             }
-            let raw = hex::decode(&e.bin_sha).map_err(|_| AllowlistError::MalformedEntry)?;
-            let arr: [u8; 48] = raw.try_into().map_err(|_| AllowlistError::MalformedEntry)?;
+            let arr = sha_bytes(&e.bin_sha)?;
             match members.get_mut(&arr) {
                 Some(scope) => admit(scope, e.uid),
                 None => {
@@ -198,18 +360,108 @@ impl Allowlist {
 
         Ok(Self {
             trust_domain: doc.trust_domain,
+            issued_at: doc.issued_at,
             not_after: doc.not_after,
-            members,
-            any_bin,
+            body: Body::V1 { members, any_bin },
         })
     }
 
-    /// Is the caller `(uid, bin_sha)` permitted? A binary-side wildcard
-    /// (`any_bin`) admits the caller regardless of its hash; otherwise the
-    /// binary hash must be listed and its [`UidScope`] must admit this `uid`.
+    fn from_v2(doc: AllowlistDocV2, now: i64, max_age_secs: i64) -> Result<Self, AllowlistError> {
+        check_window(doc.issued_at, doc.not_after, now, max_age_secs)?;
+        let entries_digest = allowlist_v2::entries_digest(&doc.entries).map_err(v2_error)?;
+        let mut by_sha: HashMap<[u8; 48], Vec<Constraint>> =
+            HashMap::with_capacity(doc.entries.len());
+        let mut any_bin = Vec::new();
+        for e in &doc.entries {
+            let c = Constraint {
+                uid: e.uid,
+                sid_hash: e.user_sid_hash,
+                path_hash: e.path_hash,
+                expires_at: e.expires_at,
+            };
+            if e.bin_sha == BIN_SHA_WILDCARD {
+                any_bin.push(c);
+            } else {
+                by_sha.entry(sha_bytes(&e.bin_sha)?).or_default().push(c);
+            }
+        }
+        Ok(Self {
+            trust_domain: doc.trust_domain,
+            issued_at: doc.issued_at,
+            not_after: doc.not_after,
+            body: Body::V2(V2Index {
+                host_uuid: doc.host_uuid,
+                generation: doc.generation,
+                entries_digest,
+                by_sha,
+                any_bin,
+                entries: doc.entries,
+            }),
+        })
+    }
+
+    /// Is the caller `(uid, bin_sha)` permitted? The v1 check; kept for
+    /// diagnostics. It ignores the hard expiry and, for a v2 body, the entry
+    /// expiry, and an entry with a path or SID constraint admits nobody here
+    /// (fail closed). The helper API decides with [`Self::permits_caller`].
     #[must_use]
     pub fn permits(&self, uid: u32, bin_sha: &[u8; 48]) -> bool {
-        scope_admits(self.any_bin.as_ref(), uid) || scope_admits(self.members.get(bin_sha), uid)
+        let caller = CallerFacts {
+            uid,
+            bin_sha,
+            exe_path: None,
+            user_sid: None,
+        };
+        self.permits_caller(&caller, i64::MIN)
+    }
+
+    /// Is `caller` permitted at `now`? After the hard expiry (`not_after`)
+    /// nobody is (fail closed).
+    ///
+    /// - **v1**: a binary-side wildcard admits the caller regardless of its
+    ///   hash; otherwise the hash must be listed and its uid scope must admit
+    ///   the caller's uid.
+    /// - **v2** (F19 §6.1): some entry with the caller's hash (or `"*"`) whose
+    ///   `uid` is absent or equal, `user_sid_hash` absent or equal to the hash
+    ///   of the caller's SID, `path_hash` absent or equal to the hash of the
+    ///   caller's canonical path, and `expires_at` absent or after `now`. A
+    ///   constraint the caller cannot be checked against (no path, no SID)
+    ///   does not match.
+    #[must_use]
+    pub fn permits_caller(&self, caller: &CallerFacts<'_>, now: i64) -> bool {
+        if now > self.not_after {
+            return false;
+        }
+        match &self.body {
+            Body::V1 { members, any_bin } => {
+                scope_admits(any_bin.as_ref(), caller.uid)
+                    || scope_admits(members.get(caller.bin_sha), caller.uid)
+            }
+            Body::V2(ix) => {
+                let (mut path_slot, mut sid_slot) = (None, None);
+                let mut path_hash = || {
+                    memo(&mut path_slot, || {
+                        let path = caller.exe_path?;
+                        let key =
+                            ferro_appid::path_key(ferro_appid::Platform::current(), path).ok()?;
+                        Some(allowlist_v2::path_hash(&ix.host_uuid, &key))
+                    })
+                };
+                let mut sid_hash = || {
+                    memo(&mut sid_slot, || {
+                        caller
+                            .user_sid
+                            .map(|sid| allowlist_v2::sid_hash(&ix.host_uuid, sid))
+                    })
+                };
+                ix.by_sha
+                    .get(caller.bin_sha)
+                    .into_iter()
+                    .flatten()
+                    .chain(&ix.any_bin)
+                    .any(|c| c.admits(caller, now, &mut path_hash, &mut sid_hash))
+            }
+        }
     }
 
     /// The trust domain the allowlist was issued for.
@@ -218,29 +470,106 @@ impl Allowlist {
         &self.trust_domain
     }
 
+    /// Issuance time, Unix seconds.
+    #[must_use]
+    pub fn issued_at(&self) -> i64 {
+        self.issued_at
+    }
+
     /// Hard expiry of the allowlist, Unix seconds.
     #[must_use]
     pub fn not_after(&self) -> i64 {
         self.not_after
     }
 
-    /// Number of distinct entries (binary hashes, plus one for a binary-side
-    /// wildcard) — a count for status reporting, never the entries themselves.
+    /// The signed format: 1 or 2.
+    #[must_use]
+    pub fn format(&self) -> u32 {
+        match self.body {
+            Body::V1 { .. } => 1,
+            Body::V2(_) => ALLOWLIST_V2_FORMAT,
+        }
+    }
+
+    /// A v2 body's host UUID (`None` for v1).
+    #[must_use]
+    pub fn host_uuid(&self) -> Option<&str> {
+        match &self.body {
+            Body::V1 { .. } => None,
+            Body::V2(ix) => Some(&ix.host_uuid),
+        }
+    }
+
+    /// A v2 body's generation (`None` for v1).
+    #[must_use]
+    pub fn generation(&self) -> Option<u64> {
+        match &self.body {
+            Body::V1 { .. } => None,
+            Body::V2(ix) => Some(ix.generation),
+        }
+    }
+
+    /// A v2 body's `entries_digest` (`None` for v1).
+    #[must_use]
+    pub fn entries_digest(&self) -> Option<[u8; 48]> {
+        match &self.body {
+            Body::V1 { .. } => None,
+            Body::V2(ix) => Some(ix.entries_digest),
+        }
+    }
+
+    /// A v2 body's verified entries, for listing (`None` for v1).
+    #[must_use]
+    pub fn entries_v2(&self) -> Option<&[AllowEntryV2]> {
+        match &self.body {
+            Body::V1 { .. } => None,
+            Body::V2(ix) => Some(&ix.entries),
+        }
+    }
+
+    /// Number of distinct entries — v1: binary hashes, plus one for a
+    /// binary-side wildcard; v2: entries — a count for status reporting,
+    /// never the entries themselves.
     #[must_use]
     pub fn entry_count(&self) -> usize {
-        self.members.len() + usize::from(self.any_bin.is_some())
+        match &self.body {
+            Body::V1 { members, any_bin } => members.len() + usize::from(any_bin.is_some()),
+            Body::V2(ix) => ix.entries.len(),
+        }
     }
 
     /// The folded rules this allowlist enforces: the any-binary wildcard (if
     /// any) first, then one rule per pinned binary hash in ascending hash
     /// order. A read-only view for operator diagnostics (`mia
-    /// allowlist-diagnose`); the helper API decides with [`Self::permits`],
-    /// which admits a caller exactly when some rule's binary is the caller's
-    /// (or the wildcard) and its [`RuleUids`] admits the caller's uid.
+    /// allowlist-diagnose`); the helper API decides with
+    /// [`Self::permits_caller`].
     #[must_use]
     pub fn rules(&self) -> Vec<AllowRule> {
-        let mut pinned: Vec<AllowRule> = self
-            .members
+        let (members, any_bin) = match &self.body {
+            Body::V1 { members, any_bin } => (members.clone(), any_bin.clone()),
+            Body::V2(ix) => {
+                let fold = |cs: &[Constraint], scope: &mut Option<UidScope>| {
+                    for c in cs {
+                        match scope {
+                            Some(s) => admit(s, c.uid),
+                            None => *scope = Some(seed(c.uid)),
+                        }
+                    }
+                };
+                let mut members = HashMap::new();
+                for (sha, cs) in &ix.by_sha {
+                    let mut scope = None;
+                    fold(cs, &mut scope);
+                    if let Some(scope) = scope {
+                        members.insert(*sha, scope);
+                    }
+                }
+                let mut any_bin = None;
+                fold(&ix.any_bin, &mut any_bin);
+                (members, any_bin)
+            }
+        };
+        let mut pinned: Vec<AllowRule> = members
             .iter()
             .map(|(sha, scope)| AllowRule {
                 bin_sha: Some(*sha),
@@ -248,7 +577,7 @@ impl Allowlist {
             })
             .collect();
         pinned.sort_unstable_by_key(|rule| rule.bin_sha);
-        self.any_bin
+        any_bin
             .as_ref()
             .map(|scope| AllowRule {
                 bin_sha: None,
@@ -733,13 +1062,8 @@ mod tests {
         let al = Allowlist::load(&bytes, &pk, 999, 86_400).unwrap();
         assert!(al.permits(1001, &[0xAA; 48]));
         // At exactly the leeway boundary it is still accepted.
-        let al = Allowlist::load(
-            &bytes,
-            &pk,
-            1000 - ALLOWLIST_NOT_BEFORE_LEEWAY_SECS,
-            86_400,
-        )
-        .unwrap();
+        let al =
+            Allowlist::load(&bytes, &pk, 1000 - ALLOWLIST_NOT_BEFORE_LEEWAY_SECS, 86_400).unwrap();
         assert!(al.permits(1001, &[0xAA; 48]));
     }
 
@@ -977,5 +1301,167 @@ mod tests {
         assert!(al.is_none());
         assert_eq!(outcome, AllowlistLoad::Missing);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── v2 (F19 §6.1) ───────────────────────────────────────────────────────
+
+    const HOST: &str = "1b4e28ba-2fa1-4d2a-883f-0016d3cca427";
+    const PATH: &str = "/opt/tool/bin/tool";
+
+    fn v2_entry(sha: u8) -> AllowEntryV2 {
+        AllowEntryV2 {
+            approval_id: [sha; 16],
+            bin_sha: hex::encode([sha; 48]),
+            uid: None,
+            user_sid_hash: None,
+            path_hash: None,
+            expires_at: None,
+        }
+    }
+
+    fn v2_bytes(entries: Vec<AllowEntryV2>, now: i64, sk: &CompositeSecretKey) -> Vec<u8> {
+        let doc = AllowlistDocV2 {
+            format: ALLOWLIST_V2_FORMAT,
+            trust_domain: "ferrogate.test".into(),
+            host_uuid: HOST.into(),
+            generation: 7,
+            issued_at: now,
+            not_after: now + 3600,
+            entries,
+        };
+        encode(&allowlist_v2::sign_v2(&doc, sk).unwrap()).unwrap()
+    }
+
+    fn path_hash_of(path: &str) -> [u8; 32] {
+        let key = ferro_appid::path_key(ferro_appid::Platform::current(), path).unwrap();
+        allowlist_v2::path_hash(HOST, &key)
+    }
+
+    fn caller<'a>(
+        uid: u32,
+        sha: &'a [u8; 48],
+        path: Option<&'a str>,
+        sid: Option<&'a str>,
+    ) -> CallerFacts<'a> {
+        CallerFacts {
+            uid,
+            bin_sha: sha,
+            exe_path: path,
+            user_sid: sid,
+        }
+    }
+
+    #[test]
+    fn v2_loads_under_its_own_context_and_carries_its_binding() {
+        let (sk, pk) = keypair();
+        let al = Allowlist::load(
+            &v2_bytes(vec![v2_entry(0xAA)], 1000, &sk),
+            &pk,
+            1000,
+            86_400,
+        )
+        .unwrap();
+        assert_eq!(al.format(), 2);
+        assert_eq!(al.host_uuid(), Some(HOST));
+        assert_eq!(al.generation(), Some(7));
+        assert_eq!(
+            al.entries_digest(),
+            Some(allowlist_v2::entries_digest(&[v2_entry(0xAA)]).unwrap())
+        );
+        assert_eq!(al.entry_count(), 1);
+        assert!(al.permits_caller(&caller(5, &[0xAA; 48], None, None), 1000));
+        // `load_v1` refuses a v2 body (wrong context) and `load_v2` a v1 one.
+        let v2 = v2_bytes(vec![v2_entry(0xAA)], 1000, &sk);
+        assert!(matches!(
+            Allowlist::load_v1(&v2, &pk, 1000, 86_400),
+            Err(AllowlistError::BadSignature)
+        ));
+        let v1 = signed_bytes(&doc(1000), &sk);
+        assert!(matches!(
+            Allowlist::load_v2(&v1, &pk, 1000, 86_400),
+            Err(AllowlistError::BadSignature)
+        ));
+        // Another key verifies neither.
+        let (_, other) = keypair();
+        assert!(Allowlist::load(&v2, &other, 1000, 86_400).is_err());
+    }
+
+    #[test]
+    fn v2_matcher_checks_uid_path_sid_and_expiry() {
+        let (sk, pk) = keypair();
+        let sid = "S-1-5-21-1-2-3-1001";
+        let entries = vec![
+            // 0xA1: uid 1001 at PATH only.
+            AllowEntryV2 {
+                uid: Some(1001),
+                path_hash: Some(path_hash_of(PATH)),
+                ..v2_entry(0xA1)
+            },
+            // 0xA2: one Windows user (by SID), any path.
+            AllowEntryV2 {
+                user_sid_hash: Some(allowlist_v2::sid_hash(HOST, sid)),
+                ..v2_entry(0xA2)
+            },
+            // 0xA3: anyone until t = 1500.
+            AllowEntryV2 {
+                expires_at: Some(1500),
+                ..v2_entry(0xA3)
+            },
+        ];
+        let al = Allowlist::load(&v2_bytes(entries, 1000, &sk), &pk, 1000, 86_400).unwrap();
+        let a1 = [0xA1; 48];
+        assert!(al.permits_caller(&caller(1001, &a1, Some(PATH), None), 1000));
+        // Path mismatch, unknown path, uid mismatch, unknown hash.
+        assert!(!al.permits_caller(&caller(1001, &a1, Some("/tmp/tool"), None), 1000));
+        assert!(!al.permits_caller(&caller(1001, &a1, None, None), 1000));
+        assert!(!al.permits_caller(&caller(1002, &a1, Some(PATH), None), 1000));
+        assert!(!al.permits_caller(&caller(1001, &[0xEE; 48], Some(PATH), None), 1000));
+        // SID: equal (case-insensitive, as `sid_hash` upper-cases), other, none.
+        let a2 = [0xA2; 48];
+        assert!(al.permits_caller(&caller(7, &a2, None, Some(sid)), 1000));
+        assert!(al.permits_caller(&caller(7, &a2, None, Some(&sid.to_lowercase())), 1000));
+        assert!(!al.permits_caller(&caller(7, &a2, None, Some("S-1-5-21-9-9-9-1001")), 1000));
+        assert!(!al.permits_caller(&caller(7, &a2, None, None), 1000));
+        // Expiry is enforced on every check, before the document's not_after.
+        let a3 = [0xA3; 48];
+        assert!(al.permits_caller(&caller(7, &a3, None, None), 1499));
+        assert!(!al.permits_caller(&caller(7, &a3, None, None), 1500));
+        // The legacy `permits` fails closed on path and SID constraints.
+        assert!(!al.permits(1001, &a1));
+        assert!(!al.permits(7, &a2));
+    }
+
+    #[test]
+    fn v2_legacy_wildcards_and_the_hard_expiry() {
+        let (sk, pk) = keypair();
+        let entries = vec![AllowEntryV2 {
+            approval_id: [0; 16],
+            bin_sha: BIN_SHA_WILDCARD.into(),
+            uid: Some(42),
+            user_sid_hash: None,
+            path_hash: None,
+            expires_at: None,
+        }];
+        let al = Allowlist::load(&v2_bytes(entries, 1000, &sk), &pk, 1000, 86_400).unwrap();
+        assert!(al.permits_caller(&caller(42, &[0x01; 48], None, None), 1000));
+        assert!(!al.permits_caller(&caller(43, &[0x01; 48], None, None), 1000));
+        // After not_after nobody is admitted, whatever the entries say.
+        assert!(!al.permits_caller(&caller(42, &[0x01; 48], None, None), 1000 + 3601));
+        assert_eq!(
+            al.rules(),
+            vec![AllowRule {
+                bin_sha: None,
+                uids: RuleUids::Only(vec![42])
+            }]
+        );
+    }
+
+    #[test]
+    fn v1_bodies_also_stop_admitting_after_not_after() {
+        let (sk, pk) = keypair();
+        let al = Allowlist::load(&signed_bytes(&doc(1000), &sk), &pk, 1000, 86_400).unwrap();
+        let facts = caller(1001, &[0xAA; 48], None, None);
+        assert!(al.permits_caller(&facts, 4600));
+        assert!(!al.permits_caller(&facts, 4601));
     }
 }

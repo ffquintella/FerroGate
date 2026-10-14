@@ -67,12 +67,7 @@ const APP_BIN: [u8; 48] = [0xAB; 48];
 const APP_UID: u32 = 1001;
 
 fn id(uid: u32, bin: [u8; 48]) -> CallerIdentity {
-    CallerIdentity {
-        pid: 4321,
-        uid,
-        gid: uid,
-        bin_sha: bin,
-    }
+    CallerIdentity::new(4321, uid, uid, bin)
 }
 
 fn minter() -> ChildTokenMinter {

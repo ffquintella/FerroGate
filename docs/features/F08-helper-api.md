@@ -43,7 +43,12 @@ See [../helper-api.md](../helper-api.md).
 Implemented in `crates/mia/src/helper/`:
 
 - `proto` — CBOR request/response types and length-delimited framing
-  (4-byte big-endian length, bounded by `MAX_FRAME_LEN`).
+  (4-byte big-endian length, bounded by `MAX_FRAME_LEN`). The types live in
+  `crates/mia-helper-proto`, shared with the Rust SDK's `helper-client`
+  feature. Since 0.29 the socket also accepts the F19 **protocol v2**
+  envelope `{v: 2, op}` (`Token`, `RegisterSelf`, `RegisterFile` with an
+  `SCM_RIGHTS` descriptor, `RequestStatus`); a frame without `v` is still the
+  v1 request. See [helper-api.md](../helper-api.md#protocol-v2-app-registration-f19).
 - `auth` — the `CallerAuth` trait plus the pure `cross_check_ima` parser; the
   Linux `ImaCallerAuth` (`SO_PEERCRED` + IMA) is compiled only on Linux while
   the trait, identity type, and cross-check logic are portable and unit-tested

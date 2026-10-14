@@ -13,6 +13,8 @@
 //!   Linux; the Windows authenticator lives in the `ferro-winauth` crate).
 //! - [`allowlist`] — the signed, fail-closed caller allowlist.
 //! - [`token`] — the DPoP-bound child-token minter (feature F09).
+//! - [`exe_path`] — canonical executable paths resolved by the OS from an
+//!   open file or a running process (feature F19 §4.2).
 //! - [`server`] — the transport-agnostic request pipeline plus the UDS
 //!   (Unix) and Named Pipe (Windows) listeners.
 //! - [`socket_dir`] — which group the Unix socket and its directory get, and
@@ -21,6 +23,7 @@
 pub mod allowlist;
 pub mod auth;
 pub mod crl;
+pub mod exe_path;
 pub mod ledger;
 pub mod proto;
 pub mod socket_dir;
@@ -39,5 +42,5 @@ pub use token::{ChildTokenMinter, MintedToken, MinterConfig, MAX_CHILD_TTL_SECS}
 #[cfg(any(unix, windows))]
 pub use server::{
     system_clock, AllowlistReloader, Clock, HelperServer, HelperServerConfig, MinterReloader,
-    ServerError,
+    RegistrationHandler, ServerError,
 };

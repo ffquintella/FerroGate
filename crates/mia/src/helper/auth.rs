@@ -36,16 +36,48 @@ pub struct PeerCred {
 }
 
 /// A caller identity established from kernel-attested sources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallerIdentity {
     /// Calling process id.
     pub pid: u32,
-    /// Calling user id.
+    /// Calling user id (the token user's RID on Windows).
     pub uid: u32,
     /// Calling group id.
     pub gid: u32,
     /// IMA-verified `SHA-384` of the calling binary.
     pub bin_sha: [u8; 48],
+    /// Canonical path of the calling executable (F19 §4.2), as the kernel
+    /// resolved it: `/proc/<pid>/exe` without a ` (deleted)` suffix on Linux,
+    /// the on-disk form of the opened image on macOS, the final path name on
+    /// Windows. `None` when the platform could not resolve a valid one; an
+    /// allowlist v2 entry with a path constraint then admits nobody (fail
+    /// closed).
+    pub exe_path: Option<String>,
+    /// **Windows.** The caller's full user SID (`S-1-5-…`), for allowlist v2
+    /// SID constraints. `None` elsewhere, or when it could not be read.
+    pub user_sid: Option<String>,
+}
+
+impl CallerIdentity {
+    /// An identity with no resolved path or SID.
+    #[must_use]
+    pub const fn new(pid: u32, uid: u32, gid: u32, bin_sha: [u8; 48]) -> Self {
+        Self {
+            pid,
+            uid,
+            gid,
+            bin_sha,
+            exe_path: None,
+            user_sid: None,
+        }
+    }
+
+    /// The same identity with `exe_path` set.
+    #[must_use]
+    pub fn with_exe_path(mut self, exe_path: impl Into<String>) -> Self {
+        self.exe_path = Some(exe_path.into());
+        self
+    }
 }
 
 /// Why caller authentication failed. Each variant maps to a stable opcode for
@@ -285,6 +317,15 @@ mod windows_auth {
                 .map_err(|_| AuthError::ImageUnreadable { partial })?;
             let bytes = std::fs::read(&path).map_err(|_| AuthError::ImageUnreadable { partial })?;
             let bin_sha = bin_sha384(&bytes);
+            // `canonicalize` opens the image and asks for its final path name
+            // (`GetFinalPathNameByHandleW`), which expands 8.3 names; the
+            // F19 rules then strip `\\?\` and map `\\?\UNC\` to `\\`.
+            let exe_path = std::fs::canonicalize(&path)
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .and_then(|p| ferro_appid::path::from_windows_final_path(&p).ok())
+                .map(|c| c.path);
+            let user_sid = ferro_winauth::process_user_sid(pid).ok();
 
             let uid = ferro_winauth::process_user_rid(pid)
                 .map_err(|_| AuthError::ImageUnreadable { partial })?;
@@ -303,6 +344,8 @@ mod windows_auth {
                 uid,
                 gid: 0, // not meaningful on Windows
                 bin_sha,
+                exe_path,
+                user_sid,
             })
         }
     }
@@ -352,14 +395,23 @@ mod macos_auth {
 
             let path = libproc::proc_pid::pidpath(pid_i32)
                 .map_err(|_| AuthError::ExeUnreadable { partial })?;
-            let bytes = std::fs::read(&path).map_err(|_| AuthError::ExeUnreadable { partial })?;
+            // Hash and canonical path come from one open file, so they
+            // describe the same image (F19 §4.1).
+            let mut file =
+                std::fs::File::open(&path).map_err(|_| AuthError::ExeUnreadable { partial })?;
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)
+                .map_err(|_| AuthError::ExeUnreadable { partial })?;
             let bin_sha = bin_sha384(&bytes);
+            let exe_path = crate::helper::exe_path::macos_canonical(&file);
 
             Ok(CallerIdentity {
                 pid,
                 uid: cred.uid,
                 gid: cred.gid,
                 bin_sha,
+                exe_path,
+                user_sid: None,
             })
         }
     }
@@ -443,6 +495,11 @@ mod linux {
                 .to_str()
                 .ok_or(AuthError::ExeUnreadable { partial })?
                 .to_string();
+            // The F19 §4.2 canonical form: ` (deleted)` stripped, so a process
+            // still running after an upgrade keeps matching by path.
+            let canonical = ferro_appid::path::from_linux_link(exe_path_str.as_bytes())
+                .ok()
+                .map(|c| c.path);
             // Read through the /proc/<pid>/exe handle so we hash the bytes the
             // running process was loaded from, even if the on-disk name moved.
             let contents =
@@ -457,6 +514,8 @@ mod linux {
                     uid,
                     gid,
                     bin_sha: disk_sha,
+                    exe_path: canonical,
+                    user_sid: None,
                 });
             }
 
@@ -469,6 +528,8 @@ mod linux {
                     uid,
                     gid,
                     bin_sha,
+                    exe_path: canonical,
+                    user_sid: None,
                 }),
                 Err(MismatchOutcome::Mismatch) => Err(AuthError::ImaMismatch { partial }),
                 Err(MismatchOutcome::Missing) => Err(AuthError::ImaMissingEntry { partial }),
@@ -513,7 +574,10 @@ mod tests {
             .identify(cred)
             .expect("without_ima identify should succeed with no IMA log");
         assert_eq!(id.pid, std::process::id());
-        assert_ne!(id.bin_sha, [0u8; 48], "bin_sha must be the real binary hash");
+        assert_ne!(
+            id.bin_sha, [0u8; 48],
+            "bin_sha must be the real binary hash"
+        );
     }
 
     #[test]

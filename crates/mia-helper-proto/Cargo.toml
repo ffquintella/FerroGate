@@ -1,0 +1,23 @@
+[package]
+name        = "mia-helper-proto"
+description = "FerroGate — MIA helper-API wire types (features F08, F19): token requests and the v2 registration envelope"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish                = false
+
+# Deliberately tiny, like `mia-status-proto`: the Rust SDK's helper client and
+# the `mia` daemon share these types, so an application never depends on the
+# daemon crate (TPM stack, gRPC client, key handling). Keep it that way — no
+# runtime, no crypto, no I/O beyond `std::io::{Read, Write}` framing.
+
+[lints]
+workspace = true
+
+[dependencies]
+serde     = { workspace = true }
+ciborium  = { workspace = true }
+thiserror = { workspace = true }

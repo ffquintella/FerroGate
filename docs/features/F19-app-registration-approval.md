@@ -4,9 +4,13 @@
 > end-to-end sequence: [app-approval-and-admin.md](../app-approval-and-admin.md).
 > Admin authentication used by every admin RPC below: [F20](F20-admin-authentication.md).
 >
-> **Status (M37 wave B, 0.29.0):** CMIS side implemented — host RPCs, auto-update,
-> admin operations, allowlist v2 compile/serve and sweepers (T265–T268, T271).
-> Not yet: the MIA sync loop, helper v2 and `mia app` (T269, T270), the legacy
+> **Status (M37, 0.29.0):** CMIS side implemented — host RPCs, auto-update,
+> admin operations, allowlist v2 compile/serve and sweepers (T265–T268, T271);
+> MIA side implemented — the sync loop with the v2 matcher, helper protocol v2,
+> the `registration` service with its ledger and outbox, `mia app`, and the
+> SDK `helper-client` feature (T269, T270). Not yet: the tray items, Windows
+> `RegisterFile` (impersonated open) and signer summaries, the macOS ACL and
+> Windows DACL checks behind `path_protected`, the legacy
 > import and mode switch (M38), `ListHosts`, stored-response idempotency for
 > admin edits (retries are refused by state instead), PII pseudonymisation
 > after retention, and signing restricted to the leader (any node signs with

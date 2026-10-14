@@ -195,6 +195,62 @@ The third-party verifier (an API gateway, sidecar, …) validates:
 3. The `cnf.jkt` matches the DPoP proof presented alongside.
 4. Application-level policy on `actor_bin` and `actor_uid`.
 
+## Protocol v2: app registration (F19)
+
+Since 0.29 the socket also carries a v2 envelope, `{v: 2, op}` (types in
+`crates/mia-helper-proto`, shared with the Rust SDK's `helper-client`
+feature). A frame without `v` is still read as the v1 `HelperReq` above, so
+old clients keep working; an agent older than v2 drops a v2 frame without a
+reply (clients report "agent too old").
+
+```rust
+struct HelperFrame { v: u8 /* 2 */, op: HelperOp }      // deny_unknown_fields
+enum HelperOp {                                          // tagged by "kind"
+    Token { audience, dpop_jkt, ttl_secs },              // v1 semantics → HelperResp
+    RegisterSelf  { client_request_id: [u8; 16], reason: Option<String> },
+    RegisterFile  { client_request_id: [u8; 16], path: String,
+                    for_user: Option<UserSel>, reason: Option<String> },
+    RequestStatus { request_ids: Vec<[u8; 16]> },        // ≤ 50; empty = all own
+}
+enum RegistrationResp {
+    Submitted { request_id, local_id, state, revision, approval_id, retry_after },
+    AlreadyApproved { approval_id },
+    Status(Vec<LocalRequestStatus>),
+    Error { code: RegErrorCode, retry_after },
+}
+// LocalState: queued | pending | approved | auto_approved | denied | expired | refused
+```
+
+- **Caller identity** is established exactly as for tokens (kernel peer
+  credentials, IMA on Linux); `CallerIdentity` now also carries the
+  kernel-resolved canonical `exe_path` and, on Windows, the full `user_sid`.
+- **`RegisterSelf`** identifies the caller's running image from one open file
+  (Linux `/proc/<pid>/exe`) with `ferro-appid` — never executed — and refuses
+  it unless its SHA-384 equals the authenticated caller hash.
+- **`RegisterFile`** (`mia app register --exe`, the tray): the client opens the
+  file itself and passes the descriptor with `SCM_RIGHTS`; the daemon refuses
+  an `O_PATH` or write-only descriptor and anything that is not a regular file
+  with an execute bit, and hashes only that descriptor, so it is no hash
+  oracle for files the user cannot read. `for_user` needs root. Not offered on
+  Windows yet (it needs the impersonated open in `ferro-winauth`).
+- **Limits:** 10 requests per uid and 60 per host per hour, two concurrent
+  hashes, `registration.max_file_size_mib`, frames ≤ 64 KiB, reason ≤ 200
+  characters, unknown fields rejected.
+- **`RequestStatus`** answers only the caller's own requests (all for root).
+  A token refusal stays non-informative.
+
+The daemon signs each request with the host machine key
+(`ferrogate-app-request-v1`) and submits it to CMIS `SubmitAppRequest` with a
+daemon-generated `client_request_id` (never the caller's). What cannot be
+submitted — CMIS unreachable, no host SVID yet, CMIS still in legacy allowlist
+mode (`mode_legacy`), `rate_limited` — stays `queued` in the local ledger
+(`app-requests.cbor`, `0600`, terminal entries kept 30 days) and is retried on
+every allowlist-sync tick, which also polls pending requests. An approval that
+names a newer allowlist generation wakes the sync at once, so the app can
+retry its token after `retry_after` seconds. CMIS audits every request
+(`AppRequestSubmitted`, …); registration operations emit no
+`LocalGrant`/`LocalDenied`.
+
 ## Why DPoP
 
 A pure bearer token can be stolen and replayed by anyone who reads it once.

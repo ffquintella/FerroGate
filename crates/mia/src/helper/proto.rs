@@ -4,69 +4,23 @@
 //! `docs/helper-api.md`). Each message is a single CBOR value preceded by a
 //! 4-byte big-endian length. The length is bounded by [`MAX_FRAME_LEN`] so a
 //! hostile or buggy client cannot make the MIA allocate without limit.
+//!
+//! The message types — the v1 token request and the v2 envelope with the F19
+//! registration operations — live in the `mia-helper-proto` crate and are
+//! re-exported here; this module adds the async (tokio) framing the daemon
+//! uses.
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Largest frame the server will read or write, in bytes. Requests are tiny;
-/// a minted child token is a few KiB of composite signature, so 64 KiB is
-/// generous while still bounding per-connection memory.
-pub const MAX_FRAME_LEN: usize = 64 * 1024;
-
-/// A token request from a local caller.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HelperReq {
-    /// Target audience the token is minted for, e.g. `https://api.example.com`.
-    pub audience: String,
-    /// Base64url SHA-256 thumbprint of the caller's DPoP public JWK.
-    pub dpop_jkt: String,
-    /// Requested lifetime in seconds; clamped server-side to
-    /// [`crate::helper::token::MAX_CHILD_TTL_SECS`].
-    pub ttl_secs: u32,
-}
-
-/// A minted child token plus the metadata a caller needs to schedule renewal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChildToken {
-    /// The compact JWS child token.
-    pub jws: String,
-    /// Expiry, Unix seconds.
-    pub exp: i64,
-}
-
-/// Stable refusal opcodes. These are a closed set — never caller input — so
-/// the channel exposes no oracle surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    /// Caller failed authentication or is not on the allowlist.
-    PermissionDenied,
-    /// The MIA holds no valid host SVID, so it cannot mint.
-    NoHostSvid,
-    /// The cached CRL is missing or stale (> 5 min), so the MIA fails closed
-    /// and refuses to mint until a fresh CRL is pulled (feature F11).
-    CrlStale,
-    /// The request was malformed (bad fields).
-    MalformedRequest,
-    /// The server is shedding load; retry later.
-    RateLimited,
-    /// An unexpected internal error.
-    Internal,
-}
-
-/// The server's reply to a [`HelperReq`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HelperResp {
-    /// A successfully minted token.
-    Token(ChildToken),
-    /// A refusal, optionally with a retry hint (seconds).
-    Error {
-        /// The refusal opcode.
-        code: ErrorCode,
-        /// Suggested seconds to wait before retrying, if applicable.
-        retry_after: Option<u32>,
-    },
-}
+// The wire types are shared with the Rust SDK's helper client through the
+// tiny `mia-helper-proto` crate, so an application never depends on the
+// daemon crate. They are re-exported here unchanged.
+pub use mia_helper_proto::{
+    decode_request, format_id, parse_id, ChildToken, ErrorCode, HelperFrame, HelperOp, HelperReq,
+    HelperResp, LocalRequestStatus, LocalState, ProtoError, RegErrorCode, RegistrationResp,
+    Request, UserSel, ID_LEN, MAX_FRAME_LEN, PROTOCOL_V2,
+};
 
 /// Framing / codec failures.
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +63,16 @@ where
     R: AsyncReadExt + Unpin,
     T: for<'de> Deserialize<'de>,
 {
+    let body = read_frame_bytes(r).await?;
+    ciborium::from_reader(&body[..]).map_err(|e| FrameError::Decode(e.to_string()))
+}
+
+/// Read one length-delimited frame body without decoding it (the server
+/// decodes it with [`decode_request`], which tells v1 from v2).
+pub async fn read_frame_bytes<R>(r: &mut R) -> Result<Vec<u8>, FrameError>
+where
+    R: AsyncReadExt + Unpin,
+{
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -117,7 +81,7 @@ where
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    ciborium::from_reader(&body[..]).map_err(|e| FrameError::Decode(e.to_string()))
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -147,6 +111,14 @@ mod tests {
         write_frame(&mut buf, &resp).await.unwrap();
         let back: HelperResp = read_frame(&mut &buf[..]).await.unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn the_shared_default_endpoint_is_the_daemon_default() {
+        assert_eq!(
+            std::path::Path::new(mia_helper_proto::DEFAULT_ENDPOINT),
+            crate::config::default_helper_socket(None)
+        );
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@ SDK_CRATES=(
   ferro-child-verify
   ferro-svid
   ferro-attest
+  mia-helper-proto
   ferrogate-sdk-rust
 )
 
@@ -133,6 +134,7 @@ crates needed to integrate with FerroGate:
 | \`ferro-svid-verify\`  | Reference verifier for composite-signed JWS SVIDs. |
 | \`ferro-child-verify\` | Reference verifier for DPoP-bound composite-signed child tokens. |
 | \`ferro-attest\`       | TPM 2.0 attestation verification. |
+| \`mia-helper-proto\`   | MIA helper-API wire types (the SDK's \`helper-client\` feature). |
 | \`ferro-sep\`          | Machine signing key for the TPM-less host-key profile (\`ferro-attest\` dependency). |
 | \`ferro-machineid\`    | Stable hardware fingerprint for the TPM-less host-key profile (\`ferro-attest\` dependency). |
 | \`ferro-crypto\`       | Hybrid post-quantum cryptographic primitives (shared dependency). |

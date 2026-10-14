@@ -4,6 +4,7 @@ members = [
     "crates/cmis",
     "crates/mia",
     "crates/mia-status-proto",
+    "crates/mia-helper-proto",
     "crates/mia-tray",
     "crates/ferro-crypto",
     "crates/ferro-transport",

@@ -15,8 +15,8 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::{mpsc, Semaphore};
 
 use super::{
-    serve_connection, AllowlistReloader, Clock, HelperServerConfig, MinterReloader, ServerError,
-    Shared,
+    serve_connection, AllowlistReloader, Clock, HelperServerConfig, MinterReloader,
+    RegistrationHandler, ServerError, Shared,
 };
 use crate::helper::allowlist::Allowlist;
 use crate::helper::auth::{AuthError, CallerAuth, PeerCred};
@@ -78,6 +78,14 @@ impl<A: CallerAuth> HelperServer<A> {
     pub fn minter_reloader(&self) -> MinterReloader<A> {
         MinterReloader {
             shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// Install the F19 registration handler (once, before serving). Without
+    /// one, registration operations answer `registration_disabled`.
+    pub fn set_registration(&self, handler: Arc<dyn RegistrationHandler>) {
+        if self.shared.registration.set(handler).is_err() {
+            tracing::warn!("registration handler already installed; keeping the first");
         }
     }
 

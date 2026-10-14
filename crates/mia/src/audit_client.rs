@@ -59,6 +59,24 @@ pub struct HostProofSigner<'a> {
     pub host_uuid: &'a str,
 }
 
+/// The F19 §7.1 host proof over `doc` under signing `context`: the SVID, the
+/// machine key's DER SPKI (CMIS checks it against the SVID's `cnf.jkt`) and
+/// the machine-key signature over `context ‖ doc`. Every host-authenticated
+/// call — audit forwarding, app requests, status, allowlist sync — is signed
+/// here, each under its own context.
+pub fn host_call_auth(
+    signer: &HostProofSigner<'_>,
+    context: &[u8],
+    doc: &[u8],
+) -> Result<HostCallAuth, ferro_sep::SepError> {
+    let sig = signer.key.sign(&host_call::signing_input(context, doc))?;
+    Ok(HostCallAuth {
+        svid_jws: signer.svid_jws.to_string(),
+        sep_pub: signer.key.public_spki_der(),
+        sig,
+    })
+}
+
 /// Build the host-signed `AppendAuditEvent` request for `event_cbor`, issued
 /// at `issued_at` with `nonce`. [`forward`] calls it with the current time and
 /// a fresh random nonce; it is public so the proof can be checked offline.
@@ -70,16 +88,10 @@ pub fn signed_request(
 ) -> Result<AppendAuditRequest, AuditForwardError> {
     let doc = AuditForwardDoc::new(signer.host_uuid, issued_at, nonce, &event_cbor);
     let doc = host_call::encode_audit_forward(&doc)?;
-    let sig = signer
-        .key
-        .sign(&host_call::signing_input(AUDIT_FORWARD_CONTEXT, &doc))?;
+    let auth = host_call_auth(signer, AUDIT_FORWARD_CONTEXT, &doc)?;
     Ok(AppendAuditRequest {
         event_cbor,
-        auth: Some(HostCallAuth {
-            svid_jws: signer.svid_jws.to_string(),
-            sep_pub: signer.key.public_spki_der(),
-            sig,
-        }),
+        auth: Some(auth),
         doc,
     })
 }

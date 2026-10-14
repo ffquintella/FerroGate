@@ -119,6 +119,12 @@ fn main() -> anyhow::Result<()> {
         // running agent (SIGHUP) to re-read its config + allowlist, then exits.
         Some("--reload") => return mia::resync::run_reload(&args[1..]),
         Some("test") => return mia::selftest::run(&args[1..]),
+        // Application registration (feature F19): `register` and `status` talk
+        // to the running agent over the helper socket as the invoking user;
+        // `list` reads the verified allowlist. Exit: 0 approved, 3 pending or
+        // queued, 4 denied, 1 error, 2 usage.
+        #[cfg(any(unix, windows))]
+        Some("app") => std::process::exit(mia::app_cli::run(&args[1..])),
         // Read the running agent's status endpoint (feature F18). Exits with a
         // stable code: 0 healthy, 1 not all healthy, 3 agent not running, …
         Some("status") => std::process::exit(mia::status_cli::run(&args[1..])),
@@ -618,6 +624,8 @@ fn print_usage() {
          \x20 x509-svid         inspect the machine-bound X.509-SVID store\n\
          \x20 test              check CMIS connectivity and helper-token issuance\n\
          \x20 status            report each environment's state from the running agent\n\
+         \x20 app               register an application (register --exe), show your\n\
+         \x20                   requests (status), list the verified allowlist (list)\n\
          \x20 default-environment  show, set <env> or clear the environment that serves\n\
          \x20                   the well-known helper address (applies on restart)\n\
          \x20 service           manage the Windows service (install/uninstall/start/stop)\n\
@@ -1244,7 +1252,10 @@ async fn bootstrap_host_svid_host_key(
         cmis = %endpoint,
         "host SVID obtained via host-key attestation; token minting enabled"
     );
-    Some(host_session_from_attested(attested))
+    let mut session = host_session_from_attested(attested);
+    // The SVID's `cnf.jkt` binds this key, so it signs host calls.
+    session.host_call_key = Some(std::sync::Arc::new(key));
+    Some(session)
 }
 
 /// The owned attestation inputs the bootstrap and re-attestation paths need:
@@ -1483,6 +1494,7 @@ fn host_session_from_attested(attested: mia::client::AttestedSvid) -> HostSessio
         expires_at: attested.bundle.expires_at,
         x509_store,
         minter: ChildTokenMinter::new(attested.svid_secret, cfg),
+        host_call_key: None,
     }
 }
 
@@ -1702,6 +1714,23 @@ struct HostSession {
     expires_at: i64,
     /// The X.509-SVID store backend the credential was sealed under, if any.
     x509_store: Option<&'static str>,
+    /// The machine key the SVID's `cnf.jkt` binds, which signs host calls
+    /// (allowlist sync, app requests; F19 §7.1). Only the host-key tier binds
+    /// it today; a TPM SVID binds the AIK, so those hosts keep the legacy
+    /// allowlist fetch.
+    host_call_key: Option<std::sync::Arc<dyn ferro_sep::MachineKey + Send + Sync>>,
+}
+
+/// The host-call credentials of `session`, when its SVID binds a key that can
+/// sign host calls.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn host_credentials(session: &HostSession) -> Option<mia::host_api::HostCredentials> {
+    mia::host_api::HostCredentials::new(
+        session.host_call_key.clone()?,
+        session.jws.clone(),
+        &session.spiffe_id,
+        session.expires_at,
+    )
 }
 
 /// Extract the host UUID from a host SVID SPIFFE id (`spiffe://<td>/host/<uuid>`)
@@ -2094,6 +2123,12 @@ struct ReattestParams {
     /// The attestation inputs (backend + TPM EK chain) the background
     /// re-attestation uses.
     attest: HostAttestConfig,
+    /// The host-call credentials the sync loop and the registration service
+    /// sign with; filled when the re-attestation succeeds.
+    creds: mia::host_api::CredentialSlot,
+    /// The running sync loop (F19), if any: the new SVID makes it sync at
+    /// once, and it — not the start-only fetch — refreshes the allowlist.
+    sync_trigger: Option<mia::allowlist_sync::SyncTrigger>,
 }
 
 /// When startup attestation fails — CMIS unreachable, or (commonly) DNS/VPN not
@@ -2135,10 +2170,28 @@ fn spawn_reattest_task<A>(
             };
             let spiffe_id = session.spiffe_id.clone();
             let jws = session.jws.clone();
+            params.creds.set(host_credentials(&session));
 
             // 1. Switch minting on now that we hold a host SVID.
             minter_reloader.set(Some(session.minter)).await;
             tracing::info!(%spiffe_id, "re-attestation succeeded; token minting enabled");
+
+            // With the sync loop running and host calls signable, it
+            // refreshes the allowlist (F19): wake it now.
+            if let (Some(trigger), true) = (&params.sync_trigger, params.creds.get().is_some()) {
+                trigger.sync_now();
+                if params.propose {
+                    maybe_spawn_propose_task(
+                        Some(&resolver),
+                        Some(&spiffe_id),
+                        Some(jws),
+                        ledger,
+                        params.self_sha,
+                        params.propose_interval,
+                    );
+                }
+                return;
+            }
 
             // 2. Refresh the signed allowlist from CMIS and live-swap it. Without
             //    this, minting is on but every non-self caller is denied
@@ -2271,6 +2324,10 @@ where
     };
     let host_spiffe_id = session.as_ref().map(|s| s.spiffe_id.clone());
     let host_jws = session.as_ref().map(|s| s.jws.clone());
+    // Host-call credentials for the allowlist sync and app registration
+    // (F19 §7.1); a re-attestation fills them later if this start had none.
+    let creds = mia::host_api::CredentialSlot::new();
+    creds.set(session.as_ref().and_then(host_credentials));
     let minter = session.map(|s| s.minter);
     if minter.is_none() {
         tracing::warn!(
@@ -2279,10 +2336,14 @@ where
     }
 
     // Optionally refresh the on-disk allowlist from CMIS before loading it, so
-    // the served body stays in sync with what the operator provisioned.
+    // the served body stays in sync with what the operator provisioned. The
+    // F19 sync loop supersedes this start-only fetch when it runs.
+    let sync_on = config.allowlist_sync_enabled() && resolver.is_some();
     let allowlist_path = config.allowlist_path();
+    // A host whose SVID binds no host-call key (TPM tier today) cannot sync:
+    // it keeps the start-only fetch.
     maybe_fetch_allowlist(
-        config.allowlist.fetch,
+        config.allowlist.fetch && !(sync_on && creds.get().is_some()),
         &allowlist_path,
         config.allowlist_key(),
         resolver.as_ref(),
@@ -2298,6 +2359,24 @@ where
     // ECONNREFUSED. Only an explicitly configured allowlist without a key, or
     // one that cannot be read, refuses to start (see `load_for_startup`).
     let (allowlist, outcome) = mia::helper::allowlist::load_for_startup(config, clock())?;
+    // With the sync on, the synced body (state directory) wins, and every
+    // body must pass the host binding and rollback checks (F19 §6.2).
+    let (allowlist, outcome, held) = if sync_on {
+        let host = host_spiffe_id
+            .as_deref()
+            .and_then(mia::host_api::split_host_spiffe_id)
+            .map(|(td, uuid)| (uuid, td));
+        let f = mia::allowlist_sync::load_in_force(
+            &mia::allowlist_sync::SyncConfig::from_config(config),
+            (allowlist, outcome),
+            host,
+            clock(),
+        );
+        (f.allowlist, f.outcome, f.held)
+    } else {
+        (allowlist, outcome, None)
+    };
+    let nothing_in_force = allowlist.is_none();
     status.set_allowlist(outcome);
 
     // The socket's group: `helper.socket_gid` when set; on macOS, for a socket
@@ -2323,6 +2402,7 @@ where
     let crl = Arc::new(CrlCache::new());
     status.set_crl_cache(Arc::clone(&crl));
     maybe_spawn_crl_puller(resolver.clone(), Arc::clone(&crl));
+    let services_audit = audit_tx.clone();
     let server = HelperServer::bind(
         helper_config,
         auth,
@@ -2341,6 +2421,24 @@ where
     })?;
     tracing::info!(listener = %socket_path.display(), "helper API listening");
 
+    // F19: app registration behind the helper API, and the allowlist sync
+    // loop (which also drives the registration outbox).
+    let services = mia::app_services::start(mia::app_services::ServiceInputs {
+        config,
+        resolver: resolver.clone(),
+        creds: creds.clone(),
+        sink: Arc::new(server.allowlist_reloader()),
+        held,
+        sync_now: nothing_in_force,
+        audit: services_audit,
+        status: status.clone(),
+        clock: Arc::clone(&clock),
+        ima_enforced: std::env::var("FERROGATE_REQUIRE_IMA").map_or(true, |v| v != "0"),
+    });
+    if let Some(registrar) = &services.registrar {
+        server.set_registration(Arc::new(registrar.clone()));
+    }
+
     // Live config + allowlist reload on SIGHUP: `mia --reload` /
     // `mia resync-allowlist --reload` (or a manual `kill -HUP`) re-reads the
     // configuration file and signed allowlist and swaps them in without a
@@ -2354,6 +2452,7 @@ where
         log_reload,
         clock.clone(),
         status.clone(),
+        services.sync_trigger.clone(),
     );
     #[cfg(not(unix))]
     let _ = (&config_source, &log_reload, &clock, &status);
@@ -2391,6 +2490,8 @@ where
                     propose_interval: config.allowlist_propose_interval(),
                     self_sha: server.self_sha(),
                     attest: HostAttestConfig::from_config(config),
+                    creds: creds.clone(),
+                    sync_trigger: services.sync_trigger.clone(),
                 },
                 clock.clone(),
                 status.clone(),
@@ -2438,6 +2539,7 @@ fn spawn_reload_task<A>(
     log_reload: LogReload,
     clock: mia::helper::Clock,
     status: mia::status::StatusHandle,
+    sync_trigger: Option<mia::allowlist_sync::SyncTrigger>,
 ) where
     A: mia::helper::auth::CallerAuth,
 {
@@ -2465,6 +2567,16 @@ fn spawn_reload_task<A>(
 
             // Log verbosity can change live.
             log_reload(config.log_directive());
+
+            // With the F19 sync loop running, only it puts allowlists in
+            // force (host binding, rollback checks): a reload asks it to sync
+            // now instead of re-reading a body from disk. Turning the sync
+            // off takes a restart.
+            if let Some(trigger) = &sync_trigger {
+                trigger.sync_now();
+                tracing::info!("configuration reloaded; allowlist sync requested");
+                continue;
+            }
 
             // Allowlist: re-load from the (possibly changed) path/key/max-age.
             // The body falls back to its per-environment default; without a

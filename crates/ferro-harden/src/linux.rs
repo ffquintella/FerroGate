@@ -307,6 +307,11 @@ fn syscall_nr(name: &str) -> Option<i64> {
         #[cfg(target_arch = "x86_64")]
         "mkdir" => libc::SYS_mkdir,
         "mkdirat" => libc::SYS_mkdirat,
+        // `rename` is x86_64-only; arm64 has only `renameat2`.
+        #[cfg(target_arch = "x86_64")]
+        "rename" => libc::SYS_rename,
+        "renameat2" => libc::SYS_renameat2,
+        "lgetxattr" => libc::SYS_lgetxattr,
         "getdents64" => libc::SYS_getdents64,
         #[cfg(target_arch = "x86_64")]
         "fstat" => libc::SYS_fstat,
@@ -397,8 +402,16 @@ mod tests {
         // (and thus over-block at runtime). The exception is a handful of legacy
         // syscalls that exist only on x86_64 (arm64 kept only the `*at` /
         // `*_pwait` forms); `build_program` skips them where they don't resolve.
-        const X86_64_ONLY: &[&str] =
-            &["fstat", "poll", "epoll_wait", "mkdir", "readlink", "unlink", "chmod"];
+        const X86_64_ONLY: &[&str] = &[
+            "fstat",
+            "poll",
+            "epoll_wait",
+            "mkdir",
+            "readlink",
+            "unlink",
+            "chmod",
+            "rename",
+        ];
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         for name in ALLOWED_SYSCALLS {
             if X86_64_ONLY.contains(name) && !cfg!(target_arch = "x86_64") {
@@ -418,8 +431,8 @@ mod tests {
         // arch; this exercises the seccompiler integration without altering the
         // test process.
         if target_arch().is_some() {
-            assert!(!build_program(SeccompMode::Enforce).unwrap().is_empty());
-            assert!(!build_program(SeccompMode::Audit).unwrap().is_empty());
+            assert_ne!(build_program(SeccompMode::Enforce).unwrap().len(), 0);
+            assert_ne!(build_program(SeccompMode::Audit).unwrap().len(), 0);
         }
     }
 
@@ -463,23 +476,22 @@ mod tests {
                 // parent's assertion fails loudly.
                 libc::_exit(0);
             }
-        } else {
-            // Parent: reap and inspect.
-            let mut status: libc::c_int = 0;
-            // SAFETY: standard waitpid on our own child.
-            let w = unsafe { libc::waitpid(pid, &mut status, 0) };
-            assert_eq!(w, pid, "waitpid failed: {}", last_os_error());
-            assert!(
-                libc::WIFSIGNALED(status),
-                "child should have been killed by a signal, status={status:#x}"
-            );
-            assert_eq!(
-                libc::WTERMSIG(status),
-                libc::SIGSYS,
-                "child should die from SIGSYS (seccomp), got signal {}",
-                libc::WTERMSIG(status)
-            );
         }
+        // Parent: reap and inspect.
+        let mut status: libc::c_int = 0;
+        // SAFETY: standard waitpid on our own child.
+        let w = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(w, pid, "waitpid failed: {}", last_os_error());
+        assert!(
+            libc::WIFSIGNALED(status),
+            "child should have been killed by a signal, status={status:#x}"
+        );
+        assert_eq!(
+            libc::WTERMSIG(status),
+            libc::SIGSYS,
+            "child should die from SIGSYS (seccomp), got signal {}",
+            libc::WTERMSIG(status)
+        );
     }
 
     // Regression for the crash-loop observed in production: after the setuid()
@@ -520,16 +532,15 @@ mod tests {
                 && caps::read(None, CapSet::Effective).is_ok_and(|e| e == want);
             // SAFETY: _exit is async-signal-safe.
             unsafe { libc::_exit(i32::from(!ok)) };
-        } else {
-            let mut status: libc::c_int = 0;
-            // SAFETY: waitpid on our own child.
-            let w = unsafe { libc::waitpid(pid, &mut status, 0) };
-            assert_eq!(w, pid, "waitpid failed: {}", last_os_error());
-            assert!(
-                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                "restrict_capabilities must recover CAP_SETPCAP into the effective \
-                 set before PR_CAPBSET_DROP; child status={status:#x}"
-            );
         }
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid on our own child.
+        let w = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(w, pid, "waitpid failed: {}", last_os_error());
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "restrict_capabilities must recover CAP_SETPCAP into the effective \
+             set before PR_CAPBSET_DROP; child status={status:#x}"
+        );
     }
 }
