@@ -1,45 +1,48 @@
-//! Per-uid and host-wide registration budgets (F19 §7.4: 10 per uid per
-//! hour, 60 per hour in total), as sliding one-hour windows.
+//! Per-requester and host-wide registration budgets (F19 §7.4: 10 per uid
+//! per hour, 60 per hour in total), as sliding one-hour windows. The
+//! requester key is the uid on Unix and the full SID on Windows
+//! ([`super::ledger::Requester`]).
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 
 /// The window, in seconds.
 const WINDOW_SECS: i64 = 3600;
 
-/// Sliding-window counters.
+/// Sliding-window counters, per requester key `K`.
 #[derive(Debug)]
-pub struct Limiter {
-    per_uid: u32,
+pub struct Limiter<K> {
+    per_key: u32,
     total: u32,
-    by_uid: HashMap<u32, VecDeque<i64>>,
+    by_key: HashMap<K, VecDeque<i64>>,
     all: VecDeque<i64>,
 }
 
-impl Limiter {
-    /// At most `per_uid` requests per uid and `total` overall per hour.
+impl<K: Hash + Eq> Limiter<K> {
+    /// At most `per_key` requests per requester and `total` overall per hour.
     #[must_use]
-    pub fn new(per_uid: u32, total: u32) -> Self {
+    pub fn new(per_key: u32, total: u32) -> Self {
         Self {
-            per_uid,
+            per_key,
             total,
-            by_uid: HashMap::new(),
+            by_key: HashMap::new(),
             all: VecDeque::new(),
         }
     }
 
-    /// Spend one request for `uid` at `now`, or return the seconds until one
+    /// Spend one request for `key` at `now`, or return the seconds until one
     /// is available.
-    pub fn check(&mut self, uid: u32, now: i64) -> Result<(), u32> {
+    pub fn check(&mut self, key: K, now: i64) -> Result<(), u32> {
         let since = now - WINDOW_SECS;
         prune(&mut self.all, since);
-        let mine = self.by_uid.entry(uid).or_default();
+        let mine = self.by_key.entry(key).or_default();
         prune(mine, since);
         let wait = |q: &VecDeque<i64>| {
             q.front().map_or(1, |t| {
                 u32::try_from((t + WINDOW_SECS - now).max(1)).unwrap_or(1)
             })
         };
-        if mine.len() >= self.per_uid as usize {
+        if mine.len() >= self.per_key as usize {
             return Err(wait(mine));
         }
         if self.all.len() >= self.total as usize {
@@ -47,8 +50,8 @@ impl Limiter {
         }
         mine.push_back(now);
         self.all.push_back(now);
-        // Forget idle uids so the map stays bounded by the active ones.
-        self.by_uid.retain(|_, q| !q.is_empty());
+        // Forget idle requesters so the map stays bounded by the active ones.
+        self.by_key.retain(|_, q| !q.is_empty());
         Ok(())
     }
 }
@@ -65,7 +68,7 @@ mod tests {
 
     #[test]
     fn budgets_are_per_uid_and_total_and_slide() {
-        let mut l = Limiter::new(2, 3);
+        let mut l = Limiter::<u32>::new(2, 3);
         assert!(l.check(1, 0).is_ok());
         assert!(l.check(1, 10).is_ok());
         assert_eq!(l.check(1, 20), Err(3580));

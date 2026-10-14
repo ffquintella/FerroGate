@@ -6,11 +6,11 @@
 #![allow(clippy::too_many_lines)] // each test walks one scenario end to end.
 
 use ferro_raft::apps::{
-    dedup_key, ApprovalChoice, ApprovalEdit, ApprovalFilter, ApprovalSnapshot, ApprovalState,
-    ApprovalTerms, Approve, AutoChecks, AutoDowngradeReason, AutoIntake, Continuity, Cursor, Deny,
-    Intake, IntakeChecks, LineageRow, NewRequest, ObservedBinary, PathMatch, RequestFilter,
-    RequestOrigin, RequestState, RevisionChange, Revoke, UpdatePolicy, UserIdentity, UserKind,
-    UserScope, FLAG_PATH_PROTECTED,
+    dedup_key, is_pseudonym, ApprovalChoice, ApprovalEdit, ApprovalFilter, ApprovalSnapshot,
+    ApprovalState, ApprovalTerms, Approve, AutoChecks, AutoDowngradeReason, AutoIntake, Continuity,
+    Cursor, Deny, Intake, IntakeChecks, LineageRow, NewRequest, ObservedBinary, PathMatch,
+    RequestFilter, RequestOrigin, RequestState, RevisionChange, Revoke, UpdatePolicy, UserIdentity,
+    UserKind, UserScope, FLAG_PATH_PROTECTED, PSEUDONYM_PREFIX,
 };
 use ferro_raft::{Cluster, LedgerError};
 use hiqlite::Param;
@@ -173,9 +173,146 @@ fn p(s: &str) -> Param {
 }
 
 #[tokio::test]
-async fn the_ledger_is_schema_migration_1() {
+async fn the_ledger_is_schema_migrations_1_and_2() {
     let (c, _d) = cluster("migr").await;
-    assert_eq!(c.applied_migrations().await.unwrap(), vec![1]);
+    assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2]);
+    c.shutdown().await.unwrap();
+}
+
+/// F19 security review: the user (`sid`, `user_name`) of an approval that
+/// is not `ACTIVE` could be rewritten without a `row_version` bump, so an
+/// `EXPIRED` approval could be re-pointed at another user and renewed. Now
+/// the user changes only by a versioned narrowing, or — unversioned, the
+/// pseudonymisation of F19 §10 — to the pseudonym format once `REVOKED`.
+#[tokio::test]
+async fn an_approvals_user_changes_in_place_only_by_pseudonymisation_once_revoked() {
+    let (c, _d) = cluster("userguard").await;
+    let alice = user(1000, "alice");
+    let r1 = request(&c, "1", "/opt/u", 1, &alice, 0).await;
+    c.app_submit_pending(&r1, &checks()).await.unwrap();
+    let mut t = terms(UpdatePolicy::ManualEachTime, Continuity::Anchored);
+    t.expires_at = Some(NOW + 10);
+    approve(&c, &r1.request_id, "u1", t).await;
+    assert!(c
+        .app_expire_approval("u1", NOW + 20, NOW * 1000 + 1)
+        .await
+        .unwrap());
+    let expired = c.app_approval("u1").await.unwrap().unwrap();
+    assert_eq!(expired.state, ApprovalState::Expired);
+
+    let pseudonym = format!("{}{}", PSEUDONYM_PREFIX, "ab".repeat(32));
+    assert!(is_pseudonym(&pseudonym));
+    let id = || p("u1");
+    // EXPIRED (renewable): no in-place rewrite of the user, not even to a
+    // pseudonym, and not with a bare row_version bump either.
+    for (sql, params) in [
+        (
+            "UPDATE app_approvals SET sid = 'S-1-5-21-9-9-9-500' WHERE approval_id = ?1",
+            vec![id()],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = 'mallory' WHERE approval_id = ?1",
+            vec![id()],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = ?2 WHERE approval_id = ?1",
+            vec![id(), p(&pseudonym)],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = 'mallory', row_version = row_version + 1 \
+             WHERE approval_id = ?1",
+            vec![id()],
+        ),
+    ] {
+        assert!(
+            raw(&c, sql, params).await.is_err(),
+            "must be refused: {sql}"
+        );
+    }
+    assert_eq!(c.app_approval("u1").await.unwrap().unwrap(), expired);
+
+    let revoked = c
+        .app_revoke_approval(
+            &Revoke {
+                approval_id: "u1".into(),
+                admin_id: "admin-2".into(),
+                reason_code: 9,
+                expected_row_version: None,
+            },
+            NOW + 30,
+            NOW * 1000 + 2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.state, ApprovalState::Revoked);
+    let revisions = c.app_approval_revisions("u1").await.unwrap().len();
+
+    // REVOKED: a real value, a malformed pseudonym, or a pseudonym combined
+    // with any other change is refused.
+    let upper = format!("{}{}", PSEUDONYM_PREFIX, "AB".repeat(32));
+    let short = format!("{}{}", PSEUDONYM_PREFIX, "ab".repeat(31));
+    assert!(!is_pseudonym(&upper) && !is_pseudonym(&short));
+    for (sql, params) in [
+        (
+            "UPDATE app_approvals SET user_name = 'mallory' WHERE approval_id = ?1",
+            vec![id()],
+        ),
+        (
+            "UPDATE app_approvals SET sid = 'S-1-5-21-9-9-9-500' WHERE approval_id = ?1",
+            vec![id()],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = NULL WHERE approval_id = ?1",
+            vec![id()],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = ?2 WHERE approval_id = ?1",
+            vec![id(), p(&upper)],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = ?2 WHERE approval_id = ?1",
+            vec![id(), p(&short)],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = ?2, uid = 0 WHERE approval_id = ?1",
+            vec![id(), p(&pseudonym)],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = ?2, note = 'x' WHERE approval_id = ?1",
+            vec![id(), p(&pseudonym)],
+        ),
+        (
+            "UPDATE app_approvals SET user_name = ?2, row_version = row_version + 1 \
+             WHERE approval_id = ?1",
+            vec![id(), p(&pseudonym)],
+        ),
+    ] {
+        assert!(
+            raw(&c, sql, params).await.is_err(),
+            "must be refused: {sql}"
+        );
+    }
+    assert_eq!(c.app_approval("u1").await.unwrap().unwrap(), revoked);
+
+    // The pseudonymisation itself: in place, unversioned, final.
+    assert_eq!(
+        raw(
+            &c,
+            "UPDATE app_approvals SET user_name = ?2 WHERE approval_id = ?1",
+            vec![id(), p(&pseudonym)],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let after = c.app_approval("u1").await.unwrap().unwrap();
+    assert_eq!(after.user_name.as_deref(), Some(pseudonym.as_str()));
+    assert_eq!(after.row_version, revoked.row_version);
+    assert_eq!(after.state, ApprovalState::Revoked);
+    assert_eq!(
+        c.app_approval_revisions("u1").await.unwrap().len(),
+        revisions
+    );
     c.shutdown().await.unwrap();
 }
 

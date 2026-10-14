@@ -717,6 +717,7 @@ sent on a later sync tick.
 enable = true                 # FERROGATE_REGISTRATION_ENABLE
 assisted = true               # allow `mia app register --exe` / the tray
 max_per_uid_per_hour = 10     # plus 60 per hour for the whole host
+max_open_per_uid = 50         # open (queued/pending) requests per user, 1..=100
 max_file_size_mib = 2048
 version_sources = ["pe", "plist", "elf-note", "dpkg"]
 ledger_path = ""              # default: app-requests[-<env>].cbor in the state directory (0600)
@@ -724,8 +725,21 @@ ledger_path = ""              # default: app-requests[-<env>].cbor in the state 
 
 The ledger holds paths and uids of local requests (personal data): queued
 documents are dropped once CMIS has them, and closed requests are pruned after
-30 days. Registering for another user (`--for-user`) needs root; Windows
-supports `RegisterSelf` but not yet `RegisterFile`.
+30 days. Requests are kept per requester (uid; the full SID on Windows): each
+may hold at most `max_open_per_uid` open requests, and when the 1000-entry
+ledger is full the requester with the most closed requests loses its oldest
+one. Registering for another user (`--for-user`) needs root; Windows supports
+`RegisterSelf` but not yet `RegisterFile`.
+
+The path MIA reports for a binary, and matches against path-constrained
+allowlist entries, must name the hashed file in MIA's own mount namespace
+(same device and inode), and a calling process must share MIA's mount
+namespace and root. Applications in containers or other mount namespaces
+(Flatpak, Snap, `unshare`) therefore cannot register and never match a path
+constraint, and the `mia` service must run in the host's initial mount
+namespace: do not add `PrivateTmp=`, `ProtectSystem=` or similar systemd
+drop-ins. `path_protected` is reported on Linux only; macOS and Windows never
+set it until their ACL and DACL checks exist.
 
 #### Installing `allowlist.key`: `mia allowlist-key`
 

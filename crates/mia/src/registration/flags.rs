@@ -4,12 +4,21 @@
 //! registration adds `deleted_on_disk` and `ima_unverified`.
 //!
 //! The walk covers the file and every ancestor directory up to `/`, with
-//! `lstat` on the canonical (kernel-resolved) path. A component is
-//! *protected* when root owns it, it is not writable by others, and a group
-//! that can write it is an administrators' group (root's; also `admin` on
-//! macOS); on Linux it must also carry no POSIX access ACL, which could grant
-//! write to anyone. `path_protected` needs every component protected and a
-//! local file system.
+//! `lstat` on the canonical (kernel-resolved) path, which the caller has
+//! already bound to the hashed file in the daemon's mount namespace
+//! ([`crate::helper::exe_path::bind`]). A component is *protected* when root
+//! owns it, it is not writable by others, and a group that can write it is
+//! an administrators' group (root's; also `admin` on macOS), and it carries
+//! no access ACL, which could grant write to anyone. `path_protected` needs
+//! every component protected and a local file system.
+//!
+//! ACLs are inspected on Linux only (the `system.posix_acl_access`
+//! attribute). macOS exposes ACLs only through the ACL API
+//! (`acl_get_link_np`, `getattrlist`), FFI this `#![forbid(unsafe_code)]`
+//! crate has no safe wrapper for, and Windows needs a DACL walk: on those
+//! platforms the ACL check cannot be made, so it fails closed and
+//! **`path_protected` is never set** there until it exists (ROADMAP M41).
+//! The other flags are still reported.
 //!
 //! The flags inform the approver and the auto-update continuity rule; they
 //! never grant anything by themselves (CMIS decides, F19 §5.3).
@@ -96,7 +105,8 @@ struct Walk {
     user_writable: bool,
     /// Some component is writable by everyone.
     world_writable: bool,
-    /// Some component carries a POSIX access ACL (Linux).
+    /// Some component carries an access ACL, or ACLs cannot be inspected
+    /// on this platform (fail closed).
     acl: bool,
 }
 
@@ -119,16 +129,17 @@ fn walk(path: &Path) -> Walk {
         if meta.uid() != 0 || (mode & 0o020 != 0 && !ADMIN_GIDS.contains(&meta.gid())) {
             w.user_writable = true;
         }
-        if has_access_acl(component) {
+        if may_have_access_acl(component) {
             w.acl = true;
         }
     }
     w
 }
 
-/// Whether `path` carries an extended POSIX access ACL.
+/// Whether `path` may carry an extended POSIX access ACL (an unexpected
+/// error counts as "may").
 #[cfg(target_os = "linux")]
-fn has_access_acl(path: &Path) -> bool {
+fn may_have_access_acl(path: &Path) -> bool {
     match rustix::fs::lgetxattr(path, "system.posix_acl_access", &mut [0u8; 0][..]) {
         Ok(_) => true,
         // No ACL, or a file system without ACL support.
@@ -136,11 +147,13 @@ fn has_access_acl(path: &Path) -> bool {
     }
 }
 
-/// macOS keeps ACLs outside the extended attributes; they are not inspected
-/// (only root can set one on a root-owned component).
+/// macOS (and other Unix): ACLs cannot be inspected here. Root can grant a
+/// user write on a root-owned directory with an ACL entry (`chmod +a`), so
+/// "no ACL" cannot be assumed: always "may", so `path_protected` is never
+/// set (fail closed).
 #[cfg(all(unix, not(target_os = "linux")))]
-fn has_access_acl(_path: &Path) -> bool {
-    false
+fn may_have_access_acl(_path: &Path) -> bool {
+    true
 }
 
 /// Network and FUSE file systems, by type name.
@@ -313,14 +326,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_root_owned_system_binary_is_protected() {
-        // `/bin/sh` is root-owned on every supported Unix, in root-owned,
-        // non-world-writable directories on a local file system.
+        // `/bin/sh` is root-owned, in root-owned, non-world-writable
+        // directories on a local file system, without ACLs.
         let canonical = std::fs::canonicalize("/bin/sh").unwrap();
         let bits = path_flags(canonical.to_str().unwrap());
         assert_ne!(bits & RiskFlags::PATH_PROTECTED, 0, "flags {bits:#x}");
         assert_eq!(bits & RiskFlags::USER_WRITABLE_PATH, 0);
+    }
+
+    /// Without an ACL check (macOS, other Unix) even a root-owned system
+    /// binary is not `path_protected`: an ACL could grant a user write.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn without_an_acl_check_nothing_is_protected() {
+        let canonical = std::fs::canonicalize("/bin/sh").unwrap();
+        let bits = path_flags(canonical.to_str().unwrap());
+        assert_eq!(bits & RiskFlags::PATH_PROTECTED, 0, "flags {bits:#x}");
+        assert_eq!(
+            bits & RiskFlags::USER_WRITABLE_PATH,
+            0,
+            "the mode-bit walk still runs"
+        );
     }
 }

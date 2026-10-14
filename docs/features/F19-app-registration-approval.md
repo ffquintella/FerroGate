@@ -10,11 +10,14 @@
 > the `registration` service with its ledger and outbox, `mia app`, and the
 > SDK `helper-client` feature (T269, T270). Not yet: the tray items, Windows
 > `RegisterFile` (impersonated open) and signer summaries, the macOS ACL and
-> Windows DACL checks behind `path_protected`, the legacy
+> Windows DACL checks behind `path_protected` (until they exist macOS and
+> Windows never set `path_protected`: fail closed, T290), the legacy
 > import and mode switch (M38), `ListHosts`, stored-response idempotency for
 > admin edits (retries are refused by state instead), PII pseudonymisation
-> after retention, and signing restricted to the leader (any node signs with
-> the replicated key; the generation compare-and-set keeps bodies consistent).
+> after retention (open follow-up T289, waiting for the DPO's retention
+> periods; the store already accepts it, §10), and signing restricted to the
+> leader (any node signs with the replicated key; the generation
+> compare-and-set keeps bodies consistent).
 
 ## Summary
 
@@ -377,6 +380,23 @@ Rules:
 
 Limits: ≤ 4096 bytes, absolute, no NUL, no `..` after canonicalisation.
 
+**Binding (Unix).** The kernel renders a path in the mount namespace the file
+was opened in: after `unshare -Urm` a user can bind-mount any file over
+`/usr/bin/foo`, run it, and `/proc/<pid>/exe` reads `/usr/bin/foo`. MIA
+therefore uses a resolved path, for registration and for the runtime
+`path_hash` match alike, only when it is **bound**: the path names, in MIA's
+own mount namespace, the very file that was hashed (`lstat(path)` has the
+`(st_dev, st_ino)` of the hashed descriptor), and for a running process the
+process also shares MIA's mount namespace and root (`/proc/<pid>/ns/mnt`,
+`/proc/<pid>/root`). Otherwise the path is unresolved: registration fails with
+`file_not_eligible` (`path_unresolved` in the log) and v2 entries with a path
+constraint admit nobody. A running image deleted on disk (`nlink = 0`) of a
+process in MIA's namespace keeps its last path (`deleted_on_disk`) but is never
+`path_protected`; a passed descriptor of a deleted file is refused. Callers in
+containers or other mount namespaces (Flatpak, Snap, `unshare`) can therefore
+neither register nor match path-constrained entries, and MIA itself must run in
+the host's initial mount namespace (no `PrivateTmp=`/`ProtectSystem=` drop-ins).
+
 Domain-separated hashes (`ferro-svid`) used in the v2 document:
 
 - `path_hash = SHA-256("ferrogate-path-v1" ‖ 0x00 ‖ host_uuid ‖ 0x00 ‖ path_key)`
@@ -419,7 +439,7 @@ never "repaired".
 
 | Bit | Flag | Set by | Meaning shown to the approver |
 |-----|------|--------|-------------------------------|
-| 0 | `path_protected` | MIA | File and every ancestor are writable only by root / Administrators / SYSTEM / TrustedInstaller (mode bits plus POSIX ACL xattr; Windows DACL) |
+| 0 | `path_protected` | MIA | File and every ancestor are writable only by root / Administrators / SYSTEM / TrustedInstaller (mode bits plus POSIX ACL xattr; Windows DACL), checked on a path bound to the hashed file (§4.2). Linux only for now: without the macOS ACL and Windows DACL checks it is never set there (T290) |
 | 1 | `user_writable_path` | MIA | The requesting user or another non-admin principal can replace the file |
 | 2 | `world_writable` | MIA | The file or an ancestor is world-writable |
 | 3 | `temp_dir` | MIA | The path is under `/tmp`, `/var/tmp`, `%TEMP%`, Downloads |
@@ -530,7 +550,7 @@ stays ACTIVE** (INV-1).
 |-----|------------------|--------|-------|
 | `ListAppRequests` | `app_request.list` | Paged, filtered listing | §7.5 filters |
 | `GetAppRequest` | `app_request.read` | Detail, lineage history, flags | |
-| `ApproveAppRequest` | `app_request.approve` + step-up | `PENDING` → `APPROVED`. Creates an approval, or reuses a covering one. Generation bump. | Strict SoD policy only: approver ≠ `requested_by_admin_id` (`sod_self_approval`). With the policy off, approving one's own `admin_direct` request is allowed and audited as `AppApprovedBySameActor`. Optional `also_revoke_approval_ids[]` (each audited as a revocation, INV-2). |
+| `ApproveAppRequest` | `app_request.approve` + step-up | `PENDING` → `APPROVED`. Creates an approval, or reuses a covering one. Generation bump. | Strict SoD policy only: approver ≠ `requested_by_admin_id` (`sod_self_approval`). With the policy off, approving one's own `admin_direct` request is allowed and audited as `AppApprovedBySameActor`. Optional `also_revoke_approval_ids[]` (each audited as a revocation, INV-2); a non-empty list also needs `approval.revoke` (`permission_denied` otherwise, nothing written). |
 | `DenyAppRequest` | `app_request.deny` + step-up | `PENDING` → `DENIED` | `reason_code` required; `message` ≤ 200 is shown to the requester |
 | `ListApprovals` / `GetApproval` | `approval.list` / `approval.read` | Includes revisions and lineage tree | |
 | `UpdateApproval` | `approval.update` + step-up | Edit `update_policy`, `expires_at`, `continuity`, `note`, `user_scope` (narrowing only: any → exact is allowed, exact → any is not), `path_match` (narrowing only). Generation bump if the compiled entry changes. | `expected_row_version`. Renewal of `EXPIRED` → `ACTIVE`. Widening scope needs a new request. |
@@ -685,6 +705,7 @@ state_path = ""              # default: allowlist.state beside allowlist.path
 enable = true                # FERROGATE_REGISTRATION_ENABLE
 assisted = true              # allow RegisterFile (mia app register --exe / tray)
 max_per_uid_per_hour = 10
+max_open_per_uid = 50        # open (queued/pending) requests per requester, 1..=100
 max_file_size_mib = 2048
 version_sources = ["pe", "plist", "elf-note", "dpkg"]
 ledger_path = ""             # default: app-requests.cbor in the environment state dir (root, 0600)
@@ -812,7 +833,13 @@ Default limits (CMIS env; MIA config):
   `(host, user)`, 60 status calls per hour, one sync per 30 s;
 - per lineage: 3 auto-approvals per 24 h;
 - MIA: 10 `RegisterSelf`/`RegisterFile` per uid per hour, 60 per hour in total,
-  at most 2 concurrent hash computations, helper frame ≤ 64 KiB (unchanged).
+  at most 50 open (queued or pending) requests per requester
+  (`max_open_per_uid`, 1..=100), at most 2 concurrent hash computations, helper
+  frame ≤ 64 KiB (unchanged). Requests are keyed by uid on Unix and by the full
+  user SID on Windows (a RID alone is shared across domains). The local ledger
+  holds 1000 requests; when it is full, the requester holding the most closed
+  requests loses its oldest one, and a new request is refused only when every
+  entry is still open.
 
 #### 7.5 Admin search and filter fields
 
@@ -894,6 +921,9 @@ enum RegistrationResp {
 | I | Personal data (user names, home paths) leaks through the signed body, logs or other hosts | Hashes only in v2; host RPCs scoped to the caller's own requests; PII-free audit; `info`-level logs carry ids only |
 | I | Unauthenticated listing of a host's software inventory | v2 only through authenticated `SyncAllowlist`; legacy v1 `GetAllowlist` is scheduled for removal |
 | D | Request floods to CMIS or approvers | Per-host and per-user rate limits, pending caps, denial cool-down, deduplication |
+| D | One local user fills MIA's request ledger and blocks everyone | Per-requester open-request cap; a full ledger drops the heaviest requester's oldest closed entry first |
+| S / E | A user fakes a protected path with a mount namespace (`unshare -Urm` + bind mount) to get `path_protected` and auto-approval, or to satisfy a `path_hash` constraint | Paths are bound to the hashed file by `(st_dev, st_ino)` in MIA's namespace, and a process must share MIA's mount namespace and root (§4.2) |
+| E | An `EXPIRED` approval's user rewritten in the store, then renewed | Store triggers (migration 2): `sid`/`user_name` changes are versioned; only a `REVOKED` approval's may be pseudonymised in place (§10) |
 | D | Parser bombs in PE, plist or ELF data | Size, depth and time caps; fuzzing; fail to "no version" |
 | D | Sync stampede after a fleet restart | Initial random delay, ±10 % jitter, `not_modified`, server minimum interval |
 
@@ -941,6 +971,14 @@ plaintext paths and free-text messages are **never** included. The existing
 | `app_approvals.user_name`, `sid` | Personal data | Same | While `ACTIVE`, then as above | Viewers, approvers |
 | `app_requests.decision_message`, `reason` | Free text, may contain PII | ≤ 200 chars; UI warns not to include personal data | As requests | Approvers; requester (own) |
 | MIA `app-requests.cbor` | Personal data (local paths, uids) | root `0600` | 30 days after terminal state | root |
+
+**Pseudonymisation (open follow-up T289).** The sweep waits for the DPO to fix
+the retention periods. The store already constrains it: an approval's `sid` and
+`user_name` may be replaced in place only once it is `REVOKED`, and only by a
+pseudonym `pseudonym:v1:` followed by 64 lowercase hex characters (a keyed
+SHA-256; `ferro_raft::apps::is_pseudonym`). Every other change to them is
+versioned. An `EXPIRED` approval can be renewed, so the sweep must revoke it
+before pseudonymising it.
 
 Legal basis: information security of FGV systems (proposal; **the DPO must
 validate**). Minimisation: hashes in signed artefacts and audit; host RPCs only

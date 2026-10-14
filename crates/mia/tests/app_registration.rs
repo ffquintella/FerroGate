@@ -294,6 +294,7 @@ async fn rig(tag: &str) -> Rig {
             enable: true,
             assisted: true,
             max_per_uid_per_hour: 10,
+            max_open_per_uid: 50,
             ledger_path: dir.join("app-requests.cbor"),
             identify: IdentifyConfig {
                 max_file_size: 1024 * 1024,

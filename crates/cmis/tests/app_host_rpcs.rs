@@ -166,6 +166,72 @@ async fn host_auth_negatives_change_nothing() {
     assert_eq!(h.cmis.audit.len(), before, "nothing audited");
 }
 
+/// Log capture for one test thread (`tracing::subscriber::set_default`).
+#[derive(Clone, Default)]
+struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A signed document that does not decode is refused with stable codes and
+/// logged without the decoder's message, which quotes the document (here an
+/// unknown key holding a home path): F19 §8 "I", no PII in logs.
+#[tokio::test]
+async fn a_malformed_document_is_logged_without_its_contents() {
+    let (h, a, _) = setup("malformed-log").await;
+    approvals_mode(&h.cmis).await;
+    let secret = "/home/zelda-private/secret-tool";
+    let mut value =
+        ciborium::Value::serialized(&a.app_doc(PATH, sha(1), 1000, "alice", 0)).unwrap();
+    let ciborium::Value::Map(fields) = &mut value else {
+        panic!("a document is a map")
+    };
+    fields.push((
+        ciborium::Value::Text(secret.into()),
+        ciborium::Value::Integer(1.into()),
+    ));
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&value, &mut bytes).unwrap();
+    let req = ferro_proto::v1::SubmitAppRequestRequest {
+        auth: Some(a.auth(ferro_svid::app_docs::APP_REQUEST_CONTEXT, &bytes)),
+        doc: bytes,
+    };
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .finish();
+    let e = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        h.mi.submit_app_request(tonic::Request::new(req))
+            .await
+            .unwrap_err()
+    };
+    assert_eq!(e.code(), Code::InvalidArgument);
+    assert!(!e.message().contains("zelda"));
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("host_auth.malformed_doc"), "{logs}");
+    assert!(logs.contains("reason=\"malformed\""), "{logs}");
+    assert!(!logs.contains("zelda"), "{logs}");
+    assert_eq!(request_count(&h.cmis).await, 0);
+}
+
 #[tokio::test]
 async fn submission_is_refused_in_legacy_mode() {
     let (h, a, _) = setup("legacy").await;

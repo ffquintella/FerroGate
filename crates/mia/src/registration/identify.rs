@@ -11,9 +11,20 @@
 //!   no hash oracle for files the client cannot read (`/etc/shadow`). The
 //!   descriptor must be open for reading (not `O_PATH`) and name a regular
 //!   file with an execute bit.
+//!
+//! In both cases the canonical path must be **bound** to the hashed file
+//! ([`crate::helper::exe_path::bind`]): it must name that very file (same
+//! device and inode) in the daemon's mount namespace, and a running process
+//! must share the daemon's mount namespace and root. A path rendered in
+//! another namespace (a bind mount over `/usr/bin/foo` after `unshare -Urm`)
+//! would otherwise be reported, and flagged `path_protected`, for a file the
+//! user controls. An unbound path is refused as `path_unresolved`. A running
+//! image deleted on disk keeps its last path but is never `path_protected`.
 
 use std::fs::File;
 
+#[cfg(unix)]
+use ferro_appid::CanonicalPath;
 use ferro_appid::{IdentifyError, IdentifyOptions, Limits, Platform, RiskFlags, VersionSources};
 use ferro_svid::app_docs::{BinaryDesc, SignerDesc};
 use mia_helper_proto::RegErrorCode;
@@ -84,22 +95,43 @@ pub fn running_image(
 #[cfg(unix)]
 fn open_running_image(caller: &CallerIdentity) -> Result<(File, String, bool), IdentifyFailure> {
     // Linux: the kernel's handle on the running image, even when the file was
-    // replaced or removed on disk. Elsewhere: the path the authenticator
-    // resolved from the process.
+    // replaced or removed on disk; its path counts only when the process
+    // shares the daemon's mount namespace and root, and is bound to the
+    // image (a deleted image keeps its last path). macOS: the path the
+    // authenticator resolved from the process, bound to the opened file.
     #[cfg(not(target_os = "macos"))]
-    let file = File::open(format!("/proc/{}/exe", caller.pid))
-        .map_err(|_| IdentifyFailure::NotEligible("exe_unreadable"))?;
+    let (file, canonical) = {
+        let file = File::open(format!("/proc/{}/exe", caller.pid))
+            .map_err(|_| IdentifyFailure::NotEligible("exe_unreadable"))?;
+        let canonical = crate::helper::exe_path::of_running_image(caller.pid, &file)
+            .ok_or(IdentifyFailure::NotEligible("path_unresolved"))?;
+        (file, canonical)
+    };
     #[cfg(target_os = "macos")]
-    let file = {
+    let (file, canonical) = {
         let path = caller
             .exe_path
             .as_deref()
             .ok_or(IdentifyFailure::NotEligible("exe_unresolved"))?;
-        File::open(path).map_err(|_| IdentifyFailure::NotEligible("exe_unreadable"))?
+        let file = File::open(path).map_err(|_| IdentifyFailure::NotEligible("exe_unreadable"))?;
+        let resolved = crate::helper::exe_path::of_open_file(&file)
+            .map_err(|_| IdentifyFailure::NotEligible("path_unresolved"))?;
+        let canonical = bound(&file, resolved, false)?;
+        (file, canonical)
     };
-    let canonical = crate::helper::exe_path::of_open_file(&file)
-        .map_err(|_| IdentifyFailure::NotEligible("path_unresolved"))?;
     Ok((file, canonical.path, canonical.deleted_on_disk))
+}
+
+/// `resolved` bound to `file` ([`crate::helper::exe_path::bind`]), or
+/// `path_unresolved`.
+#[cfg(unix)]
+fn bound(
+    file: &File,
+    resolved: CanonicalPath,
+    trust_deleted: bool,
+) -> Result<CanonicalPath, IdentifyFailure> {
+    crate::helper::exe_path::bind(file, resolved, trust_deleted)
+        .ok_or(IdentifyFailure::NotEligible("path_unresolved"))
 }
 
 #[cfg(windows)]
@@ -135,9 +167,9 @@ pub fn passed_file(mut file: File, cfg: &IdentifyConfig) -> Result<Identified, I
     if meta.permissions().mode() & 0o111 == 0 {
         return Err(IdentifyFailure::NotEligible("not_executable"));
     }
-    let canonical = crate::helper::exe_path::of_open_file(&file)
+    let resolved = crate::helper::exe_path::of_open_file(&file)
         .map_err(|_| IdentifyFailure::NotEligible("path_unresolved"))?;
-    let mut ident = describe(&mut file, &canonical.path, canonical.deleted_on_disk, cfg)?;
+    let mut ident = describe_resolved(&mut file, resolved, cfg)?;
     // A file is not a measured `execve`: IMA never vouched for it.
     if cfg!(target_os = "linux") {
         ident.binary.flags |= RiskFlags::IMA_UNVERIFIED;
@@ -145,7 +177,22 @@ pub fn passed_file(mut file: File, cfg: &IdentifyConfig) -> Result<Identified, I
     Ok(ident)
 }
 
-/// Hash and describe the open `file` at `canonical`.
+/// Describe a passed descriptor at the path the OS `resolved` for it. The
+/// descriptor may come from another mount namespace, so the path must be
+/// bound to it here, and a deleted file (whose last path cannot be checked
+/// in the namespace it came from) is refused.
+#[cfg(unix)]
+fn describe_resolved(
+    file: &mut File,
+    resolved: CanonicalPath,
+    cfg: &IdentifyConfig,
+) -> Result<Identified, IdentifyFailure> {
+    let canonical = bound(file, resolved, false)?;
+    describe(file, &canonical.path, canonical.deleted_on_disk, cfg)
+}
+
+/// Hash and describe the open `file` at `canonical`, a path already bound
+/// to it (or, `deleted_on_disk`, where the deleted image was).
 fn describe(
     file: &mut File,
     canonical: &str,
@@ -172,6 +219,9 @@ fn describe(
     })?;
     let mut flags = ident.flags.0 | super::flags::path_flags(canonical);
     if deleted_on_disk {
+        // The path now names another file (or nothing): what protects it
+        // says nothing about the image that was hashed.
+        flags &= !RiskFlags::PATH_PROTECTED;
         flags |= RiskFlags::DELETED_ON_DISK;
     }
     let signer: Option<SignerDesc> = None;
@@ -286,6 +336,59 @@ mod tests {
             passed_file(File::open(&path).unwrap(), &small).unwrap_err(),
             IdentifyFailure::TooLarge
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mount-namespace attack (`unshare -Urm`, bind mount over a
+    /// protected binary): the OS renders a protected path for a file the
+    /// user controls. `/bin/sh` stands in for the protected path; the hashed
+    /// file is a user's. The path must be refused, never reported or flagged
+    /// `path_protected`.
+    #[test]
+    fn a_path_that_names_another_file_is_refused_not_protected() {
+        let dir = scratch("spoof");
+        let path = dir.join("evil");
+        write_exec(&path, b"#!/bin/true\nevil", 0o755);
+        let mut file = File::open(&path).unwrap();
+        let sh = std::fs::canonicalize("/bin/sh").unwrap();
+        let spoofed = CanonicalPath {
+            path: sh.to_str().unwrap().to_string(),
+            deleted_on_disk: false,
+        };
+        assert_eq!(
+            describe_resolved(&mut file, spoofed, &cfg()).unwrap_err(),
+            IdentifyFailure::NotEligible("path_unresolved")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_passed_file_deleted_on_disk_is_refused() {
+        let dir = scratch("gone");
+        let path = dir.join("tool");
+        write_exec(&path, b"#!/bin/true\ngone", 0o755);
+        let file = File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            passed_file(file, &cfg()).unwrap_err(),
+            IdentifyFailure::NotEligible("path_unresolved")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A running image deleted on disk keeps its last path, but that path
+    /// now names another file: it never counts as protected.
+    #[test]
+    fn a_deleted_image_is_never_path_protected() {
+        let dir = scratch("deleted");
+        let path = dir.join("old");
+        write_exec(&path, b"#!/bin/true\nold", 0o755);
+        let mut file = File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let sh = std::fs::canonicalize("/bin/sh").unwrap();
+        let ident = describe(&mut file, sh.to_str().unwrap(), true, &cfg()).unwrap();
+        assert_ne!(ident.binary.flags & RiskFlags::DELETED_ON_DISK, 0);
+        assert_eq!(ident.binary.flags & RiskFlags::PATH_PROTECTED, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

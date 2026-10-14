@@ -613,6 +613,10 @@ pub struct RegistrationConfig {
     pub assisted: Option<bool>,
     /// Requests per uid per hour; `None` ⇒ 10.
     pub max_per_uid_per_hour: Option<u32>,
+    /// Open (queued or pending) requests one requester (uid; Windows SID)
+    /// may hold, `1..=100`; `None` ⇒ 50. Keeps one local user from filling
+    /// the request ledger.
+    pub max_open_per_uid: Option<u32>,
     /// Largest file identified, in MiB, at most 2048; `None` ⇒ 2048.
     pub max_file_size_mib: Option<u64>,
     /// Version sources consulted, of `pe`, `plist`, `elf-note`, `dpkg`;
@@ -1442,6 +1446,17 @@ impl Config {
     #[must_use]
     pub fn registration_max_per_uid_per_hour(&self) -> u32 {
         self.registration.max_per_uid_per_hour.unwrap_or(10).max(1)
+    }
+
+    /// Open requests one requester may hold (`registration.max_open_per_uid`,
+    /// default 50, clamped to `1..=100` so that filling the 1000-entry
+    /// ledger with open requests takes at least ten requesters).
+    #[must_use]
+    pub fn registration_max_open_per_uid(&self) -> u32 {
+        self.registration
+            .max_open_per_uid
+            .unwrap_or(50)
+            .clamp(1, 100)
     }
 
     /// The largest file identified, in bytes (`registration.max_file_size_mib`,

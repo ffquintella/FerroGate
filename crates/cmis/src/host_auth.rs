@@ -251,7 +251,8 @@ pub struct AuthenticatedHost {
 
 /// A host call document that decoded but failed validation: the stable
 /// reason code (`x-ferrogate-reason`) and, when known, the field it names
-/// (`x-ferrogate-field`).
+/// (`x-ferrogate-field`). The `Display` text can quote the document (paths,
+/// user names): log only [`DocError::reason`] and [`DocError::field`].
 pub trait DocError: std::fmt::Display {
     /// The stable reason code returned to the (authenticated) host.
     fn reason(&self) -> &'static str;
@@ -423,9 +424,18 @@ pub fn authenticate<D: HostCallDoc, E: DocError>(
     ferro_sep::verify_p256(&auth.sep_pub, &input, &auth.sig)
         .map_err(|_| host_auth_failed("bad_signature", host))?;
 
-    // 5. The document (authenticated from here on).
+    // 5. The document (authenticated from here on). Only the stable codes
+    // are logged: the decoder's message can quote the document's strings
+    // (an unknown key, an unknown variant), and the document carries paths
+    // and user names (F19 §8 "I", §10).
     let doc = (call.decode)(call.doc).map_err(|e| {
-        tracing::warn!(event = "host_auth.malformed_doc", error = %e, host_uuid = %svid.host_uuid, "signed host document did not decode");
+        tracing::warn!(
+            event = "host_auth.malformed_doc",
+            reason = e.reason(),
+            field = e.field().unwrap_or(""),
+            host_uuid = %svid.host_uuid,
+            "signed host document did not decode"
+        );
         invalid_field(e.reason(), e.field())
     })?;
 

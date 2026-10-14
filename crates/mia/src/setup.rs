@@ -1261,6 +1261,9 @@ fn render_carried_tail(out: &mut String, c: &Carried) {
         if let Some(v) = reg.max_per_uid_per_hour {
             let _ = writeln!(out, "max_per_uid_per_hour = {v}");
         }
+        if let Some(v) = reg.max_open_per_uid {
+            let _ = writeln!(out, "max_open_per_uid = {v}");
+        }
         if let Some(v) = reg.max_file_size_mib {
             let _ = writeln!(out, "max_file_size_mib = {v}");
         }

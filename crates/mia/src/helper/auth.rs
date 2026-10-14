@@ -49,9 +49,12 @@ pub struct CallerIdentity {
     /// Canonical path of the calling executable (F19 §4.2), as the kernel
     /// resolved it: `/proc/<pid>/exe` without a ` (deleted)` suffix on Linux,
     /// the on-disk form of the opened image on macOS, the final path name on
-    /// Windows. `None` when the platform could not resolve a valid one; an
-    /// allowlist v2 entry with a path constraint then admits nobody (fail
-    /// closed).
+    /// Windows. On Unix it is set only when it is bound to the hashed image
+    /// in the daemon's own mount namespace (same device and inode; on Linux
+    /// the caller also shares the daemon's mount namespace and root), see
+    /// [`crate::helper::exe_path`]. `None` when the platform could not
+    /// resolve a valid, bound one; an allowlist v2 entry with a path
+    /// constraint then admits nobody (fail closed).
     pub exe_path: Option<String>,
     /// **Windows.** The caller's full user SID (`S-1-5-…`), for allowlist v2
     /// SID constraints. `None` elsewhere, or when it could not be read.
@@ -495,16 +498,21 @@ mod linux {
                 .to_str()
                 .ok_or(AuthError::ExeUnreadable { partial })?
                 .to_string();
-            // The F19 §4.2 canonical form: ` (deleted)` stripped, so a process
-            // still running after an upgrade keeps matching by path.
-            let canonical = ferro_appid::path::from_linux_link(exe_path_str.as_bytes())
-                .ok()
-                .map(|c| c.path);
             // Read through the /proc/<pid>/exe handle so we hash the bytes the
             // running process was loaded from, even if the on-disk name moved.
-            let contents =
-                std::fs::read(&exe_link).map_err(|_| AuthError::ExeUnreadable { partial })?;
+            let mut image =
+                std::fs::File::open(&exe_link).map_err(|_| AuthError::ExeUnreadable { partial })?;
+            let mut contents = Vec::new();
+            std::io::Read::read_to_end(&mut image, &mut contents)
+                .map_err(|_| AuthError::ExeUnreadable { partial })?;
             let disk_sha = bin_sha384(&contents);
+            // The F19 §4.2 canonical form (` (deleted)` stripped, so a process
+            // still running after an upgrade keeps matching by path), taken
+            // from the same open image and bound to it in the daemon's mount
+            // namespace: a path rendered in another namespace (a bind mount
+            // over a protected binary) is no path at all, so a v2 entry with
+            // a path constraint admits nobody (fail closed).
+            let canonical = crate::helper::exe_path::of_running_image(pid, &image).map(|c| c.path);
 
             // IMA not enforced on this host: trust the hash of the loaded binary
             // (read through /proc/<pid>/exe) without a measurement-log cross-check.
@@ -577,6 +585,11 @@ mod tests {
         assert_ne!(
             id.bin_sha, [0u8; 48],
             "bin_sha must be the real binary hash"
+        );
+        // This process shares the daemon's view: its path is bound.
+        assert_eq!(
+            id.exe_path.as_deref().map(std::path::Path::new),
+            Some(std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()).as_deref()
         );
     }
 

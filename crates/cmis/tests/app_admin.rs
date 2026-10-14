@@ -225,6 +225,89 @@ async fn app_rpcs_refuse_callers_without_a_session_permission_or_step_up() {
         .all(|e| matches!(e, AuditEvent::AdminAccessDenied { .. })));
 }
 
+/// `ApproveAppRequest` with `also_revoke_approval_ids` revokes: the caller
+/// needs `approval.revoke` as well as `app_request.approve`, or nothing
+/// happens (`PERMISSION_DENIED permission_denied`).
+#[tokio::test]
+async fn also_revoking_needs_the_revoke_permission() {
+    use cmis::admin::authz::Permission;
+    let w = world("apps-also-revoke", false).await;
+    let first = submit(&w, 1, 1000, "alice", 0).await;
+    let old_id = approve(&w, &w.token, approve_req(&first.request_id, manual_terms()))
+        .await
+        .unwrap()
+        .approval
+        .unwrap()
+        .approval_id;
+    let update = submit(&w, 2, 1000, "alice", 0).await;
+    let mut req = approve_req(&update.request_id, manual_terms());
+    req.also_revoke_approval_ids = vec![old_id.clone()];
+    req.also_revoke_reason_code = 2;
+    let as_caller = |perms: Vec<Permission>, req: ApproveAppRequestRequest| {
+        let mut call = tonic::Request::new(req);
+        call.extensions_mut()
+            .insert(cmis::admin::AdminContext::synthetic(
+                &w.approver.admin_id,
+                perms,
+            ));
+        call
+    };
+    let before = app_events(&w.h).len();
+
+    // May approve, may not revoke (a custom group; the built-in approvers
+    // hold both permissions).
+    let e =
+        w.h.svc
+            .approve_app_request(as_caller(
+                vec![Permission::AppRequestApprove, Permission::ApprovalUpdate],
+                req.clone(),
+            ))
+            .await
+            .unwrap_err();
+    assert_eq!(
+        (e.code(), e.message()),
+        (Code::PermissionDenied, "permission_denied")
+    );
+    let cluster = w.h.cmis.cluster();
+    assert_eq!(
+        cluster.app_approval(&old_id).await.unwrap().unwrap().state,
+        ApprovalState::Active,
+        "nothing revoked"
+    );
+    assert_eq!(
+        cluster
+            .app_request(&update.request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::Pending,
+        "nothing approved"
+    );
+    let refused = &app_events(&w.h)[before..];
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(matches!(
+        &refused[0],
+        AuditEvent::AdminAccessDenied { permission, .. } if permission == "approval.revoke"
+    ));
+
+    // With `approval.revoke` too, the same call approves and revokes.
+    let ok =
+        w.h.svc
+            .approve_app_request(as_caller(
+                vec![Permission::AppRequestApprove, Permission::ApprovalRevoke],
+                req,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+    assert_eq!(ok.approval.unwrap().state, 1);
+    assert_eq!(
+        cluster.app_approval(&old_id).await.unwrap().unwrap().state,
+        ApprovalState::Revoked
+    );
+}
+
 #[tokio::test]
 async fn approve_and_deny_emit_one_event_each_and_reach_the_host() {
     let w = world("apps-decide", false).await;

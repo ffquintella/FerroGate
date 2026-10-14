@@ -5,8 +5,8 @@
 //! For each request the [`Registrar`]:
 //!
 //! 1. checks `[registration]` (`enable`, `assisted`), the requester's
-//!    idempotency id, `for_user` (root only) and the per-uid and host
-//!    budgets;
+//!    idempotency id, its open-request cap (`max_open_per_uid`), `for_user`
+//!    (root only) and the per-requester and host budgets;
 //! 2. identifies the binary without executing it ([`identify`]): the
 //!    caller's running image, or the descriptor the client passed;
 //! 3. records it in the local ledger ([`ledger`]) as `Queued`, with an
@@ -24,7 +24,9 @@
 //! ([`Registrar`] implements [`SyncHook`]).
 //!
 //! `RequestStatus` answers only the caller's own requests (all for root), so
-//! registration never reveals another user's applications.
+//! registration never reveals another user's applications. "Own" is keyed by
+//! the uid on Unix and by the full user SID on Windows
+//! ([`ledger::Requester`]).
 
 pub mod identify;
 pub mod ledger;
@@ -56,7 +58,7 @@ use crate::helper::server::{Clock, RegistrationHandler};
 use crate::host_api::{CredentialSlot, HostApi};
 use crate::status::StatusHandle;
 use identify::{Identified, IdentifyConfig, IdentifyFailure};
-use ledger::{Ledger, LedgerEntry};
+use ledger::{Ledger, LedgerEntry, Requester};
 use limiter::Limiter;
 
 /// Host-wide registration budget per hour (F19 §7.4).
@@ -75,6 +77,11 @@ const MAX_STATUS_IDS_PER_CALL: usize = ferro_svid::app_docs::MAX_STATUS_REQUEST_
 /// and normally applies the new generation within seconds.
 const APPROVED_RETRY_SECS: u32 = 5;
 
+/// The `retry_after` given when a requester holds too many open requests,
+/// or the ledger is full of open requests: open requests close only when an
+/// administrator decides them or they expire.
+const OPEN_CAP_RETRY_SECS: u32 = 3600;
+
 /// Registration settings.
 #[derive(Debug, Clone)]
 pub struct RegistrarConfig {
@@ -84,6 +91,9 @@ pub struct RegistrarConfig {
     pub assisted: bool,
     /// `registration.max_per_uid_per_hour`.
     pub max_per_uid_per_hour: u32,
+    /// `registration.max_open_per_uid`: open (queued or pending) requests
+    /// one requester may hold.
+    pub max_open_per_uid: u32,
     /// `registration.ledger_path`.
     pub ledger_path: PathBuf,
     /// How binaries are identified.
@@ -102,6 +112,7 @@ impl RegistrarConfig {
             enable: config.registration_enabled(),
             assisted: config.registration_assisted(),
             max_per_uid_per_hour: config.registration_max_per_uid_per_hour(),
+            max_open_per_uid: config.registration_max_open_per_uid(),
             ledger_path: config.registration_ledger_path(),
             identify: IdentifyConfig {
                 max_file_size: config.registration_max_file_size(),
@@ -139,7 +150,7 @@ struct Inner {
     creds: CredentialSlot,
     trigger: SyncTrigger,
     ledger: Mutex<Ledger>,
-    limiter: std::sync::Mutex<Limiter>,
+    limiter: std::sync::Mutex<Limiter<Requester>>,
     hashing: Semaphore,
     status: std::sync::OnceLock<StatusHandle>,
     clock: Clock,
@@ -236,8 +247,12 @@ impl Registrar {
                 .await
             }
             HelperOp::RequestStatus { request_ids } => {
+                // Windows without a SID: no key, nothing visible.
+                let Some(who) = Requester::of(&caller) else {
+                    return RegistrationResp::Status(Vec::new());
+                };
                 let ledger = self.inner.ledger.lock().await;
-                RegistrationResp::Status(ledger.visible(caller.uid, &request_ids))
+                RegistrationResp::Status(ledger.visible(&who, &request_ids))
             }
             HelperOp::Token { .. } => refuse(RegErrorCode::MalformedRequest, None),
         }
@@ -256,17 +271,27 @@ impl Registrar {
             return refuse(RegErrorCode::RegistrationDisabled, None);
         }
         let now = self.now();
-        // A repeated idempotency id returns the same request, free of charge.
-        if let Some(e) = self
-            .inner
-            .ledger
-            .lock()
-            .await
-            .by_caller_id(caller.uid, &caller_request_id)
+        // Windows: the SID is the key; without it the request cannot be
+        // told apart from a same-RID user of another domain.
+        let Some(who) = Requester::of(&caller) else {
+            tracing::warn!("registration refused: caller SID unknown");
+            return refuse(RegErrorCode::Internal, None);
+        };
+        let max_open = self.inner.cfg.max_open_per_uid as usize;
         {
-            return answer(e, false);
+            let ledger = self.inner.ledger.lock().await;
+            // A repeated idempotency id returns the same request, free of
+            // charge.
+            if let Some(e) = ledger.by_caller_id(&who, &caller_request_id) {
+                return answer(e, false);
+            }
+            // Over the open-request cap: refused before any hashing or
+            // budget is spent.
+            if ledger.open_count(&who) >= max_open {
+                return refuse(RegErrorCode::RateLimited, Some(OPEN_CAP_RETRY_SECS));
+            }
         }
-        let target = match self.target(&caller, for_user) {
+        let target = match self.target(&caller, &who, for_user) {
             Ok(t) => t,
             Err(code) => return refuse(code, None),
         };
@@ -275,7 +300,7 @@ impl Registrar {
             .limiter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .check(caller.uid, now);
+            .check(who.clone(), now);
         if let Err(wait) = spent {
             return refuse(RegErrorCode::RateLimited, Some(wait));
         }
@@ -296,11 +321,13 @@ impl Registrar {
 
         let local_id = {
             let mut ledger = self.inner.ledger.lock().await;
-            if let Some(e) = ledger.open_duplicate(caller.uid, target.uid, &path, &bin_sha) {
+            if let Some(e) = ledger.open_duplicate(&who, target.uid, &path, &bin_sha) {
                 return answer(e, false);
             }
-            if !ledger.has_room() {
-                return refuse(RegErrorCode::RateLimited, Some(3600));
+            // Checked again under the lock: concurrent requests of one
+            // requester may have passed the early check together.
+            if ledger.open_count(&who) >= max_open || !ledger.make_room() {
+                return refuse(RegErrorCode::RateLimited, Some(OPEN_CAP_RETRY_SECS));
             }
             // 1 self (the app's own image), 2 assisted (a file named by a
             // user, root or the tray).
@@ -330,6 +357,7 @@ impl Registrar {
                 request_id: None,
                 approval_id: None,
                 requester_uid: caller.uid,
+                requester_sid: who.sid().map(str::to_string),
                 target_uid: target.uid,
                 path,
                 bin_sha,
@@ -360,18 +388,20 @@ impl Registrar {
         )
     }
 
-    /// The user the request is for: the caller, or — for root only — the
-    /// `for_user` selection.
+    /// The user the request is for: the caller, or — for Unix root only —
+    /// the `for_user` selection.
     fn target(
         &self,
         caller: &CallerIdentity,
+        who: &Requester,
         sel: Option<UserSel>,
     ) -> Result<Target, RegErrorCode> {
         let _ = self;
         let Some(sel) = sel else {
             return Ok(Target::of_caller(caller));
         };
-        if caller.uid != 0 {
+        // A Windows RID of 0 is not root: `is_root` needs a Unix caller.
+        if !who.is_root() {
             return Err(RegErrorCode::PermissionDenied);
         }
         let uid = match sel {
@@ -451,7 +481,12 @@ impl Registrar {
             },
             Err(e) => {
                 // The document itself is invalid: it can never be accepted.
-                tracing::warn!(error = %e, "app request document invalid; refusing it");
+                // Stable codes only: the document holds paths and user names.
+                tracing::warn!(
+                    reason = e.reason(),
+                    field = e.field().unwrap_or(""),
+                    "app request document invalid; refusing it"
+                );
                 self.update(local_id, now, |entry| {
                     entry.state = LocalState::Refused;
                     entry.doc = None;

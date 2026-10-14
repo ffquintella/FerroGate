@@ -107,6 +107,7 @@ fn config(dir: &std::path::Path) -> RegistrarConfig {
         enable: true,
         assisted: true,
         max_per_uid_per_hour: 10,
+        max_open_per_uid: 50,
         ledger_path: dir.join("app-requests.cbor"),
         identify: IdentifyConfig {
             max_file_size: 1024 * 1024,
@@ -554,4 +555,164 @@ async fn the_ledger_survives_a_restart() {
     };
     assert_eq!(items[0].local_id, local_id);
     assert_eq!(items[0].state, LocalState::Pending);
+}
+
+/// A second executable in the rig's directory, distinct from `r.tool`.
+#[cfg(unix)]
+fn extra_tool(r: &Rig, n: u8) -> std::fs::File {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = r.dir.join(format!("tool{n}"));
+    std::fs::write(&path, format!("#!/bin/true\ntool {n}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::File::open(&path).unwrap()
+}
+
+fn status_of(resp: RegistrationResp) -> Vec<mia_helper_proto::LocalRequestStatus> {
+    match resp {
+        RegistrationResp::Status(items) => items,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+fn status_op() -> HelperOp {
+    HelperOp::RequestStatus {
+        request_ids: vec![],
+    }
+}
+
+/// One local user cannot hold more than `max_open_per_uid` open requests;
+/// other users are not affected, and retries are still answered.
+#[cfg(unix)]
+#[tokio::test]
+async fn open_requests_are_capped_per_requester() {
+    let r = rig_with("opencap", |c| c.max_open_per_uid = 2);
+    // CMIS is unreachable: every request stays queued (open).
+    for n in 1..=2u8 {
+        let (state, _) = submitted_state(
+            &r.registrar
+                .handle_op(caller(1000), register_file(&r, n), Some(extra_tool(&r, n)))
+                .await,
+        );
+        assert_eq!(state, LocalState::Queued);
+    }
+    assert_eq!(
+        r.registrar
+            .handle_op(caller(1000), register_file(&r, 3), Some(extra_tool(&r, 3)))
+            .await,
+        RegistrationResp::Error {
+            code: RegErrorCode::RateLimited,
+            retry_after: Some(OPEN_CAP_RETRY_SECS)
+        }
+    );
+    // A retry of an existing request is still answered.
+    assert_eq!(
+        submitted_state(
+            &r.registrar
+                .handle_op(caller(1000), register_file(&r, 1), Some(extra_tool(&r, 1)))
+                .await
+        )
+        .0,
+        LocalState::Queued
+    );
+    // Another user registers normally.
+    let (state, _) = submitted_state(
+        &r.registrar
+            .handle_op(caller(1001), register_file(&r, 4), Some(extra_tool(&r, 4)))
+            .await,
+    );
+    assert_eq!(state, LocalState::Queued);
+    assert_eq!(
+        status_of(r.registrar.handle_op(caller(1000), status_op(), None).await).len(),
+        2
+    );
+}
+
+/// A ledger filled by one user's closed requests makes room by dropping
+/// that user's oldest one: other users can still register.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_full_ledger_does_not_block_other_requesters() {
+    let r = rig_with("full", |c| {
+        let mut l = Ledger::open(&c.ledger_path);
+        for i in 0..ledger::MAX_ENTRIES {
+            let mut e = ledger::tests::entry(
+                0,
+                666,
+                LocalState::Refused,
+                NOW - 100 + i64::try_from(i).unwrap(),
+            );
+            e.local_id[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+            e.caller_request_id = e.local_id;
+            l.insert(e);
+        }
+        l.save().unwrap();
+    });
+    let (state, local_id) = submitted_state(
+        &r.registrar
+            .handle_op(caller(1000), register_file(&r, 1), open_tool(&r))
+            .await,
+    );
+    assert_eq!(state, LocalState::Queued);
+    let mine = status_of(r.registrar.handle_op(caller(1000), status_op(), None).await);
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].local_id, local_id);
+    let ledger = Ledger::open(&r.dir.join("app-requests.cbor"));
+    assert_eq!(ledger.entries().len(), ledger::MAX_ENTRIES);
+    let mut oldest = [0u8; 16];
+    oldest[..8].copy_from_slice(&0u64.to_be_bytes());
+    assert!(ledger.get(&oldest).is_none(), "the flooder's oldest went");
+}
+
+fn sid_caller(rid: u32, sid: &str) -> CallerIdentity {
+    let mut c = caller(rid);
+    c.user_sid = Some(sid.into());
+    c
+}
+
+/// Windows keys requests by SID: same-RID users of different domains see
+/// only their own requests and never collide on idempotency ids.
+#[cfg(unix)]
+#[tokio::test]
+async fn same_rid_users_of_different_domains_get_their_own_requests() {
+    let r = rig("sid");
+    let a = sid_caller(1104, "S-1-5-21-1111-2222-3333-1104");
+    let b = sid_caller(1104, "S-1-5-21-4444-5555-6666-1104");
+    let (_, local_a) = submitted_state(
+        &r.registrar
+            .handle_op(a.clone(), register_file(&r, 1), open_tool(&r))
+            .await,
+    );
+    assert_eq!(
+        status_of(r.registrar.handle_op(b.clone(), status_op(), None).await).len(),
+        0
+    );
+    let probe = HelperOp::RequestStatus {
+        request_ids: vec![local_a],
+    };
+    assert_eq!(
+        status_of(r.registrar.handle_op(b.clone(), probe, None).await).len(),
+        0
+    );
+    // The same idempotency id (and binary) from B is B's own new request.
+    let (_, local_b) = submitted_state(
+        &r.registrar
+            .handle_op(b.clone(), register_file(&r, 1), open_tool(&r))
+            .await,
+    );
+    assert_ne!(local_a, local_b);
+    let theirs: Vec<_> = status_of(r.registrar.handle_op(b, status_op(), None).await)
+        .into_iter()
+        .map(|s| s.local_id)
+        .collect();
+    assert_eq!(theirs, vec![local_b]);
+    let mine: Vec<_> = status_of(r.registrar.handle_op(a, status_op(), None).await)
+        .into_iter()
+        .map(|s| s.local_id)
+        .collect();
+    assert_eq!(mine, vec![local_a]);
+    // A Unix caller with the same number is neither of them.
+    assert_eq!(
+        status_of(r.registrar.handle_op(caller(1104), status_op(), None).await).len(),
+        0
+    );
 }

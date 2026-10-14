@@ -1,7 +1,12 @@
-//! DDL of the app approval ledger (F19 §2), applied as schema migration 1.
+//! DDL of the app approval ledger (F19 §2), applied as schema migrations 1
+//! ([`LEDGER_SCHEMA`]) and 2 ([`APPROVAL_USER_GUARDS`]).
 //!
 //! Tables first, then indexes, then triggers (trigger bodies name tables
 //! created earlier in the same migration). Every statement is idempotent.
+//! Migration 1 is kept exactly as first applied; migration 2 replaces three
+//! of its `app_approvals` triggers (`DROP TRIGGER IF EXISTS`, then `CREATE`,
+//! in one transaction), so databases created by migration 1 and new ones end
+//! with the same guards.
 //!
 //! The triggers are the **database half** of the non-replacement invariant
 //! (ADR-0004 INV-1 to INV-3). They guard against application bugs; the audit
@@ -19,13 +24,133 @@
 //!   (F19 §10), and only once it is terminal.
 //! - What an approval authorizes (host, lineage, hash, revision, origin,
 //!   parent, approver) never changes. Scope only narrows, `REVOKED` is final,
-//!   every policy change advances `row_version` by one and must have its
+//!   every policy or user change (`uid`, `user_kind`, `sid`, `user_name`
+//!   included) advances `row_version` by one and must have its
 //!   `app_approval_revisions` row, and an auto-update approval must copy an
 //!   active, unfrozen auto-update parent of its lineage, expiry included,
 //!   and never re-approve a revoked or denied hash.
+//! - The user of an approval changes only when an any-user scope is
+//!   narrowed (versioned), or — the one unversioned change — when the
+//!   `sid`/`user_name` of a `REVOKED` (final) approval is pseudonymised
+//!   (F19 §10): replaced by a value in the [`PSEUDONYM_PREFIX`] format. An
+//!   `EXPIRED` approval can be renewed, so its user is never rewritten in
+//!   place.
 //! - A host's allowlist generation never decreases.
 
-/// Statements of schema migration 1, in order.
+/// Prefix of a pseudonymised personal value (F19 §10): `pseudonym:v1:`
+/// followed by 64 lowercase hex characters (a keyed SHA-256). A `:` appears
+/// in neither a Unix nor a Windows user name, nor in a SID, so a pseudonym
+/// never collides with a real identity.
+pub const PSEUDONYM_PREFIX: &str = "pseudonym:v1:";
+
+/// Whether `value` is in the pseudonym format the ledger triggers accept for
+/// the pseudonymisation of a revoked approval ([`PSEUDONYM_PREFIX`] + 64
+/// lowercase hex characters).
+#[must_use]
+pub fn is_pseudonym(value: &str) -> bool {
+    value.strip_prefix(PSEUDONYM_PREFIX).is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// SQL: `$col` holds a pseudonym ([`is_pseudonym`]); `0` for `NULL`.
+macro_rules! pseudonym_sql {
+    ($col:literal) => {
+        concat!(
+            "coalesce((",
+            $col,
+            " GLOB 'pseudonym:v1:*' AND length(",
+            $col,
+            ") = 77 AND substr(",
+            $col,
+            ", 14) NOT GLOB '*[^0-9a-f]*'), 0)"
+        )
+    };
+}
+
+/// SQL: this update of a `REVOKED` approval changes `sid` and `user_name`
+/// only to pseudonyms (or not at all).
+macro_rules! pseudonymises_revoked_sql {
+    () => {
+        concat!(
+            "(OLD.state = 3 AND (NEW.sid IS OLD.sid OR ",
+            pseudonym_sql!("NEW.sid"),
+            ") AND (NEW.user_name IS OLD.user_name OR ",
+            pseudonym_sql!("NEW.user_name"),
+            "))"
+        )
+    };
+}
+
+/// Statements of schema migration 2, in order: the `app_approvals` user
+/// guards of migration 1, replaced (F19 security review). Migration 1 let
+/// `sid` and `user_name` change without a `row_version` bump on any approval
+/// that was not `ACTIVE`, so the user of an `EXPIRED` approval could be
+/// rewritten and the approval then renewed for someone else; nor did its
+/// versioned and `REVOKED`-final checks cover those two columns.
+pub(crate) const APPROVAL_USER_GUARDS: &[&str] = &[
+    "DROP TRIGGER IF EXISTS app_approvals_user_changes_on_narrowing",
+    concat!(
+        "CREATE TRIGGER IF NOT EXISTS app_approvals_user_changes_on_narrowing \
+            BEFORE UPDATE ON app_approvals \
+            WHEN (NEW.uid IS NOT OLD.uid OR NEW.user_kind IS NOT OLD.user_kind \
+                    OR NEW.sid IS NOT OLD.sid OR NEW.user_name IS NOT OLD.user_name) \
+                AND NOT (OLD.user_scope = 2 AND NEW.user_scope = 1) \
+                AND NOT (NEW.state = 3 AND NEW.uid IS OLD.uid \
+                    AND NEW.user_kind IS OLD.user_kind AND NEW.row_version = OLD.row_version \
+                    AND ",
+        pseudonymises_revoked_sql!(),
+        ") \
+            BEGIN SELECT RAISE(ABORT, 'app_approvals: the user of an approval changes only when an \
+                any-user scope is narrowed, or is pseudonymised once revoked'); END"
+    ),
+    "DROP TRIGGER IF EXISTS app_approvals_revoked_final",
+    concat!(
+        "CREATE TRIGGER IF NOT EXISTS app_approvals_revoked_final \
+            BEFORE UPDATE ON app_approvals \
+            WHEN OLD.state = 3 AND (NEW.state IS NOT 3 OR NEW.row_version IS NOT OLD.row_version \
+                OR NEW.expires_at IS NOT OLD.expires_at \
+                OR NEW.update_policy IS NOT OLD.update_policy \
+                OR NEW.continuity IS NOT OLD.continuity OR NEW.user_scope IS NOT OLD.user_scope \
+                OR NEW.path_match IS NOT OLD.path_match OR NEW.user_kind IS NOT OLD.user_kind \
+                OR NEW.uid IS NOT OLD.uid OR NEW.note IS NOT OLD.note \
+                OR NEW.superseded_by IS NOT OLD.superseded_by OR NEW.revoked_at IS NOT OLD.revoked_at \
+                OR NEW.revoked_by_admin_id IS NOT OLD.revoked_by_admin_id \
+                OR NEW.revoke_reason_code IS NOT OLD.revoke_reason_code \
+                OR (NEW.sid IS NOT OLD.sid AND NOT ",
+        pseudonym_sql!("NEW.sid"),
+        ") OR (NEW.user_name IS NOT OLD.user_name AND NOT ",
+        pseudonym_sql!("NEW.user_name"),
+        ")) \
+            BEGIN SELECT RAISE(ABORT, 'app_approvals: REVOKED is final'); END"
+    ),
+    "DROP TRIGGER IF EXISTS app_approvals_changes_are_versioned",
+    concat!(
+        "CREATE TRIGGER IF NOT EXISTS app_approvals_changes_are_versioned \
+            BEFORE UPDATE ON app_approvals \
+            WHEN (NEW.state IS NOT OLD.state OR NEW.update_policy IS NOT OLD.update_policy \
+                    OR NEW.continuity IS NOT OLD.continuity OR NEW.expires_at IS NOT OLD.expires_at \
+                    OR NEW.note IS NOT OLD.note OR NEW.user_scope IS NOT OLD.user_scope \
+                    OR NEW.path_match IS NOT OLD.path_match OR NEW.user_kind IS NOT OLD.user_kind \
+                    OR NEW.uid IS NOT OLD.uid OR NEW.revoked_at IS NOT OLD.revoked_at \
+                    OR NEW.revoked_by_admin_id IS NOT OLD.revoked_by_admin_id \
+                    OR NEW.revoke_reason_code IS NOT OLD.revoke_reason_code \
+                    OR NEW.row_version IS NOT OLD.row_version \
+                    OR ((NEW.sid IS NOT OLD.sid OR NEW.user_name IS NOT OLD.user_name) \
+                        AND NOT ",
+        pseudonymises_revoked_sql!(),
+        ")) \
+                AND (NEW.row_version IS NOT OLD.row_version + 1 \
+                    OR NOT EXISTS (SELECT 1 FROM app_approval_revisions v \
+                        WHERE v.approval_id = OLD.approval_id AND v.row_version = NEW.row_version)) \
+            BEGIN SELECT RAISE(ABORT, 'app_approvals: every change advances row_version by one and \
+                has a revision record'); END"
+    ),
+];
+
+/// Statements of schema migration 1, in order. Kept exactly as first
+/// applied; three of its triggers are replaced by migration 2
+/// ([`APPROVAL_USER_GUARDS`]).
 pub(crate) const LEDGER_SCHEMA: &[&str] = &[
     // ---- tables -------------------------------------------------------------
     "CREATE TABLE IF NOT EXISTS app_lineages ( \
@@ -324,6 +449,7 @@ pub(crate) const LEDGER_SCHEMA: &[&str] = &[
             OR NEW.approved_by_admin_id IS NOT OLD.approved_by_admin_id \
             OR NEW.created_at IS NOT OLD.created_at \
         BEGIN SELECT RAISE(ABORT, 'app_approvals: what an approval authorizes is immutable'); END",
+    // Replaced by migration 2 (`APPROVAL_USER_GUARDS`): sid and user_name.
     "CREATE TRIGGER IF NOT EXISTS app_approvals_revoked_final \
         BEFORE UPDATE ON app_approvals \
         WHEN OLD.state = 3 AND (NEW.state IS NOT 3 OR NEW.row_version IS NOT OLD.row_version \
@@ -342,6 +468,8 @@ pub(crate) const LEDGER_SCHEMA: &[&str] = &[
             OR (OLD.path_match = 1 AND NEW.path_match = 2) \
         BEGIN SELECT RAISE(ABORT, 'app_approvals: scope only narrows; widening needs a new \
             request'); END",
+    // Replaced by migration 2: its carve-out let sid and user_name change
+    // unversioned on any non-ACTIVE approval.
     "CREATE TRIGGER IF NOT EXISTS app_approvals_user_changes_on_narrowing \
         BEFORE UPDATE ON app_approvals \
         WHEN (NEW.uid IS NOT OLD.uid OR NEW.user_kind IS NOT OLD.user_kind \
@@ -359,6 +487,7 @@ pub(crate) const LEDGER_SCHEMA: &[&str] = &[
             OR (OLD.state = 2 AND NEW.state = 1 \
                 AND (NEW.expires_at IS NULL OR NEW.expires_at > OLD.expires_at))) \
         BEGIN SELECT RAISE(ABORT, 'app_approvals: invalid state transition'); END",
+    // Replaced by migration 2: sid and user_name.
     "CREATE TRIGGER IF NOT EXISTS app_approvals_changes_are_versioned \
         BEFORE UPDATE ON app_approvals \
         WHEN (NEW.state IS NOT OLD.state OR NEW.update_policy IS NOT OLD.update_policy \

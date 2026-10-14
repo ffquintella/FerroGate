@@ -51,6 +51,7 @@ pub use model::{
     UserScope, FLAG_PATH_PROTECTED,
 };
 pub use reads::{HashHistory, LiveApproval, PendingCounts, MAX_STATUS_IDS};
+pub use schema::{is_pseudonym, PSEUDONYM_PREFIX};
 pub use search::{
     ApprovalFilter, ApprovalListItem, Cursor, RequestFilter, RequestListItem, MAX_PAGE_SIZE,
 };

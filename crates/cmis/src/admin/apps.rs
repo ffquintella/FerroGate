@@ -722,6 +722,16 @@ pub async fn approve_app_request(
     let strict = st.config().strict_sod;
     let now = st.now();
     let req = request.into_inner();
+    // Revoking alongside the approval is a revocation: it needs
+    // `approval.revoke` as well, checked before anything is read or written.
+    if !req.also_revoke_approval_ids.is_empty() {
+        require_also(
+            authz,
+            &ctx,
+            paths::APPROVE_APP_REQUEST,
+            Permission::ApprovalRevoke,
+        )?;
+    }
     check_idempotency(&req.idempotency_key)?;
     check_id(&req.request_id, "request_id")?;
     let cluster = st.cluster();
@@ -1109,17 +1119,29 @@ async fn registration_outcome(
 /// Refuse a single-step registration from a caller without
 /// `app_request.approve`, recording the refusal like the layer does.
 fn require_approve(authz: &AdminAuthz, ctx: &AdminContext) -> Result<(), Status> {
-    if ctx.has(Permission::AppRequestApprove) {
+    require_also(
+        authz,
+        ctx,
+        paths::ADMIN_REGISTER_APPLICATION,
+        Permission::AppRequestApprove,
+    )
+}
+
+/// Refuse a call to `path` that also needs `permission` beyond the one its
+/// `METHOD_ACCESS` rule names (`PERMISSION_DENIED permission_denied`),
+/// recording the refusal like the layer does.
+fn require_also(
+    authz: &AdminAuthz,
+    ctx: &AdminContext,
+    path: &str,
+    permission: Permission,
+) -> Result<(), Status> {
+    if ctx.has(permission) {
         return Ok(());
     }
-    if let Some(Access::Session(mut rule)) = access_for(paths::ADMIN_REGISTER_APPLICATION) {
-        rule.permission = Some(Permission::AppRequestApprove);
-        authz.deny(
-            Some(ctx),
-            paths::ADMIN_REGISTER_APPLICATION,
-            rule,
-            "permission_denied",
-        );
+    if let Some(Access::Session(mut rule)) = access_for(path) {
+        rule.permission = Some(permission);
+        authz.deny(Some(ctx), path, rule, "permission_denied");
     }
     Err(Status::permission_denied("permission_denied"))
 }

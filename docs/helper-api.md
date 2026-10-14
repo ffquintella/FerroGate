@@ -224,6 +224,12 @@ enum RegistrationResp {
 - **Caller identity** is established exactly as for tokens (kernel peer
   credentials, IMA on Linux); `CallerIdentity` now also carries the
   kernel-resolved canonical `exe_path` and, on Windows, the full `user_sid`.
+  On Unix `exe_path` is set only when it is bound to the hashed image: it
+  names that very file (same device and inode) in the daemon's mount
+  namespace, and on Linux the caller shares the daemon's mount namespace and
+  root. A path faked with a bind mount in another namespace is no path, so
+  path-constrained v2 entries admit nobody (fail closed); the same rule
+  applies to the path a registration reports.
 - **`RegisterSelf`** identifies the caller's running image from one open file
   (Linux `/proc/<pid>/exe`) with `ferro-appid` — never executed — and refuses
   it unless its SHA-384 equals the authenticated caller hash.
@@ -233,10 +239,13 @@ enum RegistrationResp {
   with an execute bit, and hashes only that descriptor, so it is no hash
   oracle for files the user cannot read. `for_user` needs root. Not offered on
   Windows yet (it needs the impersonated open in `ferro-winauth`).
-- **Limits:** 10 requests per uid and 60 per host per hour, two concurrent
-  hashes, `registration.max_file_size_mib`, frames ≤ 64 KiB, reason ≤ 200
-  characters, unknown fields rejected.
+- **Limits:** 10 requests per uid and 60 per host per hour, at most
+  `registration.max_open_per_uid` (50) open requests per requester, two
+  concurrent hashes, `registration.max_file_size_mib`, frames ≤ 64 KiB,
+  reason ≤ 200 characters, unknown fields rejected. A full ledger drops the
+  oldest closed request of the requester holding the most closed requests.
 - **`RequestStatus`** answers only the caller's own requests (all for root).
+  Requests are keyed by uid on Unix and by the full user SID on Windows.
   A token refusal stays non-informative.
 
 The daemon signs each request with the host machine key

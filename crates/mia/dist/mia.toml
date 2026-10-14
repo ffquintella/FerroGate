@@ -124,6 +124,8 @@
 #enable = true
 #assisted = true
 #max_per_uid_per_hour = 10
+# Open (queued or pending) requests one user may hold, 1..=100.
+#max_open_per_uid = 50
 #max_file_size_mib = 2048
 #version_sources = ["pe", "plist", "elf-note", "dpkg"]
 #ledger_path = ""
