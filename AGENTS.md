@@ -7,7 +7,7 @@ should follow the conventions below in addition to the upstream
 ## Project shape
 
 - Kind     : CLI tool
-- Database : MySQL
+- Database : hiqlite (embedded SQLite replicated with Raft; see `crates/ferro-raft`)
 
 ## House rules
 

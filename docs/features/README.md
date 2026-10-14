@@ -22,6 +22,13 @@ reviewed in isolation, even though some have ordering dependencies.
 | F14 | [Root key ceremony and rotation](F14-root-key-ceremony.md) | CMIS, offline | Done (offline-signer + ferro-ceremony; JWKS newer-preferred; staging dry-run) |
 | F17 | [X.509-SVID profile](F17-x509-svid.md) | CMIS, MIA | Done (issuance, reference verifier, machine-bound store: TPM / Secure Enclave / machine key); serving the credential to a workload pending |
 | F18 | [MIA tray companion](F18-mia-tray.md) | MIA | In progress (daemon side and `mia-tray` done; e2e state coverage, real-prompt and package-build verification pending) |
+| F19 | [Application registration and approval lifecycle](F19-app-registration-approval.md) | CMIS, MIA, SDK | Specified (Proposed; needs F20 Phase 0 first) |
+| F20 | [Administrator authentication and authorization](F20-admin-authentication.md) | CMIS, CLI | Specified (Proposed; Phase 0 closes a critical gap and blocks F19/F21/F22) |
+| F21 | [Server administration TUI](F21-admin-tui.md) | CMIS tools | Specified (Proposed) |
+| F22 | [Tray admin client](F22-tray-admin-client.md) | MIA tray | Specified (Proposed) |
+
+The four features above are tied together, with an end-to-end sequence, in
+[../app-approval-and-admin.md](../app-approval-and-admin.md).
 
 For the planned ordering and progress tracking see
 [../roadmap.md](../roadmap.md).

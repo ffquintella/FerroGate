@@ -11,6 +11,8 @@ ADRs are immutable once **Accepted**. To revise a decision, add a new ADR that
 | ADR | Title | Status |
 |-----|-------|--------|
 | [0001](0001-grpc-over-http-transport.md) | gRPC over HTTP/REST for the control plane | Accepted |
+| [0004](0004-app-approval-ledger.md) | Application approval ledger and the non-replacement invariant | Proposed |
+| [0005](0005-admin-authentication.md) | Administrator authentication and authorization for CMIS | Proposed |
 
 ## Status values
 
