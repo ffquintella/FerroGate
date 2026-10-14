@@ -280,11 +280,13 @@ so `mia allowlist-key fetch --reload` needs no restart either. (Windows has no
   at 96 h and capped at 30 days). Re-issue rather
   than mint long-lived lists so the MIA's freshness check stays meaningful.
 - **Admin authorization.** `SetAllowlist`/`DeleteAllowlist`/`ListAllowlists` are
-  admin RPCs, authenticated out of band as operator actions exactly like
-  `RevokeSvid`/`BumpEpoch` (transport-level: SPKI-pinned TLS + network/proxy
-  controls). `GetAllowlist` is deliberately unauthenticated. Every set/delete is
-  recorded in the audit log (`AllowlistSet`/`AllowlistDeleted`, host UUID + entry
-  count only — no PII).
+  admin RPCs that, since 0.29.0 (F20), need an administrator session exactly
+  like `RevokeSvid`/`BumpEpoch`: sign in with `ferrogate admin login`; writes
+  also need a fresh second-factor step-up. The TLS layer does not authenticate
+  callers. `GetAllowlist` is deliberately unauthenticated. Every set/delete is
+  recorded in the audit log (`AllowlistSet`/`AllowlistDeleted`, host UUID +
+  entry count + pseudonymous administrator id — no PII). See
+  [operations.md](operations.md#administrator-access-f20).
 
 ## Limitations (current)
 

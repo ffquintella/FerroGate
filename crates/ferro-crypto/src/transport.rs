@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, NamedGroup, ServerConfig};
 
 use crate::pin::{SpkiPin, SpkiPinVerifier};
@@ -38,6 +39,10 @@ pub enum TransportConfigError {
     /// did not match, or the key could not be parsed).
     #[error("rustls config: {0}")]
     Rustls(#[from] rustls::Error),
+    /// The client-certificate verifier could not be built from the configured
+    /// CA roots (for example an empty or unparseable root set).
+    #[error("client certificate verifier: {0}")]
+    ClientVerifier(String),
 }
 
 /// Build a server-side rustls config for the FerroGate transport.
@@ -56,6 +61,61 @@ pub fn server_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
+    cfg.alpn_protocols = vec![ALPN_H2.to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// Build a server-side rustls config that additionally **requires** a client
+/// certificate chaining to one of `client_ca_roots` (mutual TLS).
+///
+/// Used by the CMIS admin listener when `CMIS_ADMIN_CLIENT_CA` is set (F20
+/// §2): the client certificate is an extra factor on top of the admin session,
+/// never a substitute for it. A client presenting no certificate, or one that
+/// does not chain to a configured root, fails the handshake. Otherwise
+/// identical to [`server_config`].
+pub fn server_config_with_client_auth(
+    mode: ProviderMode,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    client_ca_roots: Vec<CertificateDer<'static>>,
+) -> Result<Arc<ServerConfig>, TransportConfigError> {
+    let provider = Arc::new(ferrogate_provider(mode));
+    let mut roots = rustls::RootCertStore::empty();
+    for root in client_ca_roots {
+        roots.add(root)?;
+    }
+    let verifier =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+            .build()
+            .map_err(|e| TransportConfigError::ClientVerifier(e.to_string()))?;
+    let mut cfg = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)?;
+    cfg.alpn_protocols = vec![ALPN_H2.to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// Build a client-side rustls config that authenticates the server by SPKI
+/// pin and presents `client_chain` / `client_key` when the server asks for a
+/// client certificate (the optional admin-listener mTLS of F20 §2).
+///
+/// # Panics
+///
+/// Panics if `pins` is empty; see [`client_config`].
+pub fn client_config_with_client_auth(
+    mode: ProviderMode,
+    pins: Vec<SpkiPin>,
+    client_chain: Vec<CertificateDer<'static>>,
+    client_key: PrivateKeyDer<'static>,
+) -> Result<Arc<ClientConfig>, TransportConfigError> {
+    let provider = Arc::new(ferrogate_provider(mode));
+    let verifier = SpkiPinVerifier::new(pins, Arc::clone(&provider));
+    let mut cfg = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(client_chain, client_key)?;
     cfg.alpn_protocols = vec![ALPN_H2.to_vec()];
     Ok(Arc::new(cfg))
 }

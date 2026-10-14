@@ -11,6 +11,8 @@
 //!   MIA verifies.
 //! - [`claims`] — the `ferrogate-svid-v1` payload schema.
 //! - [`envelope`] — compact-JWS encode/decode and the signing transcript.
+//! - [`host_call`] — the signed documents of host-authenticated RPCs (F19
+//!   §7.1 `HostCallAuth`; `AppendAuditEvent` since F20 Phase 0).
 //! - [`spiffe`] — SPIFFE-ID derivation from `SHA-384(ek_cert)`.
 //! - [`jwks`] — the composite JWK / JWK-set the reference verifier consumes.
 //! - [`issue`] — the [`issue::Issuer`] that produces signed SVIDs.
@@ -30,6 +32,7 @@ pub mod allowlist;
 pub mod claims;
 pub mod crl;
 pub mod envelope;
+pub mod host_call;
 pub mod issue;
 pub mod jwks;
 pub mod lifecycle;

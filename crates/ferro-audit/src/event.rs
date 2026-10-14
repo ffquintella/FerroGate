@@ -49,6 +49,10 @@ pub enum AuditEvent {
         cert_sha: Hash384,
         /// Stable opcode for the revocation reason.
         reason: String,
+        /// Pseudonymous id (UUIDv7) of the administrator whose authenticated
+        /// session made the call (F20). Absent on events written before F20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_admin_id: Option<String>,
     },
     /// Every SVID and child token for a host was revoked (admin RPC).
     HostRevoked {
@@ -56,6 +60,10 @@ pub enum AuditEvent {
         spiffe_id: String,
         /// Stable opcode for the revocation reason.
         reason: String,
+        /// Pseudonymous id (UUIDv7) of the administrator whose authenticated
+        /// session made the call (F20). Absent on events written before F20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_admin_id: Option<String>,
     },
     /// A host passed the F13 fleet-manifest pre-admission check at the start
     /// of `Attest` — its EK certificate hash is enrolled — and was allowed to
@@ -83,6 +91,10 @@ pub enum AuditEvent {
         new_epoch: u64,
         /// Short, stable opcode for why (e.g. `"rim-policy-change"`).
         reason: String,
+        /// Pseudonymous id (UUIDv7) of the administrator whose authenticated
+        /// session made the call (F20). Absent on events written before F20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_admin_id: Option<String>,
     },
     /// A host's signed caller allowlist was stored or replaced (admin RPC).
     AllowlistSet {
@@ -92,11 +104,19 @@ pub enum AuditEvent {
         entry_count: u32,
         /// Hard expiry CMIS stamped, Unix seconds.
         not_after: i64,
+        /// Pseudonymous id (UUIDv7) of the administrator whose authenticated
+        /// session made the call (F20). Absent on events written before F20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_admin_id: Option<String>,
     },
     /// A host's stored allowlist was deleted (admin RPC).
     AllowlistDeleted {
         /// EK-derived host UUID whose allowlist was removed.
         host_uuid: String,
+        /// Pseudonymous id (UUIDv7) of the administrator whose authenticated
+        /// session made the call (F20). Absent on events written before F20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_admin_id: Option<String>,
     },
     /// A host proposed a caller allowlist that was queued for operator review
     /// (an allowlist already exists, or policy declines to auto-adopt).
@@ -122,6 +142,10 @@ pub enum AuditEvent {
     AllowlistProposalRejected {
         /// EK-derived host UUID whose pending proposal was dropped.
         host_uuid: String,
+        /// Pseudonymous id (UUIDv7) of the administrator whose authenticated
+        /// session made the call (F20). Absent on events written before F20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_admin_id: Option<String>,
     },
     /// A threshold key share was used to reconstruct the issuance key.
     KeyShareUsed {
@@ -163,6 +187,200 @@ pub enum AuditEvent {
         by_uid: u32,
         /// Dotted names of the keys whose value changed (e.g. `cmis.endpoint`).
         keys: Vec<String>,
+    },
+    // ---- Administrator authentication (F20 §10) -------------------------
+    //
+    // Administrators appear only as an opaque `admin_id` (UUIDv7) and a
+    // `session_ref` (a short digest of the session hash, never the token).
+    // Source addresses and attempted usernames are keyed HMACs under the
+    // per-deployment audit pseudonymisation key. No username, display name,
+    // password, TOTP code or token is ever recorded.
+    /// An administrator signed in.
+    AdminLoginSucceeded {
+        /// Pseudonymous administrator id.
+        admin_id: String,
+        /// Reference to the new session.
+        session_ref: String,
+        /// Authenticator assurance level of the session (2 TOTP or a synced
+        /// passkey, 3 a device-bound FIDO2 credential).
+        aal: u8,
+        /// Second-factor method used (`"totp"` or `"webauthn"`).
+        mfa_method: String,
+        /// Client kind (1 tui, 2 tray, 3 cli).
+        client_kind: u8,
+        /// Keyed HMAC of the source IP.
+        src_ip_hmac: String,
+    },
+    /// A sign-in attempt failed. The client always sees the same generic
+    /// error; the reason here is a stable opcode.
+    AdminLoginFailed {
+        /// Keyed HMAC of the normalised username that was attempted.
+        account_ref_hmac: String,
+        /// `invalid_credentials`, `disabled`, `nonce`, or
+        /// `method_not_allowed` (a second factor the F20 §5 policy refuses
+        /// for this client, e.g. TOTP from the tray for a FIDO2-bound group).
+        reason: String,
+        /// Keyed HMAC of the source IP.
+        src_ip_hmac: String,
+        /// Lock applied by this failure, in seconds (0 when none).
+        lock_secs: u64,
+    },
+    /// A progressive login lock (NRM §5.3.5) was applied to a throttle key.
+    AdminLockoutApplied {
+        /// `ip`, `ip_device` or `account`.
+        key_kind: String,
+        /// Lock duration in seconds.
+        lock_secs: u64,
+    },
+    /// Login failures crossed the alerting threshold (F20 §8).
+    AdminLoginAnomaly {
+        /// Failures recorded across all keys in the last 10 minutes.
+        failures_10m: u32,
+    },
+    /// An administrator ended their own session.
+    AdminLogout {
+        /// Pseudonymous administrator id.
+        admin_id: String,
+        /// Reference to the ended session.
+        session_ref: String,
+    },
+    /// A session was revoked by the server or by an administrator.
+    AdminSessionRevoked {
+        /// Owner of the revoked session.
+        admin_id: String,
+        /// Reference to the revoked session.
+        session_ref: String,
+        /// Administrator who revoked it, when not the server itself.
+        by_admin_id: Option<String>,
+        /// Stable opcode (`ip_mismatch`, `evicted`, `password_changed`, ...).
+        reason: String,
+    },
+    /// A step-up (fresh second factor) was attempted on a session.
+    AdminStepUp {
+        /// Pseudonymous administrator id.
+        admin_id: String,
+        /// Reference to the session (before rotation).
+        session_ref: String,
+        /// Second-factor method used (`"totp"` or `"webauthn"`).
+        mfa_method: String,
+        /// Whether the step-up succeeded.
+        success: bool,
+    },
+    /// An administrator password was changed.
+    AdminPasswordChanged {
+        /// Account whose password changed.
+        admin_id: String,
+        /// True when the account holder changed it themself.
+        by_self: bool,
+    },
+    /// An administrator account was created (pending enrollment).
+    AdminAccountCreated {
+        /// New account id.
+        admin_id: String,
+        /// Creating administrator.
+        by_admin_id: String,
+        /// Group names granted at creation.
+        groups: Vec<String>,
+    },
+    /// An administrator account was updated.
+    AdminAccountUpdated {
+        /// Updated account id.
+        admin_id: String,
+        /// Updating administrator.
+        by_admin_id: String,
+        /// Names of the changed fields (never their values).
+        changed_fields: Vec<String>,
+        /// The new group set, when it changed.
+        groups: Option<Vec<String>>,
+    },
+    /// An administrator account changed state.
+    AdminAccountStateChanged {
+        /// Account id.
+        admin_id: String,
+        /// Administrator who changed it.
+        by_admin_id: String,
+        /// `active` or `disabled`.
+        state: String,
+    },
+    /// An administrator's credentials were reset and a reset token issued.
+    AdminCredentialsReset {
+        /// Account id.
+        admin_id: String,
+        /// Administrator who reset them.
+        by_admin_id: String,
+        /// Whether the password was cleared.
+        password: bool,
+        /// Whether the second factor was cleared.
+        mfa: bool,
+    },
+    /// An enrollment or reset token was redeemed.
+    AdminEnrollmentCompleted {
+        /// Account id.
+        admin_id: String,
+        /// `enroll` or `reset`.
+        purpose: String,
+        /// True when the redeeming IP matches an active session of the
+        /// account's creator (F20 §9 residual-risk flag).
+        same_ip_as_creator: bool,
+    },
+    /// An administrator added a second factor to their own account from a
+    /// signed-in session (F20 §5 enrollment, item 2).
+    AdminMfaEnrolled {
+        /// Account that gained the factor.
+        admin_id: String,
+        /// `totp` or `webauthn`.
+        method: String,
+    },
+    /// A second factor was removed from an account.
+    AdminMfaRemoved {
+        /// Account that lost the factor.
+        admin_id: String,
+        /// `totp` or `webauthn`.
+        method: String,
+        /// Administrator who removed it, when not the account holder.
+        by_admin_id: Option<String>,
+    },
+    /// A FIDO2 assertion carried a valid signature but a signature counter
+    /// that did not advance: the authenticator may have been cloned. The
+    /// assertion was refused.
+    AdminWebAuthnCloneDetected {
+        /// Account whose credential reported the regression.
+        admin_id: String,
+        /// Opaque factor reference (a digest of the credential id, never the
+        /// credential or its key).
+        factor_id: String,
+    },
+    /// The first administrator account was bootstrapped.
+    AdminBootstrapCompleted {
+        /// The bootstrapped account id.
+        admin_id: String,
+    },
+    /// The strict separation-of-duties policy differs from the value last
+    /// recorded.
+    AdminSodModeChanged {
+        /// The policy now in force.
+        strict: bool,
+    },
+    /// An admin method call was refused after authentication.
+    AdminAccessDenied {
+        /// Caller, when a session was established.
+        admin_id: Option<String>,
+        /// Full gRPC method path.
+        method: String,
+        /// Permission the method needs (empty when none).
+        permission: String,
+        /// Stable opcode (`permission_denied`, `method_not_classified`, ...).
+        reason: String,
+    },
+    /// An admin method call passed authentication and authorization and was
+    /// handed to its handler. Mutations additionally record their own event.
+    AdminCallAuthorized {
+        /// Caller.
+        admin_id: String,
+        /// Reference to the caller's session.
+        session_ref: String,
+        /// Full gRPC method path.
+        method: String,
     },
 }
 
@@ -225,6 +443,7 @@ mod tests {
         let b = encode(&AuditEvent::SvidRevoked {
             cert_sha: Hash384([0u8; 48]),
             reason: "rim".into(),
+            by_admin_id: None,
         })
         .unwrap();
         assert_ne!(a, b);
@@ -233,5 +452,75 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         assert!(decode(&[0xFF, 0xFF, 0xFF]).is_err());
+    }
+
+    /// Attributing a legacy admin mutation to an administrator must not change
+    /// the encoding of an unattributed event, so leaf hashes of events written
+    /// before F20 stay reproducible.
+    #[test]
+    fn unattributed_legacy_event_encodes_as_before_f20() {
+        // A pre-F20 encoder produced exactly the tag plus `host_uuid`.
+        #[derive(serde::Serialize)]
+        #[serde(tag = "type")]
+        enum Old {
+            AllowlistDeleted { host_uuid: String },
+        }
+        let e = AuditEvent::AllowlistDeleted {
+            host_uuid: "h".into(),
+            by_admin_id: None,
+        };
+        let bytes = encode(&e).unwrap();
+        let mut old = Vec::new();
+        ciborium::into_writer(
+            &Old::AllowlistDeleted {
+                host_uuid: "h".into(),
+            },
+            &mut old,
+        )
+        .unwrap();
+        assert_eq!(bytes, old);
+        assert_eq!(decode(&old).unwrap(), e);
+    }
+
+    #[test]
+    fn admin_events_round_trip() {
+        let events = vec![
+            AuditEvent::AdminLoginSucceeded {
+                admin_id: "0190".into(),
+                session_ref: "ab".into(),
+                aal: 2,
+                mfa_method: "totp".into(),
+                client_kind: 3,
+                src_ip_hmac: "cd".into(),
+            },
+            AuditEvent::AdminAccessDenied {
+                admin_id: None,
+                method: "/ferrogate.v1.MachineIdentity/SetAllowlist".into(),
+                permission: "legacy.allowlist.write".into(),
+                reason: "permission_denied".into(),
+            },
+            AuditEvent::AllowlistSet {
+                host_uuid: "h".into(),
+                entry_count: 1,
+                not_after: 2,
+                by_admin_id: Some("0190".into()),
+            },
+            AuditEvent::AdminMfaEnrolled {
+                admin_id: "0190".into(),
+                method: "webauthn".into(),
+            },
+            AuditEvent::AdminMfaRemoved {
+                admin_id: "0190".into(),
+                method: "totp".into(),
+                by_admin_id: None,
+            },
+            AuditEvent::AdminWebAuthnCloneDetected {
+                admin_id: "0190".into(),
+                factor_id: "wa_00".into(),
+            },
+        ];
+        for e in events {
+            assert_eq!(decode(&encode(&e).unwrap()).unwrap(), e);
+        }
     }
 }

@@ -1,10 +1,12 @@
 //! `cmis` — Central Machine Identity Service binary.
 //!
-//! A thin wrapper: assemble [`cmis::CmisState`] and serve the
-//! [`cmis::MachineIdentitySvc`] gRPC surface. The listener terminates
+//! A thin wrapper: assemble [`cmis::CmisState`] and hand it to
+//! [`cmis::server::run`], which serves the [`cmis::MachineIdentitySvc`] gRPC
+//! surface and the F20 admin listener. The main listener terminates
 //! hybrid-PQC TLS (F01, `X25519MLKEM768`-only) when `CMIS_TLS_CERT` +
 //! `CMIS_TLS_KEY` are configured, falling back to a plaintext bring-up server
-//! for local development otherwise. A TEE-resident issuance key (F06) and a
+//! for local development otherwise (admin methods then answer
+//! `tls_required`). A TEE-resident issuance key (F06) and a
 //! configured phase-3 credential maker are layered on in later milestones;
 //! until then `JWKS` is fully functional and `Attest` will report the
 //! credential service as unavailable.
@@ -19,11 +21,10 @@ use anyhow::Context as _;
 
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::fleet_manifest::FleetManifestLoader;
-use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
+use cmis::{CmisConfig, CmisState};
 use ferro_attest::{RimLoader, RimStore, TpmQuoteVerifier, TrustedKeys, VendorTrustStore};
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore, SthSigner};
 use ferro_crypto::composite::CompositePublicKey;
-use ferro_crypto::tls::ProviderMode;
 use ferro_raft::{Cluster, ClusterConfig, PeerNode, PeerTls};
 use ferro_svid::Issuer;
 use tracing_subscriber::EnvFilter;
@@ -158,7 +159,10 @@ async fn resolve_cluster_seed(
                 tracing::warn!("no issuer seed on disk or in the cluster — minting a fresh one");
                 seed
             };
-            if cluster.try_store_issuer_seed(&candidate, now_unix()).await? {
+            if cluster
+                .try_store_issuer_seed(&candidate, now_unix())
+                .await?
+            {
                 if past_deadline && !cluster.is_leader().await {
                     tracing::warn!(
                         wait = ?FOLLOWER_SEED_WAIT,
@@ -199,8 +203,12 @@ fn read_seed_file(path: &std::path::Path) -> anyhow::Result<Option<[u8; 32]>> {
 
 /// Interpret raw bytes as a 32-byte Ed25519/composite master seed.
 fn parse_seed(bytes: &[u8], src: &str) -> anyhow::Result<[u8; 32]> {
-    <[u8; 32]>::try_from(bytes)
-        .map_err(|_| anyhow::anyhow!("issuer seed from {src} is {} bytes, expected 32", bytes.len()))
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "issuer seed from {src} is {} bytes, expected 32",
+            bytes.len()
+        )
+    })
 }
 
 /// Write the canonical seed to `path` as `0600`, creating parent dirs. Writes
@@ -275,8 +283,10 @@ fn load_vendor_trust() -> anyhow::Result<VendorTrustStore> {
 /// lifetime (same floor/ceiling as the SVID TTL).
 fn apply_host_key_hardening(cmis_config: &mut CmisConfig) {
     if let Ok(v) = std::env::var("CMIS_REQUIRE_PREREGISTERED_HOST_KEY") {
-        cmis_config.require_preregistered_host_key =
-            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        cmis_config.require_preregistered_host_key = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
     }
     if let Some(n) = ttl_from_env(
         "CMIS_HOST_KEY_SVID_TTL_SECS",
@@ -375,8 +385,12 @@ async fn start_cluster() -> anyhow::Result<Arc<Cluster>> {
 /// - else `CMIS_PEER_TLS` truthy (`1`/`true`/`yes`/`on`) → self-signed.
 /// - else `None` (cleartext; cluster must sit on a trusted private network).
 fn resolve_peer_tls() -> anyhow::Result<Option<PeerTls>> {
-    let cert = std::env::var("CMIS_PEER_TLS_CERT").ok().filter(|s| !s.is_empty());
-    let key = std::env::var("CMIS_PEER_TLS_KEY").ok().filter(|s| !s.is_empty());
+    let cert = std::env::var("CMIS_PEER_TLS_CERT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let key = std::env::var("CMIS_PEER_TLS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
     match (cert, key) {
         (Some(cert_path), Some(key_path)) => {
             tracing::info!(%cert_path, "inter-node TLS: operator-supplied certificate");
@@ -392,8 +406,12 @@ fn resolve_peer_tls() -> anyhow::Result<Option<PeerTls>> {
         }
         (None, None) => {}
     }
-    let enabled = std::env::var("CMIS_PEER_TLS")
-        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    let enabled = std::env::var("CMIS_PEER_TLS").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
     if enabled {
         tracing::info!("inter-node TLS: shared cert derived from secret (secret-authenticated)");
         Ok(Some(PeerTls::SelfSigned))
@@ -486,8 +504,7 @@ async fn main() -> anyhow::Result<()> {
     // allowlist yet, queue every later change for operator review.
     let mut cmis_config = CmisConfig::default();
     if let Ok(v) = std::env::var("CMIS_ALLOWLIST_PROPOSALS") {
-        cmis_config.allowlist_proposal_policy =
-            cmis::state::ProposalPolicy::from_env_value(&v);
+        cmis_config.allowlist_proposal_policy = cmis::state::ProposalPolicy::from_env_value(&v);
     }
     tracing::info!(
         proposal_policy = ?cmis_config.allowlist_proposal_policy,
@@ -511,6 +528,12 @@ async fn main() -> anyhow::Result<()> {
         cmis_config.allowlist_ttl_secs = i64::try_from(n).unwrap_or(72 * 3600);
     }
     apply_host_key_hardening(&mut cmis_config);
+    // F20 Phase 0: host-call limits (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`).
+    cmis_config.host_calls = cmis::host_auth::HostCallConfig::from_env()?;
+    tracing::info!(
+        audit_forward_max_per_min = cmis_config.host_calls.audit_forward_per_min,
+        "host call limits"
+    );
     tracing::info!(
         svid_ttl_secs = cmis_config.svid_ttl_secs,
         allowlist_ttl_secs = cmis_config.allowlist_ttl_secs,
@@ -594,60 +617,10 @@ async fn main() -> anyhow::Result<()> {
         cmis::crl_publisher::DEFAULT_PUBLISH_INTERVAL,
     );
 
-    serve_grpc(addr, state).await
-}
-
-/// Serve the `MachineIdentity` gRPC surface on `addr`.
-///
-/// F01 transport: with `CMIS_TLS_CERT` + `CMIS_TLS_KEY` configured the
-/// listener terminates hybrid-PQC TLS (`X25519MLKEM768`-only) via the shared
-/// `ferro-crypto` provider, so a legacy / non-PQC client fails the handshake
-/// and never reaches the gRPC layer. With neither set, the plaintext bring-up
-/// server is kept for local development (loud warning). Setting only one of
-/// the pair is a configuration error and aborts startup.
-async fn serve_grpc(addr: std::net::SocketAddr, state: Arc<CmisState>) -> anyhow::Result<()> {
-    let svc = MachineIdentitySvc::new(state).into_server();
-    let tls = match (
-        std::env::var_os("CMIS_TLS_CERT"),
-        std::env::var_os("CMIS_TLS_KEY"),
-    ) {
-        (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
-        (None, None) => None,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "CMIS_TLS_CERT and CMIS_TLS_KEY must be set together"
-            ))
-        }
-    };
-
-    if let Some((cert_path, key_path)) = tls {
-        let (cert_chain, key) = cmis::transport::load_pem_identity(&cert_path, &key_path)?;
-        let server_config =
-            ferro_crypto::transport::server_config(ProviderMode::HybridOnly, cert_chain, key)?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!(
-            version = env!("CARGO_PKG_VERSION"),
-            %addr,
-            "FerroGate CMIS — hybrid-PQC TLS gRPC server (X25519MLKEM768-only)"
-        );
-        let incoming = cmis::transport::tls_incoming(listener, server_config);
-        tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(incoming)
-            .await?;
-    } else {
-        tracing::warn!(
-            version = env!("CARGO_PKG_VERSION"),
-            %addr,
-            "FerroGate CMIS — PLAINTEXT gRPC bring-up server (set CMIS_TLS_CERT + \
-             CMIS_TLS_KEY for hybrid-PQC TLS)"
-        );
-        tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve(addr)
-            .await?;
-    }
-    Ok(())
+    // F20: admin authentication settings (`CMIS_ADMIN_*`). The listeners —
+    // main and admin — are composed in `cmis::server`.
+    let admin_cfg = cmis::admin::AdminConfig::from_env()?;
+    cmis::server::run(addr, state, admin_cfg).await
 }
 
 #[cfg(test)]
@@ -744,7 +717,10 @@ mod tests {
 
         let first = resolve_cluster_seed(&cluster, &path).await.unwrap();
         let second = resolve_cluster_seed(&cluster, &path).await.unwrap();
-        assert_eq!(first, second, "an established seed is stable across resolves");
+        assert_eq!(
+            first, second,
+            "an established seed is stable across resolves"
+        );
 
         cluster.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);

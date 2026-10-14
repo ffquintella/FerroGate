@@ -18,6 +18,20 @@ use ferro_raft::Cluster;
 use ferro_svid::{IssueParams, Issuer, LastAttestation};
 use sha2::{Digest, Sha384};
 
+/// An admin RPC request as the authorization layer hands it to the handler:
+/// carrying an authenticated operator context (F20). These tests exercise the
+/// handlers' business logic; authentication itself is covered by the
+/// `admin_*` tests.
+fn admin<T>(msg: T) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    req.extensions_mut()
+        .insert(cmis::admin::AdminContext::synthetic(
+            "test-operator",
+            cmis::admin::Permission::ALL,
+        ));
+    req
+}
+
 /// A credential maker that is never exercised by these RPCs.
 struct UnusedCredentialMaker;
 impl CredentialMaker for UnusedCredentialMaker {
@@ -112,7 +126,7 @@ async fn revoke_svid_appears_in_jwks_crl_and_audit() {
     let audit_len_before = state.audit.len();
 
     let resp = svc
-        .revoke_svid(tonic::Request::new(RevokeSvidRequest {
+        .revoke_svid(admin(RevokeSvidRequest {
             cert_sha: cert_sha.clone(),
             reason: "key-compromise".into(),
         }))
@@ -141,7 +155,7 @@ async fn revoke_host_appears_in_jwks_crl() {
     let (svc, _state) = svc().await;
     let spiffe = "spiffe://ferrogate.test/host/deadbeef".to_string();
 
-    svc.revoke_host(tonic::Request::new(RevokeHostRequest {
+    svc.revoke_host(admin(RevokeHostRequest {
         spiffe_id: spiffe.clone(),
         reason: "decommissioned".into(),
     }))
@@ -180,7 +194,7 @@ async fn revoked_svid_is_rejected_by_reference_verifier_after_propagation() {
         .expect("accepted before revocation");
 
     // Revoke it; the admin RPC republishes the CRL immediately.
-    svc.revoke_svid(tonic::Request::new(RevokeSvidRequest {
+    svc.revoke_svid(admin(RevokeSvidRequest {
         cert_sha,
         reason: "key-compromise".into(),
     }))
@@ -240,7 +254,7 @@ async fn revoking_an_svid_also_revokes_the_x509_certificate_issued_with_it() {
         .expect("certificate accepted before revocation");
 
     // Revoke by the JWS digest — the only handle the operator CLI offers.
-    svc.revoke_svid(tonic::Request::new(RevokeSvidRequest {
+    svc.revoke_svid(admin(RevokeSvidRequest {
         cert_sha: hex::encode(Sha384::digest(issued.jws.as_bytes())),
         reason: "key-compromise".into(),
     }))
@@ -265,7 +279,7 @@ async fn revoking_an_svid_also_revokes_the_x509_certificate_issued_with_it() {
 async fn malformed_cert_sha_is_rejected() {
     let (svc, _state) = svc().await;
     let err = svc
-        .revoke_svid(tonic::Request::new(RevokeSvidRequest {
+        .revoke_svid(admin(RevokeSvidRequest {
             cert_sha: "not-hex".into(),
             reason: "x".into(),
         }))

@@ -511,6 +511,19 @@ CI job is the authoritative gate. Scope and abstractions are documented in
 
 ---
 
+## App approval and administration (F19–F22)
+
+Planned for 0.29.0 onward and tracked in [ROADMAP.md](../ROADMAP.md) as
+milestones M36–M41 (phase P10). Overview: [app-approval-and-admin.md](app-approval-and-admin.md).
+
+- [~] [F20 — Administrator authentication and authorization](features/F20-admin-authentication.md), Phase 0 first (blocking: closes the unauthenticated admin RPCs).
+- [ ] [F19 — Application registration and approval lifecycle](features/F19-app-registration-approval.md)
+- [ ] [F21 — Server administration TUI](features/F21-admin-tui.md)
+- [ ] [F22 — Tray admin client](features/F22-tray-admin-client.md)
+- Decisions: [ADR-0004](adr/0004-app-approval-ledger.md), [ADR-0005](adr/0005-admin-authentication.md)
+
+---
+
 ## Tracking
 
 When you start an item, change its `[ ]` to `[~]` and add a link to the PR.

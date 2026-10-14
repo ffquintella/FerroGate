@@ -17,6 +17,15 @@
 //! It targets the local CMIS by default (`http://127.0.0.1:8443`, the plaintext
 //! bring-up endpoint), overridable with `--endpoint` or `FERROGATE_CMIS_ENDPOINT`.
 //!
+//! **Administrator sign-in (feature F20).** The admin RPCs (`list-svids`,
+//! `revoke-*`, `bump-epoch`, and every `allowlist` subcommand except `get` and
+//! `show`) require an authenticated admin session and go to the CMIS admin
+//! listener (`--admin-endpoint`, default `https://127.0.0.1:8444`, or
+//! `$FERROGATE_ADMIN_ENDPOINT`), pinned like the main endpoint. The session
+//! comes from `--session-file` (`ferrogate admin login --session-file …`) or,
+//! without one, from an interactive sign-in that ends with the command. See
+//! `ferrogate admin help`.
+//!
 //! When the endpoint is an `https://` URL the CLI speaks the FerroGate
 //! hybrid-PQC TLS transport (feature F01) via the shared
 //! [`ferro_transport::connect_pinned`] dialer: TLS 1.3 with the
@@ -30,6 +39,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
 mod allowlist;
 
 use ferro_crypto::composite::CompositePublicKey;
@@ -41,9 +51,13 @@ use ferro_proto::v1::{
 };
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8443";
+
+/// `MachineIdentity` client that carries the admin session (if any).
+pub(crate) type CmisClient = MachineIdentityClient<InterceptedService<Channel, admin::Bearer>>;
 
 /// In-container mount point of the CMIS server certificate (PEM), as placed by
 /// the `puppet-ferrogate` module. Used as the default SPKI-pin source for an
@@ -70,6 +84,12 @@ fn usage() -> &'static str {
      \x20 spki-pin [--format hex|env|flag] print the CMIS SPKI pin from its cert\n\
      \x20                                  (--tls-cert / $FERROGATE_CMIS_TLS_CERT); no\n\
      \x20                                  connection is made\n\
+     \x20 admin <subcommand> ...           administrator sign-in and accounts (F20)\n\
+     \x20                                  (run `ferrogate admin help` for details)\n\
+     \n\
+     Admin commands (list-svids, revoke-*, bump-epoch, allowlist other than\n\
+     get/show, admin ...) need a signed-in administrator and use the admin\n\
+     listener; the others use --endpoint.\n\
      \n\
      options:\n\
      \x20 --endpoint <url>   CMIS gRPC endpoint (default http://127.0.0.1:8443,\n\
@@ -82,6 +102,16 @@ fn usage() -> &'static str {
      \x20                    (or $FERROGATE_CMIS_TLS_CERT; default\n\
      \x20                    /etc/ferrogate/tls/cmis.crt). Used only for https://\n\
      \x20                    endpoints when no --spki-pin is given.\n\
+     \x20 --admin-endpoint <url>  CMIS admin listener (default https://127.0.0.1:8444,\n\
+     \x20                    or $FERROGATE_ADMIN_ENDPOINT); pinned like --endpoint.\n\
+     \x20 --session-file <path>  keep the admin session in this 0600 file (or\n\
+     \x20                    $FERROGATE_SESSION_FILE); prefer a tmpfs such as\n\
+     \x20                    $XDG_RUNTIME_DIR. Without it each admin command signs in.\n\
+     \x20 --device-file <path>  where the server-issued device token is kept (0600;\n\
+     \x20                    default ~/.config/ferrogate/admin-device.token, or\n\
+     \x20                    $FERROGATE_DEVICE_FILE; empty disables)\n\
+     \x20 --client-cert <pem> --client-key <pem>  client certificate for an admin\n\
+     \x20                    listener that requires mTLS ($FERROGATE_ADMIN_CLIENT_CERT/_KEY)\n\
      \x20 -V, --version      print the ferrogate version and exit"
 }
 
@@ -114,15 +144,18 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // `allowlist` help works without a connection, so short-circuit before the
-    // dial when the operator only wants the subcommand reference.
-    if command == "allowlist"
-        && matches!(
-            rest.first().map(String::as_str),
-            None | Some("help" | "-h" | "--help")
-        )
-    {
+    // `allowlist` / `admin` help works without a connection, so short-circuit
+    // before the dial when the operator only wants the subcommand reference.
+    let wants_help = matches!(
+        rest.first().map(String::as_str),
+        None | Some("help" | "-h" | "--help")
+    );
+    if command == "allowlist" && wants_help {
         println!("{}", allowlist::usage());
+        return Ok(());
+    }
+    if command == "admin" && wants_help {
+        println!("{}", admin::usage());
         return Ok(());
     }
 
@@ -144,24 +177,78 @@ async fn run() -> anyhow::Result<()> {
     // error rather than a connection failure.
     if !matches!(
         command.as_str(),
-        "status" | "list-svids" | "revoke-svid" | "revoke-host" | "bump-epoch" | "allowlist"
+        "status"
+            | "list-svids"
+            | "revoke-svid"
+            | "revoke-host"
+            | "bump-epoch"
+            | "allowlist"
+            | "admin"
     ) {
         anyhow::bail!("unknown command: {command}\n\n{}", usage());
     }
 
-    let mut client = connect(&global).await?;
+    let prompter = admin::Prompter::new();
+    if command == "admin" {
+        let (sub, sub_args) = rest
+            .split_first()
+            .expect("admin with no subcommand handled above");
+        let channel = connect_admin_channel(&global).await?;
+        return admin::run(
+            admin::AdminArgs {
+                channel,
+                session_file: global.session_file.as_deref(),
+                device_file: global.device_file.as_deref(),
+                prompter: &prompter,
+            },
+            sub,
+            sub_args,
+        )
+        .await;
+    }
 
-    match command.as_str() {
-        "status" => status(&mut client).await,
-        "list-svids" => list_svids(&mut client).await,
-        "revoke-svid" => revoke_svid(&mut client, rest).await,
-        "revoke-host" => revoke_host(&mut client, rest).await,
-        "bump-epoch" => bump_epoch(&mut client, rest).await,
+    // Public reads keep using the main endpoint and need no session.
+    let public = command == "status"
+        || (command == "allowlist"
+            && matches!(rest.first().map(String::as_str), Some("get" | "show")));
+    if public {
+        let mut client = connect(&global).await?;
+        return dispatch(&mut client, command, rest).await;
+    }
+
+    // Admin RPCs: a signed-in session on the admin listener (F20 Phase 0).
+    let channel = connect_admin_channel(&global).await?;
+    let session = admin::session_for_command(
+        channel.clone(),
+        global.session_file.as_deref(),
+        global.device_file.as_deref(),
+        &prompter,
+    )
+    .await?;
+    let mut client: CmisClient =
+        MachineIdentityClient::with_interceptor(channel.clone(), session.bearer());
+    let mut result = dispatch(&mut client, command, rest).await;
+    if result.as_ref().is_err_and(admin::needs_step_up) {
+        // Nothing was changed: the first write of the command was refused.
+        admin::step_up(channel.clone(), &session, &prompter).await?;
+        result = dispatch(&mut client, command, rest).await;
+    }
+    admin::finish(channel, &session).await;
+    result
+}
+
+async fn dispatch(client: &mut CmisClient, command: &str, rest: &[String]) -> anyhow::Result<()> {
+    match command {
+        "status" => status(client).await,
+        "list-svids" => list_svids(client).await,
+        "revoke-svid" => revoke_svid(client, rest).await,
+        "revoke-host" => revoke_host(client, rest).await,
+        "bump-epoch" => bump_epoch(client, rest).await,
         "allowlist" => {
             let (sub, sub_args) = rest
                 .split_first()
                 .expect("allowlist with no subcommand handled above");
-            allowlist::run(&mut client, sub, sub_args).await
+            allowlist::run(client, sub, sub_args).await
         }
         _ => unreachable!("command validated above"),
     }
@@ -178,6 +265,16 @@ struct GlobalArgs {
     /// Explicit server-cert PEM path to derive the pin from when no explicit
     /// pin is given; `None` falls back to [`DEFAULT_TLS_CERT`].
     tls_cert: Option<String>,
+    /// CMIS admin listener (F20).
+    admin_endpoint: String,
+    /// Opt-in file holding the admin session token.
+    session_file: Option<std::path::PathBuf>,
+    /// Client certificate and key (PEM) for an mTLS admin listener.
+    client_cert: Option<String>,
+    /// Private key for `client_cert`.
+    client_key: Option<String>,
+    /// Where the server-issued device token is kept (`None`: not kept).
+    device_file: Option<std::path::PathBuf>,
 }
 
 /// Pull the global connection flags (anywhere in the arg list) out of the raw
@@ -191,6 +288,16 @@ fn parse_global_args(raw: Vec<String>) -> (GlobalArgs, Vec<String>) {
     // back to the comma-separated env list.
     let mut spki_pins: Vec<String> = Vec::new();
     let mut tls_cert = std::env::var("FERROGATE_CMIS_TLS_CERT").ok();
+    let mut admin_endpoint = std::env::var("FERROGATE_ADMIN_ENDPOINT")
+        .unwrap_or_else(|_| admin::DEFAULT_ADMIN_ENDPOINT.to_string());
+    let mut session_file = std::env::var_os("FERROGATE_SESSION_FILE").map(std::path::PathBuf::from);
+    let mut client_cert = std::env::var("FERROGATE_ADMIN_CLIENT_CERT").ok();
+    let mut client_key = std::env::var("FERROGATE_ADMIN_CLIENT_KEY").ok();
+    let mut device_file = match std::env::var_os("FERROGATE_DEVICE_FILE") {
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(std::path::PathBuf::from(v)),
+        None => admin::default_device_file(),
+    };
     let mut rest = Vec::with_capacity(raw.len());
     let mut it = raw.into_iter();
     while let Some(arg) = it.next() {
@@ -208,6 +315,31 @@ fn parse_global_args(raw: Vec<String>) -> (GlobalArgs, Vec<String>) {
             "--tls-cert" => {
                 if let Some(path) = it.next() {
                     tls_cert = Some(path);
+                }
+            }
+            "--admin-endpoint" => {
+                if let Some(url) = it.next() {
+                    admin_endpoint = url;
+                }
+            }
+            "--session-file" => {
+                if let Some(path) = it.next() {
+                    session_file = Some(std::path::PathBuf::from(path));
+                }
+            }
+            "--client-cert" => {
+                if let Some(path) = it.next() {
+                    client_cert = Some(path);
+                }
+            }
+            "--client-key" => {
+                if let Some(path) = it.next() {
+                    client_key = Some(path);
+                }
+            }
+            "--device-file" => {
+                if let Some(path) = it.next() {
+                    device_file = (!path.is_empty()).then(|| std::path::PathBuf::from(path));
                 }
             }
             _ => rest.push(arg),
@@ -229,18 +361,84 @@ fn parse_global_args(raw: Vec<String>) -> (GlobalArgs, Vec<String>) {
             endpoint,
             spki_pins,
             tls_cert,
+            admin_endpoint,
+            session_file,
+            client_cert,
+            client_key,
+            device_file,
         },
         rest,
     )
 }
 
-/// Render a gRPC error as a one-line operator message instead of tonic's full
-/// `Status` debug (which trails the gRPC metadata map).
-fn rpc_err(s: tonic::Status) -> anyhow::Error {
-    anyhow::anyhow!("CMIS refused the request ({:?}): {}", s.code(), s.message())
+/// A CMIS refusal, kept typed so callers can react to specific reasons (for
+/// example `step_up_required`). Renders as a one-line operator message instead
+/// of tonic's full `Status` debug (which trails the gRPC metadata map).
+#[derive(Debug)]
+pub(crate) struct CmisError(pub(crate) tonic::Status);
+
+impl std::fmt::Display for CmisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CMIS refused the request ({:?}): {}",
+            self.0.code(),
+            self.0.message()
+        )?;
+        if let Some(rules) = self
+            .0
+            .metadata()
+            .get("x-ferrogate-policy-failures")
+            .and_then(|v| v.to_str().ok())
+        {
+            write!(f, " [{rules}]")?;
+        }
+        if let Some(wait) = self
+            .0
+            .metadata()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+        {
+            write!(f, " (retry after {wait} s)")?;
+        }
+        Ok(())
+    }
 }
 
-async fn connect(global: &GlobalArgs) -> anyhow::Result<MachineIdentityClient<Channel>> {
+impl std::error::Error for CmisError {}
+
+/// Wrap a gRPC error for the operator (see [`CmisError`]).
+pub(crate) fn rpc_err(s: tonic::Status) -> anyhow::Error {
+    anyhow::Error::new(CmisError(s))
+}
+
+/// Dial the CMIS admin listener (always pinned hybrid-PQC TLS; with a client
+/// certificate when one is configured).
+async fn connect_admin_channel(global: &GlobalArgs) -> anyhow::Result<Channel> {
+    let endpoint = &global.admin_endpoint;
+    if !endpoint.starts_with("https://") {
+        anyhow::bail!("the admin endpoint must be https:// (got `{endpoint}`): admin traffic is never plaintext");
+    }
+    let pins = resolve_pins(global)?;
+    let channel = match (&global.client_cert, &global.client_key) {
+        (Some(cert), Some(key)) => {
+            let chain = CertificateDer::pem_file_iter(cert)
+                .map_err(|e| anyhow::anyhow!("reading client certificate {cert}: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("parsing client certificate {cert}: {e}"))?;
+            let key = rustls_pki_types::PrivateKeyDer::from_pem_file(key)
+                .map_err(|e| anyhow::anyhow!("reading client key {key}: {e}"))?;
+            ferro_transport::connect_pinned_with_client_auth(endpoint, pins, chain, key).await
+        }
+        (None, None) => ferro_transport::connect_pinned(endpoint, pins).await,
+        _ => anyhow::bail!("--client-cert and --client-key must be given together"),
+    };
+    channel.map_err(|e| {
+        anyhow::anyhow!("connect to the CMIS admin listener at `{endpoint}` failed: {e:#}")
+    })
+}
+
+async fn connect(global: &GlobalArgs) -> anyhow::Result<CmisClient> {
     let endpoint = &global.endpoint;
     if endpoint.starts_with("https://") {
         // Hybrid-PQC TLS, SPKI-pinned. The pin is resolved up front so a
@@ -252,7 +450,10 @@ async fn connect(global: &GlobalArgs) -> anyhow::Result<MachineIdentityClient<Ch
             .map_err(|e| {
                 anyhow::anyhow!("connect to CMIS at `{endpoint}` over TLS failed: {e:#}")
             })?;
-        Ok(MachineIdentityClient::new(channel))
+        Ok(MachineIdentityClient::with_interceptor(
+            channel,
+            admin::Bearer::none(),
+        ))
     } else {
         // Plaintext bring-up path: `http://` or a bare authority, unchanged.
         let channel = Channel::from_shared(endpoint.clone())
@@ -260,7 +461,10 @@ async fn connect(global: &GlobalArgs) -> anyhow::Result<MachineIdentityClient<Ch
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("connect to CMIS at `{endpoint}` failed: {e}"))?;
-        Ok(MachineIdentityClient::new(channel))
+        Ok(MachineIdentityClient::with_interceptor(
+            channel,
+            admin::Bearer::none(),
+        ))
     }
 }
 
@@ -370,7 +574,7 @@ fn render_enrollment_key(key: &CompositePublicKey, format: EnrollmentKeyFormat) 
 /// encoding for pasting into MIA setup; private key material is never returned
 /// by this RPC or handled here.
 async fn enrollment_key(
-    client: &mut MachineIdentityClient<Channel>,
+    client: &mut CmisClient,
     format: EnrollmentKeyFormat,
 ) -> anyhow::Result<()> {
     let resp = client
@@ -385,7 +589,7 @@ async fn enrollment_key(
     Ok(())
 }
 
-async fn status(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
+async fn status(client: &mut CmisClient) -> anyhow::Result<()> {
     let resp = client
         .health(HealthRequest {})
         .await
@@ -403,7 +607,7 @@ async fn status(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<(
     Ok(())
 }
 
-async fn list_svids(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
+async fn list_svids(client: &mut CmisClient) -> anyhow::Result<()> {
     let resp = client
         .list_svids(ListSvidsRequest {})
         .await
@@ -432,10 +636,7 @@ async fn list_svids(client: &mut MachineIdentityClient<Channel>) -> anyhow::Resu
     Ok(())
 }
 
-async fn revoke_svid(
-    client: &mut MachineIdentityClient<Channel>,
-    args: &[String],
-) -> anyhow::Result<()> {
+async fn revoke_svid(client: &mut CmisClient, args: &[String]) -> anyhow::Result<()> {
     let Some(cert_sha) = args.first() else {
         anyhow::bail!("revoke-svid needs a cert_sha (lowercase-hex SHA-384, 96 chars)");
     };
@@ -455,10 +656,7 @@ async fn revoke_svid(
     Ok(())
 }
 
-async fn revoke_host(
-    client: &mut MachineIdentityClient<Channel>,
-    args: &[String],
-) -> anyhow::Result<()> {
+async fn revoke_host(client: &mut CmisClient, args: &[String]) -> anyhow::Result<()> {
     let Some(spiffe_id) = args.first() else {
         anyhow::bail!("revoke-host needs a spiffe_id");
     };
@@ -478,10 +676,7 @@ async fn revoke_host(
     Ok(())
 }
 
-async fn bump_epoch(
-    client: &mut MachineIdentityClient<Channel>,
-    args: &[String],
-) -> anyhow::Result<()> {
+async fn bump_epoch(client: &mut CmisClient, args: &[String]) -> anyhow::Result<()> {
     let reason = args.first().cloned().unwrap_or_default();
     let resp = client
         .bump_epoch(BumpEpochRequest { reason })

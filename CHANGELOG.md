@@ -25,6 +25,98 @@ record them.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-10-14
+
+**Breaking security release (F20 Phase 0).** Every CMIS admin RPC now needs an
+authenticated, authorized administrator session, and `AppendAuditEvent` needs a
+host proof. `ferrogate` CLIs older than 0.29.0 can no longer run admin
+commands. Upgrade notes and the audit-log review are in
+[docs/operations.md](docs/operations.md#upgrading-to-0290-breaking-change);
+the change document is [docs/change-v0.29.0.md](docs/change-v0.29.0.md).
+
+### Added
+
+- Add `ferrogate admin` sign-in, session and account commands, and send the session on every legacy admin command (S51, T257)
+  `admin login|logout|whoami|sessions|passwd|bootstrap|enroll|accounts|groups|factors`
+  talk to the admin listener (`--admin-endpoint`, `FERROGATE_ADMIN_ENDPOINT`)
+  over the pinned transport. Secrets are prompted without echo and kept in
+  zeroized memory; the session token is written to disk only with the opt-in
+  `--session-file` (`0600`). Commands refused with `step_up_required` re-verify
+  the second factor and retry once.
+- Verify FIDO2/WebAuthn second factors on the server for login, step-up and factor enrollment (S51, S55, T258)
+  The tray admin client (F22) can enroll security keys next to TOTP;
+  `CMIS_ADMIN_TRAY_FIDO2_GROUPS` makes chosen groups use them from the tray and
+  `CMIS_ADMIN_WEBAUTHN_ORIGINS` lists the accepted origins. Replayed
+  assertions, counter regressions, wrong origins or RP IDs and another
+  account's credentials are refused.
+
+### Changed
+
+- Correct the admin-gating claim in the networking, operations, CMIS and allowlist docs, and document every new setting (S35, S56, T261)
+  `docs/networking.md` claimed the admin RPCs were gated by operator-only TLS
+  credentials; no such gate ever existed. The docs now describe the admin
+  listener, session authentication and `CMIS_LEGACY_ADMIN_ON_MAIN`, list every
+  `CMIS_ADMIN_*` variable and `CMIS_AUDIT_FORWARD_MAX_PER_MIN`, and add
+  operator sections on bootstrapping the first administrator, CLI sign-in and
+  the 0.29.0 upgrade. **Known limitations:** the client kind is self-declared,
+  so the tray FIDO2 group policy can be sidestepped by a client claiming to be
+  the CLI or TUI; login and step-up nonces are single-use per node only;
+  idempotency keys are accepted but not enforced; there is no break-glass
+  recovery; the `AppendAuditEvent` replay cache, rate limit and revocation set
+  are per node.
+
+### Fixed
+
+- Return replicated-store write failures from the allowlist and proposal RPCs instead of reporting success (S50, S56, T260)
+  `CmisState::put_allowlist`, `put_proposal`, `delete_allowlist` and
+  `delete_proposal` logged a failed Raft write and carried on, so
+  `SetAllowlist`, `ProposeAllowlist`, `DeleteAllowlist` and `DeleteProposal`
+  reported a change that never happened and audited it. They now return the
+  error: the RPC answers `UNAVAILABLE (store_unavailable)` and records no audit
+  event.
+
+### Security
+
+- Breaking: require an administrator session, a group permission and, for writes, a fresh second factor on every CMIS admin RPC (S51, S55, S56, T250, T251, T252, T253, T254, T256)
+  `SetAllowlist`, `DeleteAllowlist`, `ListAllowlists`, `ListProposals`,
+  `DeleteProposal`, `RevokeSvid`, `RevokeHost`, `BumpEpoch` and `ListSvids`
+  performed no caller check, and the CMIS listener requests no client
+  certificate, so anyone who could reach `:8443` — every MIA host — could
+  rewrite allowlists, revoke hosts or force fleet re-attestation. A tower layer
+  in front of every listener now looks each gRPC path up in one method → access
+  table (unclassified methods are refused) and each handler re-checks the
+  authenticated context. Administrators are local accounts with Argon2id
+  passwords (policy, blocklist, history, 6-month expiry) and a mandatory TOTP or
+  FIDO2 second factor; sessions are opaque, hashed at rest, bound to the source
+  IP, expire after 15 min idle and 12 h, and need a step-up for sensitive
+  methods. Logins are throttled per NRM §5.3.5 (3 → 1 min, +2 → 15 min,
+  +2 → 1 h) keyed by source IP. The first account is created from a one-time
+  bootstrap token the Raft leader writes to a root-only file. Every login,
+  account change and admin action is audited under a pseudonymous
+  administrator id. Admin methods are refused without TLS
+  (`FAILED_PRECONDITION tls_required`). **Old `ferrogate` binaries stop
+  working**; there is no unauthenticated compatibility switch. Review the
+  audit log for `AllowlistSet`, `AllowlistDeleted`, `HostRevoked` and
+  `PolicyEpochBumped` events nobody can account for.
+- Serve administration on a dedicated hybrid-PQC TLS listener with optional mTLS (S51, S35, T255)
+  `CMIS_ADMIN_LISTEN` (default `127.0.0.1:8444`) serves the new
+  `ferrogate.admin.v1.Admin` service and the legacy admin RPCs, TLS 1.3 with
+  `X25519MLKEM768` only, optionally requiring client certificates from
+  `CMIS_ADMIN_CLIENT_CA`. `CMIS_LEGACY_ADMIN_ON_MAIN` (default `true`) keeps
+  the legacy admin RPCs on `:8443` too, still session-authenticated.
+- Breaking: require a host proof on `AppendAuditEvent` and rate-limit it per host (S51, S50, T259)
+  Anyone could append forged "MIA" events or fill the WORM store. A forward now
+  carries the F19 §7.1 `HostCallAuth` proof: the host SVID (issued by this CMIS,
+  unexpired, not revoked by SVID or host), the machine key it binds through
+  `cnf.jkt`, and that key's signature over `ferrogate-audit-forward-v1 ‖ doc`,
+  where `doc = {v, host_uuid, issued_at, nonce, event_sha384}`. CMIS refuses
+  stale (±300 s), replayed (600 s per-node nonce cache), tampered and
+  wrong-host forwards, and event types a host does not produce, and limits
+  each host to `CMIS_AUDIT_FORWARD_MAX_PER_MIN` (default 600) per node. The
+  verifier is the reusable `cmis::host_auth` module the F19 host RPCs will
+  share; `ProposeAllowlist` now uses its SVID check, so a revoked host can no
+  longer propose. `mia::audit_client::forward` signs the proof.
+
 ## [0.28.2] - 2026-10-07
 
 ### Added
@@ -2749,7 +2841,8 @@ Workspace bootstrap. Pre-migration heading: `[M0] — 2026-05-22 — Workspace b
   Design documentation under `docs/` (architecture, protocol, threat model,
   TPM, crypto, per-feature specs, and the roadmap).
 
-[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.28.2...HEAD
+[Unreleased]: https://github.com/ffquintella/FerroGate/compare/releases/v0.29.0...HEAD
+[0.29.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.29.0
 [0.28.2]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.2
 [0.28.1]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.1
 [0.28.0]: https://github.com/ffquintella/FerroGate/releases/tag/releases/v0.28.0

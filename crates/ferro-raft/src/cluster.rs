@@ -348,6 +348,10 @@ pub enum ClusterError {
     /// Deriving the deterministic shared peer-TLS certificate failed.
     #[error("peer-tls cert derivation: {0}")]
     PeerCert(String),
+    /// A conditional write did not apply: a compare-and-set lost, a unique
+    /// key was taken, or a referenced row does not exist.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 /// One CMIS Raft node, talking to its peers through hiqlite.
@@ -476,6 +480,8 @@ impl Cluster {
                 Vec::<hiqlite::Param>::new(),
             )
             .await?;
+        // Administrator authentication tables (F20 §3).
+        self.init_admin_schema().await?;
         Ok(())
     }
 

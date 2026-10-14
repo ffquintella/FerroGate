@@ -856,13 +856,106 @@ that repository Actions were disabled at the time.
 > spec: S22, S32
 
 ADR-0003 is **Proposed**, not Accepted; these tasks follow its rollout plan and
-start only once it is accepted.
+start only once it is accepted. ADR-0004 (S54) supersedes it on acceptance; the
+replacement work is M37.
 
 - [ ] T231 Add the `GetProposalStatus` request, response and RPC to `ferro-proto` (S22)
 - [ ] T232 Implement read-only `GetProposalStatus` in CMIS (S22)
 - [ ] T233 Add `mia request-allowlist` to request explicit apps for this host (S22)
 - [ ] T234 Add `mia allowlist-status` to report live, pending or absent apps (S22)
 - [ ] T235 Document operator-gated approval with `CMIS_ALLOWLIST_PROPOSALS=off` (S22, S32)
+
+## [M36] Authenticated administration surface (F20 Phase 0)
+> outcome: No CMIS admin RPC answers without an authenticated, authorized administrator session over TLS; local admin accounts sign in with a password plus TOTP or FIDO2, and `AppendAuditEvent` accepts only host-signed events.
+> phase: P10
+> spec: S51, S55, S56, S35
+
+Blocking: closes the critical finding in the overview (S56, "Findings" 1-3) and
+must ship before M37-M40. Breaking change for old `ferrogate` binaries (0.29.0).
+
+- [x] T250 Gate every legacy admin RPC behind an admin session and permission, refuse admin methods without TLS (S51)
+  - note: Tower layer `crates/cmis/src/admin/layer.rs` on every listener plus per-handler `authz::require`; one `METHOD_ACCESS` table, deny by default, coverage test over the compiled file descriptor set (`admin::authz` unit tests). Plaintext listeners answer `FAILED_PRECONDITION tls_required`. Tests: `crates/cmis/tests/admin_layer.rs`, `admin_guard.rs`, `admin_e2e.rs`. Shipped in 0.29.0.
+- [x] T251 Add local admin accounts with Argon2id passwords, policy, history and expiry (S51, S55)
+  - note: `crates/cmis/src/admin/password.rs` (Argon2id RFC 9106, optional pepper, ≥ 24 chars and four classes, blocklist, forbidden substrings, history, 180-day expiry); tables in `crates/ferro-raft/src/admin.rs`. Tests: `admin_flows.rs::change_password_enforces_policy_and_forbids_reuse`, `an_expired_password_restricts_the_session_until_it_changes`, `ferro-raft/tests/admin_store.rs`.
+- [x] T252 Verify TOTP second factors with replay protection and encrypted secrets (S51)
+  - note: `crates/cmis/src/admin/totp.rs` (RFC 6238 vectors, ±1 step, forward-only step counter) and `keys.rs` (XChaCha20-Poly1305 sealing under `CMIS_ADMIN_SECRETS_KEY_FILE`). Tests: `admin_flows.rs::a_totp_code_is_accepted_once`, `admin_store.rs::totp_steps_only_move_forward`.
+- [x] T253 Issue IP-bound admin sessions with idle and absolute limits, step-up and revocation (S51)
+  - note: `crates/cmis/src/admin/session.rs`: hashed opaque tokens, 900 s idle and 12 h absolute caps, step-up window, rotation on step-up, eviction at 5. Tests: `admin_layer.rs::a_session_used_from_another_ip_is_revoked`, `idle_and_absolute_expiry_end_the_session`, `admin_flows.rs::five_failed_proofs_revoke_the_session`.
+- [x] T254 Throttle admin logins per NRM §5.3.5 (S51)
+  - note: `crates/cmis/src/admin/throttle.rs`, K_ip / K_dev / K_acct schedules 3 → 1 min, +2 → 15 min, +2 → 1 h. Tests: `admin_flows.rs::login_locks_the_source_ip_as_nrm_5_3_5_prescribes`, `parallel_guesses_cannot_outrun_the_lock`, `begin_login_floods_are_limited_per_ip`.
+- [x] T255 Serve `ferrogate.admin.v1.Admin` on a dedicated hybrid-PQC TLS listener with optional mTLS (S51, S36)
+  - note: `crates/cmis/src/server.rs` (`CMIS_ADMIN_LISTEN`, default `127.0.0.1:8444`, `CMIS_ADMIN_CLIENT_CA`), `ferro_crypto::transport::server_config_with_client_auth`. Tests: `crates/ferro-crypto/tests/mtls.rs`, `admin_layer.rs::the_admin_service_is_served_only_on_the_admin_listener`.
+- [x] T256 Bootstrap the first admin account and enroll TOTP (S51)
+  - note: `crates/cmis/src/admin/bootstrap.rs`: leader writes a one-time `0400` token to `CMIS_ADMIN_BOOTSTRAP_TOKEN_FILE`, never re-arms. Tests: `admin_e2e.rs`, `admin_flows.rs::enrollment_tokens_are_single_use_and_bootstrap_never_re_arms`, `admin_store.rs::bootstrap_creates_an_active_account_and_burns_the_token`.
+- [x] T257 Add `ferrogate login`, `logout` and bearer-authenticated admin commands to the CLI (S51)
+  - note: Delivered as `ferrogate admin login|logout|whoami|sessions|passwd|bootstrap|enroll|accounts|groups|factors` (`crates/ferrogate-cli/src/admin.rs`); legacy commands send the session to the admin listener and retry once after a step-up. Tests: `crates/ferrogate-cli/tests/admin_cli.rs`.
+- [x] T258 Verify FIDO2/WebAuthn login, step-up and factor enrollment on the server (S51, S55)
+  - note: `crates/cmis/src/admin/webauthn.rs` (ES256/EdDSA, `packed` attestation, origin and RP ID checks, counter clone detection) and `factors.rs`; `CMIS_ADMIN_TRAY_FIDO2_GROUPS`, `CMIS_ADMIN_WEBAUTHN_ORIGINS`. Tests: `crates/cmis/tests/admin_webauthn.rs` with a software authenticator. Client-side enrollment ships with M40 (F22).
+- [x] T259 Require a host signature on `AppendAuditEvent` and rate-limit it per host (S51, S50)
+  - note: Reusable F19 §7.1 verifier `crates/cmis/src/host_auth.rs` (SVID issued here, unexpired, not revoked; `cnf.jkt`; ECDSA-P256 over `ferrogate-audit-forward-v1 ‖ doc`; ±300 s; 600 s per-node nonce cache; per-host token bucket `CMIS_AUDIT_FORWARD_MAX_PER_MIN`, default 600); document `crates/ferro-svid/src/host_call.rs`; only host-originated event types accepted; MIA signs in `mia::audit_client::forward`. `ProposeAllowlist` now shares the SVID check, so revoked hosts are refused. Tests: `crates/cmis/tests/audit_forward.rs` (unsigned, wrong host, unbound key, foreign SVID, stale/future, replay, tampered event and document, wrong context, revoked host and SVID, rate limit, CMIS-only events), `proposals.rs::rejects_a_revoked_host`, `crates/mia/tests/e2e_attest.rs::audit_log_records_attest_events_and_proofs_verify_offline`.
+- [x] T260 Propagate store write failures from the legacy allowlist and proposal paths (S50, S56)
+  - note: `CmisState::{put_allowlist, put_proposal, delete_allowlist, delete_proposal}` return `ClusterError`; `SetAllowlist`, `ProposeAllowlist`, `DeleteAllowlist`, `DeleteProposal` answer `UNAVAILABLE store_unavailable` and audit nothing. Tests: `crates/cmis/tests/store_failures.rs` (SQLite trigger fault injection).
+- [x] T261 Correct the admin-gating claim in the networking docs and bump the workspace to 0.29.0 (S35, S56)
+  - note: `docs/networking.md` §1/§1a, `docs/operations.md` "Administrator access (F20)" and "Audit forwarding from hosts", `docs/cmis.md`, `docs/audit.md`, `docs/allowlist-provisioning.md`; `docs/change-v0.29.0.md`; CHANGELOG 0.29.0 records the breaking change and the known limitations.
+- [ ] T262 Pass the ESI pre-production security verification gate for the admin surface (S51, S56)
+
+## [M37] App registration and approval ledger (F19)
+> outcome: A user registers an application through the MIA helper, an administrator approves or denies it with a manual or same-path-and-user auto-update policy, approvals are never replaced by requests, and every MIA picks up new authorizations within 5 minutes.
+> phase: P10
+> spec: S50, S54, S56, S8
+
+Supersedes the host-request flow of M35 once ADR-0004 is accepted.
+
+- [ ] T263 Add the hiqlite app-request, approval and lineage tables with the non-replacement invariant (S50, S54)
+- [ ] T264 Identify binaries per platform without executing them, with sequential versions per lineage (S50)
+- [ ] T265 Add the host-authenticated `SubmitAppRequest`, `GetAppRequestStatus` and `SyncAllowlist` RPCs (S50)
+- [ ] T266 Auto-approve same-publisher updates under `AutoSamePathUser`, never re-approving denied or revoked hashes (S50, S54)
+- [ ] T267 Add admin approve, deny, edit, revoke and direct-register operations with same-actor auditing (S50, S51)
+- [ ] T268 Compile per-host signed allowlist v2 with generation and rollback protection (S50, S54)
+- [ ] T269 Poll `SyncAllowlist` from MIA every 5 minutes with jitter and atomic swap (S50)
+- [ ] T270 Add helper protocol v2 and the `mia app` registration commands (S50, S8)
+- [ ] T271 Expire approvals and sweep stale requests on the leader (S50)
+
+## [M38] Allowlist migration to approvals
+> outcome: The fleet runs MIA agents that sync allowlist v2, legacy allowlists are imported as approvals, and CMIS switches to approvals mode with v1 kept only for old agents.
+> phase: P10
+> spec: S50, S54, S56
+
+- [ ] T272 Import legacy allowlists as approvals (S50, S54)
+- [ ] T273 Switch CMIS to approvals mode and keep v1 `GetAllowlist` behind `CMIS_LEGACY_GETALLOWLIST` (S50)
+- [ ] T274 Write the change document and migration runbook for 0.29 (S56)
+
+## [M39] Server admin TUI (F21)
+> outcome: An administrator on the server lists, searches, approves, denies, edits, revokes and adds applications from a curses-style terminal UI that goes through the same gRPC authorization as every other client.
+> phase: P10
+> spec: S52, S51, S50
+
+- [ ] T275 Build the `ferrogate-tui` ratatui app with TOTP login (S52)
+- [ ] T276 Add request and approval lists with search and filters (S52)
+- [ ] T277 Add approve, deny, edit, revoke and delete flows with confirmation (S52)
+- [ ] T278 Add the single-step "add application" flow with a fresh TOTP (S52, S50)
+- [ ] T279 Strip terminal escape sequences from every rendered field (S52)
+
+## [M40] Tray admin client (F22)
+> outcome: An administrator logs in to the `mia-tray-admin` app with a password plus TOTP or FIDO2, enrolls factors, runs the admin routines and adds a local application in one step.
+> phase: P10
+> spec: S53, S51, S50, S18
+
+- [ ] T280 Ship the `mia-tray-admin` binary with in-memory, zeroized credentials (S53)
+- [ ] T281 Log in and step up with TOTP or FIDO2 from the tray admin client (S53, S51)
+- [ ] T282 Enroll and manage TOTP and FIDO2 factors from the tray admin client (S53, S51)
+- [ ] T283 Add request and approval administration screens to the tray admin client (S53)
+- [ ] T284 Add a local application in one step from the tray admin client (S53, S50)
+- [ ] T285 Package the tray admin client next to the unprivileged tray on every desktop platform (S53, S30)
+
+## [M41] App approval hardening
+> outcome: macOS signer identity feeds auto-update continuity, binary parsers run sandboxed, and a hardware-backed mTLS profile is available for administrators.
+> phase: P10
+> spec: S50, S51, S56
+
+- [ ] T286 Use the macOS code-signing identity as the auto-update continuity anchor (S50)
+- [ ] T287 Run binary metadata parsers in a sandbox (S50)
+- [ ] T288 Offer a hardware-backed mTLS client-certificate profile for admins (S51, S55)
 
 ## Backlog
 - [>] T236 Run Raft peer traffic over hybrid-PQC TLS once hiqlite supports it (S5)
@@ -943,6 +1036,13 @@ start only once it is accepted.
 | S47 | Formal verification models | formal/README.md |
 | S48 | CryptoVerif model of the hybrid AKE | formal/cryptoverif/hybrid_ake.cv |
 | S49 | Tamarin model of the attestation protocol | formal/tamarin/attestation.spthy |
+| S50 | F19 — Application registration and approval lifecycle | docs/features/F19-app-registration-approval.md |
+| S51 | F20 — Administrator authentication and authorization | docs/features/F20-admin-authentication.md |
+| S52 | F21 — Server administration TUI | docs/features/F21-admin-tui.md |
+| S53 | F22 — Tray admin client | docs/features/F22-tray-admin-client.md |
+| S54 | ADR-0004 — App approval ledger and non-replacement invariant (Proposed) | docs/adr/0004-app-approval-ledger.md |
+| S55 | ADR-0005 — Administrator authentication (Proposed) | docs/adr/0005-admin-authentication.md |
+| S56 | App approval and administration overview | docs/app-approval-and-admin.md |
 
 ## Phases
 | ID | Title | Outcome |
@@ -956,3 +1056,4 @@ start only once it is accepted.
 | P7 | Ceremony, drills, and production readiness (legacy roadmap M6) | Root keys rotate through an audited ceremony, drills are rehearsed, the protocols are formally verified and the live transport is hybrid-PQC. |
 | P8 | Fleet deployment and cross-platform agents (post-roadmap, 0.13.0 onward) | MIA and CMIS deploy across Linux, macOS and Windows fleets with provisioning, HA, TPM-less attestation and the X.509-SVID profile. |
 | P9 | Production hardening (planned) | The seams left open by earlier milestones are closed and the CI gates are restored. |
+| P10 | App approval and administration (planned, 0.29.0 onward) | Applications are registered and approved through an audited ledger, and administrators authenticate to every admin surface. |

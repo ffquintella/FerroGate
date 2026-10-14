@@ -1,9 +1,12 @@
 //! `cmis` — Central Machine Identity Service library.
 //!
 //! Hosts the `MachineIdentity` gRPC service (feature F04): the four-phase
-//! attestation handshake, SVID issuance, in-window `Rotate`, and `JWKS`. The
-//! daemon binary (`src/main.rs`) is a thin wrapper that assembles
-//! [`state::CmisState`] and serves [`service::MachineIdentitySvc`].
+//! attestation handshake, SVID issuance, in-window `Rotate`, and `JWKS`; and
+//! the administrator surface (feature F20, [`admin`]): authenticated admin
+//! sessions, the `ferrogate.admin.v1.Admin` service and the authorization
+//! layer in front of every listener. The daemon binary (`src/main.rs`) is a
+//! thin wrapper that assembles [`state::CmisState`] and calls
+//! [`server::run`].
 //!
 //! TEE residency, Raft replication, and the audit log are layered on in later
 //! milestones; the seams (the credential maker, the issued-SVID store) are
@@ -11,13 +14,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod cluster_store;
 pub mod credential;
 pub mod crl_publisher;
 pub mod fleet_manifest;
 pub mod fleet_watcher;
+pub mod host_auth;
 pub mod pcr;
 pub mod rim_watcher;
+pub mod server;
 pub mod service;
 pub mod state;
 pub mod transport;

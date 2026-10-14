@@ -29,6 +29,17 @@ values. Today it is appended to a local, append-only JSON-lines journal beside
 the configuration file (`config-audit.jsonl`); forwarding that journal to CMIS
 through `AppendAuditEvent` is a follow-up.
 
+**Forwarding from hosts.** A MIA appends its own events (`LocalGrant`,
+`LocalDenied`, `ConfigChanged`) through `AppendAuditEvent`. Since 0.29.0 every
+forward is host-authenticated (F19 §7.1 `HostCallAuth`): the host presents its
+SVID and signs, with the machine key the SVID binds, a fresh single-use
+document `{v, host_uuid, issued_at, nonce, event_sha384}` under the context
+`ferrogate-audit-forward-v1`. CMIS refuses unsigned, stale (more than 300 s
+off), replayed or tampered forwards, forwards from revoked hosts, and every
+event type a host does not produce, and rate-limits each host
+(`CMIS_AUDIT_FORWARD_MAX_PER_MIN`). The leaf is the event bytes exactly as
+forwarded. See [operations.md](operations.md#audit-forwarding-from-hosts).
+
 No personally identifiable information is recorded. EK certificates and
 binary contents are referenced only by SHA-384 hash.
 

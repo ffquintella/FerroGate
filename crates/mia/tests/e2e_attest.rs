@@ -362,10 +362,23 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
     .await;
     let mut client = spawn_server(state).await;
 
+    // The host machine key: the SVID binds it through `cnf.jkt`, and it
+    // signs the `AppendAuditEvent` host proof (F20 Phase 0).
+    let machine_key = ferro_sep::SoftwareMachineKey::generate().unwrap();
+    let jkt = {
+        use ferro_sep::MachineKey as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(machine_key.public_spki_der()))
+    };
+
     // Drive a successful attestation. CMIS appends AttestStart + SvidIssued.
-    let _attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
-        .await
-        .unwrap();
+    let attested = run_attest(&mut client, &mut evidence, jkt).await.unwrap();
+    let svid = attested.bundle;
+    let host_uuid = svid
+        .spiffe_id
+        .rsplit_once("/host/")
+        .map(|(_, u)| u.to_string())
+        .expect("a host SPIFFE id");
 
     // The latest STH must verify under the audit publisher key and report a
     // size of at least 2 leaves (AttestStart + SvidIssued).
@@ -416,9 +429,14 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
     // The published STH must agree with the proof's root.
     assert_eq!(body.root_hash.0, root);
 
-    // Forward a MIA-side event; the tree grows; consistency from the old size
-    // back to the new size verifies.
+    // Forward a MIA-side event, host-signed; the tree grows; consistency from
+    // the old size back to the new size verifies.
     let old_size = body.tree_size;
+    let signer = mia::audit_client::HostProofSigner {
+        key: &machine_key,
+        svid_jws: &svid.jws,
+        host_uuid: &host_uuid,
+    };
     let leaf_idx = mia::audit_client::forward(
         &mut client,
         &AuditEvent::LocalGrant {
@@ -427,10 +445,34 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
             bin_sha: Hash384([0xAA; 48]),
             jti: ferro_audit::Bytes16([0x55; 16]),
         },
+        &signer,
     )
     .await
     .expect("audit forward succeeds");
     assert_eq!(leaf_idx, old_size);
+
+    // A key the SVID does not bind cannot forward in this host's name.
+    let impostor = ferro_sep::SoftwareMachineKey::generate().unwrap();
+    let refused = mia::audit_client::forward(
+        &mut client,
+        &AuditEvent::LocalGrant {
+            pid: 1,
+            uid: 0,
+            bin_sha: Hash384([0xBB; 48]),
+            jti: ferro_audit::Bytes16([0x66; 16]),
+        },
+        &mia::audit_client::HostProofSigner {
+            key: &impostor,
+            svid_jws: &svid.jws,
+            host_uuid: &host_uuid,
+        },
+    )
+    .await
+    .expect_err("an unbound key is refused");
+    assert!(
+        matches!(&refused, mia::audit_client::AuditForwardError::Transport(s) if s.code() == tonic::Code::Unauthenticated),
+        "{refused:?}"
+    );
 
     // Inclusion of the new leaf, then consistency back to the previous STH.
     let inc2 = client
@@ -504,21 +546,21 @@ async fn bump_epoch_forces_full_reattestation_on_next_rotate() {
         .await
         .expect("short-path rotate succeeds before the bump");
 
-    // Bump the live policy epoch via the admin RPC.
-    let audit_before_bump = state.audit.len();
-    let resp = client
+    // A host cannot bump the epoch: BumpEpoch is an admin RPC and, since
+    // F20 Phase 0, needs an authenticated admin session.
+    let refused = client
         .bump_epoch(BumpEpochRequest {
             reason: "rim-policy-change".into(),
         })
         .await
-        .expect("bump_epoch succeeds")
-        .into_inner();
-    assert_eq!(resp.new_epoch, 2, "epoch advanced 1 -> 2");
-    assert_eq!(
-        state.audit.len(),
-        audit_before_bump + 1,
-        "one PolicyEpochBumped event recorded"
-    );
+        .expect_err("an unauthenticated caller must not bump the epoch");
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+    assert_eq!(state.current_epoch(), 1, "the refused call changed nothing");
+
+    // The operator bumps the live policy epoch (the authenticated admin path
+    // is covered in crates/cmis/tests/admin_*.rs).
+    let (_old, new_epoch) = state.bump_epoch();
+    assert_eq!(new_epoch, 2, "epoch advanced 1 -> 2");
 
     // The SVID was attested under epoch 1; with the live epoch now 2, the next
     // rotate must be refused so the host is driven back through full Attest.

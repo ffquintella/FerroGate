@@ -1,0 +1,296 @@
+// FerroGate administrator surface (feature F20, ADR-0005).
+//
+// Served only on the dedicated admin listener (CMIS_ADMIN_LISTEN, default
+// 127.0.0.1:8444) over hybrid-PQC TLS 1.3. Every method is classified in the
+// server's METHOD_ACCESS table; a method missing from that table is denied.
+//
+// Login, step-up and enrollment carry a password and a second factor: TOTP
+// (every client) or a FIDO2 / WebAuthn credential (the tray admin client
+// only, F20 §5). CMIS is the WebAuthn relying party with RP ID
+// `ferrogate-admin.<trust_domain>`; user verification is required and the
+// attestation conveyance is "none".
+//
+// Secrets (passwords, TOTP codes, session/device/enrollment tokens) and
+// WebAuthn responses travel only inside the admin TLS channel and never
+// appear in logs or audit events.
+
+syntax = "proto3";
+
+package ferrogate.admin.v1;
+
+service Admin {
+  // ---- Authentication (public, throttled) ----
+  rpc BeginLogin (BeginLoginRequest) returns (BeginLoginResponse);
+  rpc Login (LoginRequest) returns (LoginResponse);
+
+  // ---- Session (any authenticated session) ----
+  rpc BeginStepUp (BeginStepUpRequest) returns (BeginStepUpResponse);
+  rpc StepUp (StepUpRequest) returns (StepUpResponse);
+  rpc Logout (LogoutRequest) returns (LogoutResponse);
+  rpc WhoAmI (WhoAmIRequest) returns (WhoAmIResponse);
+  rpc ListMySessions (ListMySessionsRequest) returns (ListMySessionsResponse);
+  rpc RevokeSession (RevokeSessionRequest) returns (RevokeSessionResponse);
+  rpc ChangePassword (ChangePasswordRequest) returns (ChangePasswordResponse);
+  rpc ListMyFactors (ListMyFactorsRequest) returns (ListMyFactorsResponse);
+  rpc BeginAddFactor (BeginAddFactorRequest) returns (BeginAddFactorResponse);
+  rpc CompleteAddFactor (CompleteAddFactorRequest) returns (CompleteAddFactorResponse);
+  rpc RemoveFactor (RemoveFactorRequest) returns (RemoveFactorResponse);
+
+  // ---- Enrollment (public, throttled; the enrollment token is the credential) ----
+  rpc BeginEnrollment (BeginEnrollmentRequest) returns (BeginEnrollmentResponse);
+  rpc CompleteEnrollment (CompleteEnrollmentRequest) returns (CompleteEnrollmentResponse);
+
+  // ---- Account administration ----
+  rpc ListAdminAccounts (ListAdminAccountsRequest) returns (ListAdminAccountsResponse);
+  rpc ListAdminGroups (ListAdminGroupsRequest) returns (ListAdminGroupsResponse);
+  rpc CreateAdminAccount (CreateAdminAccountRequest) returns (CreateAdminAccountResponse);
+  rpc UpdateAdminAccount (UpdateAdminAccountRequest) returns (UpdateAdminAccountResponse);
+  rpc SetAdminAccountState (SetAdminAccountStateRequest) returns (SetAdminAccountStateResponse);
+  rpc ResetAdminCredentials (ResetAdminCredentialsRequest) returns (ResetAdminCredentialsResponse);
+}
+
+// Client kind: 1 tui, 2 tray, 3 cli.
+message ClientInfo { uint32 kind = 1; string version = 2; }
+
+// Per-operation second-factor proof (F20 §7 "M"). For a WebAuthn proof,
+// `nonce` is a `stepup_nonce` from BeginStepUp (single use, 2 min) and the
+// assertion signs the challenge BeginStepUp returned with it. A TOTP proof
+// needs no nonce.
+message MfaProof {
+  oneof f {
+    string totp_code = 1;
+    WebAuthnAssertion webauthn_assertion = 2;
+  }
+  bytes nonce = 3;
+}
+
+// ---- WebAuthn (FIDO2 security keys and platform authenticators) ----
+
+// BeginLogin, BeginStepUp: request for an assertion.
+message WebAuthnChallenge {
+  bytes  challenge = 1;                    // single use, bound to the login or step-up nonce
+  string rp_id = 2;                        // ferrogate-admin.<trust_domain>
+  repeated bytes allow_credential_ids = 3; // decoys for unknown accounts
+  uint32 user_verification = 4;            // 1 = required
+  int64  timeout_ms = 5;
+}
+// Authenticator response to WebAuthnChallenge.
+message WebAuthnAssertion {
+  bytes credential_id = 1;
+  bytes authenticator_data = 2;
+  bytes client_data_json = 3;
+  bytes signature = 4;
+  bytes user_handle = 5;
+}
+// BeginEnrollment, BeginAddFactor: request for a new credential.
+message WebAuthnCreationOptions {
+  bytes  challenge = 1;
+  string rp_id = 2;
+  string rp_name = 3;
+  bytes  user_id = 4;                      // opaque handle, not the admin id
+  string user_name = 5;
+  string display_name = 6;
+  repeated int32 pub_key_cred_params = 7;  // COSE alg ids: -7 ES256, -8 EdDSA
+  repeated bytes exclude_credential_ids = 8; // already enrolled keys
+  uint32 user_verification = 9;            // 1 = required
+  uint32 attestation = 10;                 // 1 = none
+}
+// Authenticator response to WebAuthnCreationOptions. Attestation formats
+// `none` and `packed` are accepted; `label` is at most 64 characters.
+message WebAuthnAttestation {
+  bytes credential_id = 1;
+  bytes attestation_object = 2;
+  bytes client_data_json = 3;
+  repeated string transports = 4;
+  string label = 5;
+}
+
+// ---- Login ----
+
+// `methods`: 1 totp, 2 webauthn — what this account may use from this client
+// kind (the TUI and CLI get TOTP only). `webauthn` is set when 2 is listed.
+message BeginLoginRequest  { string username = 1; string device_token = 2; ClientInfo client = 3; }
+message BeginLoginResponse { bytes login_nonce = 1; repeated uint32 methods = 2; WebAuthnChallenge webauthn = 3; }
+
+// `client` is the same `ClientInfo` sent to BeginLogin; `device_token`
+// selects the throttle bucket (F20 §8) and is not a credential. A WebAuthn
+// assertion signs the challenge BeginLogin returned with `login_nonce`.
+message LoginRequest {
+  bytes login_nonce = 1;
+  string username = 2;
+  string password = 3;
+  oneof second_factor {
+    string totp_code = 4;
+    WebAuthnAssertion webauthn_assertion = 5;
+  }
+  string device_token = 6;
+  ClientInfo client = 7;
+}
+message LoginResponse {
+  string session_token = 1;
+  int64 idle_timeout_secs = 2;
+  int64 absolute_expires_at = 3;
+  uint32 aal = 4;
+  bool password_change_required = 5;
+  int64 password_expires_at = 6;
+  string device_token = 7;
+  string admin_id = 8;
+  string display_name = 9;
+  repeated string groups = 10;
+  // A tray session of a CMIS_ADMIN_TRAY_FIDO2_GROUPS member who holds no
+  // FIDO2 credential yet: restricted to factor enrollment, WhoAmI and Logout.
+  bool factor_enrollment_required = 11;
+}
+
+// ---- Step-up (rotates the session token) ----
+
+// `webauthn` is set when this session may step up with a FIDO2 credential.
+message BeginStepUpRequest  {}
+message BeginStepUpResponse { bytes stepup_nonce = 1; WebAuthnChallenge webauthn = 2; }
+message StepUpRequest  { bytes stepup_nonce = 1; MfaProof proof = 2; }
+message StepUpResponse { string session_token = 1; int64 step_up_valid_until = 2; }
+
+// ---- Session management ----
+
+message LogoutRequest  {}
+message LogoutResponse {}
+
+message WhoAmIRequest {}
+message WhoAmIResponse {
+  string admin_id = 1;
+  string username = 2;
+  string display_name = 3;
+  repeated string groups = 4;
+  repeated string permissions = 5;
+  uint32 aal = 6;
+  int64 mfa_at = 7;
+  bool restricted = 8;
+  int64 password_expires_at = 9;
+  string session_ref = 10;
+  bool factor_enrollment_required = 11;
+}
+
+message SessionInfo {
+  string session_ref = 1;
+  int64 created_at = 2;
+  int64 last_seen_at = 3;
+  string source_ip = 4;
+  uint32 client_kind = 5;
+  bool current = 6;
+  uint32 aal = 7;
+}
+message ListMySessionsRequest  {}
+message ListMySessionsResponse { repeated SessionInfo sessions = 1; }
+
+// Empty `admin_id` revokes one of the caller's own sessions; another account's
+// session needs `session.revoke_any` and a fresh step-up.
+message RevokeSessionRequest  { string session_ref = 1; string admin_id = 2; }
+message RevokeSessionResponse {}
+
+message ChangePasswordRequest  { string current_password = 1; string new_password = 2; MfaProof proof = 3; }
+message ChangePasswordResponse { string session_token = 1; int64 password_expires_at = 2; }
+
+// `method`: 1 totp, 2 webauthn.
+message FactorInfo { string factor_id = 1; uint32 method = 2; string label = 3; int64 created_at = 4; int64 last_used_at = 5; }
+message ListMyFactorsRequest  {}
+message ListMyFactorsResponse { repeated FactorInfo factors = 1; }
+
+// Factor management from a signed-in session (F20 §5, tray admin client).
+// BeginAddFactor needs a recent step-up; CompleteAddFactor and RemoveFactor
+// carry a per-operation proof of a factor the account already holds.
+message BeginAddFactorRequest  { uint32 method = 1; }                    // 1 totp, 2 webauthn
+message BeginAddFactorResponse {
+  bytes enroll_nonce = 1;
+  string totp_provisioning_uri = 2;
+  WebAuthnCreationOptions webauthn_creation_options = 3;
+}
+message CompleteAddFactorRequest {
+  string idempotency_key = 1;
+  bytes enroll_nonce = 2;
+  string label = 3;
+  string totp_code = 4;
+  WebAuthnAttestation webauthn_attestation = 5;
+  MfaProof proof = 6;                                                      // proof of an existing factor
+}
+message CompleteAddFactorResponse { string factor_id = 1; }
+message RemoveFactorRequest { string idempotency_key = 1; string factor_id = 2; MfaProof proof = 3; }
+message RemoveFactorResponse {}
+
+// ---- Enrollment ----
+
+// `webauthn_creation_options` is set when the token enrolls second factors
+// for an existing account (not for the TOTP-only bootstrap).
+message BeginEnrollmentRequest  { string enrollment_token = 1; }
+message BeginEnrollmentResponse {
+  string username = 1;
+  bool username_choosable = 2;
+  string display_name = 3;
+  string totp_provisioning_uri = 4;
+  WebAuthnCreationOptions webauthn_creation_options = 5;
+  uint32 password_min_len = 6;
+}
+// At least one of `totp_code` / `webauthn_attestation` when the token
+// enrolls second factors; both may be sent.
+message CompleteEnrollmentRequest {
+  string enrollment_token = 1;
+  string username = 2;
+  string display_name = 3;
+  string password = 4;
+  string totp_code = 5;
+  WebAuthnAttestation webauthn_attestation = 6;
+}
+message CompleteEnrollmentResponse { string admin_id = 1; }
+
+// ---- Account administration ----
+
+// `state`: 1 pending_enrollment, 2 active, 3 disabled.
+message AdminAccountInfo {
+  string admin_id = 1;
+  string username = 2;
+  string display_name = 3;
+  uint32 state = 4;
+  repeated string groups = 5;
+  int64 created_at = 6;
+  int64 last_login_at = 7;
+  int64 password_expires_at = 8;
+  uint64 row_version = 9;
+}
+message ListAdminAccountsRequest  {}
+message ListAdminAccountsResponse { repeated AdminAccountInfo accounts = 1; }
+
+message AdminGroupInfo { string group_id = 1; string name = 2; bool builtin = 3; repeated string permissions = 4; }
+message ListAdminGroupsRequest  {}
+message ListAdminGroupsResponse { repeated AdminGroupInfo groups = 1; }
+
+message CreateAdminAccountRequest {
+  string idempotency_key = 1;
+  string username = 2;
+  string display_name = 3;
+  repeated string groups = 4;
+  MfaProof proof = 5;
+  int64 enrollment_ttl_secs = 6;
+}
+message CreateAdminAccountResponse { string admin_id = 1; string enrollment_token = 2; int64 enrollment_expires_at = 3; }
+
+message UpdateAdminAccountRequest {
+  string idempotency_key = 1;
+  string admin_id = 2;
+  uint64 expected_row_version = 3;
+  optional string display_name = 4;
+  bool replace_groups = 5;
+  repeated string groups = 6;
+  MfaProof proof = 7;
+}
+message UpdateAdminAccountResponse { uint64 row_version = 1; }
+
+message SetAdminAccountStateRequest { string idempotency_key = 1; string admin_id = 2; uint32 state = 3; MfaProof proof = 4; }
+message SetAdminAccountStateResponse { uint64 row_version = 1; }
+
+message ResetAdminCredentialsRequest {
+  string idempotency_key = 1;
+  string admin_id = 2;
+  bool reset_password = 3;
+  bool reset_mfa = 4;
+  MfaProof proof = 5;
+}
+message ResetAdminCredentialsResponse { string enrollment_token = 1; int64 expires_at = 2; }

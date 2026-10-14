@@ -21,6 +21,20 @@ use ferro_proto::v1::{
 use ferro_raft::Cluster;
 use ferro_svid::Issuer;
 
+/// An admin RPC request as the authorization layer hands it to the handler:
+/// carrying an authenticated operator context (F20). These tests exercise the
+/// handlers' business logic; authentication itself is covered by the
+/// `admin_*` tests.
+fn admin<T>(msg: T) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    req.extensions_mut()
+        .insert(cmis::admin::AdminContext::synthetic(
+            "test-operator",
+            cmis::admin::Permission::ALL,
+        ));
+    req
+}
+
 struct UnusedCredentialMaker;
 impl CredentialMaker for UnusedCredentialMaker {
     fn make_credential(
@@ -99,7 +113,7 @@ async fn set_then_get_serves_a_verifiable_signed_allowlist() {
     let host = "host-uuid-1";
 
     let set = svc
-        .set_allowlist(tonic::Request::new(SetAllowlistRequest {
+        .set_allowlist(admin(SetAllowlistRequest {
             host_uuid: host.into(),
             entries: vec![entry(1000, 0xAA), entry(1001, 0xBB)],
             ttl_secs: 3600,
@@ -127,7 +141,6 @@ async fn set_then_get_serves_a_verifiable_signed_allowlist() {
     assert_eq!(doc.issued_at, set.issued_at);
     assert_eq!(doc.not_after, set.not_after);
     assert!(doc.entries.iter().any(|e| e.uid == Some(1000)));
-
 }
 
 #[tokio::test]
@@ -147,7 +160,7 @@ async fn get_unknown_host_returns_empty_not_error() {
 async fn set_rejects_malformed_entry_hash() {
     let (svc, _g) = svc().await;
     let err = svc
-        .set_allowlist(tonic::Request::new(SetAllowlistRequest {
+        .set_allowlist(admin(SetAllowlistRequest {
             host_uuid: "host".into(),
             entries: vec![AllowEntryMsg {
                 uid: Some(1),
@@ -164,7 +177,7 @@ async fn set_rejects_malformed_entry_hash() {
 async fn set_rejects_empty_host_uuid() {
     let (svc, _g) = svc().await;
     let err = svc
-        .set_allowlist(tonic::Request::new(SetAllowlistRequest {
+        .set_allowlist(admin(SetAllowlistRequest {
             host_uuid: "  ".into(),
             entries: vec![entry(1, 0x11)],
             ttl_secs: 60,
@@ -178,7 +191,7 @@ async fn set_rejects_empty_host_uuid() {
 async fn list_and_delete_reflect_stored_allowlists() {
     let (svc, _g) = svc().await;
     for (host, n) in [("h1", 0x01u8), ("h2", 0x02u8)] {
-        svc.set_allowlist(tonic::Request::new(SetAllowlistRequest {
+        svc.set_allowlist(admin(SetAllowlistRequest {
             host_uuid: host.into(),
             entries: vec![entry(1000, n)],
             ttl_secs: 600,
@@ -188,7 +201,7 @@ async fn list_and_delete_reflect_stored_allowlists() {
     }
 
     let listed = svc
-        .list_allowlists(tonic::Request::new(ListAllowlistsRequest {}))
+        .list_allowlists(admin(ListAllowlistsRequest {}))
         .await
         .expect("list ok")
         .into_inner();
@@ -196,7 +209,7 @@ async fn list_and_delete_reflect_stored_allowlists() {
     assert!(listed.items.iter().all(|s| s.entry_count == 1));
 
     let del = svc
-        .delete_allowlist(tonic::Request::new(DeleteAllowlistRequest {
+        .delete_allowlist(admin(DeleteAllowlistRequest {
             host_uuid: "h1".into(),
         }))
         .await
@@ -206,7 +219,7 @@ async fn list_and_delete_reflect_stored_allowlists() {
 
     // Deleting again reports it was already gone.
     let del2 = svc
-        .delete_allowlist(tonic::Request::new(DeleteAllowlistRequest {
+        .delete_allowlist(admin(DeleteAllowlistRequest {
             host_uuid: "h1".into(),
         }))
         .await
@@ -215,20 +228,19 @@ async fn list_and_delete_reflect_stored_allowlists() {
     assert!(!del2.existed);
 
     let listed = svc
-        .list_allowlists(tonic::Request::new(ListAllowlistsRequest {}))
+        .list_allowlists(admin(ListAllowlistsRequest {}))
         .await
         .expect("list ok")
         .into_inner();
     assert_eq!(listed.items.len(), 1);
     assert_eq!(listed.items[0].host_uuid, "h2");
-
 }
 
 #[tokio::test]
 async fn ttl_zero_falls_back_to_a_default_window() {
     let (svc, _g) = svc().await;
     let set = svc
-        .set_allowlist(tonic::Request::new(SetAllowlistRequest {
+        .set_allowlist(admin(SetAllowlistRequest {
             host_uuid: "h".into(),
             entries: vec![entry(1, 0x11)],
             ttl_secs: 0,

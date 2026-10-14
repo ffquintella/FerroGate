@@ -13,9 +13,12 @@
 
 - Single multi-threaded Tokio runtime, ~N+1 worker threads (one per core, one
   for I/O reactor).
-- One `tonic` gRPC server, no other listeners (rationale:
+- `tonic` gRPC only, on two listeners (rationale:
   [ADR-0001](adr/0001-grpc-over-http-transport.md); ports and firewall rules:
-  [networking.md](networking.md)).
+  [networking.md](networking.md)): the control plane (`CMIS_LISTEN`, `:8443`)
+  and, since 0.29.0, the admin listener (`CMIS_ADMIN_LISTEN`, default
+  `127.0.0.1:8444`, TLS only). One authorization layer sits in front of both
+  (see "Administrator authentication" below).
 - A small set of background tasks: Raft tick, audit-flush, CRL publisher,
   RIM refresh, key-share heartbeat.
 
@@ -135,9 +138,44 @@ service MachineIdentity {
   `x-ferrogate-crl` containing a signed CRL delta.
 - `GetEnrollmentKey`/`GetAllowlist` are unauthenticated (public key material and
   signature-protected allowlist bodies); `Set`/`Delete`/`ListAllowlists` are
-  admin RPCs authenticated out of band like revocation. Allowlists are keyed by
-  EK-derived host UUID and stored in the same backend as issued SVIDs (the
-  `host_allowlists` Raft keyspace when clustered).
+  admin RPCs that need an administrator session, like revocation (see
+  "Administrator authentication"). Allowlists are keyed by EK-derived host UUID
+  and stored in the same backend as issued SVIDs (the `host_allowlists` Raft
+  keyspace when clustered). A store write that fails is returned as
+  `UNAVAILABLE (store_unavailable)`, never reported as done.
+- `AppendAuditEvent` is a host method: it needs the F19 §7.1 host proof (SVID
+  + machine-key signature over a fresh `{v, host_uuid, issued_at, nonce,
+  event_sha384}` document, context `ferrogate-audit-forward-v1`), accepts only
+  host-originated event types and is rate-limited per host
+  (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`, default 600/min). The shared verifier is
+  `cmis::host_auth`, reused by the F19 host RPCs.
+
+## Administrator authentication
+
+Feature [F20](features/F20-admin-authentication.md), Phase 0 shipped in 0.29.0
+(`crates/cmis/src/admin/`):
+
+- Local administrator accounts: Argon2id passwords (optional pepper,
+  blocklist, history, 6-month expiry) and a mandatory second factor — TOTP for
+  every client, FIDO2/WebAuthn from the tray admin client.
+- Opaque session tokens, stored only as hashes, bound to the source IP, with
+  idle and absolute expiry, step-up for sensitive methods and server-side
+  revocation; NRM §5.3.5 progressive login throttling keyed by IP.
+- One method → access table (`admin::authz::METHOD_ACCESS`) drives the tower
+  layer on every listener and the per-handler guards; a method missing from it
+  is refused, and a test proves every compiled RPC is classified. Access is
+  `Public`, `Host` (host proof in the handler), `AdminPublic` (login and
+  enrollment, TLS only) or `Session` (permission from groups, optional
+  step-up).
+- Admin methods are never served without TLS (`FAILED_PRECONDITION
+  tls_required`); the legacy admin RPCs are also served on the control plane
+  while `CMIS_LEGACY_ADMIN_ON_MAIN=true`.
+- Every login, account change and admin action is audited under a
+  pseudonymous administrator id.
+
+Every `CMIS_ADMIN_*` variable, the bootstrap of the first account, CLI sign-in,
+the 0.29.0 upgrade notes and the known limitations are in
+[operations.md](operations.md#administrator-access-f20).
 
 ## Configuration sketch
 
@@ -179,6 +217,18 @@ peer_tls      = true                            # CMIS_PEER_TLS=1 (rustls inter-
 allowlist     = "/var/lib/ferrogate/rim/current.json"
 generations   = 6
 
+[admin]
+# The shipped binary reads these from env (full table: operations.md
+# "Administrator access"). Admin listener, TLS only, never internet-facing.
+listen               = "127.0.0.1:8444"         # CMIS_ADMIN_LISTEN
+client_ca            = ""                       # CMIS_ADMIN_CLIENT_CA (optional mTLS)
+legacy_admin_on_main = true                     # CMIS_LEGACY_ADMIN_ON_MAIN
+strict_sod           = false                    # CMIS_ADMIN_STRICT_SOD
+secrets_key          = "/var/lib/ferrogate/admin/secrets.key"          # CMIS_ADMIN_SECRETS_KEY_FILE
+audit_pseudonym_key  = "/var/lib/ferrogate/admin/audit-pseudonym.key"  # CMIS_AUDIT_PSEUDONYM_KEY_FILE
+tray_fido2_groups    = ["ferrogate-approvers"]  # CMIS_ADMIN_TRAY_FIDO2_GROUPS
+audit_forward_max_per_min = 600                 # CMIS_AUDIT_FORWARD_MAX_PER_MIN (host proof RPC)
+
 [audit]
 worm_dir      = "/var/lib/ferrogate/audit"      # local-disk WORM store (O_CREAT|O_EXCL)
 sigsum_log    = "https://sigsum.example.org/log1"
@@ -187,8 +237,11 @@ sigsum_log    = "https://sigsum.example.org/log1"
 ## Error model
 
 All client-visible errors map to a small fixed set of gRPC status codes; the
-*reason* is never returned to the client to avoid oracles. Detailed failure
-reasons go only to the audit log.
+*detailed reason* is never returned to the client to avoid oracles. Detailed
+failure reasons go only to the audit log and the CMIS log. Host-proof and
+admin methods put one stable reason code per class in the status message (in
+parentheses below) — for example every host-authentication failure is the same
+`host_auth_failed`.
 
 | Condition | gRPC status |
 |-----------|-------------|
@@ -199,3 +252,10 @@ reasons go only to the audit log.
 | AIK signature over CSR invalid | `PERMISSION_DENIED` |
 | Replay of nonce | `ABORTED` |
 | Internal (signer unavailable, …) | `UNAVAILABLE` |
+| Replicated-store write failed | `UNAVAILABLE` (`store_unavailable`) |
+| Host proof missing or invalid (SVID, revoked, `cnf.jkt`, signature, freshness, replay, event digest) | `UNAUTHENTICATED` (`host_auth_failed`) |
+| Host proof document names another host | `PERMISSION_DENIED` (`host_mismatch`) |
+| Host over its rate limit | `RESOURCE_EXHAUSTED` (`rate_limited`, `retry-after`) |
+| Admin method without a valid session | `UNAUTHENTICATED` (`session_invalid`) |
+| Admin method without the permission | `PERMISSION_DENIED` (`permission_denied`) |
+| Admin method over plaintext | `FAILED_PRECONDITION` (`tls_required`) |

@@ -32,6 +32,20 @@ use ferro_svid::allowlist::{self, AllowEntry, ProposalDoc};
 use ferro_svid::{host_uuid_from_ek_digest, IssueParams, Issuer};
 use sha2::{Digest, Sha256};
 
+/// An admin RPC request as the authorization layer hands it to the handler:
+/// carrying an authenticated operator context (F20). These tests exercise the
+/// handlers' business logic; authentication itself is covered by the
+/// `admin_*` tests.
+fn admin<T>(msg: T) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    req.extensions_mut()
+        .insert(cmis::admin::AdminContext::synthetic(
+            "test-operator",
+            cmis::admin::Permission::ALL,
+        ));
+    req
+}
+
 struct UnusedCredentialMaker;
 impl CredentialMaker for UnusedCredentialMaker {
     fn make_credential(
@@ -221,7 +235,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
     let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly).await;
 
     // An operator has already provisioned an allowlist.
-    svc.set_allowlist(tonic::Request::new(SetAllowlistRequest {
+    svc.set_allowlist(admin(SetAllowlistRequest {
         host_uuid: host.clone(),
         entries: vec![AllowEntryMsg {
             uid: Some(1),
@@ -246,7 +260,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
     assert_eq!(resp.outcome, Outcome::Pending as i32);
 
     let pending = svc
-        .list_proposals(tonic::Request::new(ListProposalsRequest {}))
+        .list_proposals(admin(ListProposalsRequest {}))
         .await
         .unwrap()
         .into_inner();
@@ -269,7 +283,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
 
     // Rejecting drops it.
     let del = svc
-        .delete_proposal(tonic::Request::new(DeleteProposalRequest {
+        .delete_proposal(admin(DeleteProposalRequest {
             host_uuid: host.clone(),
         }))
         .await
@@ -277,7 +291,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
         .into_inner();
     assert!(del.existed);
     let empty = svc
-        .list_proposals(tonic::Request::new(ListProposalsRequest {}))
+        .list_proposals(admin(ListProposalsRequest {}))
         .await
         .unwrap()
         .into_inner();
@@ -372,5 +386,29 @@ async fn rejects_unissued_svid() {
         .propose_allowlist(tonic::Request::new(req))
         .await
         .expect_err("foreign svid rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+/// A revoked host cannot keep proposing with its still-unexpired SVID: the
+/// SVID check is shared with the F19 §7.1 host proof and consults the
+/// revocation working set.
+#[tokio::test]
+async fn rejects_a_revoked_host() {
+    let (svc, key, host, jws, _g) = setup(ProposalPolicy::BootstrapOnly).await;
+    let spiffe_id = ferro_svid::envelope::decode(&jws).unwrap().claims.sub;
+    svc.state().revoke(
+        ferro_svid::RevocationTarget::Host { spiffe_id },
+        "compromised",
+        now_unix(),
+    );
+    let err = svc
+        .propose_allowlist(tonic::Request::new(proposal_req(
+            &key,
+            &host,
+            vec![entry(1000, 0xAA)],
+            &jws,
+        )))
+        .await
+        .expect_err("revoked host rejected");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }

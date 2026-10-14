@@ -71,6 +71,145 @@ full how-it-works, the OpenSSL pin recipe, and troubleshooting.
   ahead of the cutover so both old and new certificates verify during the
   overlap window.
 
+## Administrator access (F20)
+
+Since **0.29.0** every CMIS admin RPC requires an individual administrator
+account: a session obtained with a password **and** a second factor, a group
+that grants the method's permission, and — for writes such as `SetAllowlist`,
+`RevokeHost` or `BumpEpoch` — a second-factor step-up in the last 5 minutes.
+Before 0.29.0 those RPCs performed no caller check at all. Design:
+[F20](features/F20-admin-authentication.md); listener and firewall:
+[networking.md](networking.md#1a-cmis-admin-listener--tcp-8444).
+
+### Configuration
+
+All variables are read at CMIS start. A malformed value aborts startup rather
+than falling back to a weaker default.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CMIS_ADMIN_LISTEN` | `127.0.0.1:8444` | Admin listener (`Admin` service + legacy admin RPCs). TLS only; bind a management interface, never an internet-facing one |
+| `CMIS_ADMIN_TLS_CERT` / `CMIS_ADMIN_TLS_KEY` | the main listener's (`CMIS_TLS_CERT`/`_KEY`) | Admin listener certificate and key (PEM); set both or neither. Without any certificate the admin listener does not start |
+| `CMIS_ADMIN_CLIENT_CA` | unset | PEM CA bundle; when set the admin listener also requires an mTLS client certificate from it |
+| `CMIS_LEGACY_ADMIN_ON_MAIN` | `true` | Also serve the legacy admin RPCs on the main listener (`:8443`), still session-authenticated. Set `false` once every operator uses a 0.29 CLI |
+| `CMIS_ADMIN_STRICT_SOD` | `false` | Strict separation of duties: an account administrator may not hold the approver group, and nobody approves their own request |
+| `CMIS_ADMIN_STEP_UP_WINDOW_SECS` | `300` | How long a second-factor step-up stays valid for sensitive methods (capped at 900; `0` = only the same second) |
+| `CMIS_ADMIN_SESSION_BIND_IP` | `true` | Revoke a session presented from another source IP |
+| `CMIS_ADMIN_SESSION_IDLE_SECS` | `900` | Session idle timeout (60–900) |
+| `CMIS_ADMIN_SESSION_ABSOLUTE_SECS` | `43200` | Session absolute lifetime (at least the idle timeout, at most 12 h) |
+| `CMIS_ADMIN_SECRETS_KEY_FILE` | `/var/lib/ferrogate/admin/secrets.key` | 32-byte key sealing TOTP secrets and keying server MACs. Every node of a cluster must hold the same file (a node with a different key refuses to start the admin subsystem). Generated (`0400`, with a warning) only when unset and the default file is missing; an explicitly configured file must already exist |
+| `CMIS_AUDIT_PSEUDONYM_KEY_FILE` | `/var/lib/ferrogate/admin/audit-pseudonym.key` | 32-byte key for the keyed pseudonyms (source IPs, attempted usernames) written to the audit log. Same generation rule |
+| `CMIS_ADMIN_PEPPER_FILE` | unset | Optional 32-byte password pepper (id 1) mixed into Argon2id |
+| `CMIS_ADMIN_PASSWORD_BLOCKLIST_FILE` | unset | Breached-password corpus, one password per line, checked on every password set |
+| `CMIS_ADMIN_BOOTSTRAP_TOKEN_FILE` | `/var/lib/ferrogate/admin-bootstrap.token` | Where the leader writes the one-time first-account bootstrap token |
+| `CMIS_ADMIN_TRAY_FIDO2_GROUPS` | empty | Comma-separated built-in groups whose members must use FIDO2 when signing in from the tray admin client (for example `ferrogate-approvers`). An unknown group name aborts startup |
+| `CMIS_ADMIN_WEBAUTHN_ORIGINS` | `https://ferrogate-admin.<trust domain>` | Comma-separated `https://` origins a WebAuthn `clientDataJSON` may name; each must be the RP ID `ferrogate-admin.<CMIS_TRUST_DOMAIN>` or a subdomain |
+| `CMIS_TRUST_DOMAIN` | `ferrogate.dev` | Also fixes the WebAuthn RP ID and is forbidden inside passwords |
+| `CMIS_AUDIT_FORWARD_MAX_PER_MIN` | `600` | `AppendAuditEvent` calls each host may make per minute, per CMIS node (1–60000) — see [Audit forwarding from hosts](#audit-forwarding-from-hosts) |
+
+The key files (secrets, pseudonym, pepper) are credentials kept in
+configuration: keep them root-owned and unreadable by group and others (CMIS
+refuses them otherwise) on every CMIS node, identical across the cluster, out
+of version control and of backups that leave the node, and enter their
+rotation dates in the credential inventory. Argon2id parameters are not
+configurable; production always runs the RFC 9106 values.
+
+The `ferrogate` CLI reads, besides its flags:
+
+| Variable | Meaning |
+|----------|---------|
+| `FERROGATE_ADMIN_ENDPOINT` | Admin listener URL (default `https://127.0.0.1:8444`), pinned like `--endpoint` (`--spki-pin` / `--tls-cert`) |
+| `FERROGATE_SESSION_FILE` | Opt-in file (`0600`) keeping the session token between commands; put it on a tmpfs such as `$XDG_RUNTIME_DIR`. Without it each admin command signs in and out |
+| `FERROGATE_DEVICE_FILE` | Where the server-issued device token is kept (default `~/.config/ferrogate/admin-device.token`; empty disables). It only separates people behind one IP for throttling |
+| `FERROGATE_ADMIN_CLIENT_CERT` / `FERROGATE_ADMIN_CLIENT_KEY` | Client certificate and key for an admin listener with mTLS |
+
+### Bootstrapping the first administrator
+
+1. Start CMIS 0.29.0 with TLS material (`CMIS_TLS_CERT`/`CMIS_TLS_KEY` or the
+   `CMIS_ADMIN_TLS_*` pair). On a fresh deployment — no account, bootstrap
+   never completed — the Raft leader writes a one-time token to
+   `CMIS_ADMIN_BOOTSTRAP_TOKEN_FILE` (`0400`, valid 24 h) and logs only its
+   path.
+2. On **that** node, as root, redeem it:
+
+   ```sh
+   ferrogate admin bootstrap --token-file /var/lib/ferrogate/admin-bootstrap.token
+   ```
+
+   Choose a username, display name and a password of at least 24 characters
+   (the CLI can be fed a password manager's output on stdin). CMIS shows a
+   TOTP provisioning URI **once**: add it to an authenticator app, then type
+   the current code.
+3. The first account receives every built-in group (only
+   `ferrogate-account-admins` under `CMIS_ADMIN_STRICT_SOD=true`). CMIS
+   deletes the token file, records the bootstrap in the replicated store and
+   never re-arms it. An `AdminBootstrapCompleted` event is audited.
+
+### Signing in with the CLI
+
+```sh
+ferrogate --admin-endpoint https://cmis-1.mgmt:8444 --spki-pin <hex> \
+  --session-file "$XDG_RUNTIME_DIR/ferrogate.session" admin login
+ferrogate --session-file "$XDG_RUNTIME_DIR/ferrogate.session" allowlist list
+ferrogate --session-file "$XDG_RUNTIME_DIR/ferrogate.session" admin logout
+```
+
+`admin login` prompts (without echo) for the username, password and TOTP
+code. Commands that need a step-up (writes, revocation, epoch bump) prompt for
+a fresh TOTP code and retry once. Without `--session-file` every admin command
+signs in, runs and signs out. `ferrogate admin help` lists `whoami`,
+`sessions`, `passwd`, `accounts`, `groups` and `factors`. FIDO2 security keys
+are enrolled and used from the tray admin client; the CLI uses TOTP.
+
+**Adding administrators.** An account administrator runs
+`ferrogate admin accounts create <username> --group <group>…`. CMIS prints a
+single-use enrollment token (24 h by default) — deliver it over a second
+channel; the new administrator redeems it with `ferrogate admin enroll
+--token-file <file>` (password + TOTP) or from the tray admin client.
+Built-in groups: `ferrogate-viewers` (read-only), `ferrogate-approvers`
+(application approvals), `ferrogate-account-admins` (accounts, other
+sessions), `ferrogate-platform-operators` (legacy allowlists, SVID and host
+revocation, epoch bump). `ferrogate admin groups` prints their permissions.
+
+### Upgrading to 0.29.0 (breaking change)
+
+- **Old `ferrogate` CLIs stop working.** A 0.28 or older CLI sends no session,
+  so every admin command it issues (`allowlist set/add/remove/delete/list`,
+  `list-svids`, `revoke-svid`, `revoke-host`, `bump-epoch`) is refused with
+  `UNAUTHENTICATED`. There is no unauthenticated compatibility switch. Upgrade
+  the CLI on operator workstations and on CMIS nodes, bootstrap the first
+  account, create the others, and move automation that called admin RPCs to
+  an interactive administrator (non-interactive service principals are not
+  available yet).
+- `CMIS_LEGACY_ADMIN_ON_MAIN` defaults to `true`, so 0.29 CLIs still pointed
+  at `:8443` keep working with a session. Set it to `false` once every
+  operator uses the admin listener.
+- `AppendAuditEvent` now requires a host proof; senders older than 0.29 are
+  refused (`UNAUTHENTICATED`). The shipped MIA daemon does not forward events
+  over the network yet, so nothing in a stock deployment breaks.
+- **Review the audit log.** Until 0.29.0 anyone who could reach `:8443` —
+  every MIA host, for one — could call the admin RPCs. Before relying on the
+  new controls, review the existing audit log for `AllowlistSet`,
+  `AllowlistDeleted`, `HostRevoked` and `PolicyEpochBumped` events that no
+  operator can account for, and re-issue the affected allowlists. Events
+  written before 0.29.0 carry no `by_admin_id`.
+
+### Known limitations (0.29.0)
+
+- The client kind (TUI, tray, CLI) is self-declared by the client, so the
+  `CMIS_ADMIN_TRAY_FIDO2_GROUPS` policy can be sidestepped by a client that
+  claims to be the CLI or TUI and signs in with TOTP.
+- Login and step-up nonces are single-use **per node** only; on a multi-node
+  cluster a captured nonce could be presented once to each node within its
+  lifetime (the password and second factor are still required).
+- `idempotency_key` fields are accepted but not yet enforced: a retried
+  mutation is executed again.
+- There is no break-glass recovery yet: if every account administrator is
+  locked out, recovery needs a new deployment-level procedure (planned).
+- The `AppendAuditEvent` replay cache and rate limit are per node, like the
+  revocation working set; host revocation reaches only the node that received
+  `RevokeHost` until revocations are replicated.
+
 ## SVID rotation
 
 - At 60% of TTL the MIA performs a `Rotate` RPC. If PCRs and `policy_id` are
@@ -98,7 +237,9 @@ full how-it-works, the OpenSSL pin recipe, and troubleshooting.
   only the signature gates what is admitted.
 - **Epoch bump (mass re-attestation).** For a compromised RIM generation or a
   vulnerable kernel image, the operator calls the `BumpEpoch(reason)` admin RPC
-  (authenticated as an operator action at the transport). It advances the live
+  (`ferrogate bump-epoch`; an administrator session with `policy.epoch_bump`
+  and a fresh step-up, see [Administrator access](#administrator-access-f20)).
+  It advances the live
   policy epoch and records a `PolicyEpochBumped` audit event. Every host whose
   last full attestation was under the previous epoch is refused at its next
   `Rotate` (`FAILED_PRECONDITION`) and driven back through a full four-phase
@@ -111,8 +252,9 @@ full how-it-works, the OpenSSL pin recipe, and troubleshooting.
   (`x-ferrogate-crl`). The CRL is signed with the composite issuance key under
   the `ferrogate-crl-v1` domain context and verified against the issuer key the
   same JWKS publishes.
-- Operators revoke through the `MachineIdentity` admin RPCs (authenticated as
-  operator actions at the transport):
+- Operators revoke through the `MachineIdentity` admin RPCs (an administrator
+  session with `svid.revoke` and a fresh step-up, see
+  [Administrator access](#administrator-access-f20)):
   - `RevokeSvid(cert_sha, reason)` — revoke one SVID by the lowercase-hex
     `SHA-384` of its compact JWS.
   - `RevokeHost(spiffe_id, reason)` — revoke every SVID and child token for a
@@ -132,6 +274,33 @@ full how-it-works, the OpenSSL pin recipe, and troubleshooting.
   the operator bumps the policy epoch via `BumpEpoch` — see "RIM policy and
   epoch bump" above. Every host attested under the old epoch re-attests at its
   next rotation; the global audit log records the bump (`PolicyEpochBumped`).
+
+## Audit forwarding from hosts
+
+`AppendAuditEvent` lets a MIA host append its own events (`LocalGrant`,
+`LocalDenied`, `ConfigChanged`) to the CMIS audit log. Since 0.29.0 (F20
+Phase 0) each call carries a **host proof** (F19 §7.1 `HostCallAuth`):
+
+- the host's current SVID, issued by this CMIS, unexpired and not revoked
+  (neither the SVID nor its host);
+- the machine key the SVID binds through `cnf.jkt`, and its ECDSA-P256
+  signature over `ferrogate-audit-forward-v1 ‖ doc`, where `doc` is
+  `{v, host_uuid, issued_at, nonce, event_sha384}` and `event_sha384` is the
+  SHA-384 of the forwarded event bytes.
+
+CMIS refuses, without appending anything, a missing or invalid proof, a
+document naming another host (`PERMISSION_DENIED host_mismatch`), an
+`issued_at` more than 300 s from its clock, a `(host, nonce)` pair already seen
+in the last 600 s, event bytes that do not match the signed digest, and any
+event type a host does not produce (`PERMISSION_DENIED event_not_forwardable`
+— a host cannot write issuance, revocation or admin events). Authentication
+failures all answer `UNAUTHENTICATED host_auth_failed`; the precise reason is
+in the CMIS log (`event = "host_auth.failed"`). Each host may forward
+`CMIS_AUDIT_FORWARD_MAX_PER_MIN` events per minute per node (default 600,
+burst of one minute's budget); beyond that CMIS answers
+`RESOURCE_EXHAUSTED rate_limited` with a `retry-after` header in seconds.
+Keep host clocks synchronised (NTP): a host more than 5 minutes off cannot
+forward.
 
 ## Caller allowlists
 
@@ -156,10 +325,14 @@ signs them with the enrollment key.
   - `ferrogate allowlist get --host <uuid> --out allowlist.cbor` — fetch the raw
     signed CBOR to place at a host's `allowlist.path` (a MIA with `GetAllowlist`
     reachability can fetch it directly instead).
-- `Set`/`Delete`/`ListAllowlists` are admin RPCs authenticated as operator
-  actions at the transport, exactly like revocation; `GetAllowlist` is
+- `Set`/`Delete`/`ListAllowlists` are admin RPCs that need an administrator
+  session (`legacy.allowlist.write` plus a fresh step-up for set and delete,
+  `legacy.allowlist.read` to list), exactly like revocation; `GetAllowlist` is
   unauthenticated (the body is signature-protected and not secret). Each set or
-  delete records an audit event (`AllowlistSet` / `AllowlistDeleted`). CMIS
+  delete records an audit event (`AllowlistSet` / `AllowlistDeleted`) naming
+  the administrator. If the replicated store refuses the write, the RPC
+  answers `UNAVAILABLE (store_unavailable)` and records nothing; retry once the
+  cluster is healthy. Host proposals (`ProposeAllowlist`) behave the same. CMIS
   stamps a validity window (default 96 h via `CMIS_ALLOWLIST_TTL_SECS`, floored
   at 96 h and capped at 30 days); re-issue rather than
   mint long-lived lists. Full workflow: [allowlist-provisioning.md](allowlist-provisioning.md).

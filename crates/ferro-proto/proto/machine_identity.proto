@@ -45,16 +45,17 @@ service MachineIdentity {
   // Admin RPC: store or replace the caller allowlist for a host. CMIS stamps
   // the issuer trust domain and the validity window, signs the supplied entries
   // with the enrollment key (context `ferrogate-allowlist-v1`), and persists the
-  // signed body. Authenticated out of band as an operator action.
+  // signed body. Requires an administrator session with
+  // `legacy.allowlist.write` and a fresh step-up (F20).
   rpc SetAllowlist (SetAllowlistRequest) returns (SetAllowlistResponse);
 
-  // Admin RPC: delete a host's stored allowlist. Authenticated out of band as an
-  // operator action.
+  // Admin RPC: delete a host's stored allowlist. Requires an administrator
+  // session with `legacy.allowlist.write` and a fresh step-up (F20).
   rpc DeleteAllowlist (DeleteAllowlistRequest) returns (DeleteAllowlistResponse);
 
   // Admin RPC: enumerate the host UUIDs that have a stored allowlist, with
-  // validity and entry-count metadata. Authenticated out of band as an operator
-  // action.
+  // validity and entry-count metadata. Requires an administrator session with
+  // `legacy.allowlist.read` (F20).
   rpc ListAllowlists (ListAllowlistsRequest) returns (ListAllowlistsResponse);
 
   // ---- Allowlist proposals (host-driven TOFU) ----
@@ -71,29 +72,34 @@ service MachineIdentity {
   rpc ProposeAllowlist (ProposeAllowlistRequest) returns (ProposeAllowlistResponse);
 
   // Admin RPC: enumerate pending allowlist proposals awaiting operator review,
-  // with their full proposed entries. Authenticated out of band as an operator
-  // action.
+  // with their full proposed entries. Requires an administrator session with
+  // `legacy.allowlist.read` (F20).
   rpc ListProposals (ListProposalsRequest) returns (ListProposalsResponse);
 
   // Admin RPC: drop a host's pending proposal — used to reject it, and to clean
-  // up after approving it (the operator approves via SetAllowlist). Authenticated
-  // out of band as an operator action.
+  // up after approving it (the operator approves via SetAllowlist). Requires an
+  // administrator session with `legacy.allowlist.write` and a fresh step-up
+  // (F20).
   rpc DeleteProposal (DeleteProposalRequest) returns (DeleteProposalResponse);
 
   // ---- Revocation (F11) ----
 
   // Admin RPC: revoke a single SVID by the lowercase-hex SHA-384 of its compact
   // JWS. The revocation appears in the next published CRL (CMIS publishes
-  // immediately on revoke). Authenticated out of band as an operator action.
+  // immediately on revoke). Requires an administrator session with
+  // `svid.revoke` and a fresh step-up (F20).
   rpc RevokeSvid (RevokeSvidRequest) returns (RevokeResponse);
 
   // Admin RPC: revoke every SVID and child token for a host SPIFFE ID.
+  // Requires an administrator session with `svid.revoke` and a fresh step-up
+  // (F20).
   rpc RevokeHost (RevokeHostRequest) returns (RevokeResponse);
 
   // Admin RPC: bump the live RIM policy epoch (feature F10). Every host whose
   // last full attestation was under the previous epoch is forced through a
   // fresh four-phase Attest at its next Rotate. Records a PolicyEpochBumped
-  // audit event. Authenticated out of band as an operator action.
+  // audit event. Requires an administrator session with `policy.epoch_bump`
+  // and a fresh step-up (F20).
   rpc BumpEpoch (BumpEpochRequest) returns (BumpEpochResponse);
 
   // ---- Operator inventory ----
@@ -101,8 +107,8 @@ service MachineIdentity {
   // Admin RPC: enumerate the issued SVIDs this node knows about — the local
   // store on a single replica, or the full clustered set on an HA deployment.
   // Returns a compact summary per SVID, including the `cert_sha` an operator
-  // can feed straight into RevokeSvid. Authenticated out of band as an
-  // operator action.
+  // can feed straight into RevokeSvid. Requires an administrator session with
+  // `svid.list` (F20).
   rpc ListSvids (ListSvidsRequest) returns (ListSvidsResponse);
 
   // ---- Audit log (F07) ----
@@ -120,7 +126,10 @@ service MachineIdentity {
 
   // MIA-originated event forwarder. The body is canonical CBOR of a
   // `ferro_audit::AuditEvent`; CMIS appends it to its log and returns the
-  // assigned leaf index.
+  // assigned leaf index. Host-authenticated (F20 Phase 0): the request must
+  // carry a `HostCallAuth` proof over an `AuditForwardDoc` that binds the
+  // event by SHA-384, under context `ferrogate-audit-forward-v1`. Only
+  // host-originated event types are accepted; calls are rate-limited per host.
   rpc AppendAuditEvent (AppendAuditRequest) returns (AppendAuditResponse);
 
   // ---- Cluster health (F05) ----
@@ -464,7 +473,33 @@ message ConsistencyProofResponse {
   repeated bytes audit_path = 4;
 }
 
-message AppendAuditRequest { bytes event_cbor = 1; }
+// Host call authentication (F19 §7.1), shared by every host-authenticated
+// RPC. CMIS checks, in order: the SVID was issued by this CMIS, is currently
+// valid and is not revoked; base64url(SHA-256(sep_pub)) equals the SVID's
+// `cnf.jkt`; `sig` verifies under `sep_pub` over `context ‖ doc`; the document
+// names the SVID's host UUID; `|issued_at - now| <= 300 s`; and, for RPCs with
+// a nonce, `(host_uuid, nonce)` was not seen in the last 600 s. Every failure
+// answers UNAUTHENTICATED `host_auth_failed`, except a document naming another
+// host (PERMISSION_DENIED `host_mismatch`).
+message HostCallAuth {
+  // The host's compact-JWS SVID.
+  string svid_jws = 1;
+  // DER SubjectPublicKeyInfo of the host machine key the SVID is bound to.
+  bytes sep_pub = 2;
+  // X9.62 DER ECDSA-P256/SHA-256 signature over `context ‖ doc`.
+  bytes sig = 3;
+}
+
+message AppendAuditRequest {
+  // Canonical CBOR of a `ferro_audit::AuditEvent`.
+  bytes event_cbor = 1;
+  // Host proof over `doc` (context `ferrogate-audit-forward-v1`).
+  HostCallAuth auth = 2;
+  // Canonical CBOR of `ferro_svid::host_call::AuditForwardDoc`
+  // `{v, host_uuid, issued_at, nonce, event_sha384}`, carried as opaque bytes
+  // so the exact bytes the host signed are what CMIS verifies.
+  bytes doc = 3;
+}
 message AppendAuditResponse { uint64 leaf_index = 1; }
 
 // ---- Cluster health ------------------------------------------------------

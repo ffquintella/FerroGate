@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod cluster;
 mod peer_cert;
 

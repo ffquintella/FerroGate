@@ -27,7 +27,6 @@
 
 use std::collections::HashMap;
 
-use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
 use ferro_proto::v1::{
     AllowEntryMsg, DeleteAllowlistRequest, DeleteProposalRequest, GetAllowlistRequest,
     ListAllowlistsRequest, ListProposalsRequest, PendingProposal, SetAllowlistRequest,
@@ -37,9 +36,8 @@ use ferro_svid::host_uuid_from_ek_digest;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
 use sha2::{Digest, Sha384};
-use tonic::transport::Channel;
 
-use crate::rpc_err;
+use crate::{rpc_err, CmisClient};
 
 /// Default validity window applied on `add`/`remove` when neither `--ttl` nor an
 /// existing allowlist's remaining window is available (one day).
@@ -82,11 +80,7 @@ pub(crate) fn usage() -> &'static str {
 }
 
 /// Dispatch an `allowlist` subcommand.
-pub(crate) async fn run(
-    client: &mut MachineIdentityClient<Channel>,
-    sub: &str,
-    args: &[String],
-) -> anyhow::Result<()> {
+pub(crate) async fn run(client: &mut CmisClient, sub: &str, args: &[String]) -> anyhow::Result<()> {
     let flags = Flags::parse(args);
     match sub {
         "set" => set(client, &flags).await,
@@ -110,7 +104,7 @@ pub(crate) async fn run(
 
 // ---- subcommands -----------------------------------------------------------
 
-async fn set(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn set(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     let entries = flags.entries()?;
     if entries.is_empty() {
@@ -125,20 +119,28 @@ async fn set(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyh
     Ok(())
 }
 
-async fn add(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn add(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     let new_entries = flags.entries()?;
     if new_entries.is_empty() {
         anyhow::bail!("add needs at least one --entry or --bin");
     }
     let existing = fetch_doc(client, &host_uuid).await?;
-    let mut entries = existing.as_ref().map(|d| d.entries.clone()).unwrap_or_default();
+    let mut entries = existing
+        .as_ref()
+        .map(|d| d.entries.clone())
+        .unwrap_or_default();
     for e in new_entries {
-        if !entries.iter().any(|x| x.uid == e.uid && x.bin_sha == e.bin_sha) {
+        if !entries
+            .iter()
+            .any(|x| x.uid == e.uid && x.bin_sha == e.bin_sha)
+        {
             entries.push(e);
         }
     }
-    let ttl = flags.ttl()?.unwrap_or_else(|| remaining_ttl(existing.as_ref()));
+    let ttl = flags
+        .ttl()?
+        .unwrap_or_else(|| remaining_ttl(existing.as_ref()));
     let resp = put(client, &host_uuid, entries, ttl).await?;
     println!(
         "updated allowlist for {host_uuid}: issued_at={}, not_after={}",
@@ -147,7 +149,7 @@ async fn add(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyh
     Ok(())
 }
 
-async fn remove(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn remove(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     // Either filter may be given. `--uid N` drops entries pinned to N; `--bin-sha
     // X` drops every entry for that binary (any scope, including a wildcard);
@@ -193,15 +195,14 @@ async fn remove(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
     Ok(())
 }
 
-async fn get(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn get(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     let bytes = fetch_bytes(client, &host_uuid).await?;
     let Some(bytes) = bytes else {
         anyhow::bail!("no allowlist stored for {host_uuid}");
     };
     if let Some(out) = flags.one("--out") {
-        std::fs::write(out, &bytes)
-            .map_err(|e| anyhow::anyhow!("writing `{out}`: {e}"))?;
+        std::fs::write(out, &bytes).map_err(|e| anyhow::anyhow!("writing `{out}`: {e}"))?;
         println!("wrote {} bytes to {out}", bytes.len());
     } else {
         use std::io::Write as _;
@@ -212,7 +213,7 @@ async fn get(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyh
     Ok(())
 }
 
-async fn show(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn show(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     let Some(doc) = fetch_doc(client, &host_uuid).await? else {
         anyhow::bail!("no allowlist stored for {host_uuid}");
@@ -228,7 +229,7 @@ async fn show(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> any
     Ok(())
 }
 
-async fn list(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
+async fn list(client: &mut CmisClient) -> anyhow::Result<()> {
     let resp = client
         .list_allowlists(ListAllowlistsRequest {})
         .await
@@ -249,7 +250,7 @@ async fn list(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn delete(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn delete(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     let resp = client
         .delete_allowlist(DeleteAllowlistRequest {
@@ -266,7 +267,7 @@ async fn delete(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
     Ok(())
 }
 
-async fn proposals(client: &mut MachineIdentityClient<Channel>) -> anyhow::Result<()> {
+async fn proposals(client: &mut CmisClient) -> anyhow::Result<()> {
     let items = fetch_proposals(client).await?;
     if items.is_empty() {
         println!("(no pending proposals)");
@@ -284,7 +285,7 @@ async fn proposals(client: &mut MachineIdentityClient<Channel>) -> anyhow::Resul
     Ok(())
 }
 
-async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn review(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     let Some(proposal) = fetch_proposal(client, &host_uuid).await? else {
         anyhow::bail!("no pending proposal for {host_uuid}");
@@ -337,7 +338,10 @@ async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
         .filter(|e| !proposed_set.contains(&(e.uid, e.bin_sha.as_str())))
         .collect();
     if !dropped.is_empty() {
-        println!("\nwould be removed ({}) — live today, absent from the proposal:", dropped.len());
+        println!(
+            "\nwould be removed ({}) — live today, absent from the proposal:",
+            dropped.len()
+        );
         for e in dropped {
             println!("  - uid={:<7} bin_sha={}", fmt_uid(e.uid), e.bin_sha);
         }
@@ -353,7 +357,7 @@ async fn review(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
     Ok(())
 }
 
-async fn approve(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn approve(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     let Some(proposal) = fetch_proposal(client, &host_uuid).await? else {
         anyhow::bail!("no pending proposal for {host_uuid}");
@@ -385,7 +389,7 @@ async fn approve(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> 
     Ok(())
 }
 
-async fn reject(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> anyhow::Result<()> {
+async fn reject(client: &mut CmisClient, flags: &Flags) -> anyhow::Result<()> {
     let host_uuid = flags.host_uuid()?;
     let resp = client
         .delete_proposal(DeleteProposalRequest {
@@ -405,9 +409,7 @@ async fn reject(client: &mut MachineIdentityClient<Channel>, flags: &Flags) -> a
 // ---- RPC helpers -----------------------------------------------------------
 
 /// Fetch every pending proposal.
-async fn fetch_proposals(
-    client: &mut MachineIdentityClient<Channel>,
-) -> anyhow::Result<Vec<PendingProposal>> {
+async fn fetch_proposals(client: &mut CmisClient) -> anyhow::Result<Vec<PendingProposal>> {
     let resp = client
         .list_proposals(ListProposalsRequest {})
         .await
@@ -418,7 +420,7 @@ async fn fetch_proposals(
 
 /// Fetch the pending proposal for one host (`None` when none pending).
 async fn fetch_proposal(
-    client: &mut MachineIdentityClient<Channel>,
+    client: &mut CmisClient,
     host_uuid: &str,
 ) -> anyhow::Result<Option<PendingProposal>> {
     Ok(fetch_proposals(client)
@@ -429,7 +431,7 @@ async fn fetch_proposal(
 
 /// Push entries to CMIS and return `(issued_at, not_after, new_entry_count)`.
 async fn put(
-    client: &mut MachineIdentityClient<Channel>,
+    client: &mut CmisClient,
     host_uuid: &str,
     entries: Vec<AllowEntry>,
     ttl_secs: i64,
@@ -455,10 +457,7 @@ async fn put(
 }
 
 /// Fetch the raw signed-allowlist bytes for a host (`None` when none stored).
-async fn fetch_bytes(
-    client: &mut MachineIdentityClient<Channel>,
-    host_uuid: &str,
-) -> anyhow::Result<Option<Vec<u8>>> {
+async fn fetch_bytes(client: &mut CmisClient, host_uuid: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let resp = client
         .get_allowlist(GetAllowlistRequest {
             host_uuid: host_uuid.to_string(),
@@ -471,7 +470,7 @@ async fn fetch_bytes(
 
 /// Fetch and decode the allowlist body for a host (`None` when none stored).
 async fn fetch_doc(
-    client: &mut MachineIdentityClient<Channel>,
+    client: &mut CmisClient,
     host_uuid: &str,
 ) -> anyhow::Result<Option<AllowlistDoc>> {
     let Some(bytes) = fetch_bytes(client, host_uuid).await? else {
@@ -526,7 +525,10 @@ impl Flags {
 
     /// The last value given for `key`, if any (last-wins for single-valued flags).
     fn one(&self, key: &str) -> Option<&str> {
-        self.values.get(key).and_then(|v| v.last()).map(String::as_str)
+        self.values
+            .get(key)
+            .and_then(|v| v.last())
+            .map(String::as_str)
     }
 
     fn many(&self, key: &str) -> &[String] {
@@ -639,7 +641,10 @@ fn normalize_sha(s: impl AsRef<str>) -> anyhow::Result<String> {
     }
     let raw = hex::decode(s).map_err(|_| anyhow::anyhow!("bin_sha is not hex: `{s}`"))?;
     if raw.len() != 48 {
-        anyhow::bail!("bin_sha must be 48 bytes (SHA-384), got {} bytes", raw.len());
+        anyhow::bail!(
+            "bin_sha must be 48 bytes (SHA-384), got {} bytes",
+            raw.len()
+        );
     }
     Ok(s.to_lowercase())
 }

@@ -4,6 +4,12 @@
 //! Client-visible errors map to the small fixed status set in `docs/cmis.md`
 //! §"Error model"; the precise reason is logged for the audit trail but never
 //! returned, so a probing client learns nothing about which check tripped.
+//!
+//! The legacy admin RPCs (`SetAllowlist`, `DeleteAllowlist`, `ListAllowlists`,
+//! `ListProposals`, `DeleteProposal`, `RevokeSvid`, `RevokeHost`, `BumpEpoch`,
+//! `ListSvids`) are authenticated and authorized by the admin layer (F20
+//! Phase 0) and each handler re-checks the [`crate::admin::AdminContext`] the
+//! layer inserted, so they fail closed even if the layer is missing.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +24,7 @@ use ferro_attest::{
     PcrSet, QuoteVerification, RejectReason,
 };
 use ferro_audit::{AuditEvent, Hash384};
-use ferro_crypto::composite::{CompositePublicKey, CompositeSignature};
+use ferro_crypto::composite::CompositePublicKey;
 use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
@@ -41,6 +47,7 @@ use ferro_svid::{
 };
 use sha2::{Digest, Sha256, Sha384};
 
+use crate::admin::authz::{paths, require};
 use crate::fleet_manifest::EnrollmentDecision;
 use crate::pcr::aggregate_digest;
 use crate::state::{CmisState, HostKeyBinding, IssuedRecord, ProposalPolicy};
@@ -62,6 +69,12 @@ impl MachineIdentitySvc {
     #[must_use]
     pub fn into_server(self) -> MachineIdentityServer<Self> {
         MachineIdentityServer::new(self)
+    }
+
+    /// The shared state behind this front end.
+    #[must_use]
+    pub fn state(&self) -> &Arc<CmisState> {
+        &self.state
     }
 
     /// Publish a fresh CRL right now so a revocation reaches consumers within
@@ -130,6 +143,13 @@ fn revocation_reason(raw: &str) -> String {
     trimmed.chars().take(64).collect()
 }
 
+/// The answer to a replicated-store write that failed (F19 §7.4): the
+/// change did not happen and the caller may retry. The cause is logged by
+/// the state layer, never returned.
+fn store_unavailable() -> Status {
+    Status::unavailable("store_unavailable")
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -140,7 +160,7 @@ fn unix_now() -> i64 {
 /// logged and swallowed — they must never take down the issuance path. (A
 /// future hardened CMIS may instead refuse to serve while audit is wedged;
 /// noted in `docs/audit.md`.)
-fn audit_record(state: &CmisState, event: AuditEvent, now: i64) {
+pub(crate) fn audit_record(state: &CmisState, event: AuditEvent, now: i64) {
     if let Err(e) = state.audit.append(&event) {
         // ERROR, not WARN: a failing append usually means every later append
         // fails too (e.g. a wedged WORM store), and operators must see that.
@@ -177,44 +197,6 @@ fn sha384(bytes: &[u8]) -> [u8; 48] {
     let mut out = [0u8; 48];
     out.copy_from_slice(&Sha384::digest(bytes));
     out
-}
-
-/// Verify a presented host SVID JWS was issued by this CMIS and is currently
-/// valid, returning `(host_uuid, cnf.jkt, subject_spiffe_id)`. Used by
-/// `ProposeAllowlist` to bind a proposal to an attested host in-band (there is
-/// no mTLS; the SVID is the host's bearer of identity here). Verifies only
-/// against the current issuer key — a host presenting a rotated/cross-signed
-/// SVID re-attests rather than proposes, which is acceptable at bootstrap time.
-#[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
-fn verify_proposing_svid(
-    state: &CmisState,
-    svid_jws: &str,
-    now: i64,
-) -> Result<(String, String, String), Status> {
-    let decoded = ferro_svid::envelope::decode(svid_jws)
-        .map_err(|_| Status::unauthenticated("malformed svid"))?;
-    let sig = CompositeSignature::from_concat_bytes(&decoded.signature)
-        .map_err(|_| Status::unauthenticated("malformed svid signature"))?;
-    state
-        .issuer
-        .public_key()
-        .verify(
-            ferro_svid::SVID_SIGNING_CONTEXT,
-            decoded.signing_input.as_bytes(),
-            &sig,
-        )
-        .map_err(|_| Status::unauthenticated("svid not issued by this cmis"))?;
-    let claims = decoded.claims;
-    if now < claims.nbf || now > claims.exp {
-        return Err(Status::unauthenticated("svid is not currently valid"));
-    }
-    let host_uuid = claims
-        .sub
-        .rsplit_once("/host/")
-        .map(|(_, u)| u.to_string())
-        .filter(|u| !u.is_empty())
-        .ok_or_else(|| Status::unauthenticated("svid subject is not a host id"))?;
-    Ok((host_uuid, claims.cnf.jkt, claims.sub))
 }
 
 /// Decode a stored, already-signed live allowlist into its document (metadata
@@ -885,6 +867,7 @@ impl MachineIdentity for MachineIdentitySvc {
         &self,
         request: Request<SetAllowlistRequest>,
     ) -> Result<Response<SetAllowlistResponse>, Status> {
+        let admin = require(&request, paths::SET_ALLOWLIST)?;
         let req = request.into_inner();
         let now = unix_now();
 
@@ -927,17 +910,21 @@ impl MachineIdentity for MachineIdentitySvc {
             Status::internal("allowlist encode failed")
         })?;
 
-        self.state.put_allowlist(&req.host_uuid, bytes, now).await;
+        self.state
+            .put_allowlist(&req.host_uuid, bytes, now)
+            .await
+            .map_err(|_| store_unavailable())?;
         audit_record(
             &self.state,
             AuditEvent::AllowlistSet {
+                by_admin_id: Some(admin.admin_id.clone()),
                 host_uuid: req.host_uuid.clone(),
                 entry_count,
                 not_after,
             },
             now,
         );
-        tracing::info!(host_uuid = %req.host_uuid, entry_count, not_after, "allowlist set");
+        tracing::info!(host_uuid = %req.host_uuid, entry_count, not_after, admin_id = %admin.admin_id, "allowlist set");
         Ok(Response::new(SetAllowlistResponse {
             issued_at: now,
             not_after,
@@ -948,16 +935,22 @@ impl MachineIdentity for MachineIdentitySvc {
         &self,
         request: Request<DeleteAllowlistRequest>,
     ) -> Result<Response<DeleteAllowlistResponse>, Status> {
+        let admin = require(&request, paths::DELETE_ALLOWLIST)?;
         let host_uuid = request.into_inner().host_uuid;
         if host_uuid.trim().is_empty() {
             return Err(Status::invalid_argument("empty host_uuid"));
         }
-        let existed = self.state.delete_allowlist(&host_uuid).await;
+        let existed = self
+            .state
+            .delete_allowlist(&host_uuid)
+            .await
+            .map_err(|_| store_unavailable())?;
         if existed {
             let now = unix_now();
             audit_record(
                 &self.state,
                 AuditEvent::AllowlistDeleted {
+                    by_admin_id: Some(admin.admin_id.clone()),
                     host_uuid: host_uuid.clone(),
                 },
                 now,
@@ -969,8 +962,9 @@ impl MachineIdentity for MachineIdentitySvc {
 
     async fn list_allowlists(
         &self,
-        _request: Request<ListAllowlistsRequest>,
+        request: Request<ListAllowlistsRequest>,
     ) -> Result<Response<ListAllowlistsResponse>, Status> {
+        require(&request, paths::LIST_ALLOWLISTS)?;
         let items = self
             .state
             .list_allowlists()
@@ -1009,10 +1003,14 @@ impl MachineIdentity for MachineIdentitySvc {
         let req = request.into_inner();
         let now = unix_now();
 
-        // 1. Verify the presenting SVID was issued by this CMIS and is still
-        //    valid; pull out the host UUID and the DPoP key thumbprint it binds.
-        let (svid_host_uuid, cnf_jkt, proposer_spiffe_id) =
-            verify_proposing_svid(&self.state, &req.svid_jws, now)?;
+        // 1. Verify the presenting SVID was issued by this CMIS, is still
+        //    valid and is not revoked; pull out the host UUID and the machine
+        //    key thumbprint it binds (shared with the F19 §7.1 host proof).
+        let crate::host_auth::HostSvid {
+            host_uuid: svid_host_uuid,
+            cnf_jkt,
+            spiffe_id: proposer_spiffe_id,
+        } = crate::host_auth::verify_host_svid(&self.state, &req.svid_jws, now)?;
 
         // 2. The presented machine key must be the one the SVID is bound to.
         let computed_jkt =
@@ -1093,9 +1091,13 @@ impl MachineIdentity for MachineIdentitySvc {
             })?;
             self.state
                 .put_allowlist(&proposal.host_uuid, bytes, now)
-                .await;
-            // A previously queued proposal for this host is now moot.
-            self.state.delete_proposal(&proposal.host_uuid).await;
+                .await
+                .map_err(|_| store_unavailable())?;
+            // A previously queued proposal for this host is now moot. The
+            // adoption itself is stored, so a failure to drop the stale
+            // proposal (already logged at error by the state layer) does not
+            // turn the adoption into an error.
+            let _ = self.state.delete_proposal(&proposal.host_uuid).await;
             audit_record(
                 &self.state,
                 AuditEvent::AllowlistAutoAdopted {
@@ -1127,7 +1129,8 @@ impl MachineIdentity for MachineIdentitySvc {
                     proposed_at: now,
                 },
             )
-            .await;
+            .await
+            .map_err(|_| store_unavailable())?;
         audit_record(
             &self.state,
             AuditEvent::AllowlistProposed {
@@ -1147,8 +1150,9 @@ impl MachineIdentity for MachineIdentitySvc {
 
     async fn list_proposals(
         &self,
-        _request: Request<ListProposalsRequest>,
+        request: Request<ListProposalsRequest>,
     ) -> Result<Response<ListProposalsResponse>, Status> {
+        require(&request, paths::LIST_PROPOSALS)?;
         let items = self
             .state
             .list_proposals()
@@ -1184,16 +1188,22 @@ impl MachineIdentity for MachineIdentitySvc {
         &self,
         request: Request<DeleteProposalRequest>,
     ) -> Result<Response<DeleteProposalResponse>, Status> {
+        let admin = require(&request, paths::DELETE_PROPOSAL)?;
         let host_uuid = request.into_inner().host_uuid;
         if host_uuid.trim().is_empty() {
             return Err(Status::invalid_argument("empty host_uuid"));
         }
-        let existed = self.state.delete_proposal(&host_uuid).await;
+        let existed = self
+            .state
+            .delete_proposal(&host_uuid)
+            .await
+            .map_err(|_| store_unavailable())?;
         if existed {
             let now = unix_now();
             audit_record(
                 &self.state,
                 AuditEvent::AllowlistProposalRejected {
+                    by_admin_id: Some(admin.admin_id.clone()),
                     host_uuid: host_uuid.clone(),
                 },
                 now,
@@ -1207,6 +1217,7 @@ impl MachineIdentity for MachineIdentitySvc {
         &self,
         request: Request<RevokeSvidRequest>,
     ) -> Result<Response<RevokeResponse>, Status> {
+        let admin = require(&request, paths::REVOKE_SVID)?;
         let req = request.into_inner();
         let now = unix_now();
 
@@ -1227,6 +1238,7 @@ impl MachineIdentity for MachineIdentitySvc {
         audit_record(
             &self.state,
             AuditEvent::SvidRevoked {
+                by_admin_id: Some(admin.admin_id.clone()),
                 cert_sha: Hash384(cert_bytes),
                 reason: reason.clone(),
             },
@@ -1258,6 +1270,7 @@ impl MachineIdentity for MachineIdentitySvc {
         &self,
         request: Request<RevokeHostRequest>,
     ) -> Result<Response<RevokeResponse>, Status> {
+        let admin = require(&request, paths::REVOKE_HOST)?;
         let req = request.into_inner();
         let now = unix_now();
 
@@ -1276,6 +1289,7 @@ impl MachineIdentity for MachineIdentitySvc {
         audit_record(
             &self.state,
             AuditEvent::HostRevoked {
+                by_admin_id: Some(admin.admin_id.clone()),
                 spiffe_id: req.spiffe_id.clone(),
                 reason,
             },
@@ -1290,6 +1304,7 @@ impl MachineIdentity for MachineIdentitySvc {
         &self,
         request: Request<BumpEpochRequest>,
     ) -> Result<Response<BumpEpochResponse>, Status> {
+        let admin = require(&request, paths::BUMP_EPOCH)?;
         let req = request.into_inner();
         let now = unix_now();
         // Reuse the same bounded-opcode normalisation as revocation so the audit
@@ -1300,6 +1315,7 @@ impl MachineIdentity for MachineIdentitySvc {
         audit_record(
             &self.state,
             AuditEvent::PolicyEpochBumped {
+                by_admin_id: Some(admin.admin_id.clone()),
                 old_epoch,
                 new_epoch,
                 reason,
@@ -1312,8 +1328,9 @@ impl MachineIdentity for MachineIdentitySvc {
 
     async fn list_svids(
         &self,
-        _request: Request<ListSvidsRequest>,
+        request: Request<ListSvidsRequest>,
     ) -> Result<Response<ListSvidsResponse>, Status> {
+        require(&request, paths::LIST_SVIDS)?;
         let svids = self
             .state
             .list_svids()
@@ -1416,11 +1433,41 @@ impl MachineIdentity for MachineIdentitySvc {
         request: Request<AppendAuditRequest>,
     ) -> Result<Response<AppendAuditResponse>, Status> {
         let req = request.into_inner();
+        let now = unix_now();
+        if req.event_cbor.len() > MAX_FORWARDED_EVENT_BYTES {
+            return Err(Status::invalid_argument("field_too_long"));
+        }
+
+        // F20 Phase 0: only an attested, unrevoked host may append, with a
+        // fresh, unreplayed proof over a document binding these event bytes,
+        // within its per-host rate (F19 §7.1 `HostCallAuth`).
+        let event_cbor = req.event_cbor.as_slice();
+        let bind = |doc: &ferro_svid::host_call::AuditForwardDoc| doc.binds_event(event_cbor);
+        let (host, _doc) = crate::host_auth::authenticate(
+            &self.state,
+            crate::host_auth::HostCall {
+                auth: req.auth.as_ref(),
+                context: ferro_svid::host_call::AUDIT_FORWARD_CONTEXT,
+                doc: &req.doc,
+                decode: ferro_svid::host_call::decode_audit_forward,
+                bind: &bind,
+                limiter: Some(self.state.host_calls.audit_forward_limiter()),
+            },
+            now,
+        )?;
+
         let event = ferro_audit::event::decode(&req.event_cbor).map_err(|e| {
-            tracing::warn!(error = %e, "forwarded audit event failed to decode");
+            tracing::warn!(error = %e, host_uuid = %host.host_uuid, "forwarded audit event failed to decode");
             Status::invalid_argument("malformed audit event")
         })?;
-        let now = unix_now();
+        if !host_forwardable(&event) {
+            tracing::warn!(
+                event = "audit.forward.refused",
+                host_uuid = %host.host_uuid,
+                "a host tried to forward a CMIS-side audit event"
+            );
+            return Err(Status::permission_denied("event_not_forwardable"));
+        }
         let leaf_index = self.state.audit.append(&event).map_err(|e| {
             tracing::error!(error = %e, "audit append (forwarded) failed");
             Status::unavailable("audit log unavailable")
@@ -1429,6 +1476,56 @@ impl MachineIdentity for MachineIdentitySvc {
             tracing::warn!(error = %e, "audit STH produce failed after forward");
         }
         Ok(Response::new(AppendAuditResponse { leaf_index }))
+    }
+}
+
+/// Upper bound on a forwarded `event_cbor`. The largest host event
+/// (`ConfigChanged` with a 4 KiB path and its key names) is far below this.
+const MAX_FORWARDED_EVENT_BYTES: usize = 64 * 1024;
+
+/// Whether a host may forward `event` through `AppendAuditEvent`. Only events
+/// a MIA produces are accepted, so a host cannot forge CMIS-side records
+/// (issuance, revocation, admin actions) into the log. Exhaustive on purpose:
+/// a new variant does not compile until it is classified here.
+fn host_forwardable(event: &AuditEvent) -> bool {
+    match event {
+        AuditEvent::LocalGrant { .. }
+        | AuditEvent::LocalDenied { .. }
+        | AuditEvent::ConfigChanged { .. } => true,
+        AuditEvent::AttestStart { .. }
+        | AuditEvent::AttestFail { .. }
+        | AuditEvent::SvidIssued { .. }
+        | AuditEvent::SvidRevoked { .. }
+        | AuditEvent::HostRevoked { .. }
+        | AuditEvent::HostEnrolled { .. }
+        | AuditEvent::HostRejected { .. }
+        | AuditEvent::PolicyEpochBumped { .. }
+        | AuditEvent::AllowlistSet { .. }
+        | AuditEvent::AllowlistDeleted { .. }
+        | AuditEvent::AllowlistProposed { .. }
+        | AuditEvent::AllowlistAutoAdopted { .. }
+        | AuditEvent::AllowlistProposalRejected { .. }
+        | AuditEvent::KeyShareUsed { .. }
+        | AuditEvent::AdminLoginSucceeded { .. }
+        | AuditEvent::AdminLoginFailed { .. }
+        | AuditEvent::AdminLockoutApplied { .. }
+        | AuditEvent::AdminLoginAnomaly { .. }
+        | AuditEvent::AdminLogout { .. }
+        | AuditEvent::AdminSessionRevoked { .. }
+        | AuditEvent::AdminStepUp { .. }
+        | AuditEvent::AdminPasswordChanged { .. }
+        | AuditEvent::AdminAccountCreated { .. }
+        | AuditEvent::AdminAccountUpdated { .. }
+        | AuditEvent::AdminAccountStateChanged { .. }
+        | AuditEvent::AdminCredentialsReset { .. }
+        | AuditEvent::AdminEnrollmentCompleted { .. }
+        | AuditEvent::AdminMfaEnrolled { .. }
+        | AuditEvent::AdminMfaRemoved { .. }
+        | AuditEvent::AdminWebAuthnCloneDetected { .. }
+        | AuditEvent::AdminBootstrapCompleted { .. }
+        | AuditEvent::AdminSodModeChanged { .. }
+        | AuditEvent::AdminAccessDenied { .. }
+        | AuditEvent::AdminCallAuthorized { .. } => false,
     }
 }
 

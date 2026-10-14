@@ -21,7 +21,7 @@ use rand_core::{Rng as _, UnwrapErr};
 use ferro_attest::TpmQuoteVerifier;
 use ferro_audit::AuditLog;
 use ferro_crypto::composite::CompositePublicKey;
-use ferro_raft::{Cluster, NodeRole};
+use ferro_raft::{Cluster, ClusterError, NodeRole};
 use ferro_svid::{
     child_signing_kid, CrlBody, CrlEntry, IssueParams, IssuedSvid, Issuer, Jwk, JwkSet,
     LastAttestation, RevocationTarget, SignedCrl,
@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 use crate::cluster_store;
 use crate::credential::CredentialMaker;
 use crate::fleet_manifest::{EnrollmentDecision, FleetStore};
+use crate::host_auth::{HostCallConfig, HostCallGuard};
 
 /// How CMIS treats a host-driven allowlist proposal (see `ProposeAllowlist`).
 /// All variants still verify the proposal's SVID + signature first; this only
@@ -91,6 +92,9 @@ pub struct CmisConfig {
     /// `None` ⇒ use [`Self::svid_ttl_secs`]. A shorter TTL makes the
     /// lower-assurance software identities re-attest more often.
     pub host_key_svid_ttl_secs: Option<u64>,
+    /// Host call authentication limits (F19 §7.1; `AppendAuditEvent` rate,
+    /// `CMIS_AUDIT_FORWARD_MAX_PER_MIN`).
+    pub host_calls: HostCallConfig,
 }
 
 impl Default for CmisConfig {
@@ -104,6 +108,7 @@ impl Default for CmisConfig {
             allowlist_proposal_policy: ProposalPolicy::default(),
             require_preregistered_host_key: false,
             host_key_svid_ttl_secs: None,
+            host_calls: HostCallConfig::default(),
         }
     }
 }
@@ -180,6 +185,9 @@ pub struct CmisState {
     /// the pin through the Raft store so every replica enforces the same binding
     /// is a documented deployment seam.
     host_key_pins: Mutex<HashMap<[u8; 48], Vec<u8>>>,
+    /// Host call authentication state (F19 §7.1): the per-node nonce replay
+    /// cache and per-host rate limiters used by [`crate::host_auth`].
+    pub host_calls: HostCallGuard,
     /// The Raft cluster mediating all durable state: issued SVIDs
     /// (`issued_svids`), per-host signed allowlists (`host_allowlists`), and
     /// pending allowlist proposals (`pending_allowlist_proposals`). A
@@ -235,6 +243,7 @@ impl CmisState {
         cluster: Arc<Cluster>,
     ) -> Self {
         let published_keys = RwLock::new(issuer.jwks().keys);
+        let host_calls = HostCallGuard::new(config.host_calls);
         Self {
             issuer,
             verifier,
@@ -248,6 +257,7 @@ impl CmisState {
             published_crl: RwLock::new(None),
             fleet: FleetStore::unenforced(),
             host_key_pins: Mutex::new(HashMap::new()),
+            host_calls,
             cluster,
         }
     }
@@ -502,6 +512,24 @@ impl CmisState {
         }
     }
 
+    /// Whether the revocation working set names the host `spiffe_id` or the
+    /// SVID whose compact-JWS digest is `svid_cert_sha` (lowercase-hex
+    /// SHA-384). Consulted by host call authentication ([`crate::host_auth`])
+    /// so a revoked host cannot keep using its still-unexpired SVID.
+    ///
+    /// Process-local like the working set itself (see [`CmisState::revoke`]).
+    #[must_use]
+    pub fn is_revoked(&self, spiffe_id: &str, svid_cert_sha: &str) -> bool {
+        self.revocations
+            .lock()
+            .entries
+            .iter()
+            .any(|e| match &e.target {
+                RevocationTarget::Host { spiffe_id: s } => s == spiffe_id,
+                RevocationTarget::Svid { cert_sha } => cert_sha.eq_ignore_ascii_case(svid_cert_sha),
+            })
+    }
+
     /// Build, sign, and publish a fresh CRL from the current working set.
     ///
     /// Expired entries (`expires_at <= now`) are pruned first — once an SVID's
@@ -643,14 +671,21 @@ impl CmisState {
     /// Store or replace a host's signed caller allowlist, keyed by its
     /// EK-derived host UUID. `signed_bytes` is the opaque CBOR `SignedAllowlist`
     /// the issuer minted; the cluster treats it as a blob.
-    pub async fn put_allowlist(&self, host_uuid: &str, signed_bytes: Vec<u8>, now: i64) {
-        if let Err(e) = self
-            .cluster
+    ///
+    /// A failed write is logged **and returned** — the caller must not report
+    /// the change as made (F19 §7.4).
+    pub async fn put_allowlist(
+        &self,
+        host_uuid: &str,
+        signed_bytes: Vec<u8>,
+        now: i64,
+    ) -> Result<(), ClusterError> {
+        self.cluster
             .upsert_allowlist(host_uuid, &signed_bytes, now)
             .await
-        {
-            tracing::error!(error = %e, %host_uuid, "cluster allowlist upsert failed");
-        }
+            .inspect_err(|e| {
+                tracing::error!(error = %e, %host_uuid, "cluster allowlist upsert failed");
+            })
     }
 
     /// Fetch a host's stored signed allowlist bytes, if any. Reads are
@@ -665,15 +700,15 @@ impl CmisState {
         }
     }
 
-    /// Delete a host's stored allowlist. Returns whether one existed.
-    pub async fn delete_allowlist(&self, host_uuid: &str) -> bool {
-        match self.cluster.delete_allowlist(host_uuid).await {
-            Ok(existed) => existed,
-            Err(e) => {
+    /// Delete a host's stored allowlist. Returns whether one existed; a failed
+    /// write is logged and returned, never reported as "absent".
+    pub async fn delete_allowlist(&self, host_uuid: &str) -> Result<bool, ClusterError> {
+        self.cluster
+            .delete_allowlist(host_uuid)
+            .await
+            .inspect_err(|e| {
                 tracing::error!(error = %e, %host_uuid, "cluster allowlist delete failed");
-                false
-            }
-        }
+            })
     }
 
     /// Enumerate every stored `(host_uuid, signed_bytes)` allowlist, mirroring
@@ -691,9 +726,14 @@ impl CmisState {
     /// Store or replace a host's pending allowlist proposal. `entries_cbor` is
     /// the opaque CBOR `Vec<AllowEntry>` the host proposed; CMIS stamps the
     /// proposer SPIFFE id and time so an operator can review it later.
-    pub async fn put_proposal(&self, host_uuid: &str, rec: ProposalRecord) {
-        if let Err(e) = self
-            .cluster
+    ///
+    /// A failed write is logged **and returned** (F19 §7.4).
+    pub async fn put_proposal(
+        &self,
+        host_uuid: &str,
+        rec: ProposalRecord,
+    ) -> Result<(), ClusterError> {
+        self.cluster
             .upsert_proposal(
                 host_uuid,
                 &rec.entries_cbor,
@@ -701,9 +741,9 @@ impl CmisState {
                 rec.proposed_at,
             )
             .await
-        {
-            tracing::error!(error = %e, %host_uuid, "cluster proposal upsert failed");
-        }
+            .inspect_err(|e| {
+                tracing::error!(error = %e, %host_uuid, "cluster proposal upsert failed");
+            })
     }
 
     /// Enumerate every pending `(host_uuid, ProposalRecord)`, mirroring
@@ -732,15 +772,15 @@ impl CmisState {
         }
     }
 
-    /// Delete a host's pending proposal. Returns whether one existed.
-    pub async fn delete_proposal(&self, host_uuid: &str) -> bool {
-        match self.cluster.delete_proposal(host_uuid).await {
-            Ok(existed) => existed,
-            Err(e) => {
+    /// Delete a host's pending proposal. Returns whether one existed; a failed
+    /// write is logged and returned, never reported as "absent".
+    pub async fn delete_proposal(&self, host_uuid: &str) -> Result<bool, ClusterError> {
+        self.cluster
+            .delete_proposal(host_uuid)
+            .await
+            .inspect_err(|e| {
                 tracing::error!(error = %e, %host_uuid, "cluster proposal delete failed");
-                false
-            }
-        }
+            })
     }
 
     /// Coarse health summary for the `Health` gRPC.

@@ -12,13 +12,24 @@
 //!
 //! [`load_pem_identity`] reads the server certificate chain and private key
 //! from PEM files for the bring-up binary.
+//!
+//! Each accepted connection is wrapped in [`TlsConn`], whose tonic connect
+//! info ([`PeerConnectInfo`]) carries the TCP peer address and, when the
+//! listener requires mTLS, the SHA-256 of the client leaf certificate. The
+//! admin layer reads both from the request extensions (F20 §2: the client IP
+//! is the TCP peer address; the client certificate binds the session).
 
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use rustls_pki_types::pem::{self, PemObject};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::server::TlsStream;
@@ -29,6 +40,84 @@ use tokio_stream::Stream;
 /// Channel depth for accepted-but-not-yet-served TLS connections. Bounds the
 /// number of completed handshakes buffered ahead of the gRPC server.
 const ACCEPT_BUFFER: usize = 128;
+
+/// Connection facts the admin layer needs, exposed to handlers through tonic's
+/// request extensions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerConnectInfo {
+    /// TCP peer address.
+    pub remote_addr: Option<SocketAddr>,
+    /// SHA-256 of the client's leaf certificate (mTLS listeners only).
+    pub client_cert_sha256: Option<[u8; 32]>,
+}
+
+/// A handshake-complete server-side TLS connection.
+pub struct TlsConn {
+    inner: TlsStream<TcpStream>,
+    info: PeerConnectInfo,
+}
+
+impl TlsConn {
+    fn new(inner: TlsStream<TcpStream>) -> Self {
+        let (tcp, conn) = inner.get_ref();
+        let info = PeerConnectInfo {
+            remote_addr: tcp.peer_addr().ok(),
+            client_cert_sha256: conn
+                .peer_certificates()
+                .and_then(<[CertificateDer<'_>]>::first)
+                .map(|leaf| Sha256::digest(leaf.as_ref()).into()),
+        };
+        Self { inner, info }
+    }
+}
+
+impl tonic::transport::server::Connected for TlsConn {
+    type ConnectInfo = PeerConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.info.clone()
+    }
+}
+
+impl AsyncRead for TlsConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TlsConn {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
 
 /// Load a PEM certificate chain and private key for the server identity.
 ///
@@ -69,7 +158,7 @@ pub fn load_pem_identity(
 pub fn tls_incoming(
     listener: TcpListener,
     server_config: Arc<ServerConfig>,
-) -> impl Stream<Item = Result<TlsStream<TcpStream>, io::Error>> {
+) -> impl Stream<Item = Result<TlsConn, io::Error>> {
     let acceptor = TlsAcceptor::from(server_config);
     let (tx, rx) = tokio::sync::mpsc::channel(ACCEPT_BUFFER);
 
@@ -110,7 +199,7 @@ pub fn tls_incoming(
                             );
                         }
                         // Receiver gone ⇒ server is shutting down; drop quietly.
-                        let _ = tx.send(Ok(stream)).await;
+                        let _ = tx.send(Ok(TlsConn::new(stream))).await;
                     }
                     Err(e) => {
                         tracing::debug!(

@@ -23,7 +23,7 @@ use std::io;
 use ferro_crypto::pin::SpkiPin;
 use ferro_crypto::tls::ProviderMode;
 use hyper_util::rt::TokioIo;
-use rustls_pki_types::ServerName;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -49,6 +49,36 @@ use tonic::transport::{Channel, Endpoint, Uri};
 /// Panics if `pins` is empty; see [`ferro_crypto::transport::client_config`].
 pub async fn connect_pinned(endpoint: &str, pins: Vec<SpkiPin>) -> anyhow::Result<Channel> {
     let tls = ferro_crypto::transport::client_config(ProviderMode::HybridOnly, pins)?;
+    connect_with_config(endpoint, tls).await
+}
+
+/// Like [`connect_pinned`], but also presents a client certificate when the
+/// server requests one — the optional mutual TLS of the CMIS admin listener
+/// (`CMIS_ADMIN_CLIENT_CA`, feature F20 §2). The certificate is an extra factor
+/// on top of the admin session, never a substitute for it.
+///
+/// # Panics
+///
+/// Panics if `pins` is empty; see [`ferro_crypto::transport::client_config`].
+pub async fn connect_pinned_with_client_auth(
+    endpoint: &str,
+    pins: Vec<SpkiPin>,
+    client_chain: Vec<CertificateDer<'static>>,
+    client_key: PrivateKeyDer<'static>,
+) -> anyhow::Result<Channel> {
+    let tls = ferro_crypto::transport::client_config_with_client_auth(
+        ProviderMode::HybridOnly,
+        pins,
+        client_chain,
+        client_key,
+    )?;
+    connect_with_config(endpoint, tls).await
+}
+
+async fn connect_with_config(
+    endpoint: &str,
+    tls: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+) -> anyhow::Result<Channel> {
     let connector = TlsConnector::from(tls);
 
     // The custom connector performs the TLS upgrade itself, so tonic's own

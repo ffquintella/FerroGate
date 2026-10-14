@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.28.2"
+version      = "0.29.0"
 edition      = "2021"
 rust-version = "1.95"
 license      = "Apache-2.0"
@@ -87,6 +87,13 @@ fips204       = "0.4"
 base64        = "0.22"
 der           = { version = "0.8", features = ["alloc", "derive", "oid"] }
 p256          = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+# administrator authentication (F20): Argon2id password hashing, HMAC for
+# TOTP (RFC 6238, HMAC-SHA-1) and keyed pseudonyms, NFKC normalisation of
+# usernames and passwords.
+argon2                = "0.6"
+hmac                  = "0.13"
+sha1                  = "0.11"
+unicode-normalization = "0.1"
 
 # TLS stack (F01)
 rustls              = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"] }
@@ -120,6 +127,7 @@ tonic             = { version = "0.14", default-features = false, features = ["c
 tonic-prost       = "0.14"
 tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
 prost             = "0.14"
+prost-types       = "0.14"
 tokio-stream = { version = "0.1", features = ["net"] }
 futures      = "0.3"
 uuid         = { version = "1", features = ["v8"] }
