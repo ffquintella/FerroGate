@@ -40,7 +40,7 @@ use tonic::service::Interceptor;
 use tonic::transport::Channel;
 use zeroize::Zeroizing;
 
-use crate::{rpc_err, CmisError};
+use crate::{apps, rpc_err, CmisError};
 
 /// Default admin listener.
 pub(crate) const DEFAULT_ADMIN_ENDPOINT: &str = "https://127.0.0.1:8444";
@@ -72,6 +72,10 @@ pub(crate) fn usage() -> &'static str {
      \x20 factors [list]                list your second factors (TOTP, FIDO2 keys)\n\
      \x20 factors remove <factor_id>    remove one (needs a TOTP code; the last factor\n\
      \x20                               stays). FIDO2 keys are added from the tray client\n\
+     \x20 apps <action>                 application approvals (F19); actions:\n\
+     \x20                               requests, request, approve, deny, approvals,\n\
+     \x20                               approval, update, revoke, freeze, unfreeze, register\n\
+     \x20                               (`apps help` shows every flag)\n\
      \n\
      Secrets are prompted without echo; when stdin is not a terminal they are\n\
      read one per line from stdin. The session token is never printed."
@@ -268,7 +272,7 @@ fn client_info() -> Option<ClientInfo> {
     })
 }
 
-fn proof(code: Zeroizing<String>) -> Option<MfaProof> {
+pub(crate) fn proof(code: Zeroizing<String>) -> Option<MfaProof> {
     Some(MfaProof {
         f: Some(mfa_proof::F::TotpCode(code.to_string())),
         nonce: Vec::new(),
@@ -432,7 +436,7 @@ pub(crate) struct AdminArgs<'a> {
     pub(crate) prompter: &'a Prompter,
 }
 
-fn flag_values(args: &[String], name: &str) -> Vec<String> {
+pub(crate) fn flag_values(args: &[String], name: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -445,11 +449,11 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
     out
 }
 
-fn flag_value(args: &[String], name: &str) -> Option<String> {
+pub(crate) fn flag_value(args: &[String], name: &str) -> Option<String> {
     flag_values(args, name).pop()
 }
 
-fn has_flag(args: &[String], name: &str) -> bool {
+pub(crate) fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
@@ -460,7 +464,18 @@ pub(crate) async fn run(a: AdminArgs<'_>, sub: &str, args: &[String]) -> anyhow:
         "logout" => logout(a).await,
         "bootstrap" => enroll(a, args, true).await,
         "enroll" => enroll(a, args, false).await,
-        "whoami" | "sessions" | "passwd" | "accounts" | "groups" | "factors" => {
+        "whoami" | "sessions" | "passwd" | "accounts" | "groups" | "factors" | "apps" => {
+            if sub == "apps" {
+                if matches!(
+                    args.first().map(String::as_str),
+                    Some("help" | "-h" | "--help")
+                ) {
+                    println!("{}", apps::usage());
+                    return Ok(());
+                }
+                // Typos are caught before a sign-in costs a TOTP code.
+                apps::validate(args)?;
+            }
             let session =
                 session_for_command(a.channel.clone(), a.session_file, a.device_file, a.prompter)
                     .await?;
@@ -611,6 +626,7 @@ async fn authenticated(
         "passwd" => passwd(&mut admin, session, a.prompter).await,
         "accounts" => accounts(&mut admin, args, a.prompter).await,
         "factors" => factors(&mut admin, args, a.prompter).await,
+        "apps" => apps::run(&mut admin, args, a.prompter).await,
         "groups" => {
             let g = admin
                 .list_admin_groups(ListAdminGroupsRequest {})
@@ -670,7 +686,7 @@ async fn sessions(admin: &mut Admin, args: &[String]) -> anyhow::Result<()> {
 /// A server-provided string made safe for a terminal: control characters
 /// (including ANSI/OSC escape introducers) and bidi overrides removed
 /// (F20 §12).
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .filter(|c| {
             !c.is_control() && !matches!(*c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')

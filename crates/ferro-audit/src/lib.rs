@@ -45,7 +45,7 @@ pub use anchor::{
     Anchor, AnchorError, AnchorPublisher, AnchorQueue, AnchorQueueError, AnchorReceipt,
     DrainOutcome, PendingEntry,
 };
-pub use bytes::{Bytes16, Hash384};
+pub use bytes::{Bytes16, Bytes32, Hash384};
 
 pub use cosign::{
     verify_cosigned, CoSignature, CoSignedTreeHead, QuorumError, QuorumSigner, VerifyingKeyset,

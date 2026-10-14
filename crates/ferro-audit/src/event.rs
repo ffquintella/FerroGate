@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::bytes::{Bytes16, Hash384};
+use crate::bytes::{Bytes16, Bytes32, Hash384};
 
 /// One audit event.
 ///
@@ -382,6 +382,197 @@ pub enum AuditEvent {
         /// Full gRPC method path.
         method: String,
     },
+    // ---- Application registration and approval (F19 §9) -----------------
+    //
+    // Requests, approvals and lineages appear as their UUID bytes, binaries
+    // as their SHA-384, paths only as the host-salted `path_hash`. User
+    // names, SIDs, plaintext paths and free-text messages are never recorded
+    // (F19 §10); `uid` is the numeric Unix uid (or Windows RID) only.
+    // Enumerations carry the ledger's integer codes (F19 §2).
+    /// A host submitted an application request that was recorded.
+    AppRequestSubmitted {
+        /// Request id.
+        request_id: Bytes16,
+        /// Requesting host.
+        host_uuid: String,
+        /// Lineage (host + path) of the binary.
+        lineage_id: Bytes16,
+        /// SHA-384 of the binary.
+        bin_sha: Hash384,
+        /// Sequential version of the binary in its lineage.
+        revision: u32,
+        /// 1 register, 2 update (classified by CMIS).
+        kind: u8,
+        /// 1 self, 2 assisted, 3 admin_direct, 4 observed.
+        origin: u8,
+        /// Target Unix uid or Windows RID, when the request names one.
+        uid: Option<u32>,
+        /// `ferro_svid::allowlist_v2::path_hash` of the canonical path.
+        path_hash: Bytes32,
+        /// Risk-flag bitmask (F19 §4.5).
+        flags: u32,
+    },
+    /// A request was approved by the auto-update policy of a parent approval.
+    AppRequestAutoApproved {
+        /// Request id.
+        request_id: Bytes16,
+        /// The new approval.
+        approval_id: Bytes16,
+        /// The approval whose policy approved it.
+        parent_approval_id: Bytes16,
+        /// Lineage.
+        lineage_id: Bytes16,
+        /// SHA-384 of the approved binary.
+        bin_sha: Hash384,
+        /// What anchored continuity: `protected_path`, `same_signer` or
+        /// `path_user_only`.
+        continuity_basis: String,
+    },
+    /// An administrator approved another person's request.
+    AppRequestApproved {
+        /// Request id.
+        request_id: Bytes16,
+        /// The approval created or reused.
+        approval_id: Bytes16,
+        /// Approving administrator.
+        admin_id: String,
+        /// Reference to the approver's session.
+        session_ref: String,
+        /// 1 manual_each_time, 2 auto_same_path_user.
+        update_policy: u8,
+        /// 1 exact_user, 2 any_user.
+        user_scope: u8,
+        /// 1 exact, 2 any.
+        path_match: u8,
+        /// Unix seconds; `None` for no expiry.
+        expires_at: Option<i64>,
+    },
+    /// An administrator denied a request.
+    AppRequestDenied {
+        /// Request id.
+        request_id: Bytes16,
+        /// Denying administrator.
+        admin_id: String,
+        /// Reference to the session.
+        session_ref: String,
+        /// Reason code (the message shown to the requester is not recorded).
+        reason_code: u32,
+    },
+    /// A pending request passed its time-to-live (sweeper).
+    AppRequestExpired {
+        /// Request id.
+        request_id: Bytes16,
+    },
+    /// An administrator edited or renewed an approval.
+    ApprovalUpdated {
+        /// Approval id.
+        approval_id: Bytes16,
+        /// Editing administrator.
+        admin_id: String,
+        /// Reference to the session.
+        session_ref: String,
+        /// `row_version` after the edit.
+        row_version: u64,
+        /// Names of the changed fields (`expires_at`, `update_policy`, …).
+        changed_fields: Vec<String>,
+        /// Expiry before the edit.
+        old_expires_at: Option<i64>,
+        /// Expiry after the edit.
+        new_expires_at: Option<i64>,
+        /// Update policy before the edit.
+        old_policy: u8,
+        /// Update policy after the edit.
+        new_policy: u8,
+    },
+    /// An administrator revoked ("deleted") an approval; the record is kept.
+    ApprovalRevoked {
+        /// Approval id.
+        approval_id: Bytes16,
+        /// Revoking administrator.
+        admin_id: String,
+        /// Reference to the session.
+        session_ref: String,
+        /// Reason code.
+        reason_code: u32,
+    },
+    /// An approval passed its expiry (sweeper).
+    ApprovalExpired {
+        /// Approval id.
+        approval_id: Bytes16,
+    },
+    /// An administrator froze or unfroze auto-update for a lineage.
+    LineageAutoUpdateFrozen {
+        /// Lineage id.
+        lineage_id: Bytes16,
+        /// Administrator.
+        admin_id: String,
+        /// The new value.
+        frozen: bool,
+    },
+    /// The requester and the approver of an approval were the same
+    /// administrator: every single-step direct registration, and a
+    /// self-approval while the strict separation-of-duties policy is off.
+    AppApprovedBySameActor {
+        /// Request id.
+        request_id: Bytes16,
+        /// The approval.
+        approval_id: Bytes16,
+        /// The administrator (requester and approver).
+        admin_id: String,
+        /// Reference to the session.
+        session_ref: String,
+        /// Request origin (3 admin_direct).
+        origin: u8,
+        /// Second-factor method of the per-operation proof (`totp`,
+        /// `webauthn`).
+        mfa_method: String,
+        /// 1 manual_each_time, 2 auto_same_path_user.
+        update_policy: u8,
+        /// 1 exact_user, 2 any_user.
+        user_scope: u8,
+        /// 1 exact, 2 any.
+        path_match: u8,
+        /// Unix seconds; `None` for no expiry.
+        expires_at: Option<i64>,
+    },
+    /// Strict separation of duties: an administrator's direct registration
+    /// was queued as a pending request for a different approver.
+    AdminDirectRegistration {
+        /// Request id.
+        request_id: Bytes16,
+        /// Requesting administrator.
+        admin_id: String,
+    },
+    /// A host's compiled allowlist entry set changed (logged once per change,
+    /// at the first compile after it).
+    AllowlistCompiled {
+        /// Host.
+        host_uuid: String,
+        /// Generation the entry set was compiled at.
+        generation: u64,
+        /// Number of entries.
+        entry_count: u32,
+        /// SHA-384 of the canonical CBOR entries.
+        entries_digest: Hash384,
+    },
+    /// MIA verified and applied a synced allowlist v2 (forwarded by the host).
+    AllowlistSyncApplied {
+        /// The forwarding host (must be the authenticated host).
+        host_uuid: String,
+        /// Generation applied.
+        generation: u64,
+    },
+    /// MIA refused a synced allowlist v2 and kept its current one (forwarded
+    /// by the host).
+    AllowlistSyncRejected {
+        /// The forwarding host (must be the authenticated host).
+        host_uuid: String,
+        /// Generation of the refused body (0 when it did not parse).
+        generation: u64,
+        /// Stable opcode (`rollback`, `wrong_host`, `generation_conflict`,
+        /// `bad_signature`, …).
+        reason: String,
+    },
 }
 
 /// Failure modes for event codec.
@@ -517,6 +708,36 @@ mod tests {
             AuditEvent::AdminWebAuthnCloneDetected {
                 admin_id: "0190".into(),
                 factor_id: "wa_00".into(),
+            },
+            AuditEvent::AppRequestSubmitted {
+                request_id: Bytes16([1; 16]),
+                host_uuid: "h".into(),
+                lineage_id: Bytes16([2; 16]),
+                bin_sha: Hash384([3; 48]),
+                revision: 2,
+                kind: 2,
+                origin: 1,
+                uid: Some(1000),
+                path_hash: Bytes32([4; 32]),
+                flags: 1,
+            },
+            AuditEvent::AppApprovedBySameActor {
+                request_id: Bytes16([1; 16]),
+                approval_id: Bytes16([5; 16]),
+                admin_id: "0190".into(),
+                session_ref: "ab".into(),
+                origin: 3,
+                mfa_method: "totp".into(),
+                update_policy: 1,
+                user_scope: 1,
+                path_match: 1,
+                expires_at: Some(9),
+            },
+            AuditEvent::AllowlistCompiled {
+                host_uuid: "h".into(),
+                generation: 7,
+                entry_count: 1,
+                entries_digest: Hash384([6; 48]),
             },
         ];
         for e in events {

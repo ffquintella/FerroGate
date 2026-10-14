@@ -461,6 +461,7 @@ async fn fetch_bytes(client: &mut CmisClient, host_uuid: &str) -> anyhow::Result
     let resp = client
         .get_allowlist(GetAllowlistRequest {
             host_uuid: host_uuid.to_string(),
+            accept_formats: Vec::new(),
         })
         .await
         .map_err(rpc_err)?

@@ -194,6 +194,7 @@ async fn bootstrap_login_set_allowlist_logout_then_rejected() {
     let got = mi_main
         .get_allowlist(GetAllowlistRequest {
             host_uuid: "host-a".into(),
+            accept_formats: Vec::new(),
         })
         .await
         .unwrap()

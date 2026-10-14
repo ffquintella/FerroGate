@@ -337,6 +337,60 @@ signs them with the enrollment key.
   at 96 h and capped at 30 days); re-issue rather than
   mint long-lived lists. Full workflow: [allowlist-provisioning.md](allowlist-provisioning.md).
 
+## Application approvals (F19)
+
+Hosts ask for one binary at a time; administrators approve or deny
+(`crates/cmis/src/apps/`, `crates/cmis/src/admin/apps.rs`). A request never
+replaces or removes an approval: approvals end only by expiry or an
+administrator (ADR-0004).
+
+- **Mode.** The replicated setting `cmis_settings.allowlist_mode` is `legacy`
+  until the M38 switch (`ferrogate admin set-allowlist-mode approvals`, with
+  the legacy import). In `legacy` mode `SubmitAppRequest` answers
+  `FAILED_PRECONDITION mode_legacy` (MIA keeps the request queued) and
+  `SyncAllowlist` serves the host's hand-provisioned v1 entries as a v2 body,
+  so upgraded agents can already sync every 5 minutes. In `approvals` mode the
+  v2 body is compiled from the host's active approvals.
+- **Host RPCs.** All three need the host proof (SVID, `cnf.jkt`, machine-key
+  signature, ±300 s). Budgets per host and node: `CMIS_APP_SUBMIT_MAX_PER_HOUR`
+  (30; a retry of a recorded request is free), `CMIS_APP_STATUS_MAX_PER_HOUR`
+  (60), one `SyncAllowlist` per `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS` (30).
+  Open requests are capped per host (`CMIS_APP_MAX_PENDING_PER_HOST`, 50) and
+  per host and user (`CMIS_APP_MAX_PENDING_PER_USER`, 10). A request equal to
+  one denied within `CMIS_APP_DENIED_COOLDOWN_SECS` (86400; 0 disables) gets
+  that denial back. Pending requests expire after `CMIS_APP_PENDING_TTL_SECS`
+  (30 days).
+- **Auto-update.** An approval with policy `AutoSamePathUser` approves later
+  binaries at the same path for the same user when the path is protected or the
+  signer is unchanged (or the approval says `path_user_only`), never for a
+  hash once revoked or denied in the lineage, at most
+  `CMIS_APP_AUTO_UPDATE_MAX_PER_DAY` (3) per lineage per day. The child copies
+  the parent's expiry. Kill switches: `CMIS_APP_AUTO_UPDATE=off`,
+  `CMIS_APP_AUTO_UPDATE_TIERS` (`tpm,host-key` by default; drop `host-key` to
+  exclude the software tier) and the per-lineage freeze.
+- **Decisions.** Viewers list and read; approvers approve, deny, edit, revoke,
+  freeze and register directly (`ferrogate admin apps …`). Decisions and edits
+  need a recent step-up. Expiry defaults to `CMIS_APPROVAL_DEFAULT_TTL_SECS`
+  (180 days), may not exceed `CMIS_APPROVAL_MAX_TTL_SECS` (365 days), and
+  "no expiry" needs `CMIS_APPROVAL_ALLOW_NO_EXPIRY=true`. `any_user` needs an
+  explicit confirmation and combines with auto-update only on a protected path.
+- **Direct registration (accepted risk D4).** By default an approver registers
+  and approves in one step with a fresh TOTP or FIDO2 proof; the audit log
+  records it as `AppApprovedBySameActor` — review that event type in the SIEM.
+  `CMIS_ADMIN_STRICT_SOD=true` queues the request for a different approver
+  instead (`AdminDirectRegistration`) and forbids deciding one's own request.
+- **Sync and revocation.** Every change to a host's approvals bumps its
+  generation to `max(generation + 1, unix_ms)`; MIA refuses lower generations.
+  A revocation reaches an online host within one sync interval; offline hosts
+  keep their last body until its `not_after` (`CMIS_ALLOWLIST_TTL_SECS`; 24 h
+  is recommended once hosts sync). The leader's sweeper expires approvals and
+  stale requests every 60 s. Keep CMIS clocks under NTP: a clock that steps
+  backwards only delays new generations.
+- **Audit and personal data.** Events carry ids, hashes and codes only (no
+  user names, SIDs, paths or messages); user names, SIDs and paths stay in the
+  ledger, readable by viewers and approvers (F19 §10). Store failures answer
+  `UNAVAILABLE store_unavailable` and audit nothing.
+
 ## Root key rotation
 
 The composite issuance key is rotated annually in an air-gapped ceremony:

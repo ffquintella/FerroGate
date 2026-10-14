@@ -124,6 +124,11 @@ service MachineIdentity {
   rpc DeleteAllowlist  (DeleteAllowlistRequest)  returns (DeleteAllowlistResponse); // admin
   rpc ListAllowlists   (ListAllowlistsRequest)   returns (ListAllowlistsResponse);  // admin
 
+  // F19 application registration (host proof, see below).
+  rpc SubmitAppRequest    (SubmitAppRequestRequest)    returns (SubmitAppRequestResponse);
+  rpc GetAppRequestStatus (GetAppRequestStatusRequest) returns (GetAppRequestStatusResponse);
+  rpc SyncAllowlist       (SyncAllowlistRequest)       returns (SyncAllowlistResponse);
+
   // (plus the revocation, audit-log, and health RPCs.)
 }
 ```
@@ -149,6 +154,22 @@ service MachineIdentity {
   host-originated event types and is rate-limited per host
   (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`, default 600/min). The shared verifier is
   `cmis::host_auth`, reused by the F19 host RPCs.
+- `SubmitAppRequest`, `GetAppRequestStatus` and `SyncAllowlist` (F19,
+  `crates/cmis/src/apps/`) are host methods with the same proof, each under
+  its own context (`ferrogate-app-request-v1`, `ferrogate-app-status-v1`,
+  `ferrogate-allowlist-sync-v1`). A submission is deduplicated before any
+  write, auto-approved under an `AutoSamePathUser` approval when every F19
+  §5.3 condition holds, or queued `PENDING`; it never replaces or removes an
+  approval. Status only answers for the caller's own requests. `SyncAllowlist`
+  serves the host-bound allowlist **v2** (context `ferrogate-allowlist-v2`)
+  with a monotonic generation, or `not_modified`. While the replicated
+  `allowlist_mode` is `legacy` (the default until the M38 switch) submissions
+  answer `FAILED_PRECONDITION mode_legacy` and `SyncAllowlist` serves the
+  host's legacy v1 entries in v2 form. `GetAllowlist` is unchanged and never
+  serves v2. Administrators decide requests through the `Admin` service
+  (`ListAppRequests` … `AdminRegisterApplication`, F19 §5.4); a leader-only
+  sweeper expires stale requests and approvals every 60 s. Details:
+  [operations.md](operations.md#application-approvals-f19).
 
 ## Administrator authentication
 
@@ -256,6 +277,11 @@ parentheses below) — for example every host-authentication failure is the same
 | Host proof missing or invalid (SVID, revoked, `cnf.jkt`, signature, freshness, replay, event digest) | `UNAUTHENTICATED` (`host_auth_failed`) |
 | Host proof document names another host | `PERMISSION_DENIED` (`host_mismatch`) |
 | Host over its rate limit | `RESOURCE_EXHAUSTED` (`rate_limited`, `retry-after`) |
+| Host at its open-request cap (F19) | `RESOURCE_EXHAUSTED` (`too_many_pending`, `retry-after`) |
+| F19 field invalid (with `x-ferrogate-field`) | `INVALID_ARGUMENT` (`field_too_long`, `path_not_absolute`, `bad_sha`, …) |
+| F19 submission while `allowlist_mode` is `legacy` | `FAILED_PRECONDITION` (`mode_legacy`) |
+| F19 transition from the wrong state / stale `row_version` | `FAILED_PRECONDITION` (`invalid_state`) / `ABORTED` (`row_version_mismatch`) |
+| Deciding one's own request under strict SoD | `PERMISSION_DENIED` (`sod_self_approval`) |
 | Admin method without a valid session | `UNAUTHENTICATED` (`session_invalid`) |
 | Admin method without the permission | `PERMISSION_DENIED` (`permission_denied`) |
 | Admin method over plaintext | `FAILED_PRECONDITION` (`tls_required`) |

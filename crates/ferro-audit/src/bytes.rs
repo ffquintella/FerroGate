@@ -104,6 +104,7 @@ macro_rules! byte_array_newtype {
 
 byte_array_newtype!(Hash384, 48);
 byte_array_newtype!(Bytes16, 16);
+byte_array_newtype!(Bytes32, 32);
 
 #[cfg(test)]
 mod tests {

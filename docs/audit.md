@@ -40,6 +40,17 @@ event type a host does not produce, and rate-limits each host
 (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`). The leaf is the event bytes exactly as
 forwarded. See [operations.md](operations.md#audit-forwarding-from-hosts).
 
+**Application approvals (F19 §9).** CMIS records `AppRequestSubmitted`,
+`AppRequestAutoApproved`, `AppRequestApproved`, `AppRequestDenied`,
+`AppRequestExpired`, `ApprovalUpdated`, `ApprovalRevoked`, `ApprovalExpired`,
+`LineageAutoUpdateFrozen`, `AppApprovedBySameActor` (requester and approver
+were one administrator: every single-step direct registration),
+`AdminDirectRegistration` (strict SoD: queued) and `AllowlistCompiled`.
+Requests, approvals and lineages appear as UUID bytes, binaries as SHA-384,
+paths only as the host-salted `path_hash`; user names, SIDs, paths and
+free-text messages never. Hosts may forward `AllowlistSyncApplied` /
+`AllowlistSyncRejected`, and only for themselves (`host_mismatch` otherwise).
+
 No personally identifiable information is recorded. EK certificates and
 binary contents are referenced only by SHA-384 hash.
 

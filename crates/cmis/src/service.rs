@@ -28,18 +28,21 @@ use ferro_crypto::composite::CompositePublicKey;
 use ferro_proto::v1::attest_request::Phase as ReqPhase;
 use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_server::{MachineIdentity, MachineIdentityServer};
+use ferro_proto::v1::sync_allowlist_response::Result as SyncResult;
 use ferro_proto::v1::{
     AllowEntryMsg, AllowlistSummary, AppendAuditRequest, AppendAuditResponse, AttestRequest,
     AttestResponse, BumpEpochRequest, BumpEpochResponse, Challenge, ConsistencyProofRequest,
     ConsistencyProofResponse, DeleteAllowlistRequest, DeleteAllowlistResponse,
     DeleteProposalRequest, DeleteProposalResponse, FetchRequest, GetAllowlistRequest,
-    GetAllowlistResponse, GetEnrollmentKeyRequest, GetEnrollmentKeyResponse, HealthRequest,
-    HealthResponse, InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse,
-    LatestSthRequest, LatestSthResponse, ListAllowlistsRequest, ListAllowlistsResponse,
-    ListProposalsRequest, ListProposalsResponse, ListSvidsRequest, ListSvidsResponse,
-    NodeRole as ProtoNodeRole, Nonce, PendingProposal, ProposeAllowlistRequest,
-    ProposeAllowlistResponse, RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest,
-    SetAllowlistRequest, SetAllowlistResponse, SignedTreeHead, SvidBundle, SvidSummary,
+    GetAllowlistResponse, GetAppRequestStatusRequest, GetAppRequestStatusResponse,
+    GetEnrollmentKeyRequest, GetEnrollmentKeyResponse, HealthRequest, HealthResponse,
+    InclusionProofRequest, InclusionProofResponse, JwksRequest, JwksResponse, LatestSthRequest,
+    LatestSthResponse, ListAllowlistsRequest, ListAllowlistsResponse, ListProposalsRequest,
+    ListProposalsResponse, ListSvidsRequest, ListSvidsResponse, NodeRole as ProtoNodeRole, Nonce,
+    NotModified, PendingProposal, ProposeAllowlistRequest, ProposeAllowlistResponse,
+    RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest, SetAllowlistRequest,
+    SetAllowlistResponse, SignedTreeHead, SubmitAppRequestRequest, SubmitAppRequestResponse,
+    SvidBundle, SvidSummary, SyncAllowlistRequest, SyncAllowlistResponse,
 };
 use ferro_raft::NodeRole;
 use ferro_svid::{
@@ -48,7 +51,9 @@ use ferro_svid::{
 use sha2::{Digest, Sha256, Sha384};
 
 use crate::admin::authz::{paths, require};
+use crate::apps::{self, AllowlistMode};
 use crate::fleet_manifest::EnrollmentDecision;
+use crate::host_auth::{authenticate, invalid_field, HostCall};
 use crate::pcr::aggregate_digest;
 use crate::state::{CmisState, HostKeyBinding, IssuedRecord, ProposalPolicy};
 
@@ -1010,6 +1015,7 @@ impl MachineIdentity for MachineIdentitySvc {
             host_uuid: svid_host_uuid,
             cnf_jkt,
             spiffe_id: proposer_spiffe_id,
+            ..
         } = crate::host_auth::verify_host_svid(&self.state, &req.svid_jws, now)?;
 
         // 2. The presented machine key must be the one the SVID is bound to.
@@ -1449,6 +1455,7 @@ impl MachineIdentity for MachineIdentitySvc {
                 auth: req.auth.as_ref(),
                 context: ferro_svid::host_call::AUDIT_FORWARD_CONTEXT,
                 doc: &req.doc,
+                max_doc_bytes: ferro_svid::host_call::MAX_DOC_BYTES,
                 decode: ferro_svid::host_call::decode_audit_forward,
                 bind: &bind,
                 limiter: Some(self.state.host_calls.audit_forward_limiter()),
@@ -1468,6 +1475,14 @@ impl MachineIdentity for MachineIdentitySvc {
             );
             return Err(Status::permission_denied("event_not_forwardable"));
         }
+        if !forwarded_for_itself(&event, &host.host_uuid) {
+            tracing::warn!(
+                event = "audit.forward.host_mismatch",
+                host_uuid = %host.host_uuid,
+                "a host tried to forward an event naming another host"
+            );
+            return Err(Status::permission_denied("host_mismatch"));
+        }
         let leaf_index = self.state.audit.append(&event).map_err(|e| {
             tracing::error!(error = %e, "audit append (forwarded) failed");
             Status::unavailable("audit log unavailable")
@@ -1477,7 +1492,111 @@ impl MachineIdentity for MachineIdentitySvc {
         }
         Ok(Response::new(AppendAuditResponse { leaf_index }))
     }
+
+    async fn submit_app_request(
+        &self,
+        request: Request<SubmitAppRequestRequest>,
+    ) -> Result<Response<SubmitAppRequestResponse>, Status> {
+        let req = request.into_inner();
+        let now = unix_now();
+        // F19 §7.1: replay-safe through `client_request_id` (no nonce); the
+        // budget is spent after the idempotency lookup, in `apps::intake`.
+        let (host, doc) = authenticate(
+            &self.state,
+            HostCall {
+                auth: req.auth.as_ref(),
+                context: ferro_svid::app_docs::APP_REQUEST_CONTEXT,
+                doc: &req.doc,
+                max_doc_bytes: ferro_svid::app_docs::MAX_APP_REQUEST_BYTES,
+                decode: ferro_svid::app_docs::decode_app_request,
+                bind: &|_: &ferro_svid::app_docs::AppRequestDoc| true,
+                limiter: None,
+            },
+            now,
+        )?;
+        let mode = apps::mode::current(self.state.cluster())
+            .await
+            .map_err(|e| apps::ledger_status(e.into()))?;
+        if mode == AllowlistMode::Legacy {
+            return Err(Status::failed_precondition("mode_legacy"));
+        }
+        let resp = apps::intake::submit(&self.state, &host, doc, now).await?;
+        Ok(Response::new(resp))
+    }
+
+    async fn get_app_request_status(
+        &self,
+        request: Request<GetAppRequestStatusRequest>,
+    ) -> Result<Response<GetAppRequestStatusResponse>, Status> {
+        let req = request.into_inner();
+        let now = unix_now();
+        let (host, doc) = authenticate(
+            &self.state,
+            HostCall {
+                auth: req.auth.as_ref(),
+                context: ferro_svid::app_docs::APP_STATUS_CONTEXT,
+                doc: &req.doc,
+                max_doc_bytes: ferro_svid::app_docs::MAX_APP_STATUS_BYTES,
+                decode: ferro_svid::app_docs::decode_app_status,
+                bind: &|_: &ferro_svid::app_docs::AppStatusDoc| true,
+                limiter: Some(self.state.host_calls.app_status_limiter()),
+            },
+            now,
+        )?;
+        let resp = apps::status::status(&self.state, &host, &doc).await?;
+        Ok(Response::new(resp))
+    }
+
+    async fn sync_allowlist(
+        &self,
+        request: Request<SyncAllowlistRequest>,
+    ) -> Result<Response<SyncAllowlistResponse>, Status> {
+        let req = request.into_inner();
+        let now = unix_now();
+        let (host, doc) = authenticate(
+            &self.state,
+            HostCall {
+                auth: req.auth.as_ref(),
+                context: ferro_svid::app_docs::ALLOWLIST_SYNC_CONTEXT,
+                doc: &req.doc,
+                max_doc_bytes: ferro_svid::app_docs::MAX_ALLOWLIST_SYNC_BYTES,
+                decode: ferro_svid::app_docs::decode_allowlist_sync,
+                bind: &|_: &ferro_svid::app_docs::AllowlistSyncDoc| true,
+                limiter: Some(self.state.host_calls.allowlist_sync_limiter()),
+            },
+            now,
+        )?;
+        if !doc
+            .accept_formats
+            .contains(&ferro_svid::allowlist_v2::ALLOWLIST_V2_FORMAT)
+        {
+            return Err(invalid_field("unsupported_format", Some("accept_formats")));
+        }
+        let served =
+            apps::compile::serve(&self.state, &host.host_uuid, doc.have_generation, now).await?;
+        let resp = match served {
+            apps::compile::Served::NotModified {
+                generation,
+                not_after,
+            } => SyncAllowlistResponse {
+                result: Some(SyncResult::NotModified(NotModified { not_after })),
+                generation,
+                next_poll_hint_secs: SYNC_POLL_HINT_SECS,
+            },
+            apps::compile::Served::Body {
+                generation, signed, ..
+            } => SyncAllowlistResponse {
+                result: Some(SyncResult::SignedAllowlistV2(signed)),
+                generation,
+                next_poll_hint_secs: SYNC_POLL_HINT_SECS,
+            },
+        };
+        Ok(Response::new(resp))
+    }
 }
+
+/// Advisory `SyncAllowlist` poll interval (F19 §6.5 default, 300 s).
+const SYNC_POLL_HINT_SECS: u32 = 300;
 
 /// Upper bound on a forwarded `event_cbor`. The largest host event
 /// (`ConfigChanged` with a 4 KiB path and its key names) is far below this.
@@ -1491,7 +1610,9 @@ fn host_forwardable(event: &AuditEvent) -> bool {
     match event {
         AuditEvent::LocalGrant { .. }
         | AuditEvent::LocalDenied { .. }
-        | AuditEvent::ConfigChanged { .. } => true,
+        | AuditEvent::ConfigChanged { .. }
+        | AuditEvent::AllowlistSyncApplied { .. }
+        | AuditEvent::AllowlistSyncRejected { .. } => true,
         AuditEvent::AttestStart { .. }
         | AuditEvent::AttestFail { .. }
         | AuditEvent::SvidIssued { .. }
@@ -1525,7 +1646,29 @@ fn host_forwardable(event: &AuditEvent) -> bool {
         | AuditEvent::AdminBootstrapCompleted { .. }
         | AuditEvent::AdminSodModeChanged { .. }
         | AuditEvent::AdminAccessDenied { .. }
-        | AuditEvent::AdminCallAuthorized { .. } => false,
+        | AuditEvent::AdminCallAuthorized { .. }
+        | AuditEvent::AppRequestSubmitted { .. }
+        | AuditEvent::AppRequestAutoApproved { .. }
+        | AuditEvent::AppRequestApproved { .. }
+        | AuditEvent::AppRequestDenied { .. }
+        | AuditEvent::AppRequestExpired { .. }
+        | AuditEvent::ApprovalUpdated { .. }
+        | AuditEvent::ApprovalRevoked { .. }
+        | AuditEvent::ApprovalExpired { .. }
+        | AuditEvent::LineageAutoUpdateFrozen { .. }
+        | AuditEvent::AppApprovedBySameActor { .. }
+        | AuditEvent::AdminDirectRegistration { .. }
+        | AuditEvent::AllowlistCompiled { .. } => false,
+    }
+}
+
+/// A forwarded event that names a host must name the authenticated one, so
+/// a host cannot record allowlist-sync outcomes for another host.
+fn forwarded_for_itself(event: &AuditEvent, host_uuid: &str) -> bool {
+    match event {
+        AuditEvent::AllowlistSyncApplied { host_uuid: h, .. }
+        | AuditEvent::AllowlistSyncRejected { host_uuid: h, .. } => h == host_uuid,
+        _ => true,
     }
 }
 

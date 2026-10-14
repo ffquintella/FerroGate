@@ -17,9 +17,14 @@
 //! Wave C authenticates the host method `AppendAuditEvent` with the F19 §7.1
 //! host proof; that lives outside this module, in [`crate::host_auth`],
 //! because it authenticates hosts, not administrators.
+//!
+//! F19 adds the application-approval operations ([`apps`]): listings,
+//! approve, deny, edit, revoke, the lineage freeze and the single-step
+//! direct registration, all behind the same table and guard.
 
 pub(crate) mod codec;
 
+pub mod apps;
 pub mod authz;
 pub mod bootstrap;
 pub mod clock;

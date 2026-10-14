@@ -4,6 +4,7 @@
 
 #![allow(dead_code, unreachable_pub, clippy::missing_panics_doc)]
 
+pub mod hosts;
 pub mod soft_authenticator;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -152,6 +153,15 @@ pub async fn harness(tag: &str) -> Harness {
 }
 
 pub async fn harness_with(tag: &str, tweak: impl FnOnce(&mut AdminConfig)) -> Harness {
+    harness_cfg(tag, |_| {}, tweak).await
+}
+
+/// A harness with both the CMIS and the admin configuration adjusted.
+pub async fn harness_cfg(
+    tag: &str,
+    cmis_tweak: impl FnOnce(&mut CmisConfig),
+    tweak: impl FnOnce(&mut AdminConfig),
+) -> Harness {
     let base = std::env::temp_dir().join(unique(tag));
     let audit_dir = base.join("audit");
     let raft_dir = base.join("raft");
@@ -165,11 +175,13 @@ pub async fn harness_with(tag: &str, tweak: impl FnOnce(&mut AdminConfig)) -> Ha
             .await
             .unwrap(),
     );
+    let mut cmis_config = CmisConfig::default();
+    cmis_tweak(&mut cmis_config);
     let cmis = Arc::new(CmisState::new(
         issuer,
         verifier,
         Box::new(NoCredentialMaker),
-        CmisConfig::default(),
+        cmis_config,
         audit,
         cluster,
     ));

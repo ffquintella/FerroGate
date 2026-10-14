@@ -93,8 +93,10 @@ pub struct CmisConfig {
     /// lower-assurance software identities re-attest more often.
     pub host_key_svid_ttl_secs: Option<u64>,
     /// Host call authentication limits (F19 §7.1; `AppendAuditEvent` rate,
-    /// `CMIS_AUDIT_FORWARD_MAX_PER_MIN`).
+    /// `CMIS_AUDIT_FORWARD_MAX_PER_MIN`, and the F19 host RPC budgets).
     pub host_calls: HostCallConfig,
+    /// F19 application-approval policy (`CMIS_APP_*`, `CMIS_APPROVAL_*`).
+    pub apps: crate::apps::AppConfig,
 }
 
 impl Default for CmisConfig {
@@ -109,6 +111,7 @@ impl Default for CmisConfig {
             require_preregistered_host_key: false,
             host_key_svid_ttl_secs: None,
             host_calls: HostCallConfig::default(),
+            apps: crate::apps::AppConfig::default(),
         }
     }
 }

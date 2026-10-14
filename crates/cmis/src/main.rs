@@ -29,6 +29,36 @@ use ferro_raft::{Cluster, ClusterConfig, PeerNode, PeerTls};
 use ferro_svid::Issuer;
 use tracing_subscriber::EnvFilter;
 
+/// Read the host-call limits (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`,
+/// `CMIS_APP_SUBMIT_MAX_PER_HOUR`, `CMIS_APP_STATUS_MAX_PER_HOUR`,
+/// `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`) and log what is in force.
+fn load_host_call_limits() -> anyhow::Result<cmis::host_auth::HostCallConfig> {
+    let limits = cmis::host_auth::HostCallConfig::from_env()?;
+    tracing::info!(
+        audit_forward_max_per_min = limits.audit_forward_per_min,
+        app_submit_max_per_hour = limits.app_submit_per_hour,
+        app_status_max_per_hour = limits.app_status_per_hour,
+        sync_min_interval_secs = limits.sync_min_interval_secs,
+        "host call limits"
+    );
+    Ok(limits)
+}
+
+/// Read the F19 application-approval policy (`CMIS_APP_*`,
+/// `CMIS_APPROVAL_*`) and log what is in force.
+fn load_app_policy() -> anyhow::Result<cmis::apps::AppConfig> {
+    let apps = cmis::apps::AppConfig::from_env()?;
+    tracing::info!(
+        auto_update = apps.auto_update,
+        auto_update_tiers = ?apps.auto_update_tiers,
+        approval_default_ttl_secs = apps.approval_default_ttl_secs,
+        approval_max_ttl_secs = apps.approval_max_ttl_secs,
+        allow_no_expiry = apps.allow_no_expiry,
+        "application approval policy"
+    );
+    Ok(apps)
+}
+
 /// Placeholder phase-3 maker for the unconfigured bring-up server. A real
 /// deployment injects a TCG `MakeCredential` implementation; this one refuses
 /// so no half-configured node can appear to attest hosts.
@@ -528,12 +558,10 @@ async fn main() -> anyhow::Result<()> {
         cmis_config.allowlist_ttl_secs = i64::try_from(n).unwrap_or(72 * 3600);
     }
     apply_host_key_hardening(&mut cmis_config);
-    // F20 Phase 0: host-call limits (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`).
-    cmis_config.host_calls = cmis::host_auth::HostCallConfig::from_env()?;
-    tracing::info!(
-        audit_forward_max_per_min = cmis_config.host_calls.audit_forward_per_min,
-        "host call limits"
-    );
+    // F20 Phase 0 / F19: host-call limits.
+    cmis_config.host_calls = load_host_call_limits()?;
+    // F19: application-approval policy (`CMIS_APP_*`, `CMIS_APPROVAL_*`).
+    cmis_config.apps = load_app_policy()?;
     tracing::info!(
         svid_ttl_secs = cmis_config.svid_ttl_secs,
         allowlist_ttl_secs = cmis_config.allowlist_ttl_secs,
@@ -615,6 +643,13 @@ async fn main() -> anyhow::Result<()> {
     let _crl_publisher = cmis::crl_publisher::spawn(
         Arc::clone(&state),
         cmis::crl_publisher::DEFAULT_PUBLISH_INTERVAL,
+    );
+
+    // F19 §5.5: expire stale requests and approvals every 60 s (the Raft
+    // leader only), bumping the affected hosts' allowlist generations.
+    let _app_sweeper = cmis::apps::sweep::spawn(
+        Arc::clone(&state),
+        cmis::apps::sweep::DEFAULT_SWEEP_INTERVAL,
     );
 
     // F20: admin authentication settings (`CMIS_ADMIN_*`). The listeners —

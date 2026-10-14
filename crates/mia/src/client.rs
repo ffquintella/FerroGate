@@ -91,6 +91,7 @@ pub async fn fetch_allowlist(
     let resp = client
         .get_allowlist(Request::new(GetAllowlistRequest {
             host_uuid: host_uuid.to_string(),
+            accept_formats: Vec::new(),
         }))
         .await?
         .into_inner();

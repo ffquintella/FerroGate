@@ -1311,6 +1311,7 @@ dependencies = [
  "chacha20poly1305",
  "ciborium",
  "ed25519-dalek",
+ "ferro-appid",
  "ferro-attest",
  "ferro-audit",
  "ferro-crypto",
@@ -2639,6 +2640,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "uuid",
  "zeroize",
 ]
 

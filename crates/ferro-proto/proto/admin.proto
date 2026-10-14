@@ -47,6 +47,22 @@ service Admin {
   rpc UpdateAdminAccount (UpdateAdminAccountRequest) returns (UpdateAdminAccountResponse);
   rpc SetAdminAccountState (SetAdminAccountStateRequest) returns (SetAdminAccountStateResponse);
   rpc ResetAdminCredentials (ResetAdminCredentialsRequest) returns (ResetAdminCredentialsResponse);
+
+  // ---- Application approvals (F19 §5.4) ----
+  // Reads: app_request.list/read, approval.list/read. Decisions and edits
+  // need a recent step-up; AdminRegisterApplication needs a per-operation
+  // MfaProof. Every mutation emits exactly one audit event (plus one
+  // ApprovalRevoked per `also_revoke_approval_ids` entry).
+  rpc ListAppRequests (ListAppRequestsRequest) returns (ListAppRequestsResponse);
+  rpc GetAppRequest (GetAppRequestRequest) returns (GetAppRequestResponse);
+  rpc ApproveAppRequest (ApproveAppRequestRequest) returns (ApproveAppRequestResponse);
+  rpc DenyAppRequest (DenyAppRequestRequest) returns (DenyAppRequestResponse);
+  rpc ListApprovals (ListApprovalsRequest) returns (ListApprovalsResponse);
+  rpc GetApproval (GetApprovalRequest) returns (GetApprovalResponse);
+  rpc UpdateApproval (UpdateApprovalRequest) returns (UpdateApprovalResponse);
+  rpc RevokeApproval (RevokeApprovalRequest) returns (RevokeApprovalResponse);
+  rpc SetLineageAutoUpdateFrozen (SetLineageAutoUpdateFrozenRequest) returns (SetLineageAutoUpdateFrozenResponse);
+  rpc AdminRegisterApplication (AdminRegisterApplicationRequest) returns (AdminRegisterApplicationResponse);
 }
 
 // Client kind: 1 tui, 2 tray, 3 cli.
@@ -294,3 +310,308 @@ message ResetAdminCredentialsRequest {
   MfaProof proof = 5;
 }
 message ResetAdminCredentialsResponse { string enrollment_token = 1; int64 expires_at = 2; }
+
+// ---- Application approvals (F19 §5.4, §7.5) ----
+//
+// Integer codes follow the ledger (F19 §2):
+//   request state   1 pending, 2 approved, 3 auto_approved, 4 denied, 5 expired
+//   request kind    1 register, 2 update
+//   request origin  1 self, 2 assisted, 3 admin_direct, 4 observed
+//   approval state  1 active, 2 expired, 3 revoked
+//   approval origin 1 manual, 2 auto_update, 3 admin_direct, 4 legacy_import
+//   user kind       1 unix, 2 windows
+//   user_scope      1 exact_user, 2 any_user
+//   path_match      1 exact, 2 any
+//   update_policy   1 manual_each_time, 2 auto_same_path_user
+//   continuity      1 anchored, 2 path_user_only
+//   platform        1 linux, 2 macos, 3 windows
+//   format          1 elf, 2 macho, 3 pe, 9 other
+// User names, SIDs and paths are personal data (F19 §10): shown to viewers
+// and approvers, never written to the audit log.
+
+// An operating-system user. `uid` is the Unix uid (or the Windows RID).
+message AppUser {
+  uint32 kind = 1;
+  optional int64 uid = 2;
+  string sid = 3;
+  string name = 4;
+}
+
+// One binary of a lineage, as the host reported it at first sight.
+message AppBinaryInfo {
+  string bin_sha = 1;               // lowercase hex SHA-384
+  uint32 revision = 2;
+  uint64 file_size = 3;
+  uint32 format = 4;
+  string declared_version = 5;      // untrusted, display only
+  uint32 version_source = 6;
+  string product_name = 7;
+  string bundle_id = 8;
+  string package_name = 9;
+  uint32 signer_kind = 10;          // 0 none, 1 authenticode, 2 apple
+  string signer_id = 11;
+  string signer_subject = 12;
+  bool   signer_valid = 13;
+  int64  first_seen_at = 14;
+  string display_version = 15;      // "<declared> (r<N>)" or "r<N>"
+}
+
+message AppRequestInfo {
+  string request_id = 1;
+  string host_uuid = 2;
+  string lineage_id = 3;
+  string canonical_path = 4;
+  string bin_sha = 5;
+  uint32 revision = 6;
+  uint32 kind = 7;
+  uint32 origin = 8;
+  AppUser target_user = 9;
+  optional int64 requester_uid = 10;
+  string requester_user_name = 11;
+  string requested_by_admin_id = 12;
+  string reason = 13;
+  uint32 flags = 14;                // F19 §4.5 risk bits
+  string host_tier = 15;
+  int64  submitted_at = 16;
+  int64  pending_expires_at = 17;
+  uint32 state = 18;
+  int64  decided_at = 19;
+  string decided_by_admin_id = 20;
+  uint32 decision_reason_code = 21;
+  string decision_message = 22;
+  string auto_downgrade_reason = 23;
+  string resulting_approval_id = 24;
+  bool   same_actor_approved = 25;
+  string declared_version = 26;
+  string product_name = 27;
+  string display_version = 28;
+}
+
+message ApprovalInfo {
+  string approval_id = 1;
+  string host_uuid = 2;
+  string lineage_id = 3;
+  string canonical_path = 4;
+  string bin_sha = 5;               // "*" only for legacy imports
+  uint32 revision = 6;              // 0: none (legacy import)
+  string source_request_id = 7;
+  uint32 origin = 8;
+  string parent_approval_id = 9;
+  string approved_by_admin_id = 10;
+  uint32 user_scope = 11;
+  AppUser user = 12;
+  uint32 path_match = 13;
+  uint32 update_policy = 14;
+  uint32 continuity = 15;
+  int64  created_at = 16;
+  int64  expires_at = 17;           // 0: no expiry
+  uint32 state = 18;
+  string superseded_by = 19;
+  int64  revoked_at = 20;
+  string revoked_by_admin_id = 21;
+  uint32 revoke_reason_code = 22;
+  string note = 23;
+  uint64 row_version = 24;
+  string declared_version = 25;
+  string product_name = 26;
+}
+
+// The policy view of an approval at one revision (no personal data).
+message ApprovalTermsSnapshot {
+  uint32 state = 1;
+  uint32 update_policy = 2;
+  uint32 continuity = 3;
+  int64  expires_at = 4;            // 0: no expiry
+  uint32 user_scope = 5;
+  uint32 path_match = 6;
+  uint32 revoke_reason_code = 7;
+}
+// `change_kind`: 1 created, 2 updated, 3 expired, 4 revoked, 5 renewed.
+message ApprovalRevisionInfo {
+  uint64 row_version = 1;
+  int64  changed_at = 2;
+  string changed_by_admin_id = 3;   // empty: the sweeper or a policy
+  uint32 change_kind = 4;
+  ApprovalTermsSnapshot before = 5;
+  ApprovalTermsSnapshot after = 6;
+}
+
+// Terms an approver chooses (F19 §5.4). `expires_at` 0 is the default TTL
+// (CMIS_APPROVAL_DEFAULT_TTL_SECS); `no_expiry` needs
+// CMIS_APPROVAL_ALLOW_NO_EXPIRY. `any_user` needs `confirm_any_user`.
+message ApprovalTerms {
+  uint32 user_scope = 1;            // 0 = exact_user
+  uint32 path_match = 2;            // 0 = exact
+  uint32 update_policy = 3;         // 0 = manual_each_time
+  uint32 continuity = 4;            // 0 = anchored
+  int64  expires_at = 5;
+  bool   no_expiry = 6;
+  string note = 7;                  // <= 500, no control characters
+  bool   confirm_any_user = 8;
+}
+
+// Opaque, integrity-protected page cursor.
+message PageRequest { uint32 page_size = 1; string page_token = 2; }
+
+message ListAppRequestsRequest {
+  repeated uint32 states = 1;
+  string host_uuid = 2;
+  string path_contains = 3;
+  string product_contains = 4;
+  string user_name = 5;
+  string declared_version = 6;
+  string bin_sha_prefix = 7;        // >= 8 hex characters
+  repeated uint32 origins = 8;
+  repeated uint32 kinds = 9;
+  uint32 flags_any = 10;
+  int64  submitted_after = 11;
+  int64  submitted_before = 12;
+  string text = 13;                 // <= 128
+  bool   ascending = 14;            // default: newest first
+  PageRequest page = 15;
+}
+message ListAppRequestsResponse { repeated AppRequestInfo items = 1; string next_page_token = 2; }
+
+message GetAppRequestRequest { string request_id = 1; }
+message GetAppRequestResponse {
+  AppRequestInfo request = 1;
+  AppBinaryInfo binary = 2;
+  repeated AppBinaryInfo lineage_binaries = 3;
+  repeated AppRequestInfo lineage_requests = 4;
+  repeated ApprovalInfo lineage_approvals = 5;
+  bool lineage_auto_update_frozen = 6;
+}
+
+message ApproveAppRequestRequest {
+  string idempotency_key = 1;
+  string request_id = 2;
+  // A new approval with these terms, or an existing covering approval.
+  oneof choice {
+    ApprovalTerms terms = 3;
+    string reuse_approval_id = 4;
+  }
+  // Approvals of the same host to revoke in the same transaction (INV-2:
+  // each named explicitly and audited as its own revocation).
+  repeated string also_revoke_approval_ids = 5;
+  uint32 also_revoke_reason_code = 6;
+  // Required when approving a request you registered yourself
+  // (`admin_direct`, strict SoD off): a fresh second factor.
+  MfaProof proof = 7;
+}
+message ApproveAppRequestResponse {
+  AppRequestInfo request = 1;
+  ApprovalInfo approval = 2;
+  bool same_actor = 3;
+  repeated string revoked_approval_ids = 4;
+  uint64 allowlist_generation = 5;
+}
+
+message DenyAppRequestRequest {
+  string idempotency_key = 1;
+  string request_id = 2;
+  uint32 reason_code = 3;           // required, non-zero
+  string message = 4;               // <= 200, shown to the requester
+}
+message DenyAppRequestResponse { AppRequestInfo request = 1; }
+
+message ListApprovalsRequest {
+  repeated uint32 states = 1;
+  string host_uuid = 2;
+  string lineage_id = 3;
+  string path_contains = 4;
+  string product_contains = 5;
+  string user_name = 6;
+  string declared_version = 7;
+  string bin_sha_prefix = 8;
+  repeated uint32 policies = 9;
+  repeated uint32 approval_origins = 10;
+  int64  expires_before = 11;
+  int64  expires_after = 12;
+  int64  created_after = 13;
+  int64  created_before = 14;
+  bool   include_superseded = 15;
+  bool   legacy_only = 16;
+  bool   no_expiry_only = 17;
+  string text = 18;
+  bool   ascending = 19;
+  PageRequest page = 20;
+}
+message ListApprovalsResponse { repeated ApprovalInfo items = 1; string next_page_token = 2; }
+
+message GetApprovalRequest { string approval_id = 1; }
+message GetApprovalResponse {
+  ApprovalInfo approval = 1;
+  repeated ApprovalRevisionInfo revisions = 2;
+  repeated ApprovalInfo lineage_approvals = 3;
+  AppBinaryInfo binary = 4;
+}
+
+// Unset fields stay unchanged. Scope can only be narrowed. A future
+// `expires_at` on an EXPIRED approval renews it.
+message UpdateApprovalRequest {
+  string idempotency_key = 1;
+  string approval_id = 2;
+  uint64 expected_row_version = 3;
+  optional uint32 update_policy = 4;
+  optional uint32 continuity = 5;
+  optional int64 expires_at = 6;
+  bool clear_expiry = 7;            // no expiry (CMIS_APPROVAL_ALLOW_NO_EXPIRY)
+  optional string note = 8;
+  bool clear_note = 9;
+  bool narrow_to_exact_user = 10;
+  bool narrow_to_exact_path = 11;
+}
+message UpdateApprovalResponse { ApprovalInfo approval = 1; uint64 allowlist_generation = 2; }
+
+message RevokeApprovalRequest {
+  string idempotency_key = 1;
+  string approval_id = 2;
+  uint32 reason_code = 3;           // required, non-zero
+  uint64 expected_row_version = 4;  // 0: whatever is current
+}
+message RevokeApprovalResponse { ApprovalInfo approval = 1; uint64 allowlist_generation = 2; }
+
+message SetLineageAutoUpdateFrozenRequest { string idempotency_key = 1; string lineage_id = 2; bool frozen = 3; }
+message SetLineageAutoUpdateFrozenResponse {}
+
+// The binary of a direct registration, as the admin client identified it
+// (`ferro-appid`). `flags` keeps only the host-settable bits.
+message AppBinaryDesc {
+  string canonical_path = 1;
+  uint32 platform = 2;
+  string sha384 = 3;                // lowercase hex
+  uint64 size = 4;
+  uint32 format = 5;
+  string declared_version = 6;
+  uint32 version_source = 7;
+  string product_name = 8;
+  string bundle_id = 9;
+  string package_name = 10;
+  uint32 signer_kind = 11;
+  string signer_id = 12;
+  string signer_subject = 13;
+  bool   signer_valid = 14;
+  uint32 flags = 15;
+}
+
+// Single step by default: the request is recorded APPROVED with its approval
+// in one transaction (`AppApprovedBySameActor`). With CMIS_ADMIN_STRICT_SOD
+// the request waits as PENDING for a different approver.
+// `idempotency_key` (required, UUID): a retry by the same administrator
+// returns the stored outcome.
+message AdminRegisterApplicationRequest {
+  string idempotency_key = 1;
+  MfaProof proof = 2;
+  string host_uuid = 3;
+  AppBinaryDesc binary = 4;
+  AppUser target_user = 5;
+  string reason = 6;
+  ApprovalTerms terms = 7;
+}
+message AdminRegisterApplicationResponse {
+  AppRequestInfo request = 1;       // absent when deduplicated onto an approval
+  ApprovalInfo approval = 2;        // absent while PENDING (strict SoD)
+  bool queued = 3;                  // strict SoD: waits for another approver
+  bool deduplicated = 4;            // an active approval already covered it
+  uint64 allowlist_generation = 5;
+}

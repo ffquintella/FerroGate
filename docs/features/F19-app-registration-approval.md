@@ -3,6 +3,14 @@
 > Decision record: [ADR-0004](../adr/0004-app-approval-ledger.md). Overview and
 > end-to-end sequence: [app-approval-and-admin.md](../app-approval-and-admin.md).
 > Admin authentication used by every admin RPC below: [F20](F20-admin-authentication.md).
+>
+> **Status (M37 wave B, 0.29.0):** CMIS side implemented — host RPCs, auto-update,
+> admin operations, allowlist v2 compile/serve and sweepers (T265–T268, T271).
+> Not yet: the MIA sync loop, helper v2 and `mia app` (T269, T270), the legacy
+> import and mode switch (M38), `ListHosts`, stored-response idempotency for
+> admin edits (retries are refused by state instead), PII pseudonymisation
+> after retention, and signing restricted to the leader (any node signs with
+> the replicated key; the generation compare-and-set keeps bodies consistent).
 
 ## Summary
 
