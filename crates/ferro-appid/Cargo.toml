@@ -1,0 +1,21 @@
+[package]
+name        = "ferro-appid"
+description = "FerroGate — read-only binary identification for app registration (F19 §4)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish                = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror  = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+# `.note.package` descriptors are JSON (F19 §4.3).
+serde_json = { workspace = true }
+plist      = { workspace = true }

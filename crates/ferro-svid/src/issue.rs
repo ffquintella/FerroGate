@@ -213,6 +213,29 @@ impl Issuer {
         Ok(allowlist::sign(&doc, &self.secret)?)
     }
 
+    /// Sign a v2 allowlist (ADR-0004) for `host_uuid` at `generation`,
+    /// stamping this issuer's trust domain. Entries are sorted into the
+    /// canonical order; the signature uses the v2 context.
+    pub fn sign_allowlist_v2(
+        &self,
+        host_uuid: &str,
+        generation: u64,
+        entries: Vec<crate::allowlist_v2::AllowEntryV2>,
+        issued_at: i64,
+        not_after: i64,
+    ) -> Result<SignedAllowlist, crate::allowlist_v2::AllowlistV2Error> {
+        let doc = crate::allowlist_v2::AllowlistDocV2 {
+            format: crate::allowlist_v2::ALLOWLIST_V2_FORMAT,
+            trust_domain: self.trust_domain.clone(),
+            host_uuid: host_uuid.to_string(),
+            generation,
+            issued_at,
+            not_after,
+            entries,
+        };
+        crate::allowlist_v2::sign_v2(&doc, &self.secret)
+    }
+
     /// Mint an SVID in **both** profiles. `now` is the reference clock in Unix
     /// seconds.
     ///

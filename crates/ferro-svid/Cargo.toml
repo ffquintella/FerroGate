@@ -27,6 +27,8 @@ uuid       = { workspace = true }
 
 [dev-dependencies]
 ferro-svid-verify = { path = "../ferro-svid-verify" }
+# Shared F19 §4.2 vectors: `path_hash` over `ferro_appid::path_key`.
+ferro-appid       = { path = "../ferro-appid" }
 # An independent X.509 parser, so the interop test proves the X.509-SVID leaf is
 # readable by a stack that knows nothing about how we encoded it.
 # `verify` brings in the parser's own signature checker, so the interop test

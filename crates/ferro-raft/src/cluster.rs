@@ -5,8 +5,9 @@
 //! not depend on hiqlite types directly. Concretely:
 //!
 //! - Schema is created once at startup with idempotent `CREATE TABLE
-//!   IF NOT EXISTS` statements; no migration manager (the hiqlite migration
-//!   workflow requires `RustEmbed` and is overkill for two tables).
+//!   IF NOT EXISTS` statements, followed by the small ordered migration
+//!   runner in `migrations` (F19 §2) for everything added since; the hiqlite
+//!   migration workflow requires `RustEmbed` and is not used.
 //! - Writes go through the Raft leader; hiqlite's `Client` transparently
 //!   forwards from follower nodes, so callers do not need to dispatch.
 //! - Reads can be strongly consistent (leader-only) or eventually consistent;
@@ -482,6 +483,11 @@ impl Cluster {
             .await?;
         // Administrator authentication tables (F20 §3).
         self.init_admin_schema().await?;
+        // Versioned migrations: the app approval ledger (F19 §2) onwards.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        self.run_migrations(now).await?;
         Ok(())
     }
 

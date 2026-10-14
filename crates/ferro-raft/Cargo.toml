@@ -20,6 +20,8 @@ serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 anyhow      = { workspace = true }
 tracing     = { workspace = true }
+# Approval revision snapshots (F19 §2 `app_approval_revisions.before_cbor`).
+ciborium    = { workspace = true }
 # Deterministic shared peer-TLS cert derived from the cluster secret (see
 # `peer_cert`): rcgen builds the cert, ring derives the key seed via HMAC, and
 # pki-types wraps the PKCS#8 key for rcgen.

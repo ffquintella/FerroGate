@@ -19,6 +19,7 @@ members = [
     "crates/ferro-winauth",
     "crates/ferro-harden",
     "crates/ferro-machineid",
+    "crates/ferro-appid",
     "crates/ferro-sep",
     "crates/ferrogate-cli",
     "crates/ferrogate-sdk-rust",
@@ -136,6 +137,15 @@ uuid         = { version = "1", features = ["v8"] }
 # `_cmis._tcp.<domain>` SRV record to the live CMIS nodes, then fail over
 # between them. Pure-Rust async resolver (reads the platform's resolver config).
 hickory-resolver = "0.26"
+
+# Binary identification (F19 §4.3): reads app-bundle `Info.plist` files, XML
+# or binary. Pure Rust, MIT; its dependencies (quick-xml, time, indexmap,
+# base64) are already in the tree. `ferro-appid` needs the event-stream
+# reader (an explicit heap stack, no recursion) so it can bound nesting before
+# any tree exists: the stable `Value` API builds a tree whose recursive drop
+# overflows the stack on hostile nesting. That reader sits behind plist's
+# "unstable" feature, hence the exact pin; re-check the API when bumping.
+plist = { version = "=1.10.1", default-features = false, features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
 
 # misc
 parking_lot = "0.12"
