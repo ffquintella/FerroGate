@@ -1,0 +1,76 @@
+[package]
+name        = "ferrogate-tui"
+description = "FerroGate — server administration TUI (ferrogate-tui, feature F21): requests, approvals and direct adds over the pinned admin listener"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish                = false
+
+# The crate is a headless library (state machine, views, sanitiser, gRPC
+# client task) plus a thin binary that owns the terminal. Every rule lives in
+# the library so it is tested without a terminal (`ratatui::backend::TestBackend`).
+#
+# It has no database code and no dependency on `cmis` outside its tests: every
+# action is a call to the `ferrogate.admin.v1.Admin` service over the
+# SPKI-pinned hybrid-PQC admin listener (`ferro-transport`), authorised by the
+# server like any other client (F20 `AdminAuthz`).
+[lib]
+name = "ferrogate_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrogate-tui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ferro-proto     = { path = "../ferro-proto" }
+ferro-crypto    = { path = "../ferro-crypto" }
+ferro-transport = { path = "../ferro-transport" }
+# F19 §4.5 risk-flag bits (single source of truth; no I/O used).
+ferro-appid     = { path = "../ferro-appid" }
+
+tokio             = { workspace = true }
+tonic             = { workspace = true }
+anyhow            = { workspace = true }
+serde             = { workspace = true }
+toml              = { workspace = true }
+zeroize           = { workspace = true }
+uuid              = { workspace = true, features = ["v4"] }
+ratatui           = { workspace = true }
+unicode-width     = { workspace = true }
+unicode-segmentation = { workspace = true }
+static_assertions = { workspace = true }
+
+# Unix: the effective uid for the configuration trust check and the
+# `O_NOFOLLOW | O_NONBLOCK` open of the configuration and device-token files,
+# through safe wrappers (no libc calls in this crate).
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["std", "process", "fs"] }
+
+[dev-dependencies]
+# The integration tests drive the TUI against the in-process CMIS harness of
+# `crates/cmis/tests/support` (included by path) behind a real TLS admin
+# listener; these are the crates that harness needs.
+cmis          = { path = "../cmis" }
+ferro-attest  = { path = "../ferro-attest" }
+ferro-audit   = { path = "../ferro-audit" }
+ferro-raft    = { path = "../ferro-raft" }
+ferro-sep     = { path = "../ferro-sep" }
+ferro-svid    = { path = "../ferro-svid" }
+base64        = { workspace = true }
+ciborium      = { workspace = true }
+sha2          = { workspace = true }
+hex           = { workspace = true }
+p256          = { workspace = true }
+ed25519-dalek = { workspace = true }
+rcgen         = { workspace = true }
+rustls-pki-types = { workspace = true }
+proptest      = { workspace = true }
+# Holds the TLS connections of a listener that never answers (RPC deadline test).
+tokio-stream  = { workspace = true }

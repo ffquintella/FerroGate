@@ -476,6 +476,108 @@ session and a recent step-up (the CLI asks for a TOTP code when needed).
    and then fails closed. `GetAllowlist` is deprecated and will be removed in
    a later release.
 
+### Administering approvals with `ferrogate-tui` (F21)
+
+`ferrogate-tui` is a full-screen terminal UI for viewers and approvers
+(`crates/ferrogate-tui`). It runs as an unprivileged user on a CMIS node (over
+SSH) or on a workstation, and talks only to the **admin listener** over the
+hybrid-PQC TLS transport with SPKI pinning. It has no database code: every
+action is an `Admin` gRPC call authorised by CMIS exactly like the CLI's, so
+running it on a CMIS node grants nothing extra.
+
+1. **Configure** (no secrets): `$XDG_CONFIG_HOME/ferrogate/admin.toml`
+   (`~/.config/…`), else `/etc/ferrogate/admin.toml`, or `--config <path>`:
+
+   ```toml
+   endpoint          = "https://127.0.0.1:8444"
+   spki_pins         = ["<sha384-hex>"]   # required: no trust on first use
+   device_token_path = ""                 # default $XDG_STATE_HOME/ferrogate/device-token (0600)
+   refresh_secs      = 30                 # list auto-refresh (at least 5); 0 disables
+   ```
+
+   `FERROGATE_ADMIN_ENDPOINT` and `FERROGATE_ADMIN_SPKI_PIN` (comma-separated)
+   override the file. The endpoint must be `https://host:port` with an
+   **explicit port** (no path, query or user information): `https://cmis-1`
+   is refused, because without a port the transport would dial 8443, the
+   main listener, which by default presents the same certificate as the
+   admin listener. Get the pin with `ferrogate spki-pin --tls-cert
+   /etc/ferrogate/tls/cmis.crt` ([transport-tls.md](transport-tls.md)). Without
+   a pin the TUI prints these instructions and exits (status 2); an endpoint
+   that is not `https://` is refused, and so is a configuration file (or its
+   directory or any directory above it, unless sticky) that is owned by
+   someone other than you or root or is writable by group or others — it
+   decides where your password goes. The file is opened once without
+   following a symbolic link (a symlinked `admin.toml` is refused), checked
+   on the open handle and read from it (at most 64 KiB).
+   A wrong pin fails the TLS handshake before any username, password or code
+   is sent, and an endpoint that does not answer within 10 s is reported as
+   unreachable. Every call has a 30 s deadline, so a server that stops
+   answering cannot hold the TUI: lock and quit wipe the session token at
+   once and send `Logout` on a separate connection. The admin listener's optional client certificate
+   (`CMIS_ADMIN_CLIENT_CA`) is not supported by the TUI yet: on such a
+   listener use the CLI.
+2. **Sign in** with username, password and a TOTP code (FIDO2 and enrollment
+   are the tray admin client's, F22). Failures show one generic line or the
+   throttle countdown. An expired password must be changed first.
+3. **Work.** `1`–`6` switch Dashboard, Requests, Approvals, Hosts, Accounts,
+   Sessions; `?` shows the key map. Lists use server-side filters (`f`, the
+   F19 §7.5 fields of `ListAppRequests` and `ListApprovals`, validated inline:
+   dates `YYYY-MM-DD`, hash prefix 8–96 hex, host UUID, text ≤ 128) and
+   search (`/`), with paging (`n`/`p`) and order (`s`, newest or oldest
+   first). Lists and details reload after every change you make.
+   - **Approve** (`a`): safe defaults (manual each time, anchored, this user
+     only, exact path, server default expiry); auto-update is preselected only
+     on a protected path or for the same valid signer as the previous approved
+     revision. "Any user" or "Path + user only" need an extra `y`. The review
+     page shows everything; `y` sends with an idempotency key. When CMIS
+     answers `step_up_required` the TUI asks for a TOTP code and retries
+     **once** with the same key.
+   - **Deny** (`d`) with a reason code (1 `unknown_software`, 2
+     `policy_violation`, 3 `insufficient_justification`, 4 `duplicate`, 5
+     `security_risk`, 6 `other`) and an optional message (≤ 200, no personal
+     data).
+   - **Edit** (`e`, approval detail): policy, continuity, expiry, note, and
+     narrowing only; loosening continuity to "Path + user only" needs the
+     extra `y`, and the review page flags it and a switch to auto-update;
+     sent with `expected_row_version`. On `ABORTED` the TUI
+     reloads, shows what changed and asks again.
+   - **Revoke** (`x`): type the short id shown (`A-` and the **last** eight
+     characters of the approval id) and pick a reason (1
+     `no_longer_needed`, 2 `security_risk`, 3 `policy_violation`, 4
+     `replaced`, 5 `other`; 1000 is the legacy import's). **Freeze** (`z`)
+     toggles a lineage's auto-update.
+   - **Add application** (`A`, `app.direct_register`): host UUID, canonical
+     path, SHA-384 (96 hex), user, terms. The review page says whether it is
+     registered and approved in one step (default) or queued for a different
+     approver (`CMIS_ADMIN_STRICT_SOD=true`), and that the hash and path are
+     your assertion. `y` **always** asks for a fresh TOTP code, even inside
+     the step-up window; a wrong code changes nothing and the retry reuses the
+     idempotency key.
+4. **Leave.** `q` (confirm) or `Ctrl-C` logs out on the server and wipes the
+   token; `Ctrl-L` locks at once. With no key press the TUI locks itself 30 s
+   before the server idle timeout; a `session_invalid` answer returns to the
+   sign-in screen with "Session ended". Lock and exit clear the screen.
+
+Security notes: the password, TOTP codes and the session token live only in
+zeroized memory (never on disk, in the clipboard or in a log; the TUI has no
+logging). The device token is a throttle hint kept in a `0600` file and read
+only from a private regular file of at most 1 KiB, never through a symlink.
+A panic anywhere in the TUI stops it: nothing more is drawn, the session is
+ended and the screen cleared. Every
+string from a host or another administrator is rendered through
+`sanitize::display`: control characters and escape sequences (including
+OSC 52 clipboard writes and OSC 8 links) show as `\x1b`-style text, and bidi,
+zero-width and other default-ignorable characters (variation selectors,
+Hangul fillers, tag characters) as `⟨U+202E⟩`; widths are measured per
+grapheme exactly as the terminal grid is filled, so a hostile path cannot
+push text into the next column. `NO_COLOR` or `--monochrome` draws
+without colours; the minimum terminal is 80×24.
+
+Not in this release: the Hosts screen (CMIS has no `ListHosts` RPC yet),
+account and session administration (read-only lists here; use `ferrogate
+admin accounts|sessions`), bulk revocation from the lineage view, the
+password generator, Portuguese strings and `--log-file`.
+
 ## Root key rotation
 
 The composite issuance key is rotated annually in an air-gapped ceremony:
