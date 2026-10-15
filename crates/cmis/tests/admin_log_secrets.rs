@@ -54,6 +54,10 @@ async fn no_secret_reaches_the_logs() {
             .with_max_level(tracing::Level::TRACE)
             .with_writer(capture.clone())
             .with_ansi(false)
+            // The formatter's own timestamp carries a 6-digit microsecond
+            // fraction on every line, which would randomly equal a TOTP code
+            // (~1 run in 20). It is not application output, so drop it.
+            .without_time()
             .finish(),
     )
     .unwrap();
@@ -384,9 +388,19 @@ async fn no_secret_reaches_the_logs() {
             &s[..s.len().min(6)]
         );
     }
-    // TOTP codes are short; look for them only as standalone tokens.
+    // TOTP codes are short; look for them only as standalone tokens. A token
+    // is a maximal alphanumeric run, so digits inside hex or base64 material
+    // (ids, hashes, tokens) cannot match by chance, while a code logged as a
+    // value (`code=123456`, `"123456"`, `TotpCode(123456)`) still does.
     for c in &codes {
-        let standalone = logs.split(|ch: char| !ch.is_ascii_digit()).any(|w| w == c);
-        assert!(!standalone, "a TOTP code reached the logs");
+        if let Some(line) = logs.lines().find(|l| {
+            l.split(|ch: char| !ch.is_ascii_alphanumeric())
+                .any(|w| w == c)
+        }) {
+            panic!(
+                "a TOTP code reached the logs: {}",
+                line.replace(c.as_str(), "<code>")
+            );
+        }
     }
 }
