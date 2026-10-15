@@ -1326,7 +1326,7 @@ version = "0.29.0"
 dependencies = [
  "anyhow",
  "argon2",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chacha20poly1305",
  "ciborium",
  "ed25519-dalek",
@@ -2418,7 +2418,7 @@ dependencies = [
 name = "ferro-attest"
 version = "0.29.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ferro-crypto",
  "ferro-machineid",
  "ferro-sep",
@@ -2439,7 +2439,7 @@ dependencies = [
 name = "ferro-audit"
 version = "0.29.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ciborium",
  "ferro-crypto",
  "hex",
@@ -2456,7 +2456,7 @@ dependencies = [
 name = "ferro-ceremony"
 version = "0.29.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ferro-crypto",
  "ferro-tee",
  "hex",
@@ -2471,7 +2471,7 @@ dependencies = [
 name = "ferro-child-verify"
 version = "0.29.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ed25519-dalek",
  "ferro-crypto",
  "serde",
@@ -2485,7 +2485,7 @@ name = "ferro-crypto"
 version = "0.29.0"
 dependencies = [
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.1",
  "der",
  "ed25519-dalek",
  "fips204",
@@ -2580,7 +2580,7 @@ dependencies = [
 name = "ferro-svid"
 version = "0.29.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ciborium",
  "der",
  "ferro-appid",
@@ -2599,7 +2599,7 @@ dependencies = [
 name = "ferro-svid-verify"
 version = "0.29.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "der",
  "ferro-crypto",
  "hex",
@@ -2661,7 +2661,7 @@ name = "ferrogate-cli"
 version = "0.29.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cmis",
  "ferro-attest",
  "ferro-audit",
@@ -4440,7 +4440,7 @@ name = "mia"
 version = "0.29.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "ciborium",
  "cmis",
  "ed25519-dalek",
@@ -5180,7 +5180,7 @@ name = "offline-signer"
 version = "0.29.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "ferro-ceremony",
  "ferro-crypto",
  "ferro-svid",
