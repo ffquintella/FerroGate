@@ -98,7 +98,7 @@ sha1                  = "0.11"
 unicode-normalization = "0.1"
 
 # TLS stack (F01)
-rustls              = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"] }
+rustls              = { version = "0.23.46", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"] }
 rustls-post-quantum = "0.2"
 rustls-pki-types    = "1"
 x509-parser         = "0.18"
