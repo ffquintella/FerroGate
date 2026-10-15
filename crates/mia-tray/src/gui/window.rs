@@ -136,7 +136,8 @@ impl WindowApp {
 }
 
 impl eframe::App for WindowApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         while let Ok(obs) = self.obs_rx.try_recv() {
             self.obs = Some(obs);
         }
@@ -149,7 +150,7 @@ impl eframe::App for WindowApp {
         self.logs.poll(ctx, &self.shared, self.tab == Tab::Logs);
 
         let lang = self.shared.lang;
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+        egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 for tab in Tab::ALL {
                     ui.selectable_value(&mut self.tab, tab, tab.title().text(lang));
@@ -157,7 +158,7 @@ impl eframe::App for WindowApp {
             });
         });
         let mut intent = None;
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Status => intent = super::status_view::ui(ui, &self.shared, self.obs.as_ref()),
             Tab::Recovery => intent = self.recovery.ui(ui, &self.shared, self.obs.as_ref()),
             Tab::Setup => self.setup.ui(ui, &self.shared, self.obs.as_ref()),
