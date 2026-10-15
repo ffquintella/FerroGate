@@ -277,7 +277,9 @@ fn tpm_evidence_adapter_quote_is_accepted() {
     assert_eq!(accepted.policy_id.as_str(), "swtpm-adapter-test");
 
     // Phase 4: the adapter's restricted AIK signs the composite key bytes.
-    let sig = evidence.sign_aik(b"composite-public-key-bytes").expect("adapter sign");
+    let sig = evidence
+        .sign_aik(b"composite-public-key-bytes")
+        .expect("adapter sign");
     assert!(!sig.is_empty());
 }
 

@@ -265,7 +265,14 @@ mod tests {
         )
         .unwrap();
         let mut legacy = Vec::new();
-        ciborium::into_writer(&LegacyEntry { uid: 1001, bin_sha: sha }, &mut legacy).unwrap();
+        ciborium::into_writer(
+            &LegacyEntry {
+                uid: 1001,
+                bin_sha: sha,
+            },
+            &mut legacy,
+        )
+        .unwrap();
         assert_eq!(new, legacy, "Some(uid) must match the legacy u32 encoding");
     }
 
