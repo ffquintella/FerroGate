@@ -515,6 +515,76 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
         &new_root,
         &cons_path,
     ));
+
+    // T291: the daemon's forwarder spools an event and delivers it through
+    // the same RPC, host-signed with the host credentials; CMIS appends it.
+    let spool_dir =
+        std::env::temp_dir().join(format!("mia-e2e-audit-spool-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&spool_dir);
+    let _cleanup = RemoveOnDrop(spool_dir.clone());
+    let creds = mia::host_api::CredentialSlot::new();
+    creds.set(mia::host_api::HostCredentials::new(
+        Arc::new(machine_key),
+        svid.jws.clone(),
+        &svid.spiffe_id,
+        svid.expires_at,
+    ));
+    let (tx, rx) = tokio::sync::mpsc::channel(mia::audit_forward::CHANNEL_CAPACITY);
+    let forwarder = mia::audit_forward::spawn(
+        rx,
+        Some(mia::audit_forward::Forwarding {
+            api: Arc::new(mia::audit_forward::ChannelAuditApi::new(client.clone())),
+            creds,
+        }),
+        &spool_dir.join("audit-spool.jsonl"),
+        mia::audit_forward::ForwarderConfig::default(),
+    );
+    tx.send(AuditEvent::LocalDenied {
+        pid: 77,
+        uid: 1000,
+        bin_sha: Hash384([0xCC; 48]),
+        reason: "not_allowlisted".into(),
+    })
+    .await
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while forwarder.stats().forwarded == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the forwarder did not deliver: {:?}",
+            forwarder.stats()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(forwarder.stats().pending, 0);
+    let latest = client
+        .latest_sth(LatestSthRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .sth
+        .expect("server returned an STH");
+    let latest = verify_sth(
+        &ferro_audit::SignedTreeHead {
+            body_cbor: latest.body_cbor,
+            signer_kid: latest.signer_kid,
+            signature_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(&latest.signature),
+        },
+        &audit_pk,
+    )
+    .expect("STH must verify under audit publisher key");
+    assert_eq!(latest.tree_size, cons.new_size + 1);
+    forwarder.abort();
+}
+
+/// Removes a scratch directory when dropped, a failed test included.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 // --- F10: bump_epoch forces full re-attestation -----------------------------

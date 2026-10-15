@@ -1517,6 +1517,17 @@ impl Config {
         )
     }
 
+    /// The audit forwarder's spool (T291): `audit-spool[-<env>].jsonl` in the
+    /// daemon's state directory (root-owned `0600`). Not configurable.
+    #[must_use]
+    pub fn audit_spool_path(&self) -> PathBuf {
+        let name = match self.environment() {
+            Some(env) => format!("audit-spool-{env}.jsonl"),
+            None => "audit-spool.jsonl".to_string(),
+        };
+        crate::credstore::state_dir().join(name)
+    }
+
     /// The allowlist-propose interval; default
     /// [`DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS`], clamped to ≥ 1s.
     #[must_use]
@@ -2192,6 +2203,18 @@ mod tests {
                 (k == "FERROGATE_HELPER_ENABLE").then(|| "maybe".to_string())
             })
             .is_err());
+    }
+
+    #[test]
+    fn the_audit_spool_lives_in_the_state_directory_per_environment() {
+        let state = crate::credstore::state_dir();
+        let default = Config::from_toml("").unwrap();
+        assert_eq!(default.audit_spool_path(), state.join("audit-spool.jsonl"));
+        let named = Config::default().with_environment("prod");
+        assert_eq!(
+            named.audit_spool_path(),
+            state.join("audit-spool-prod.jsonl")
+        );
     }
 
     #[test]

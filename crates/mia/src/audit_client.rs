@@ -14,15 +14,17 @@
 //! over their rate limit. Each call signs a fresh document with a new random
 //! nonce, so a retry after `rate_limited` is a new call, not a replay.
 //!
-//! Local helper-API events (`LocalGrant`, `LocalDenied`) flow here: the
-//! [`crate::helper`] server (F08) pushes one event per request onto an `mpsc`
-//! channel, and a forwarder task drains it through [`forward`] to CMIS,
-//! decoupling token-minting latency from the audit network path.
+//! The daemon's events (`LocalGrant`, `LocalDenied`, `AllowlistSync*`) reach
+//! CMIS through [`crate::audit_forward`] (T291): the helper server (F08) and
+//! the allowlist sync push them onto an `mpsc` channel, and the forwarder
+//! logs, spools (`0600`, state directory) and sends each one, signed here by
+//! [`signed_request_now`], so token minting never waits on the network.
 //!
 //! One-shot CLI commands have no daemon channel to push onto. They record
 //! their events with [`append_local`] instead: an append-only JSON-lines
 //! journal beside the file they changed (today: `ConfigChanged` from
-//! `mia setup`, feature F18). Forwarding that journal to CMIS is a follow-up.
+//! `mia setup`, feature F18). Forwarding that journal to CMIS is a follow-up
+//! (T226).
 
 use ferro_audit::{event, AuditEvent, EventCodecError};
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
@@ -96,21 +98,30 @@ pub fn signed_request(
     })
 }
 
-/// Forward `event` to CMIS, host-signed by `signer`, and return the leaf
-/// index it was appended at.
-pub async fn forward(
-    client: &mut MachineIdentityClient<Channel>,
-    event: &AuditEvent,
+/// [`signed_request`] issued now under a fresh random nonce: what every
+/// forward sends, so a retry is a new call, never a replay.
+pub fn signed_request_now(
+    event_cbor: Vec<u8>,
     signer: &HostProofSigner<'_>,
-) -> Result<u64, AuditForwardError> {
+) -> Result<AppendAuditRequest, AuditForwardError> {
     use rand_core::{Rng as _, UnwrapErr};
-    let bytes = event::encode(event)?;
     let mut nonce = [0u8; host_call::NONCE_LEN];
     UnwrapErr(getrandom::SysRng).fill_bytes(&mut nonce);
     let issued_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    let request = signed_request(bytes, signer, issued_at, nonce)?;
+    signed_request(event_cbor, signer, issued_at, nonce)
+}
+
+/// Forward `event` to CMIS, host-signed by `signer`, and return the leaf
+/// index it was appended at. One attempt, no spool: the daemon goes through
+/// [`crate::audit_forward`] instead.
+pub async fn forward(
+    client: &mut MachineIdentityClient<Channel>,
+    event: &AuditEvent,
+    signer: &HostProofSigner<'_>,
+) -> Result<u64, AuditForwardError> {
+    let request = signed_request_now(event::encode(event)?, signer)?;
     let resp = client.append_audit_event(request).await?.into_inner();
     Ok(resp.leaf_index)
 }

@@ -53,6 +53,10 @@ pub mod allowlist_sync;
 pub mod atomic_file;
 
 pub mod audit_client;
+
+/// The daemon's audit forwarder (T291): log, spool and forward every audit
+/// event to CMIS `AppendAuditEvent`.
+pub mod audit_forward;
 pub mod client;
 
 /// Host-authenticated CMIS calls (feature F19 §7.1) and the credentials that
