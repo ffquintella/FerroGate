@@ -39,6 +39,10 @@ use ferro_proto::admin_v1::{
     RevokeApprovalResponse, SetLineageAutoUpdateFrozenRequest, SetLineageAutoUpdateFrozenResponse,
     UpdateApprovalRequest, UpdateApprovalResponse,
 };
+use ferro_proto::admin_v1::{
+    GetAllowlistModeRequest, GetAllowlistModeResponse, ImportLegacyAllowlistsRequest,
+    ImportLegacyAllowlistsResponse, SetAllowlistModeRequest, SetAllowlistModeResponse,
+};
 use ferro_raft::admin::{
     AdminAccountRow, EnrollmentCompletion, EnrollmentTokenRow, MfaVerification, PasswordUpdate,
     ACCOUNT_ACTIVE, ACCOUNT_DISABLED, ACCOUNT_PENDING, TOKEN_BOOTSTRAP, TOKEN_ENROLL, TOKEN_RESET,
@@ -681,6 +685,29 @@ impl Admin for AdminSvc {
         request: Request<AdminRegisterApplicationRequest>,
     ) -> Result<Response<AdminRegisterApplicationResponse>, Status> {
         super::apps::admin_register_application(&self.authz, request).await
+    }
+
+    // ---- F19 §11 allowlist migration (see `super::migration`) ----
+
+    async fn get_allowlist_mode(
+        &self,
+        request: Request<GetAllowlistModeRequest>,
+    ) -> Result<Response<GetAllowlistModeResponse>, Status> {
+        super::migration::get_allowlist_mode(&self.authz, request).await
+    }
+
+    async fn set_allowlist_mode(
+        &self,
+        request: Request<SetAllowlistModeRequest>,
+    ) -> Result<Response<SetAllowlistModeResponse>, Status> {
+        super::migration::set_allowlist_mode(&self.authz, request).await
+    }
+
+    async fn import_legacy_allowlists(
+        &self,
+        request: Request<ImportLegacyAllowlistsRequest>,
+    ) -> Result<Response<ImportLegacyAllowlistsResponse>, Status> {
+        super::migration::import_legacy_allowlists(&self.authz, request).await
     }
 
     async fn begin_login(

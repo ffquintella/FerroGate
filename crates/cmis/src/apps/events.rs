@@ -231,3 +231,47 @@ pub fn compiled(
         entries_digest: Hash384(digest),
     }
 }
+
+/// `AllowlistImported`: one host's legacy body gained `approvals_created`
+/// `legacy_import` approvals (F19 §11 step 4).
+#[must_use]
+pub fn imported(host_uuid: &str, approvals_created: u32, admin_id: &str) -> AuditEvent {
+    AuditEvent::AllowlistImported {
+        host_uuid: host_uuid.to_string(),
+        approvals_created,
+        admin_id: admin_id.to_string(),
+    }
+}
+
+/// What a mode switch changed, for `AllowlistModeChanged` (F19 §11 steps 5
+/// and 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModeSwitchCounts {
+    /// Live approvals the legacy bodies do not carry (switch to `legacy`).
+    pub approvals_not_reflected: u64,
+    /// Legacy imports no longer live that the legacy bodies admit again
+    /// (switch to `legacy`).
+    pub imports_readmitted: u64,
+    /// Legacy entries left without an approval (switch to `approvals`).
+    pub entries_not_imported: u64,
+}
+
+/// `AllowlistModeChanged`.
+#[must_use]
+pub fn mode_changed(
+    old_mode: &str,
+    new_mode: &str,
+    admin_id: &str,
+    session_ref: &str,
+    counts: ModeSwitchCounts,
+) -> AuditEvent {
+    AuditEvent::AllowlistModeChanged {
+        old_mode: old_mode.to_string(),
+        new_mode: new_mode.to_string(),
+        admin_id: admin_id.to_string(),
+        session_ref: session_ref.to_string(),
+        approvals_not_reflected: counts.approvals_not_reflected,
+        imports_readmitted: counts.imports_readmitted,
+        entries_not_imported: counts.entries_not_imported,
+    }
+}

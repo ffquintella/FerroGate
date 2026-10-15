@@ -419,6 +419,7 @@ MFA.
 | legacy `RevokeSvid` (S), `RevokeHost` (S) | `svid.revoke` | | | | ✓ |
 | legacy `BumpEpoch` (S) | `policy.epoch_bump` | | | | ✓ |
 | `SetAllowlistMode` (S), `ImportLegacyAllowlists` (S) (F19 §11) | `settings.allowlist_mode`, `allowlist.import` | | | | ✓ |
+| `GetAllowlistMode` (F19 §11; read-only, lets every client pick the legacy or approvals flow) | any authenticated session | ✓ | ✓ | ✓ | ✓ |
 | `MachineIdentity` host methods (`SubmitAppRequest`, `GetAppRequestStatus`, `SyncAllowlist`, `ProposeAllowlist`, `AppendAuditEvent`) | host proof (F19 §7.1) | | | | |
 | `Attest`, `FetchSVID`, `Rotate`, `JWKS`, `GetEnrollmentKey`, `GetAllowlist` (legacy), `Health`, `LatestSth`, `InclusionProof`, `ConsistencyProof` | public (unchanged) | | | | |
 
@@ -618,6 +619,7 @@ service Admin {
   rpc BeginAddFactor (BeginAddFactorRequest) returns (BeginAddFactorResponse);
   rpc CompleteAddFactor (CompleteAddFactorRequest) returns (CompleteAddFactorResponse);
   rpc RemoveFactor (RemoveFactorRequest) returns (RemoveFactorResponse);
+  rpc GetAllowlistMode (GetAllowlistModeRequest) returns (GetAllowlistModeResponse);
   rpc SetAllowlistMode (SetAllowlistModeRequest) returns (SetAllowlistModeResponse);
   rpc ImportLegacyAllowlists (ImportLegacyAllowlistsRequest) returns (ImportLegacyAllowlistsResponse);
   // F19 app-management RPCs: ListAppRequests, GetAppRequest, ApproveAppRequest, DenyAppRequest,

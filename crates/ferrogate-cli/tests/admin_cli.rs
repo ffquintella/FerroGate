@@ -769,3 +769,284 @@ async fn apps_register_list_revoke_and_show_the_history() {
         "{stdout}"
     );
 }
+
+/// F19 §11 through the CLI (M38): dry run, import (idempotent), the switch
+/// to approvals (refused until imported), `allowlist add|remove` mapped onto
+/// the approval RPCs, the read-only legacy writes, and the confirmed
+/// rollback.
+#[tokio::test]
+async fn migrate_allowlists_switch_modes_and_map_the_allowlist_commands() {
+    let cmis = spawn_cmis("migrate").await;
+    let secret = cmis.bootstrap().await;
+    let session = cmis.dir.join("session");
+    cmis.login(&secret, &session).await;
+    let s = session.to_str().unwrap();
+    let host = "33333333-3333-8333-8333-333333333333";
+    let sha = hex::encode([0xCC; 48]);
+    let sha2 = hex::encode([0xDD; 48]);
+
+    // Typos are refused before any sign-in (no stdin needed).
+    let (ok, _, stderr) = cmis
+        .run(&["admin", "set-allowlist-mode", "sideways"], &[])
+        .await;
+    assert!(!ok && stderr.contains("unknown allowlist mode"), "{stderr}");
+    let (ok, _, stderr) = cmis
+        .run(&["admin", "migrate-allowlists", "--force"], &[])
+        .await;
+    assert!(!ok && stderr.contains("unknown option --force"), "{stderr}");
+
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "allowlist",
+                "set",
+                "--host",
+                host,
+                "--entry",
+                &format!("1000:{sha}"),
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "set: {stderr}");
+
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "migrate-allowlists",
+                "--dry-run",
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "dry run: {stderr}");
+    assert!(stdout.contains("dry run: nothing was written"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("host {host}: 1 to create")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("legacy, no expiry"), "{stdout}");
+
+    // Not imported yet: the switch is refused.
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "set-allowlist-mode",
+                "approvals",
+            ],
+            &[],
+        )
+        .await;
+    assert!(!ok && stderr.contains("migrate-allowlists"), "{stderr}");
+
+    let (ok, stdout, stderr) = cmis
+        .run(&["--session-file", s, "admin", "migrate-allowlists"], &[])
+        .await;
+    assert!(ok, "import: {stderr}");
+    assert!(stdout.contains("1 approvals created"), "{stdout}");
+    let (ok, stdout, _) = cmis
+        .run(&["--session-file", s, "admin", "migrate-allowlists"], &[])
+        .await;
+    assert!(
+        ok && stdout.contains("0 approvals created, 1 already imported"),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "set-allowlist-mode",
+                "approvals",
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "switch: {stderr}");
+    assert!(
+        stdout.contains("allowlist mode: legacy -> approvals"),
+        "{stdout}"
+    );
+    let (ok, stdout, _) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "set-allowlist-mode",
+                "approvals",
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok && stdout.contains("already approvals"), "{stdout}");
+
+    // The legacy writes are read-only now, with a hint.
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "allowlist",
+                "set",
+                "--host",
+                host,
+                "--entry",
+                &format!("1000:{sha}"),
+            ],
+            &[],
+        )
+        .await;
+    assert!(!ok && stderr.contains("approvals mode"), "{stderr}");
+
+    // `add` registers one binary (fresh TOTP code); `remove` revokes.
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "allowlist",
+                "add",
+                "--host",
+                host,
+                "--entry",
+                &format!("1001:{sha2}"),
+            ],
+            &[],
+        )
+        .await;
+    assert!(!ok && stderr.contains("needs --path"), "{stderr}");
+    cmis.clock.advance(30);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "allowlist",
+                "add",
+                "--host",
+                host,
+                "--entry",
+                &format!("1001:{sha2}"),
+                "--path",
+                "/opt/tool/bin/tool",
+                "--platform",
+                "linux",
+                "--user",
+                "bob",
+                "--any-path",
+            ],
+            &[&cmis.code(&secret)],
+        )
+        .await;
+    assert!(ok, "add: {stderr}");
+    assert!(stdout.contains("approval: "), "{stdout}");
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "allowlist",
+                "remove",
+                "--host",
+                host,
+                "--uid",
+                "1000",
+            ],
+            &[],
+        )
+        .await;
+    assert!(!ok && stderr.contains("--reason-code"), "{stderr}");
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "allowlist",
+                "remove",
+                "--host",
+                host,
+                "--uid",
+                "1000",
+                "--reason-code",
+                "3",
+            ],
+            &[],
+        )
+        .await;
+    assert!(
+        !ok && stderr.contains("--yes"),
+        "no terminal, no --yes: {stderr}"
+    );
+    assert!(stdout.contains("approvals to revoke"), "{stdout}");
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "allowlist",
+                "remove",
+                "--host",
+                host,
+                "--uid",
+                "1000",
+                "--reason-code",
+                "3",
+                "--yes",
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "remove: {stderr}");
+    assert_eq!(stdout.matches("revoked approval").count(), 1, "{stdout}");
+
+    // A rollback shows what changes and needs confirmation (--yes without a
+    // terminal).
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &["--session-file", s, "admin", "set-allowlist-mode", "legacy"],
+            &[],
+        )
+        .await;
+    assert!(!ok && stderr.contains("--yes"), "{stderr}");
+    assert!(
+        stdout.contains("1 approval(s) created since the switch")
+            && stdout.contains("1 legacy import(s) revoked or expired"),
+        "{stdout}"
+    );
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "set-allowlist-mode",
+                "legacy",
+                "--yes",
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "rollback: {stderr}");
+    assert!(
+        stdout.contains("allowlist mode: approvals -> legacy"),
+        "{stdout}"
+    );
+
+    // The preserved legacy body is served again.
+    let (ok, stdout, _) = cmis.run(&["allowlist", "show", "--host", host], &[]).await;
+    assert!(
+        ok && stdout.contains(&sha) && stdout.contains("uid=1000"),
+        "{stdout}"
+    );
+}

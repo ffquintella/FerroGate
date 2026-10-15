@@ -63,6 +63,16 @@ service Admin {
   rpc RevokeApproval (RevokeApprovalRequest) returns (RevokeApprovalResponse);
   rpc SetLineageAutoUpdateFrozen (SetLineageAutoUpdateFrozenRequest) returns (SetLineageAutoUpdateFrozenResponse);
   rpc AdminRegisterApplication (AdminRegisterApplicationRequest) returns (AdminRegisterApplicationResponse);
+
+  // ---- Allowlist migration (F19 §11) ----
+  // GetAllowlistMode: any session. SetAllowlistMode needs
+  // settings.allowlist_mode and ImportLegacyAllowlists allowlist.import
+  // (platform operators), both with a recent step-up. A dry run or a switch
+  // to the mode already in force writes and audits nothing beyond the
+  // layer's AdminCallAuthorized.
+  rpc GetAllowlistMode (GetAllowlistModeRequest) returns (GetAllowlistModeResponse);
+  rpc SetAllowlistMode (SetAllowlistModeRequest) returns (SetAllowlistModeResponse);
+  rpc ImportLegacyAllowlists (ImportLegacyAllowlistsRequest) returns (ImportLegacyAllowlistsResponse);
 }
 
 // Client kind: 1 tui, 2 tray, 3 cli.
@@ -614,4 +624,94 @@ message AdminRegisterApplicationResponse {
   bool queued = 3;                  // strict SoD: waits for another approver
   bool deduplicated = 4;            // an active approval already covered it
   uint64 allowlist_generation = 5;
+}
+
+// ---- Allowlist migration (F19 §11) ----
+//
+// Mode codes: 1 legacy (hand-provisioned v1 allowlists), 2 approvals (the
+// F19 ledger). In approvals mode SetAllowlist and DeleteAllowlist answer
+// FAILED_PRECONDITION `mode_approvals` and the legacy bodies stay read-only
+// for a rollback.
+
+message GetAllowlistModeRequest {}
+message GetAllowlistModeResponse {
+  uint32 mode = 1;
+  bool legacy_get_allowlist = 2;    // CMIS_LEGACY_GETALLOWLIST on this node
+}
+
+// Switching to approvals (2) is refused with FAILED_PRECONDITION
+// `import_stale` while a legacy import is still open although its entry has
+// left the legacy body (run ImportLegacyAllowlists, which revokes it; no
+// override), and with `import_incomplete` while a legacy entry has no
+// approval, unless `allow_unimported`. Switching back to legacy (1) is refused with
+// FAILED_PRECONDITION `confirmation_required` unless `confirm_rollback`:
+// call with `dry_run` first to show the counts below to the operator.
+message SetAllowlistModeRequest {
+  string idempotency_key = 1;       // <= 128, optional
+  uint32 mode = 2;                  // required: 1 legacy, 2 approvals
+  bool dry_run = 3;                 // report only; nothing is written
+  bool confirm_rollback = 4;
+  bool allow_unimported = 5;
+}
+message SetAllowlistModeResponse {
+  uint32 previous_mode = 1;
+  uint32 mode = 2;                  // the mode in force after the call
+  bool changed = 3;                 // false for a dry run or the same mode
+  // To legacy: live approvals other than legacy imports (in practice the
+  // approvals created since the switch) that the preserved legacy bodies do
+  // not carry; they stop admitting callers.
+  uint64 approvals_not_reflected = 4;
+  // To legacy: legacy imports revoked or expired since the import that the
+  // legacy bodies admit again.
+  uint64 imports_readmitted = 5;
+  // To approvals: legacy entries without an approval, and their hosts
+  // (skipped bodies count as hosts).
+  uint64 entries_not_imported = 6;
+  uint32 hosts_not_imported = 7;
+  // To approvals: open legacy imports whose entry is no longer in the
+  // legacy body (or whose body was deleted or does not decode).
+  uint64 stale_imports = 8;
+}
+
+// One legacy entry of the import report: imported as an any-path,
+// manual-each-time approval without expiry ("legacy, no expiry").
+message LegacyImportEntry {
+  optional uint32 uid = 1;          // absent: any user
+  string bin_sha = 2;               // lowercase hex SHA-384 or "*"
+  bool already_imported = 3;
+  bool revoked = 4;                 // its import was revoked: never recreated
+}
+// An import makes the ledger follow the legacy bodies: it creates the
+// missing approvals and revokes (reason code 1000) the open imports whose
+// entry left the body, so a removed binary cannot come back in approvals mode.
+message LegacyImportHost {
+  string host_uuid = 1;
+  uint32 entries_to_create = 2;     // dry run: would be created
+  uint32 entries_already_imported = 3;
+  uint32 approvals_created = 4;     // import: created by this call
+  string skipped = 5;               // "undecodable", "not_a_host_uuid"; empty: imported
+  repeated LegacyImportEntry entries = 6;
+  uint64 allowlist_generation = 7;  // import: after the call (0: unchanged)
+  uint32 stale_imports = 8;         // dry run: would be revoked; import: still open (body unreadable)
+  uint32 imports_revoked = 9;       // import: stale imports revoked by this call
+  uint32 entries_revoked = 10;      // entries of the body whose import was revoked earlier
+}
+message ImportLegacyAllowlistsRequest {
+  string idempotency_key = 1;       // <= 128, optional
+  bool dry_run = 2;
+}
+// Hosts and entries are listed up to a bound (`hosts_truncated`,
+// `entries_truncated`); the totals are always complete. Re-running an import
+// creates and revokes nothing new.
+message ImportLegacyAllowlistsResponse {
+  bool dry_run = 1;
+  repeated LegacyImportHost hosts = 2;
+  uint64 approvals_created = 3;
+  uint64 entries_to_create = 4;
+  uint64 entries_already_imported = 5;
+  uint32 hosts_skipped = 6;
+  bool entries_truncated = 7;
+  uint64 stale_imports = 8;         // dry run: would be revoked; import: left open (unreadable bodies)
+  uint64 imports_revoked = 9;
+  bool hosts_truncated = 10;
 }

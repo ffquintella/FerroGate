@@ -336,6 +336,12 @@ signs them with the enrollment key.
   stamps a validity window (default 96 h via `CMIS_ALLOWLIST_TTL_SECS`, floored
   at 96 h and capped at 30 days); re-issue rather than
   mint long-lived lists. Full workflow: [allowlist-provisioning.md](allowlist-provisioning.md).
+- **In `approvals` mode** (after the migration below) these legacy bodies are
+  read-only: `SetAllowlist` and `DeleteAllowlist` answer
+  `FAILED_PRECONDITION mode_approvals`, `ferrogate allowlist add` registers
+  one binary as an approval and `ferrogate allowlist remove` revokes the
+  matching approvals. `GetAllowlist` then serves the lossy-safe v1 compile of
+  the approvals while `CMIS_LEGACY_GETALLOWLIST` is on.
 
 ## Application approvals (F19)
 
@@ -345,12 +351,16 @@ replaces or removes an approval: approvals end only by expiry or an
 administrator (ADR-0004).
 
 - **Mode.** The replicated setting `cmis_settings.allowlist_mode` is `legacy`
-  until the M38 switch (`ferrogate admin set-allowlist-mode approvals`, with
-  the legacy import). In `legacy` mode `SubmitAppRequest` answers
-  `FAILED_PRECONDITION mode_legacy` (MIA keeps the request queued) and
-  `SyncAllowlist` serves the host's hand-provisioned v1 entries as a v2 body,
-  so upgraded agents can already sync every 5 minutes. In `approvals` mode the
-  v2 body is compiled from the host's active approvals.
+  until a platform operator switches it (`ferrogate admin set-allowlist-mode
+  approvals`, after the legacy import; runbook below). In `legacy` mode
+  `SubmitAppRequest` answers `FAILED_PRECONDITION mode_legacy` (MIA keeps the
+  request queued) and `SyncAllowlist` serves the host's hand-provisioned v1
+  entries as a v2 body, so upgraded agents can already sync every 5 minutes.
+  In `approvals` mode the v2 body is compiled from the host's active
+  approvals, the legacy allowlist writes are refused (`mode_approvals`), and
+  `ProposeAllowlist` from a pre-F19 agent records one `observed` request per
+  new entry instead of adopting or queuing the set. Any administrator
+  session can read the mode (`GetAllowlistMode`).
 - **Host RPCs.** All three need the host proof (SVID, `cnf.jkt`, machine-key
   signature, ±300 s). Budgets per host and node: `CMIS_APP_SUBMIT_MAX_PER_HOUR`
   (30; a retry of a recorded request is free), `CMIS_APP_STATUS_MAX_PER_HOUR`
@@ -390,6 +400,81 @@ administrator (ADR-0004).
   user names, SIDs, paths or messages); user names, SIDs and paths stay in the
   ledger, readable by viewers and approvers (F19 §10). Store failures answer
   `UNAVAILABLE store_unavailable` and audit nothing.
+
+### Migrating legacy allowlists to approvals (runbook)
+
+F19 §11. The migration is reversible until the legacy bodies are deleted, which this
+release never does. Both commands need a `ferrogate-platform-operators`
+session and a recent step-up (the CLI asks for a TOTP code when needed).
+
+1. **Prerequisites.** Every CMIS node runs this release (the mode is
+   replicated; an older node would ignore it). F20 administrator accounts are
+   in place.
+2. **Upgrade the MIA fleet** and turn on `allowlist.sync = true`
+   ([mia.md](mia.md)). Agents that are not upgraded keep using `GetAllowlist`
+   (v1); they keep working through the switch with the limits in step 6.
+3. **Dry run.** `ferrogate admin migrate-allowlists --dry-run` lists, per
+   host, the entries that would become approvals ("legacy, no expiry") and
+   the ones already imported, and writes nothing. A body stored under a key
+   that is not a host UUID, or that does not decode, is reported as
+   `skipped` and is never imported: fix or delete it while still in
+   `legacy` mode.
+4. **Import.** `ferrogate admin migrate-allowlists` creates, for each legacy
+   entry, an `ACTIVE` approval with origin `legacy_import`, any path, manual
+   updates and no expiry, with the uid and the `*` wildcard exactly as
+   stored. The `host_allowlists` rows are not changed. One
+   `AllowlistImported` event per host that gained approvals; re-running
+   creates nothing new, and an import revoked later is never recreated. The
+   import keeps the ledger in step with the legacy bodies: entries added to a
+   body after an earlier run (still `legacy` mode) are imported by the next
+   run, and an import whose entry was removed from its body — or whose body
+   was deleted — is **revoked** (reason code 1000, one `ApprovalRevoked`
+   event each), so a binary removed in `legacy` mode cannot come back after
+   the switch. An entry removed and then added again stays revoked; register
+   it with `ferrogate admin apps register` if it is still wanted. If the
+   store fails part-way the command answers `UNAVAILABLE`: hosts already
+   handled stay handled and audited, so simply re-run it.
+5. **Review** the imported approvals: `ferrogate admin apps approvals
+   --state active` (or the `legacy_only` filter of `ListApprovals`). Narrow or
+   revoke wildcards (`*`, any user) you no longer want, and plan expiries:
+   legacy imports have none.
+6. **Switch.** `ferrogate admin set-allowlist-mode approvals`. CMIS refuses
+   with `FAILED_PRECONDITION import_stale` while an import whose entry left
+   its legacy body is still open (re-run the import; there is no override),
+   and with `import_incomplete` while a legacy entry has no approval or a
+   body was skipped; `--allow-unimported` overrides the latter after a
+   warning (those callers are denied in `approvals` mode). Legacy writes
+   check the mode inside their own transaction, so none lands after the
+   switch, and the switch commits only if no legacy body changed since its
+   checks (`ABORTED concurrent_change` otherwise: re-run the import, then
+   the switch). The switch is
+   audited as `AllowlistModeChanged`; switching to the mode in force changes
+   nothing and is not audited. From now on:
+   - upgraded agents sync the approvals within one interval;
+   - old agents fetch `GetAllowlist`, compiled **lossy-safe**: only approvals
+     they can enforce — any path, and a Unix uid, any user or a legacy
+     import, valid until the document's `not_after` — are included; an
+     approval with an exact path, a Windows SID or a nearer expiry is
+     omitted, so that application is denied on old agents only;
+   - `ferrogate allowlist set|delete|approve` are refused; `add` and `remove`
+     map onto direct registration and revocation (`remove` lists the
+     matches and asks; `--yes` when not on a terminal); pre-F19 proposals become
+     `observed` requests (an approver must choose an any-path scope, since
+     the path is unknown) and are never adopted.
+7. **Rollback** (if needed): `ferrogate admin set-allowlist-mode legacy`. The
+   CLI first shows how many live approvals other than legacy imports (in
+   practice those created since the switch) the preserved legacy bodies do
+   not carry — their callers are denied — and how many revoked or expired
+   legacy imports the legacy bodies admit again, then asks for confirmation
+   (`--yes` when not on a terminal; the RPC itself needs
+   `confirm_rollback`). The approvals stay in the ledger; switching to
+   `approvals` again restores them.
+8. **Retire v1.** Once no pre-F19 agent remains (`GetAllowlist` traffic in the
+   logs), set `CMIS_LEGACY_GETALLOWLIST=off` on every node. `GetAllowlist`
+   then answers `FAILED_PRECONDITION legacy_getallowlist_disabled` in both
+   modes; an old agent keeps its current file until that file's `not_after`
+   and then fails closed. `GetAllowlist` is deprecated and will be removed in
+   a later release.
 
 ## Root key rotation
 

@@ -40,17 +40,25 @@ service MachineIdentity {
   // `SignedAllowlist` bytes, or empty when none is stored. Unauthenticated: the
   // body is integrity-protected by its signature and is not secret, and a host
   // can be provisioned before it has attested (no SPIFFE id required).
+  // In `approvals` mode (F19 §6.4) the body is the lossy-safe v1 compile of
+  // the host's live approvals (any-path approvals of a Unix or any user and
+  // legacy imports, unexpired until the document's `not_after`), signed under
+  // the same context; empty only for a host nothing is known about.
+  // Deprecated: refused with FAILED_PRECONDITION
+  // `legacy_getallowlist_disabled` while CMIS_LEGACY_GETALLOWLIST is off.
   rpc GetAllowlist (GetAllowlistRequest) returns (GetAllowlistResponse);
 
   // Admin RPC: store or replace the caller allowlist for a host. CMIS stamps
   // the issuer trust domain and the validity window, signs the supplied entries
   // with the enrollment key (context `ferrogate-allowlist-v1`), and persists the
   // signed body. Requires an administrator session with
-  // `legacy.allowlist.write` and a fresh step-up (F20).
+  // `legacy.allowlist.write` and a fresh step-up (F20). Refused with
+  // FAILED_PRECONDITION `mode_approvals` in `approvals` mode (F19 §11).
   rpc SetAllowlist (SetAllowlistRequest) returns (SetAllowlistResponse);
 
   // Admin RPC: delete a host's stored allowlist. Requires an administrator
-  // session with `legacy.allowlist.write` and a fresh step-up (F20).
+  // session with `legacy.allowlist.write` and a fresh step-up (F20). Refused
+  // with FAILED_PRECONDITION `mode_approvals` in `approvals` mode (F19 §11).
   rpc DeleteAllowlist (DeleteAllowlistRequest) returns (DeleteAllowlistResponse);
 
   // Admin RPC: enumerate the host UUIDs that have a stored allowlist, with
@@ -69,6 +77,9 @@ service MachineIdentity {
   // for the host and policy permitting, CMIS signs and stores it immediately
   // (first-use bootstrap, TOFU); otherwise it queues the proposal for operator
   // review. Unlike the admin RPCs this is authenticated *in band* by the SVID.
+  // In `approvals` mode (F19 §11 step 5) nothing is adopted or queued as a
+  // proposal: each new entry becomes an `observed` app request (PENDING when
+  // any entry has an open request, UNCHANGED otherwise).
   rpc ProposeAllowlist (ProposeAllowlistRequest) returns (ProposeAllowlistResponse);
 
   // Admin RPC: enumerate pending allowlist proposals awaiting operator review,

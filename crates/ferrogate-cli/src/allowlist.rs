@@ -24,9 +24,20 @@
 //! A host is named by its EK-derived UUID. Supply it directly with `--host`, or
 //! let the CLI derive it from the EK certificate (`--ek-cert <pem>`) or the EK
 //! certificate's SHA-384 (`--ek-sha384 <hex>`).
+//!
+//! **Approvals mode (F19 §11 step 5).** Once CMIS runs in `approvals` mode
+//! (`GetAllowlistMode`) the legacy bodies are read-only: `add` becomes a
+//! direct registration (`AdminRegisterApplication`, one entry, a fresh TOTP
+//! code, the binary's `--path` and `--platform` on the host) and `remove`
+//! revokes the matching approvals (`ListApprovals` + `RevokeApproval`, a
+//! `--reason-code`). `set`, `delete` and `approve` are refused by CMIS
+//! (`mode_approvals`) with a hint to these commands.
 
 use std::collections::HashMap;
 
+use ferro_proto::admin_v1::{
+    ApprovalInfo, GetAllowlistModeRequest, ListApprovalsRequest, PageRequest, RevokeApprovalRequest,
+};
 use ferro_proto::v1::{
     AllowEntryMsg, DeleteAllowlistRequest, DeleteProposalRequest, GetAllowlistRequest,
     ListAllowlistsRequest, ListProposalsRequest, PendingProposal, SetAllowlistRequest,
@@ -37,7 +48,8 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
 use sha2::{Digest, Sha384};
 
-use crate::{rpc_err, CmisClient};
+use crate::admin::{has_flag, printable, Admin, Prompter};
+use crate::{apps, rpc_err, CmisClient, CmisError};
 
 /// Default validity window applied on `add`/`remove` when neither `--ttl` nor an
 /// existing allowlist's remaining window is available (one day).
@@ -76,23 +88,114 @@ pub(crate) fn usage() -> &'static str {
      \x20 --entry <uid>:*       wildcard binary: this uid running any binary\n\
      \x20 --entry *             wildcard both: any user running any binary\n\
      \x20 --bin   <uid>:<path>  pin to uid; a binary whose SHA-384 the CLI computes\n\
-     \x20 --bin   <path>        wildcard uid: any user running this binary"
+     \x20 --bin   <path>        wildcard uid: any user running this binary\n\
+     \n\
+     approvals mode (after `ferrogate admin set-allowlist-mode approvals`; F19):\n\
+     \x20 legacy allowlists are read-only (set, delete and approve are refused).\n\
+     \x20 add     <selector> (--entry <uid>:<sha> | --bin <uid>:<path>) --path <path on host>\n\
+     \x20         --platform linux|macos|windows --user <name> [apps register terms flags]\n\
+     \x20                  registers ONE binary as an approval (needs a TOTP code)\n\
+     \x20 remove  <selector> (--uid N | --bin-sha hex|*)... --reason-code <n> [--yes]\n\
+     \x20                  lists the matching approvals, asks, and revokes them (final;\n\
+     \x20                  the records are kept). --yes when not on a terminal"
+}
+
+/// The signed-in admin client and prompter of an admin `allowlist`
+/// command, for the approvals-mode mapping of `add` and `remove`.
+pub(crate) struct AdminCtx<'a> {
+    /// `ferrogate.admin.v1.Admin` client carrying the session.
+    pub(crate) admin: Admin,
+    /// Prompts (the TOTP code of a direct registration).
+    pub(crate) prompter: &'a Prompter,
+}
+
+/// Flags of the approvals-mode `add` that take no value.
+const SWITCHES: [&str; 3] = ["--any-path", "--no-expiry", "--path-protected"];
+
+/// Confirms the approvals-mode `remove` without a prompt.
+const YES: &str = "--yes";
+
+/// Valued flags of the approvals-mode `add` passed on to `admin apps register`.
+const REGISTER_PASS_THROUGH: [&str; 10] = [
+    "--user-kind",
+    "--sid",
+    "--size",
+    "--format",
+    "--version",
+    "--reason",
+    "--policy",
+    "--continuity",
+    "--expires-at",
+    "--note",
+];
+
+/// Most approvals one approvals-mode `remove` looks through.
+const MAX_REMOVE_SCAN: usize = 10_000;
+
+/// Whether CMIS runs in `approvals` mode (asked only for admin commands).
+/// A CMIS older than the mode switch (`UNIMPLEMENTED`) is in legacy mode.
+async fn approvals_mode(ctx: &mut AdminCtx<'_>) -> anyhow::Result<bool> {
+    match ctx
+        .admin
+        .get_allowlist_mode(GetAllowlistModeRequest {})
+        .await
+    {
+        Ok(m) => Ok(m.into_inner().mode == 2),
+        Err(s) if s.code() == tonic::Code::Unimplemented => Ok(false),
+        Err(s) => Err(rpc_err(s)),
+    }
+}
+
+/// A clearer error for the legacy writes CMIS refuses in approvals mode.
+fn explain_mode(e: anyhow::Error) -> anyhow::Error {
+    let refused = e.chain().any(|c| {
+        c.downcast_ref::<CmisError>().is_some_and(|x| {
+            x.0.code() == tonic::Code::FailedPrecondition && x.0.message() == "mode_approvals"
+        })
+    });
+    if refused {
+        e.context(
+            "CMIS runs in approvals mode: legacy allowlists are read-only. Use `ferrogate \
+             allowlist add|remove` (direct registration / revocation) or `ferrogate admin apps`",
+        )
+    } else {
+        e
+    }
 }
 
 /// Dispatch an `allowlist` subcommand.
-pub(crate) async fn run(client: &mut CmisClient, sub: &str, args: &[String]) -> anyhow::Result<()> {
-    let flags = Flags::parse(args);
+pub(crate) async fn run(
+    client: &mut CmisClient,
+    ctx: Option<&mut AdminCtx<'_>>,
+    sub: &str,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let valued: Vec<String> = args
+        .iter()
+        .filter(|a| !SWITCHES.contains(&a.as_str()) && a.as_str() != YES)
+        .cloned()
+        .collect();
+    let flags = Flags::parse(&valued);
+    if let Some(ctx) = ctx {
+        if matches!(sub, "add" | "remove") && approvals_mode(ctx).await? {
+            return if sub == "add" {
+                approvals_add(ctx, &flags, args).await
+            } else {
+                approvals_remove(ctx, &flags, has_flag(args, YES)).await
+            };
+        }
+    }
     match sub {
-        "set" => set(client, &flags).await,
-        "add" => add(client, &flags).await,
-        "remove" => remove(client, &flags).await,
+        "set" => set(client, &flags).await.map_err(explain_mode),
+        "add" => add(client, &flags).await.map_err(explain_mode),
+        "remove" => remove(client, &flags).await.map_err(explain_mode),
         "get" => get(client, &flags).await,
         "show" => show(client, &flags).await,
         "list" => list(client).await,
-        "delete" => delete(client, &flags).await,
+        "delete" => delete(client, &flags).await.map_err(explain_mode),
         "proposals" => proposals(client).await,
         "review" => review(client, &flags).await,
-        "approve" => approve(client, &flags).await,
+        "approve" => approve(client, &flags).await.map_err(explain_mode),
         "reject" => reject(client, &flags).await,
         "help" | "-h" | "--help" => {
             println!("{}", usage());
@@ -100,6 +203,192 @@ pub(crate) async fn run(client: &mut CmisClient, sub: &str, args: &[String]) -> 
         }
         other => anyhow::bail!("unknown allowlist subcommand: {other}\n\n{}", usage()),
     }
+}
+
+// ---- approvals mode (F19 §11 step 5) -------------------------------------------
+
+/// `add` in approvals mode: one entry becomes a direct registration
+/// (`ferrogate admin apps register`) of the binary at `--path` on the host.
+async fn approvals_add(
+    ctx: &mut AdminCtx<'_>,
+    flags: &Flags,
+    raw: &[String],
+) -> anyhow::Result<()> {
+    let host_uuid = flags.host_uuid()?;
+    if flags.one("--ttl").is_some() {
+        anyhow::bail!("--ttl applies to legacy allowlists; approvals take --expires-at <unix>");
+    }
+    let entries = flags.entries()?;
+    let [entry] = entries.as_slice() else {
+        anyhow::bail!(
+            "in approvals mode `add` registers exactly one --entry or --bin (each needs its \
+             own TOTP code)"
+        );
+    };
+    let Some(uid) = entry.uid else {
+        anyhow::bail!(
+            "in approvals mode an entry needs a uid (`<uid>:<sha>`); for every user use \
+             `ferrogate admin apps register --any-user --confirm-any-user`"
+        );
+    };
+    if entry.bin_is_wildcard() {
+        anyhow::bail!("in approvals mode a binary is approved by its hash; `*` is legacy only");
+    }
+    let need = |name: &str| {
+        flags.one(name).map(str::to_string).ok_or_else(|| {
+            anyhow::anyhow!(
+                "in approvals mode `add` needs {name} (the binary on the host: --path <canonical \
+                 path> --platform linux|macos|windows --user <name>)"
+            )
+        })
+    };
+    let mut register: Vec<String> = vec![
+        "register".into(),
+        "--host".into(),
+        host_uuid,
+        "--path".into(),
+        need("--path")?,
+        "--sha384".into(),
+        entry.bin_sha.clone(),
+        "--platform".into(),
+        need("--platform")?,
+        "--uid".into(),
+        uid.to_string(),
+        "--user".into(),
+        need("--user")?,
+    ];
+    for name in REGISTER_PASS_THROUGH {
+        if let Some(v) = flags.one(name) {
+            register.push(name.to_string());
+            register.push(v.to_string());
+        }
+    }
+    for name in SWITCHES {
+        if has_flag(raw, name) {
+            register.push(name.to_string());
+        }
+    }
+    apps::validate(&register)?;
+    println!("CMIS runs in approvals mode: registering the binary as an approval");
+    apps::run(&mut ctx.admin, &register, ctx.prompter).await
+}
+
+/// The active or expired approvals of `host_uuid` matching `uid` and/or
+/// `bin_sha`. Refuses (nothing revoked) a host with more approvals than one
+/// command scans.
+async fn matching_approvals(
+    admin: &mut Admin,
+    host_uuid: &str,
+    uid: Option<i64>,
+    bin_sha: Option<&str>,
+) -> anyhow::Result<Vec<ApprovalInfo>> {
+    let mut matches = Vec::new();
+    let mut token = String::new();
+    let mut scanned = 0usize;
+    loop {
+        let page = admin
+            .list_approvals(ListApprovalsRequest {
+                states: vec![1, 2],
+                host_uuid: host_uuid.to_string(),
+                include_superseded: true,
+                ascending: true,
+                page: Some(PageRequest {
+                    page_size: 100,
+                    page_token: token.clone(),
+                }),
+                ..ListApprovalsRequest::default()
+            })
+            .await
+            .map_err(rpc_err)?
+            .into_inner();
+        scanned += page.items.len();
+        matches.extend(page.items.into_iter().filter(|a| {
+            uid.is_none_or(|u| a.user.as_ref().and_then(|x| x.uid) == Some(u))
+                && bin_sha.is_none_or(|b| b == a.bin_sha)
+        }));
+        if page.next_page_token.is_empty() {
+            return Ok(matches);
+        }
+        if scanned >= MAX_REMOVE_SCAN {
+            anyhow::bail!(
+                "{host_uuid} has more than {MAX_REMOVE_SCAN} approvals; nothing was revoked. \
+                 Revoke them one by one with `ferrogate admin apps revoke`"
+            );
+        }
+        token = page.next_page_token;
+    }
+}
+
+/// `remove` in approvals mode: revoke every active or expired approval of
+/// the host that matches `--uid` and/or `--bin-sha` (records are kept),
+/// after listing them and a confirmation (`--yes` when not on a terminal).
+/// A revocation is final: a revoked legacy import is never re-imported.
+async fn approvals_remove(ctx: &mut AdminCtx<'_>, flags: &Flags, yes: bool) -> anyhow::Result<()> {
+    let host_uuid = flags.host_uuid()?;
+    let uid: Option<i64> = flags
+        .one("--uid")
+        .map(|u| {
+            u.parse::<u32>()
+                .map(i64::from)
+                .map_err(|_| anyhow::anyhow!("--uid must be a u32, got `{u}`"))
+        })
+        .transpose()?;
+    let bin_sha = flags.one("--bin-sha").map(normalize_sha).transpose()?;
+    if uid.is_none() && bin_sha.is_none() {
+        anyhow::bail!("remove needs --uid <N> and/or --bin-sha <hex>");
+    }
+    let reason_code: u32 = flags
+        .one("--reason-code")
+        .ok_or_else(|| anyhow::anyhow!("in approvals mode `remove` needs --reason-code <n>"))?
+        .parse()
+        .ok()
+        .filter(|n| *n != 0)
+        .ok_or_else(|| anyhow::anyhow!("--reason-code must be a positive number"))?;
+
+    let matches = matching_approvals(&mut ctx.admin, &host_uuid, uid, bin_sha.as_deref()).await?;
+    if matches.is_empty() {
+        anyhow::bail!("no matching approval to revoke for {host_uuid}");
+    }
+    println!("approvals to revoke on {host_uuid}:");
+    for a in &matches {
+        println!(
+            "  {}  uid={}  bin_sha={}",
+            printable(&a.approval_id),
+            a.user
+                .as_ref()
+                .and_then(|u| u.uid)
+                .map_or_else(|| "*".to_string(), |u| u.to_string()),
+            printable(&a.bin_sha)
+        );
+    }
+    if !yes {
+        if !ctx.prompter.is_tty() {
+            anyhow::bail!("revoking is final: re-run with --yes to confirm");
+        }
+        if !ctx.prompter.confirm("Revoke these approvals (final)?")? {
+            anyhow::bail!("cancelled; nothing was revoked");
+        }
+    }
+    for a in &matches {
+        let r = ctx
+            .admin
+            .revoke_approval(RevokeApprovalRequest {
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+                approval_id: a.approval_id.clone(),
+                reason_code,
+                expected_row_version: a.row_version,
+            })
+            .await
+            .map_err(rpc_err)?
+            .into_inner();
+        println!(
+            "revoked approval {} (bin_sha={}; allowlist generation {})",
+            printable(&a.approval_id),
+            printable(&a.bin_sha),
+            r.allowlist_generation
+        );
+    }
+    Ok(())
 }
 
 // ---- subcommands -----------------------------------------------------------

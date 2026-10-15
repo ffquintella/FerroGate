@@ -20,6 +20,10 @@
 //! - **Sequential revisions.** [`Cluster::app_observe_binary`] allocates
 //!   revision `n` of a lineage exactly once; the database refuses gaps and
 //!   reuse.
+//! - **Legacy import (F19 §11).** [`Cluster::app_import_legacy`] only
+//!   inserts `legacy_import` approvals, each under an id derived from its
+//!   v1 entry, so a re-run creates nothing and a revoked import is never
+//!   recreated; the legacy `host_allowlists` rows are never written.
 //!
 //! The same rules are enforced again by SQLite triggers ([`schema`]), so an
 //! application bug cannot break them silently. Multi-statement writes put
@@ -34,6 +38,7 @@ mod approvals;
 mod decisions;
 mod generation;
 mod intake;
+mod legacy;
 mod model;
 mod reads;
 pub(crate) mod schema;
@@ -43,6 +48,10 @@ pub use approvals::{ApprovalEdit, Revoke};
 pub use decisions::{ApprovalChoice, Approve, Decided, Deny};
 pub use generation::GENERATION_UNCOMPILED_DIGEST;
 pub use intake::{AutoApproval, AutoChecks, AutoIntake, Intake, IntakeChecks};
+pub use legacy::{
+    legacy_approval_id, legacy_lineage_id, LegacyEntry, LegacyImport, LegacyImportRow,
+    ModeRollbackCounts, LEGACY_BIN_WILDCARD, MAX_IMPORT_BATCH,
+};
 pub use model::{
     dedup_key, is_bin_sha, ApprovalOrigin, ApprovalRevisionRow, ApprovalRow, ApprovalSnapshot,
     ApprovalState, ApprovalTerms, AutoDowngradeReason, BinaryRow, Continuity,
@@ -107,7 +116,7 @@ pub(crate) enum TxnOutcome {
 }
 
 /// The guard code in an aborted transaction's error, if it was a guard.
-fn guard_code(e: &hiqlite::Error) -> Option<String> {
+pub(crate) fn guard_code(e: &hiqlite::Error) -> Option<String> {
     const PREFIX: &str = "ferrogate-guard:";
     let text = e.to_string();
     let start = text.find(PREFIX)? + PREFIX.len();

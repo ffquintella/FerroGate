@@ -177,6 +177,38 @@ $ ferrogate allowlist get --host <uuid> --out allowlist.cbor
 $ ferrogate allowlist delete --host <uuid>
 ```
 
+#### After the switch to approvals mode (F19 §11)
+
+Once a platform operator has imported the legacy allowlists and switched CMIS
+to `approvals` mode ([runbook](operations.md#migrating-legacy-allowlists-to-approvals-runbook)),
+the bodies above are kept read-only for a rollback, and the commands change:
+
+```console
+# Import (platform operator; dry run first), then switch:
+$ ferrogate admin migrate-allowlists --dry-run
+$ ferrogate admin migrate-allowlists
+$ ferrogate admin set-allowlist-mode approvals
+
+# `add` registers ONE binary as an approval (approver; asks for a TOTP code).
+# The path is where the binary lives on the host; `apps register` terms flags
+# (--any-path, --expires-at, --policy, ...) pass through:
+$ ferrogate allowlist add --host <uuid> --entry 1001:<sha384hex> \
+    --path /opt/tool/bin/tool --platform linux --user alice
+
+# `remove` lists the matching approvals, asks, then revokes them (final; the
+# records are kept). Add --yes when not on a terminal:
+$ ferrogate allowlist remove --host <uuid> --uid 1001 --reason-code 3
+
+# `set`, `delete` and `approve` are refused (FAILED_PRECONDITION mode_approvals).
+# Roll back (shows what changes, then asks; --yes when not on a terminal):
+$ ferrogate admin set-allowlist-mode legacy
+```
+
+Pre-F19 agents keep fetching `GetAllowlist`; in approvals mode it serves only
+the approvals they can enforce (any path; a Unix uid, any user, or a legacy
+import; valid until the document's `not_after`). `CMIS_LEGACY_GETALLOWLIST=off`
+turns the deprecated v1 RPC off once no such agent remains.
+
 A MIA host can also fetch its own body automatically instead of having it
 delivered out of band: set **`allowlist.fetch = true`** (or
 `FERROGATE_ALLOWLIST_FETCH=true`, or answer the `mia setup` prompt). At each
@@ -290,6 +322,10 @@ so `mia allowlist-key fetch --reload` needs no restart either. (Windows has no
 
 ## Limitations (current)
 
+- **v1 is lossy in approvals mode.** An approval with an exact path, a
+  Windows SID or an expiry before the served document's `not_after` is not in
+  the v1 body, so pre-F19 agents deny that application; upgrade them to
+  `allowlist.sync`.
 - **No dedicated enrollment key.** The issuer key doubles as the allowlist
   signer (safe via context separation); a separate, independently-rotatable
   enrollment key is a possible future hardening.

@@ -44,6 +44,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "app approval user guards (F19 security review)",
         statements: crate::apps::schema::APPROVAL_USER_GUARDS,
     },
+    Migration {
+        version: 3,
+        name: "legacy import terms (F19 §11, M38)",
+        statements: crate::apps::schema::LEGACY_IMPORT_GUARDS,
+    },
 ];
 
 #[derive(Debug)]
@@ -169,7 +174,7 @@ mod tests {
         let c = Cluster::start_single_node(dir.to_string_lossy().into_owned())
             .await
             .unwrap();
-        assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2]);
+        assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2, 3]);
 
         // Roll the database back to what migration 1 alone left.
         for drop in APPROVAL_USER_GUARDS
@@ -191,13 +196,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(c.applied_migrations().await.unwrap(), vec![1]);
+        assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 3]);
         for name in REPLACED {
             assert!(!trigger_sql(&c, name).await.contains("pseudonym:v1:"));
         }
 
         c.run_migrations(1).await.unwrap();
-        assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2]);
+        assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2, 3]);
         for name in REPLACED {
             let sql = trigger_sql(&c, name).await;
             assert!(sql.contains("pseudonym:v1:"), "{name}: {sql}");

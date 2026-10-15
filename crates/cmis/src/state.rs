@@ -191,6 +191,9 @@ pub struct CmisState {
     /// Host call authentication state (F19 §7.1): the per-node nonce replay
     /// cache and per-host rate limiters used by [`crate::host_auth`].
     pub host_calls: HostCallGuard,
+    /// Signed v1 bodies served by `GetAllowlist` in `approvals` mode (F19
+    /// §6.4), per node; see [`crate::apps::v1`].
+    legacy_v1: crate::apps::v1::V1Cache,
     /// The Raft cluster mediating all durable state: issued SVIDs
     /// (`issued_svids`), per-host signed allowlists (`host_allowlists`), and
     /// pending allowlist proposals (`pending_allowlist_proposals`). A
@@ -261,8 +264,15 @@ impl CmisState {
             fleet: FleetStore::unenforced(),
             host_key_pins: Mutex::new(HashMap::new()),
             host_calls,
+            legacy_v1: crate::apps::v1::V1Cache::new(),
             cluster,
         }
+    }
+
+    /// The per-node cache of signed lossy-safe v1 bodies (F19 §6.4).
+    #[must_use]
+    pub fn legacy_v1_cache(&self) -> &crate::apps::v1::V1Cache {
+        &self.legacy_v1
     }
 
     /// Borrow the fleet-enrolment store handle (feature F13). Clone it to hand
@@ -688,6 +698,49 @@ impl CmisState {
             .await
             .inspect_err(|e| {
                 tracing::error!(error = %e, %host_uuid, "cluster allowlist upsert failed");
+            })
+    }
+
+    /// Store or replace a host's legacy allowlist only while the cluster is
+    /// in `legacy` mode, checked in the write's own transaction (F19 §11:
+    /// no legacy write lands after the switch to `approvals`). `Ok(false)`:
+    /// refused, nothing written. Failures are logged and returned.
+    pub async fn put_allowlist_in_legacy_mode(
+        &self,
+        host_uuid: &str,
+        signed_bytes: &[u8],
+        now: i64,
+    ) -> Result<bool, ferro_raft::LedgerError> {
+        self.cluster
+            .upsert_allowlist_unless_setting(
+                host_uuid,
+                signed_bytes,
+                now,
+                crate::apps::mode::ALLOWLIST_MODE_KEY,
+                crate::apps::AllowlistMode::Approvals.as_str(),
+            )
+            .await
+            .inspect_err(|e| {
+                tracing::error!(error = %e, %host_uuid, "cluster allowlist upsert failed");
+            })
+    }
+
+    /// Delete a host's legacy allowlist only while the cluster is in
+    /// `legacy` mode, checked in the same transaction. `Ok(None)`: refused;
+    /// `Ok(Some(existed))` otherwise.
+    pub async fn delete_allowlist_in_legacy_mode(
+        &self,
+        host_uuid: &str,
+    ) -> Result<Option<bool>, ferro_raft::LedgerError> {
+        self.cluster
+            .delete_allowlist_unless_setting(
+                host_uuid,
+                crate::apps::mode::ALLOWLIST_MODE_KEY,
+                crate::apps::AllowlistMode::Approvals.as_str(),
+            )
+            .await
+            .inspect_err(|e| {
+                tracing::error!(error = %e, %host_uuid, "cluster allowlist delete failed");
             })
     }
 

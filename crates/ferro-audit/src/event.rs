@@ -573,6 +573,40 @@ pub enum AuditEvent {
         /// `bad_signature`, …).
         reason: String,
     },
+    /// An administrator imported a host's legacy v1 allowlist as
+    /// `legacy_import` approvals (F19 §11 step 4). One event per host that
+    /// gained at least one approval; a dry run or a re-run that creates
+    /// nothing records none.
+    AllowlistImported {
+        /// The host whose legacy allowlist was imported.
+        host_uuid: String,
+        /// Approvals created by this import.
+        approvals_created: u32,
+        /// Importing administrator.
+        admin_id: String,
+    },
+    /// An administrator switched the replicated allowlist mode (F19 §11
+    /// steps 5 and 6). Switching to the mode already in force changes
+    /// nothing and records no event.
+    AllowlistModeChanged {
+        /// The mode before the switch (`legacy` or `approvals`).
+        old_mode: String,
+        /// The mode now in force.
+        new_mode: String,
+        /// Administrator.
+        admin_id: String,
+        /// Reference to the session.
+        session_ref: String,
+        /// Switching to `legacy`: live approvals the preserved legacy bodies
+        /// do not carry (they stop admitting callers).
+        approvals_not_reflected: u64,
+        /// Switching to `legacy`: legacy imports revoked or expired since the
+        /// import that the legacy bodies admit again.
+        imports_readmitted: u64,
+        /// Switching to `approvals`: legacy entries not imported (only when
+        /// the administrator explicitly allowed it).
+        entries_not_imported: u64,
+    },
 }
 
 /// Failure modes for event codec.
@@ -738,6 +772,20 @@ mod tests {
                 generation: 7,
                 entry_count: 1,
                 entries_digest: Hash384([6; 48]),
+            },
+            AuditEvent::AllowlistImported {
+                host_uuid: "h".into(),
+                approvals_created: 3,
+                admin_id: "0190".into(),
+            },
+            AuditEvent::AllowlistModeChanged {
+                old_mode: "approvals".into(),
+                new_mode: "legacy".into(),
+                admin_id: "0190".into(),
+                session_ref: "ab".into(),
+                approvals_not_reflected: 2,
+                imports_readmitted: 1,
+                entries_not_imported: 0,
             },
         ];
         for e in events {

@@ -1,4 +1,5 @@
-//! F19 policy settings (`CMIS_APP_*`, `CMIS_APPROVAL_*`).
+//! F19 policy settings (`CMIS_APP_*`, `CMIS_APPROVAL_*`,
+//! `CMIS_LEGACY_GETALLOWLIST`).
 //!
 //! Every value is read once at start. A malformed, zero or out-of-range
 //! value is an error, never silently replaced: a typo in a security setting
@@ -57,6 +58,11 @@ pub struct AppConfig {
     /// Whether approvals without expiry may be created
     /// (`CMIS_APPROVAL_ALLOW_NO_EXPIRY`, default false).
     pub allow_no_expiry: bool,
+    /// Whether the unauthenticated v1 `GetAllowlist` is served
+    /// (`CMIS_LEGACY_GETALLOWLIST`, default on; F19 §6.4, §11 step 7). Off
+    /// answers `FAILED_PRECONDITION legacy_getallowlist_disabled` in both
+    /// modes; set it once no pre-F19 agent remains (deprecated).
+    pub legacy_get_allowlist: bool,
 }
 
 impl Default for AppConfig {
@@ -72,6 +78,7 @@ impl Default for AppConfig {
             approval_default_ttl_secs: DEFAULT_APPROVAL_TTL_SECS,
             approval_max_ttl_secs: DEFAULT_APPROVAL_MAX_TTL_SECS,
             allow_no_expiry: false,
+            legacy_get_allowlist: true,
         }
     }
 }
@@ -175,6 +182,9 @@ impl AppConfig {
         if let Some(b) = flag(&get, "CMIS_APPROVAL_ALLOW_NO_EXPIRY")? {
             c.allow_no_expiry = b;
         }
+        if let Some(b) = flag(&get, "CMIS_LEGACY_GETALLOWLIST")? {
+            c.legacy_get_allowlist = b;
+        }
         Ok(c)
     }
 
@@ -208,6 +218,10 @@ mod tests {
         assert_eq!(c.approval_max_ttl_secs, 365 * DAY);
         assert_eq!(c.pending_ttl_secs, 30 * DAY);
         assert!(!c.allow_no_expiry);
+        assert!(
+            c.legacy_get_allowlist,
+            "v1 GetAllowlist is on until turned off"
+        );
         assert!(c.tier_allowed("tpm") && c.tier_allowed("host-key"));
     }
 
@@ -218,8 +232,11 @@ mod tests {
             ("CMIS_APP_AUTO_UPDATE_TIERS", "tpm"),
             ("CMIS_APPROVAL_ALLOW_NO_EXPIRY", "true"),
             ("CMIS_APP_DENIED_COOLDOWN_SECS", "0"),
+            ("CMIS_LEGACY_GETALLOWLIST", "off"),
         ])
         .unwrap();
+        assert!(!c.legacy_get_allowlist);
+        assert!(cfg(&[("CMIS_LEGACY_GETALLOWLIST", "sometimes")]).is_err());
         assert!(!c.auto_update);
         assert!(c.tier_allowed("tpm") && !c.tier_allowed("host-key"));
         assert!(c.allow_no_expiry);

@@ -40,7 +40,7 @@ use tonic::service::Interceptor;
 use tonic::transport::Channel;
 use zeroize::Zeroizing;
 
-use crate::{apps, rpc_err, CmisError};
+use crate::{apps, migration, rpc_err, CmisError};
 
 /// Default admin listener.
 pub(crate) const DEFAULT_ADMIN_ENDPOINT: &str = "https://127.0.0.1:8444";
@@ -76,6 +76,11 @@ pub(crate) fn usage() -> &'static str {
      \x20                               requests, request, approve, deny, approvals,\n\
      \x20                               approval, update, revoke, freeze, unfreeze, register\n\
      \x20                               (`apps help` shows every flag)\n\
+     \x20 migrate-allowlists [--dry-run]  import every legacy allowlist entry as an\n\
+     \x20                               approval (legacy, no expiry); --dry-run only reports\n\
+     \x20 set-allowlist-mode legacy|approvals [--yes] [--allow-unimported]\n\
+     \x20                               switch the cluster's allowlist mode (F19 §11);\n\
+     \x20                               going back to legacy asks for confirmation\n\
      \n\
      Secrets are prompted without echo; when stdin is not a terminal they are\n\
      read one per line from stdin. The session token is never printed."
@@ -128,6 +133,23 @@ impl Prompter {
                 .map_err(|e| anyhow::anyhow!("{label}: {e}"));
         }
         self.line(label)
+    }
+
+    /// Whether answers come from a terminal (else one line each from stdin).
+    pub(crate) fn is_tty(&self) -> bool {
+        self.tty
+    }
+
+    /// A yes/no question on the terminal, defaulting to no. Without a
+    /// terminal the answer is no: callers ask for an explicit flag instead.
+    pub(crate) fn confirm(&self, label: &str) -> anyhow::Result<bool> {
+        if !self.tty {
+            return Ok(false);
+        }
+        inquire::Confirm::new(label)
+            .with_default(false)
+            .prompt()
+            .map_err(|e| anyhow::anyhow!("{label}: {e}"))
     }
 
     /// A new password, typed twice on a terminal.
@@ -464,7 +486,19 @@ pub(crate) async fn run(a: AdminArgs<'_>, sub: &str, args: &[String]) -> anyhow:
         "logout" => logout(a).await,
         "bootstrap" => enroll(a, args, true).await,
         "enroll" => enroll(a, args, false).await,
-        "whoami" | "sessions" | "passwd" | "accounts" | "groups" | "factors" | "apps" => {
+        "whoami" | "sessions" | "passwd" | "accounts" | "groups" | "factors" | "apps"
+        | "migrate-allowlists" | "set-allowlist-mode" => {
+            if matches!(sub, "migrate-allowlists" | "set-allowlist-mode") {
+                if matches!(
+                    args.first().map(String::as_str),
+                    Some("help" | "-h" | "--help")
+                ) {
+                    println!("{}", migration::USAGE);
+                    return Ok(());
+                }
+                // Typos are caught before a sign-in costs a TOTP code.
+                migration::parse(sub, args)?;
+            }
             if sub == "apps" {
                 if matches!(
                     args.first().map(String::as_str),
@@ -627,6 +661,9 @@ async fn authenticated(
         "accounts" => accounts(&mut admin, args, a.prompter).await,
         "factors" => factors(&mut admin, args, a.prompter).await,
         "apps" => apps::run(&mut admin, args, a.prompter).await,
+        "migrate-allowlists" | "set-allowlist-mode" => {
+            migration::run(&mut admin, migration::parse(sub, args)?, a.prompter).await
+        }
         "groups" => {
             let g = admin
                 .list_admin_groups(ListAdminGroupsRequest {})

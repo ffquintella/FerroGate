@@ -82,6 +82,24 @@ impl MachineIdentitySvc {
         &self.state
     }
 
+    /// `FAILED_PRECONDITION (mode_approvals)` for a legacy allowlist write
+    /// while the cluster runs in `approvals` mode (F19 §11 step 5): the
+    /// legacy bodies stay read-only for a rollback. A store failure reading
+    /// the mode answers `UNAVAILABLE`.
+    #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
+    async fn refuse_in_approvals_mode(&self) -> Result<(), Status> {
+        match apps::mode::current(self.state.cluster()).await {
+            Ok(AllowlistMode::Legacy) => Ok(()),
+            Ok(AllowlistMode::Approvals) => {
+                Err(Status::failed_precondition(apps::mode::MODE_APPROVALS))
+            }
+            Err(e) => {
+                tracing::error!(event = "apps.mode.store_error", error = %e, "allowlist mode read failed");
+                Err(store_unavailable())
+            }
+        }
+    }
+
     /// Publish a fresh CRL right now so a revocation reaches consumers within
     /// one publish cycle (here, immediately) rather than waiting for the next
     /// periodic tick. A signing failure is surfaced to the admin caller.
@@ -106,6 +124,10 @@ impl MachineIdentitySvc {
             .map(|x| hex::encode(sha384(&x.leaf_der)))
     }
 }
+
+/// Seconds a pre-F19 agent is told to wait when some entries of its
+/// proposal were left for later (submission budget or pending caps).
+const PROPOSAL_DEFERRED_RETRY_SECS: u64 = 3600;
 
 /// Upper bound on a caller-allowlist validity window (30 days). Operators
 /// re-issue rather than mint long-lived lists, keeping the signed artefact
@@ -848,6 +870,24 @@ impl MachineIdentity for MachineIdentitySvc {
         if host_uuid.trim().is_empty() {
             return Err(Status::invalid_argument("empty host_uuid"));
         }
+        // Deprecated (F19 §11 step 7): an operator turns v1 off once no
+        // pre-F19 agent remains; an old agent keeps its current file.
+        if !self.state.config.apps.legacy_get_allowlist {
+            return Err(Status::failed_precondition(
+                apps::v1::LEGACY_GETALLOWLIST_DISABLED,
+            ));
+        }
+        let now = unix_now();
+        // A local read: this public RPC must not cost a leader round trip,
+        // and following a switch a few milliseconds late is harmless.
+        let mode = apps::mode::current_local(self.state.cluster())
+            .await
+            .map_err(|e| apps::ledger_status(e.into()))?;
+        if mode == AllowlistMode::Approvals {
+            // The lossy-safe v1 compile of the host's approvals (F19 §6.4).
+            let signed_allowlist = apps::v1::serve(&self.state, &host_uuid, now).await?;
+            return Ok(Response::new(GetAllowlistResponse { signed_allowlist }));
+        }
         // Unauthenticated by design: the body is integrity-protected by its
         // signature and is not secret. Absent ⇒ empty bytes, not an error, so a
         // host can poll before one is provisioned.
@@ -861,7 +901,7 @@ impl MachineIdentity for MachineIdentitySvc {
                 &self.state.issuer,
                 stored,
                 self.state.config.allowlist_ttl_secs,
-                unix_now(),
+                now,
             ),
             None => Vec::new(),
         };
@@ -873,6 +913,7 @@ impl MachineIdentity for MachineIdentitySvc {
         request: Request<SetAllowlistRequest>,
     ) -> Result<Response<SetAllowlistResponse>, Status> {
         let admin = require(&request, paths::SET_ALLOWLIST)?;
+        self.refuse_in_approvals_mode().await?;
         let req = request.into_inner();
         let now = unix_now();
 
@@ -915,10 +956,16 @@ impl MachineIdentity for MachineIdentitySvc {
             Status::internal("allowlist encode failed")
         })?;
 
-        self.state
-            .put_allowlist(&req.host_uuid, bytes, now)
+        // The mode is checked again inside the write's transaction, so a
+        // write racing a switch to `approvals` cannot land after it.
+        if !self
+            .state
+            .put_allowlist_in_legacy_mode(&req.host_uuid, &bytes, now)
             .await
-            .map_err(|_| store_unavailable())?;
+            .map_err(|_| store_unavailable())?
+        {
+            return Err(Status::failed_precondition(apps::mode::MODE_APPROVALS));
+        }
         audit_record(
             &self.state,
             AuditEvent::AllowlistSet {
@@ -941,15 +988,17 @@ impl MachineIdentity for MachineIdentitySvc {
         request: Request<DeleteAllowlistRequest>,
     ) -> Result<Response<DeleteAllowlistResponse>, Status> {
         let admin = require(&request, paths::DELETE_ALLOWLIST)?;
+        self.refuse_in_approvals_mode().await?;
         let host_uuid = request.into_inner().host_uuid;
         if host_uuid.trim().is_empty() {
             return Err(Status::invalid_argument("empty host_uuid"));
         }
         let existed = self
             .state
-            .delete_allowlist(&host_uuid)
+            .delete_allowlist_in_legacy_mode(&host_uuid)
             .await
-            .map_err(|_| store_unavailable())?;
+            .map_err(|_| store_unavailable())?
+            .ok_or_else(|| Status::failed_precondition(apps::mode::MODE_APPROVALS))?;
         if existed {
             let now = unix_now();
             audit_record(
@@ -1015,7 +1064,7 @@ impl MachineIdentity for MachineIdentitySvc {
             host_uuid: svid_host_uuid,
             cnf_jkt,
             spiffe_id: proposer_spiffe_id,
-            ..
+            tier: svid_tier,
         } = crate::host_auth::verify_host_svid(&self.state, &req.svid_jws, now)?;
 
         // 2. The presented machine key must be the one the SVID is bound to.
@@ -1059,7 +1108,54 @@ impl MachineIdentity for MachineIdentitySvc {
         }
         let entry_count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
 
-        // 5. Compare against the current live allowlist, and apply policy.
+        // 5. In `approvals` mode (F19 §11 step 5) each new entry becomes an
+        //    `observed` request; nothing is adopted or queued as a proposal.
+        let mode = apps::mode::current(self.state.cluster())
+            .await
+            .map_err(|e| apps::ledger_status(e.into()))?;
+        if mode == AllowlistMode::Approvals {
+            let outcome = apps::proposals::observe(
+                &self.state,
+                &apps::proposals::Proposer {
+                    host_uuid: svid_host_uuid.clone(),
+                    spiffe_id: proposer_spiffe_id.clone(),
+                    tier: svid_tier,
+                },
+                &entries,
+                now,
+            )
+            .await?;
+            tracing::info!(
+                event = "apps.proposal.observed",
+                host_uuid = %svid_host_uuid,
+                recorded = outcome.recorded,
+                pending = outcome.pending,
+                covered = outcome.covered,
+                skipped = outcome.skipped,
+                deferred = outcome.deferred,
+                "pre-F19 proposal mapped to observed requests"
+            );
+            if outcome.deferred > 0 {
+                // A pre-F19 agent re-proposes only a changed caller set after
+                // a success; an error makes it retry the deferred entries.
+                return Err(crate::host_auth::exhausted(
+                    "rate_limited",
+                    PROPOSAL_DEFERRED_RETRY_SECS,
+                ));
+            }
+            let outcome = if outcome.pending > 0 {
+                Outcome::Pending
+            } else {
+                Outcome::Unchanged
+            };
+            return Ok(Response::new(ProposeAllowlistResponse {
+                outcome: outcome as i32,
+                issued_at: 0,
+                not_after: 0,
+            }));
+        }
+
+        // 6. Compare against the current live allowlist, and apply policy.
         let current = self.state.get_allowlist(&proposal.host_uuid).await;
         let current_entries = current.as_deref().and_then(decode_live_entries);
         if current_entries
@@ -1095,10 +1191,15 @@ impl MachineIdentity for MachineIdentitySvc {
                 tracing::error!(error = %e, "allowlist encode failed");
                 Status::internal("allowlist encode failed")
             })?;
-            self.state
-                .put_allowlist(&proposal.host_uuid, bytes, now)
+            if !self
+                .state
+                .put_allowlist_in_legacy_mode(&proposal.host_uuid, &bytes, now)
                 .await
-                .map_err(|_| store_unavailable())?;
+                .map_err(|_| store_unavailable())?
+            {
+                // The cluster switched to `approvals` meanwhile.
+                return Err(Status::failed_precondition(apps::mode::MODE_APPROVALS));
+            }
             // A previously queued proposal for this host is now moot. The
             // adoption itself is stored, so a failure to drop the stale
             // proposal (already logged at error by the state layer) does not
@@ -1518,7 +1619,7 @@ impl MachineIdentity for MachineIdentitySvc {
             .await
             .map_err(|e| apps::ledger_status(e.into()))?;
         if mode == AllowlistMode::Legacy {
-            return Err(Status::failed_precondition("mode_legacy"));
+            return Err(Status::failed_precondition(apps::mode::MODE_LEGACY));
         }
         let resp = apps::intake::submit(&self.state, &host, doc, now).await?;
         Ok(Response::new(resp))
@@ -1658,7 +1759,9 @@ fn host_forwardable(event: &AuditEvent) -> bool {
         | AuditEvent::LineageAutoUpdateFrozen { .. }
         | AuditEvent::AppApprovedBySameActor { .. }
         | AuditEvent::AdminDirectRegistration { .. }
-        | AuditEvent::AllowlistCompiled { .. } => false,
+        | AuditEvent::AllowlistCompiled { .. }
+        | AuditEvent::AllowlistImported { .. }
+        | AuditEvent::AllowlistModeChanged { .. } => false,
     }
 }
 

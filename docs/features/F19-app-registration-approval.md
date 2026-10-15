@@ -4,20 +4,22 @@
 > end-to-end sequence: [app-approval-and-admin.md](../app-approval-and-admin.md).
 > Admin authentication used by every admin RPC below: [F20](F20-admin-authentication.md).
 >
-> **Status (M37, 0.29.0):** CMIS side implemented — host RPCs, auto-update,
+> **Status (M37 and M38, unreleased, planned 0.30.0):** CMIS side implemented — host RPCs, auto-update,
 > admin operations, allowlist v2 compile/serve and sweepers (T265–T268, T271);
 > MIA side implemented — the sync loop with the v2 matcher, helper protocol v2,
 > the `registration` service with its ledger and outbox, `mia app`, and the
 > SDK `helper-client` feature (T269, T270). Not yet: the tray items, Windows
 > `RegisterFile` (impersonated open) and signer summaries, the macOS ACL and
 > Windows DACL checks behind `path_protected` (until they exist macOS and
-> Windows never set `path_protected`: fail closed, T290), the legacy
-> import and mode switch (M38), `ListHosts`, stored-response idempotency for
+> Windows never set `path_protected`: fail closed, T290), `ListHosts`,
+> stored-response idempotency for
 > admin edits (retries are refused by state instead), PII pseudonymisation
 > after retention (open follow-up T289, waiting for the DPO's retention
 > periods; the store already accepts it, §10), and signing restricted to the
 > leader (any node signs with the replicated key; the generation
-> compare-and-set keeps bodies consistent).
+> compare-and-set keeps bodies consistent). M38 adds the legacy import, the
+> mode switch and rollback, the lossy-safe v1 `GetAllowlist` and the
+> approvals-mode mapping of the legacy RPCs and CLI (§11, T272–T274).
 
 ## Summary
 
@@ -817,11 +819,11 @@ Edits carry `uint64 expected_row_version`.
 
 | gRPC code | `x-ferrogate-reason` examples | When |
 |-----------|-------------------------------|------|
-| `INVALID_ARGUMENT` | `field_too_long`, `path_not_absolute`, `path_not_utf8`, `wildcard_not_allowed`, `bad_sha` | Validation (`x-ferrogate-field` names the field) |
+| `INVALID_ARGUMENT` | `field_too_long`, `path_not_absolute`, `path_not_utf8`, `wildcard_not_allowed`, `bad_sha`, `path_unknown` | Validation (`x-ferrogate-field` names the field); `path_unknown`: an exact-path scope for a binary without a known path (legacy import, pre-F19 proposal) |
 | `UNAUTHENTICATED` | `host_auth_failed` (single code for every host-auth failure) | SVID, signature, `cnf.jkt` or freshness failures |
 | `PERMISSION_DENIED` | `host_mismatch`, `sod_self_approval` (strict policy only), `permission_denied` | |
 | `NOT_FOUND` | `not_found` | Unknown id, or an id not visible to this caller (no cross-host oracle) |
-| `FAILED_PRECONDITION` | `invalid_state`, `step_up_required`, `mode_legacy`, `password_expired` | |
+| `FAILED_PRECONDITION` | `invalid_state`, `step_up_required`, `mode_legacy`, `mode_approvals`, `import_incomplete`, `confirmation_required`, `legacy_getallowlist_disabled`, `password_expired` | `mode_legacy`: F19 intake in `legacy` mode; `mode_approvals`: a legacy allowlist write in `approvals` mode (§11) |
 | `ABORTED` | `row_version_mismatch` | Concurrent edit |
 | `RESOURCE_EXHAUSTED` | `rate_limited`, `too_many_pending` | With `retry-after` metadata |
 | `UNAVAILABLE` | `store_unavailable` | Raft not ready. **Write failures are returned, never swallowed** (unlike today's `put_allowlist`, which logs and returns `()`). |
@@ -901,6 +903,7 @@ enum RegistrationResp {
 | `mia app list [--json]` | Entries of the current verified allowlist: approval id, hash prefix, expiry, plus local ledger paths |
 | `mia resync-allowlist [--reload]` | Uses `SyncAllowlist` when available (existing command) |
 | `ferrogate admin migrate-allowlists [--dry-run]` | Legacy import (§11), platform-operator permission |
+| `ferrogate admin set-allowlist-mode legacy\|approvals [--yes] [--allow-unimported]` | Mode switch (§11), platform-operator permission; a rollback asks for confirmation (`--yes` when not interactive) |
 
 ### 8. Security considerations and threat model
 
@@ -989,7 +992,7 @@ Deleting active approvals would break the service and goes through revocation.
 ### 11. Migration and rollout
 
 1. **Prerequisite:** F20 Phase 0 is deployed (authenticated admin RPCs).
-2. **0.29.x CMIS** ships the schema and RPCs with `cmis_settings.allowlist_mode =
+2. **0.30.x CMIS** ships the schema and RPCs with `cmis_settings.allowlist_mode =
    legacy`, so behaviour is unchanged. `SyncAllowlist` serves v2 compiled from the
    **legacy** body in legacy mode (each v1 entry maps to an entry with
    `approval_id = 0`), so new MIAs can use 5-minute sync immediately. In legacy
@@ -1007,19 +1010,38 @@ Deleting active approvals would break the service and goes through revocation.
    `host_allowlists` rows stay read-only for rollback.
 5. **Switch mode** (`ferrogate admin set-allowlist-mode approvals`; platform
    operator, step-up, audited). The setting is replicated, so every node agrees.
-   Switch only after **every** CMIS node runs ≥ 0.29. In `approvals` mode,
+   Switch only after **every** CMIS node runs ≥ 0.30. In `approvals` mode,
    `SetAllowlist` and `DeleteAllowlist` return `FAILED_PRECONDITION
-   (mode_legacy)`; `ferrogate allowlist add|remove` map to direct registration (single
+   (mode_approvals)` (as implemented: `mode_legacy` stays the refusal of F19
+   intake in `legacy` mode, so a client can tell the two apart);
+   `ferrogate allowlist add|remove` map to direct registration (single
    step unless the strict policy is on) and revocation; `ProposeAllowlist` maps to per-entry `observed` requests;
    `CMIS_ALLOWLIST_PROPOSALS` TOFU auto-adoption is disabled.
+   *Implementation notes (M38):* the switch to `approvals` is refused
+   (`import_incomplete`) while a legacy entry has no approval, unless the
+   operator passes `allow_unimported`, and (`import_stale`, no override)
+   while an import whose entry has since left its legacy body is open — the
+   import revokes those (reason code 1000), so a binary removed in `legacy`
+   mode cannot return; legacy writes check the mode in their own
+   transaction; a v1 proposal carries no path, so its
+   requests use a per-hash placeholder lineage ("unknown path") and need an
+   any-path scope (`path_unknown` otherwise); clients read the mode with
+   `GetAllowlistMode` (any session) to pick the legacy or approvals flow.
 6. **Rollback:** switching back to `legacy` serves the preserved legacy bodies.
    Approvals created after the switch are **not** reflected there. The command
-   prints the count and requires confirmation.
+   prints the count and requires confirmation. *As implemented:* the count is
+   every live approval other than a legacy import (all of them stop admitting
+   callers, whenever they were created), plus the legacy imports revoked or
+   expired since the import, which the legacy bodies admit again; the RPC
+   needs `confirm_rollback`.
 7. **Later:** set `CMIS_LEGACY_GETALLOWLIST=off` once no v1 agents remain; this
-   is announced as a deprecation in the change document.
+   is announced as a deprecation in the change document. *As implemented:*
+   off answers `FAILED_PRECONDITION (legacy_getallowlist_disabled)` in both
+   modes; an old agent keeps its current file until its `not_after`.
 
-Version: workspace 0.28.0 → **0.29.0**. Every release needs a *documento de
-mudança* and the ESI pre-production verification (NRM §5.3.1).
+Version: 0.29.0 shipped F20 Phase 0 alone, so F19 (M37, M38) ships as
+**0.30.0** ([change document](../change-v0.30.0.md)). Every release needs a
+*documento de mudança* and the ESI pre-production verification (NRM §5.3.1).
 
 ## Testing strategy (AGENTS.md rule 6)
 
@@ -1128,7 +1150,7 @@ account that share a RID.
       no-PII tests).
 - [ ] Every admin mutation emits exactly one audit event (count assertions).
 - [ ] Docs updated: `helper-api.md`, `mia.md`, `allowlist-provisioning.md`,
-      `cmis.md`, `audit.md`; change document for 0.29.0.
+      `cmis.md`, `audit.md`; change document for 0.30.0.
 
 ## Risks
 

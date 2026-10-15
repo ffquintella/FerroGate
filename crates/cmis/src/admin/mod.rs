@@ -20,7 +20,9 @@
 //!
 //! F19 adds the application-approval operations ([`apps`]): listings,
 //! approve, deny, edit, revoke, the lineage freeze and the single-step
-//! direct registration, all behind the same table and guard.
+//! direct registration, all behind the same table and guard; and the
+//! allowlist migration ([`migration`]): the legacy import and the mode
+//! switch.
 
 pub(crate) mod codec;
 
@@ -32,6 +34,7 @@ pub mod config;
 pub mod factors;
 pub mod keys;
 pub mod layer;
+pub mod migration;
 pub mod password;
 pub mod service;
 pub mod session;
