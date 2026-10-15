@@ -25,6 +25,21 @@ record them.
 
 ## [Unreleased]
 
+### Security
+
+- Upgrade rustls to 0.23.46 to fix RUSTSEC-2026-0346, -0347, -0348 and -0349 (S1, T5)
+  `cargo deny check advisories` failed on rustls 0.23.45. The worst of the four
+  advisories, RUSTSEC-2026-0349, lets an unauthenticated ServerHello push later
+  connections down to classical key exchange, which works against the
+  `X25519MLKEM768`-only provider. The other three: client session `Debug`
+  output exposed TLS secrets (-0346), buffered application data went to the
+  outer server after an ECH rejection (-0347), and Brotli certificate
+  decompression could allocate up to 1 GiB before authentication (-0348).
+  The workspace now requires `rustls >= 0.23.46`, so a fresh lockfile cannot
+  resolve to a vulnerable version. `tls_handshake` and `wire_format` still show
+  both sides negotiating `X25519MLKEM768` and a classical-only client being
+  rejected.
+
 ## [0.29.0] - 2026-10-14
 
 **Breaking security release (F20 Phase 0).** Every CMIS admin RPC now needs an

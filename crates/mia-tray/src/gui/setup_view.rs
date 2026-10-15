@@ -731,8 +731,8 @@ mod tests {
         assert!(view.editable);
         assert_eq!(view.values, values);
         assert_eq!(view.loaded.as_ref().map(|l| l.exists), Some(true));
-        assert!(view.enrollment_public_key.is_empty());
-        assert!(view.expected_key_fingerprint.is_empty());
+        assert_eq!(view.enrollment_public_key, "");
+        assert_eq!(view.expected_key_fingerprint, "");
         assert!(matches!(
             view.applied.as_ref().map(|d| &d.outcome),
             Some(Ok(Outcome::Succeeded))
