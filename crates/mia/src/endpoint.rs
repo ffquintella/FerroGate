@@ -158,9 +158,8 @@ impl CmisResolver {
                 }
             }
         }
-        Err(last_err
-            .unwrap_or_else(|| anyhow::anyhow!("no CMIS candidates to connect to")))
-        .with_context(|| format!("no reachable CMIS endpoint via {}", self.describe()))
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no CMIS candidates to connect to")))
+            .with_context(|| format!("no reachable CMIS endpoint via {}", self.describe()))
     }
 }
 
@@ -261,7 +260,10 @@ mod tests {
             srv: None,
             spki_pin: Some("not-hex".into()),
         };
-        assert!(CmisResolver::from_config(&cfg).unwrap_err().to_string().contains("SPKI pin"));
+        assert!(CmisResolver::from_config(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("SPKI pin"));
     }
 
     #[tokio::test]

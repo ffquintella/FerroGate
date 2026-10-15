@@ -28,8 +28,8 @@
 use std::collections::BTreeSet;
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, DistinguishedName, ExtendedKeyUsagePurpose,
-    IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose,
 };
 use ring::hmac;
 use rustls_pki_types::PrivatePkcs8KeyDer;
@@ -189,7 +189,11 @@ mod tests {
 
     #[test]
     fn leaf_carries_requested_sans_and_is_signed_by_ca() {
-        let sans = vec!["cmis1".to_string(), "cmis2".to_string(), "127.0.0.1".to_string()];
+        let sans = vec![
+            "cmis1".to_string(),
+            "cmis2".to_string(),
+            "127.0.0.1".to_string(),
+        ];
         let cert = derive_shared_peer_cert("shared-secret-0123456789", &sans).unwrap();
 
         // The chain is leaf then CA.

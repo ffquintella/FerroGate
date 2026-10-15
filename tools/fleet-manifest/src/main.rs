@@ -162,7 +162,10 @@ fn canonical_fingerprint(value: &str) -> Result<String> {
     let s = resolve(value)?;
     let bytes = hex::decode(&s).with_context(|| format!("fingerprint {s:?} is not hex"))?;
     if bytes.len() != 48 {
-        bail!("fingerprint must be 48 bytes (SHA-384), got {}", bytes.len());
+        bail!(
+            "fingerprint must be 48 bytes (SHA-384), got {}",
+            bytes.len()
+        );
     }
     Ok(hex::encode(bytes))
 }

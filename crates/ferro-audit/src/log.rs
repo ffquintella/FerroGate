@@ -101,7 +101,10 @@ impl AuditLog {
         if let Some(sth) = &latest_sth {
             let body = sth.body()?;
             let covered = usize::try_from(body.tree_size).map_err(|_| {
-                AuditLogError::Resume(format!("persisted STH size {} out of range", body.tree_size))
+                AuditLogError::Resume(format!(
+                    "persisted STH size {} out of range",
+                    body.tree_size
+                ))
             })?;
             if covered > tree.len() {
                 return Err(AuditLogError::Resume(format!(
