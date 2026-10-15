@@ -42,6 +42,7 @@
 mod admin;
 mod allowlist;
 mod apps;
+mod migration;
 
 use ferro_crypto::composite::CompositePublicKey;
 use ferro_crypto::pin::SpkiPin;
@@ -214,7 +215,7 @@ async fn run() -> anyhow::Result<()> {
             && matches!(rest.first().map(String::as_str), Some("get" | "show")));
     if public {
         let mut client = connect(&global).await?;
-        return dispatch(&mut client, command, rest).await;
+        return dispatch(&mut client, None, command, rest).await;
     }
 
     // Admin RPCs: a signed-in session on the admin listener (F20 Phase 0).
@@ -228,17 +229,30 @@ async fn run() -> anyhow::Result<()> {
     .await?;
     let mut client: CmisClient =
         MachineIdentityClient::with_interceptor(channel.clone(), session.bearer());
-    let mut result = dispatch(&mut client, command, rest).await;
+    // `allowlist add|remove` map onto the approval RPCs in approvals mode.
+    let mut ctx = allowlist::AdminCtx {
+        admin: ferro_proto::admin_v1::admin_client::AdminClient::with_interceptor(
+            channel.clone(),
+            session.bearer(),
+        ),
+        prompter: &prompter,
+    };
+    let mut result = dispatch(&mut client, Some(&mut ctx), command, rest).await;
     if result.as_ref().is_err_and(admin::needs_step_up) {
         // Nothing was changed: the first write of the command was refused.
         admin::step_up(channel.clone(), &session, &prompter).await?;
-        result = dispatch(&mut client, command, rest).await;
+        result = dispatch(&mut client, Some(&mut ctx), command, rest).await;
     }
     admin::finish(channel, &session).await;
     result
 }
 
-async fn dispatch(client: &mut CmisClient, command: &str, rest: &[String]) -> anyhow::Result<()> {
+async fn dispatch(
+    client: &mut CmisClient,
+    ctx: Option<&mut allowlist::AdminCtx<'_>>,
+    command: &str,
+    rest: &[String],
+) -> anyhow::Result<()> {
     match command {
         "status" => status(client).await,
         "list-svids" => list_svids(client).await,
@@ -249,7 +263,7 @@ async fn dispatch(client: &mut CmisClient, command: &str, rest: &[String]) -> an
             let (sub, sub_args) = rest
                 .split_first()
                 .expect("allowlist with no subcommand handled above");
-            allowlist::run(client, sub, sub_args).await
+            allowlist::run(client, ctx, sub, sub_args).await
         }
         _ => unreachable!("command validated above"),
     }

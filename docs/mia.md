@@ -1056,6 +1056,14 @@ by its `CMIS_ALLOWLIST_PROPOSALS` policy:
 - `always` — auto-adopt every proposal (weakest; a compromised-but-attesting
   host can grant itself callers).
 
+Once CMIS runs in `approvals` mode (F19 §11) none of these apply: nothing is
+adopted or queued as a proposal, and each new `(uid, hash)` entry becomes one
+`observed` app request for an approver (the `*` hash and MIA's own uid-less
+self entry are skipped; entries already admitted on some path are skipped).
+The path is unknown to a pre-F19 agent, so such a request can only be
+approved with an any-path scope. `allowlist.propose` is deprecated in that
+mode; use `mia app register` instead.
+
 Queued proposals are reviewed by an operator with `ferrogate allowlist
 proposals` / `review <host>` / `approve <host>` / `reject <host>`. Because a
 deny-all host denies (and therefore records) every legitimate caller, those

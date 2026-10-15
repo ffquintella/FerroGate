@@ -25,6 +25,79 @@ record them.
 
 ## [Unreleased]
 
+### Added
+
+- Import every legacy allowlist entry as a `legacy_import` approval with `ferrogate admin migrate-allowlists [--dry-run]` (S50, S54, M38, T272)
+  The new platform-operator RPC `ImportLegacyAllowlists` (`allowlist.import`,
+  step-up) turns each `(uid, bin_sha)` of every `host_allowlists` body into an
+  `ACTIVE` approval with any path, manual updates, no expiry, and the uid and
+  `*` exactly as stored. The approval id is derived from the entry, so a
+  re-run creates nothing and a revoked import is never recreated; the legacy
+  rows are only read. An import whose entry was removed from its legacy body
+  (or whose body was deleted) is revoked with reason code 1000, so a binary
+  removed in legacy mode cannot come back after the switch. A dry run
+  returns the per-host report ("legacy, no expiry", already imported, stale,
+  skipped bodies) and writes nothing. Each host that gains approvals gets its
+  generation bumped and one PII-free `AllowlistImported` event (plus one
+  `ApprovalRevoked` per revoked import); a store failure answers
+  `UNAVAILABLE store_unavailable` and audits nothing for the failed write.
+  Schema migration 3 makes the database refuse a `legacy_import` row with any
+  other terms or attached to a real lineage.
+- Switch the replicated allowlist mode with `ferrogate admin set-allowlist-mode legacy|approvals`, refusing an incomplete import and confirming a rollback (S50, M38, T273)
+  `SetAllowlistMode` (`settings.allowlist_mode`, step-up) is audited as
+  `AllowlistModeChanged`; a dry run or the mode already in force changes and
+  audits nothing. `approvals` is refused with `FAILED_PRECONDITION
+  import_stale` while an import whose entry left its legacy body is open (no
+  override) and with `import_incomplete` while a legacy entry has no
+  approval (override: `--allow-unimported`). Legacy writes check the mode in
+  their own transaction, so none lands after the switch, and the switch
+  commits only if no legacy body changed since its checks (`ABORTED
+  concurrent_change` otherwise). Switching back to `legacy` reports the live
+  approvals the preserved legacy bodies do not carry and the revoked legacy
+  imports they admit again, and needs confirmation (`--yes` when not on a
+  terminal; `confirm_rollback` on the RPC). `GetAllowlistMode` lets any
+  administrator session read the mode.
+- Write the 0.30.0 change document and the legacy-allowlist migration runbook (S56, M38, T274)
+  `docs/change-v0.30.0.md` (FGV *documento de mudança*) and the runbook in
+  `docs/operations.md`; `docs/cmis.md`, `docs/allowlist-provisioning.md`,
+  `docs/audit.md`, `docs/mia.md` and the F19/F20 specs describe the
+  approvals-mode behaviour, the new error codes and `CMIS_LEGACY_GETALLOWLIST`.
+
+### Changed
+
+- Retire the legacy allowlist writes in approvals mode and map the legacy commands and proposals onto the approval ledger (S50, M38, T273)
+  In `approvals` mode `SetAllowlist` and `DeleteAllowlist` answer
+  `FAILED_PRECONDITION mode_approvals` and the legacy bodies stay read-only
+  for a rollback. `ferrogate allowlist add` registers one binary as an
+  approval (`--path`, `--platform`, `--user`, a TOTP code) and `ferrogate
+  allowlist remove` lists and, once confirmed (`--yes` off a terminal),
+  revokes the matching approvals (`--reason-code`); against an older CMIS
+  without `GetAllowlistMode` both keep their legacy behaviour.
+  `ProposeAllowlist` from a pre-F19 agent no longer adopts or queues the set
+  (`CMIS_ALLOWLIST_PROPOSALS` does not apply): each new entry becomes one
+  `observed` request under a placeholder "unknown path" lineage, which can
+  only be approved with an any-path scope (`INVALID_ARGUMENT path_unknown`
+  otherwise) and is never auto-approved.
+- Serve the v1 `GetAllowlist` body in approvals mode as the lossy-safe compile of the host's approvals (S50, M38, T273)
+  Only approvals a pre-F19 agent can enforce are included — any path, and a
+  Unix uid, any user or a legacy import, valid until the document's
+  `not_after` — signed under the unchanged `ferrogate-allowlist-v1` context;
+  anything else is omitted, failing closed for that application on old
+  agents only. A known host always gets a signed body (so revocations reach
+  old agents); bodies are cached per node until the entry set changes or half
+  their lifetime passes, and an unknown or malformed host costs no leader
+  round trip. A pre-F19 proposal's coverage and duplicates are checked with
+  two reads per call, and more than 4096 distinct entries are refused
+  (`INVALID_ARGUMENT too_many_entries`).
+
+### Deprecated
+
+- Deprecate the unauthenticated v1 `GetAllowlist`; turn it off with `CMIS_LEGACY_GETALLOWLIST=off` once no pre-F19 agent remains (S50, M38, T273)
+  The default stays on. Off answers `FAILED_PRECONDITION
+  legacy_getallowlist_disabled` in both modes; an old agent keeps its current
+  allowlist file until that file's `not_after` and then fails closed. The RPC
+  will be removed in a later release.
+
 ### Security
 
 - Upgrade rustls to 0.23.46 to fix RUSTSEC-2026-0346, -0347, -0348 and -0349 (S1, T5)

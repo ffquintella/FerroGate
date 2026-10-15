@@ -672,6 +672,20 @@ impl Cluster {
         Ok(rows.into_iter().map(|r| (r.host_uuid, r.payload)).collect())
     }
 
+    /// All stored `(host_uuid, payload)` allowlist pairs, read through the
+    /// leader (strongly consistent), ordered by host — the input of the
+    /// legacy import (F19 §11), which must not miss a row a peer just wrote.
+    pub async fn list_allowlists_consistent(&self) -> Result<Vec<(String, Vec<u8>)>, ClusterError> {
+        let rows: Vec<RawAllowlistRow> = self
+            .client
+            .query_consistent_map(
+                "SELECT host_uuid, payload, updated_at FROM host_allowlists ORDER BY host_uuid",
+                Vec::<hiqlite::Param>::new(),
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.host_uuid, r.payload)).collect())
+    }
+
     /// Delete one host's allowlist. Returns whether a row was removed.
     pub async fn delete_allowlist(&self, host_uuid: &str) -> Result<bool, ClusterError> {
         let affected = self

@@ -131,6 +131,13 @@ service MachineIdentity {
 
   // (plus the revocation, audit-log, and health RPCs.)
 }
+
+// admin.proto, served on the admin listener (F20), allowlist migration (F19 §11):
+service Admin {
+  rpc GetAllowlistMode       (GetAllowlistModeRequest)       returns (GetAllowlistModeResponse);       // any session
+  rpc SetAllowlistMode       (SetAllowlistModeRequest)       returns (SetAllowlistModeResponse);       // settings.allowlist_mode, step-up
+  rpc ImportLegacyAllowlists (ImportLegacyAllowlistsRequest) returns (ImportLegacyAllowlistsResponse); // allowlist.import, step-up
+}
 ```
 
 - `Attest` is the only RPC that does not require an existing valid SVID; the
@@ -163,13 +170,35 @@ service MachineIdentity {
   approval. Status only answers for the caller's own requests. `SyncAllowlist`
   serves the host-bound allowlist **v2** (context `ferrogate-allowlist-v2`)
   with a monotonic generation, or `not_modified`. While the replicated
-  `allowlist_mode` is `legacy` (the default until the M38 switch) submissions
-  answer `FAILED_PRECONDITION mode_legacy` and `SyncAllowlist` serves the
-  host's legacy v1 entries in v2 form. `GetAllowlist` is unchanged and never
-  serves v2. Administrators decide requests through the `Admin` service
-  (`ListAppRequests` … `AdminRegisterApplication`, F19 §5.4); a leader-only
-  sweeper expires stale requests and approvals every 60 s. Details:
-  [operations.md](operations.md#application-approvals-f19).
+  `allowlist_mode` is `legacy` (the default) submissions answer
+  `FAILED_PRECONDITION mode_legacy` and `SyncAllowlist` serves the host's
+  legacy v1 entries in v2 form. Administrators decide requests through the
+  `Admin` service (`ListAppRequests` … `AdminRegisterApplication`, F19 §5.4);
+  a leader-only sweeper expires stale requests and approvals every 60 s.
+  Details: [operations.md](operations.md#application-approvals-f19).
+- **Allowlist migration (F19 §11, `crates/cmis/src/apps/{migration,v1,
+  proposals}.rs`, `crates/cmis/src/admin/migration.rs`).** Platform operators
+  import the legacy bodies as `legacy_import` approvals
+  (`Admin/ImportLegacyAllowlists`, dry run available, idempotent, legacy rows
+  untouched; imports whose entry left the body are revoked) and switch the
+  mode (`Admin/SetAllowlistMode`, step-up, audited; `approvals` refused with
+  `import_stale` while such an import is open and with `import_incomplete`
+  until every entry is imported; `legacy` needs `confirm_rollback`); legacy
+  writes check the mode inside their own transaction; any session reads it
+  (`Admin/GetAllowlistMode`). In `approvals` mode `SetAllowlist` and
+  `DeleteAllowlist` answer `FAILED_PRECONDITION mode_approvals`;
+  `ProposeAllowlist` from a pre-F19 agent records one `observed` request per
+  new entry (placeholder "unknown path" lineage, never auto-approved or
+  adopted); and `GetAllowlist` serves the **lossy-safe** v1 compile of the
+  host's approvals — any-path approvals of a Unix user, any user or a legacy
+  import, unexpired until the document's `not_after` — signed under the
+  unchanged `ferrogate-allowlist-v1` context and cached per node until the
+  entry set changes or half its lifetime passes; an unknown or malformed
+  host is answered from the local replica, without a leader round trip. `GetAllowlist` never serves
+  v2 and is **deprecated**: `CMIS_LEGACY_GETALLOWLIST=off` (default on)
+  refuses it in both modes with `FAILED_PRECONDITION
+  legacy_getallowlist_disabled`. Runbook:
+  [operations.md](operations.md#migrating-legacy-allowlists-to-approvals-runbook).
 
 ## Administrator authentication
 
@@ -250,6 +279,10 @@ audit_pseudonym_key  = "/var/lib/ferrogate/admin/audit-pseudonym.key"  # CMIS_AU
 tray_fido2_groups    = ["ferrogate-approvers"]  # CMIS_ADMIN_TRAY_FIDO2_GROUPS
 audit_forward_max_per_min = 600                 # CMIS_AUDIT_FORWARD_MAX_PER_MIN (host proof RPC)
 
+[apps]
+# F19 (full table: operations.md "Application approvals").
+legacy_get_allowlist = true                     # CMIS_LEGACY_GETALLOWLIST (deprecated v1 GetAllowlist; off refuses it)
+
 [audit]
 worm_dir      = "/var/lib/ferrogate/audit"      # local-disk WORM store (O_CREAT|O_EXCL)
 sigsum_log    = "https://sigsum.example.org/log1"
@@ -280,6 +313,13 @@ parentheses below) — for example every host-authentication failure is the same
 | Host at its open-request cap (F19) | `RESOURCE_EXHAUSTED` (`too_many_pending`, `retry-after`) |
 | F19 field invalid (with `x-ferrogate-field`) | `INVALID_ARGUMENT` (`field_too_long`, `path_not_absolute`, `bad_sha`, …) |
 | F19 submission while `allowlist_mode` is `legacy` | `FAILED_PRECONDITION` (`mode_legacy`) |
+| `SetAllowlist` / `DeleteAllowlist` while `allowlist_mode` is `approvals` | `FAILED_PRECONDITION` (`mode_approvals`) |
+| `GetAllowlist` while `CMIS_LEGACY_GETALLOWLIST=off` | `FAILED_PRECONDITION` (`legacy_getallowlist_disabled`) |
+| Switch to `approvals` with legacy entries not imported | `FAILED_PRECONDITION` (`import_incomplete`) |
+| Switch to `approvals` with an open import whose entry left its legacy body | `FAILED_PRECONDITION` (`import_stale`) |
+| A legacy body changed while the switch to `approvals` was being decided | `ABORTED` (`concurrent_change`) |
+| Switch back to `legacy` without `confirm_rollback` | `FAILED_PRECONDITION` (`confirmation_required`) |
+| Exact-path scope for a binary whose path is unknown (legacy import, pre-F19 proposal) | `INVALID_ARGUMENT` (`path_unknown`) |
 | F19 transition from the wrong state / stale `row_version` | `FAILED_PRECONDITION` (`invalid_state`) / `ABORTED` (`row_version_mismatch`) |
 | Deciding one's own request under strict SoD | `PERMISSION_DENIED` (`sod_self_approval`) |
 | Admin method without a valid session | `UNAUTHENTICATED` (`session_invalid`) |

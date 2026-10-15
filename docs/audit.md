@@ -51,6 +51,22 @@ paths only as the host-salted `path_hash`; user names, SIDs, paths and
 free-text messages never. Hosts may forward `AllowlistSyncApplied` /
 `AllowlistSyncRejected`, and only for themselves (`host_mismatch` otherwise).
 
+**Allowlist migration (F19 §11).** `AllowlistImported {host_uuid,
+approvals_created, admin_id}` is written once per host whose legacy body
+gained `legacy_import` approvals, after the batch committed; a dry run or a
+re-run that creates nothing writes none. `AllowlistModeChanged {old_mode,
+new_mode, admin_id, session_ref, approvals_not_reflected, imports_readmitted,
+entries_not_imported}` records each switch of the replicated mode with what
+it changed (counts only); a dry run or a switch to the mode already in force
+writes none. Both calls are still recorded as `AdminCallAuthorized` by the
+admin layer, so every attempt — dry runs included — is traceable. Neither
+event carries a uid, a hash list or a path. An import also revokes the
+imports whose entry left the legacy body, each recorded as an ordinary
+`ApprovalRevoked` with reason code 1000 and the importer's `admin_id`. A
+failed write audits nothing.
+Review `AllowlistModeChanged` with `new_mode = legacy` (a rollback re-admits
+revoked legacy imports) and `entries_not_imported > 0` in the SIEM.
+
 No personally identifiable information is recorded. EK certificates and
 binary contents are referenced only by SHA-384 hash.
 

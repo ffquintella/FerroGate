@@ -1,5 +1,6 @@
 //! DDL of the app approval ledger (F19 §2), applied as schema migrations 1
-//! ([`LEDGER_SCHEMA`]) and 2 ([`APPROVAL_USER_GUARDS`]).
+//! ([`LEDGER_SCHEMA`]), 2 ([`APPROVAL_USER_GUARDS`]) and 3
+//! ([`LEGACY_IMPORT_GUARDS`], the terms of a legacy import, F19 §11).
 //!
 //! Tables first, then indexes, then triggers (trigger bodies name tables
 //! created earlier in the same migration). Every statement is idempotent.
@@ -146,6 +147,24 @@ pub(crate) const APPROVAL_USER_GUARDS: &[&str] = &[
             BEGIN SELECT RAISE(ABORT, 'app_approvals: every change advances row_version by one and \
                 has a revision record'); END"
     ),
+];
+
+/// Statements of schema migration 3 (F19 §11, M38): the terms of a legacy
+/// import. A `legacy_import` approval is created exactly as F19 §11 step 4
+/// describes it — any path, manual each time, no expiry, no revision, no
+/// parent, no Windows identity — and never names a real lineage, so it can
+/// never become the auto-update parent of a binary a host reported. Later
+/// edits (expiry, narrowing, revocation) go through the ordinary guards.
+pub(crate) const LEGACY_IMPORT_GUARDS: &[&str] = &[
+    "CREATE TRIGGER IF NOT EXISTS app_approvals_legacy_import_terms \
+        BEFORE INSERT ON app_approvals \
+        WHEN NEW.origin = 4 AND (NEW.path_match IS NOT 2 OR NEW.update_policy IS NOT 1 \
+            OR NEW.expires_at IS NOT NULL OR NEW.revision IS NOT NULL \
+            OR NEW.parent_approval_id IS NOT NULL OR NEW.sid IS NOT NULL \
+            OR NEW.user_name IS NOT NULL OR NEW.user_kind IS NOT NULL \
+            OR EXISTS (SELECT 1 FROM app_lineages l WHERE l.lineage_id = NEW.lineage_id)) \
+        BEGIN SELECT RAISE(ABORT, 'app_approvals: a legacy import is any-path, manual each time, \
+            without expiry, revision, parent, Windows identity or lineage'); END",
 ];
 
 /// Statements of schema migration 1, in order. Kept exactly as first

@@ -1826,6 +1826,21 @@ impl Cluster {
         Ok(rows.into_iter().next().map(|r| r.0))
     }
 
+    /// Read one `cmis_settings` value from this node's replica, without a
+    /// round trip to the leader. Only for readers that tolerate a value a
+    /// few milliseconds old, such as a public read path that must stay
+    /// cheap; decisions that guard writes use [`Cluster::setting`].
+    pub async fn setting_local(&self, key: &str) -> Result<Option<String>, ClusterError> {
+        let rows: Vec<StringRow> = self
+            .client()
+            .query_map(
+                "SELECT value AS v FROM cmis_settings WHERE key = ?1",
+                vec![s(key)],
+            )
+            .await?;
+        Ok(rows.into_iter().next().map(|r| r.0))
+    }
+
     /// Write one `cmis_settings` value.
     pub async fn put_setting(&self, key: &str, value: &str) -> Result<(), ClusterError> {
         self.client()

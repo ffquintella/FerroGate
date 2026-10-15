@@ -408,6 +408,25 @@ async fn request_full(cluster: &Cluster, r: &RequestRow) -> Result<AppRequestInf
     ))
 }
 
+/// An exact-path scope needs a lineage with a real path: a legacy import has
+/// no lineage, and a pre-F19 proposal only a placeholder
+/// ([`crate::apps::proposals`]); an exact path there would never match
+/// (`INVALID_ARGUMENT path_unknown` on `field`).
+async fn require_known_path(
+    cluster: &Cluster,
+    lineage_id: &str,
+    field: &'static str,
+) -> Result<(), Status> {
+    match cluster
+        .app_lineage(lineage_id)
+        .await
+        .map_err(ledger_status)?
+    {
+        Some(l) if !crate::apps::proposals::is_unknown_path(&l) => Ok(()),
+        _ => Err(invalid_field("path_unknown", Some(field))),
+    }
+}
+
 async fn generation(cluster: &Cluster, host_uuid: &str) -> Result<u64, Status> {
     Ok(cluster
         .app_allowlist_state(host_uuid)
@@ -748,10 +767,16 @@ pub async fn approve_app_request(
         return Err(Status::permission_denied("sod_self_approval"));
     }
     let choice = match &req.choice {
-        Some(Choice::Terms(t)) => ApprovalChoice::New {
-            approval_id: new_id(),
-            terms: terms(t, pending.flags, cfg, now)?,
-        },
+        Some(Choice::Terms(t)) => {
+            let terms = terms(t, pending.flags, cfg, now)?;
+            if terms.path_match == PathMatch::Exact {
+                require_known_path(cluster, &pending.lineage_id, "terms.path_match").await?;
+            }
+            ApprovalChoice::New {
+                approval_id: new_id(),
+                terms,
+            }
+        }
         Some(Choice::ReuseApprovalId(id)) => {
             check_id(id, "reuse_approval_id")?;
             ApprovalChoice::Reuse {
@@ -932,6 +957,9 @@ pub async fn update_approval(
             None => 0,
         };
         check_wide_auto(scope, policy, flags)?;
+    }
+    if req.narrow_to_exact_path {
+        require_known_path(cluster, &current.lineage_id, "narrow_to_exact_path").await?;
     }
     let expected_row_version = i64::try_from(req.expected_row_version)
         .map_err(|_| invalid_field("bad_value", Some("expected_row_version")))?;

@@ -14,7 +14,14 @@
 //! - [`sweep`]: the leader-only sweepers that expire stale requests and
 //!   approvals (F19 §5.5);
 //! - [`mode`]: the replicated `allowlist_mode` switch (F19 §11);
-//! - [`config`]: the `CMIS_APP_*` / `CMIS_APPROVAL_*` settings.
+//! - [`migration`]: the legacy-allowlist import plan and import (F19 §11
+//!   step 4);
+//! - [`v1`]: the lossy-safe v1 `GetAllowlist` body in `approvals` mode
+//!   (F19 §6.4);
+//! - [`proposals`]: a pre-F19 agent's `ProposeAllowlist` in `approvals`
+//!   mode, as `observed` requests (F19 §11 step 5);
+//! - [`config`]: the `CMIS_APP_*` / `CMIS_APPROVAL_*` /
+//!   `CMIS_LEGACY_GETALLOWLIST` settings.
 //!
 //! The host RPC handlers in [`crate::service`] and the administrator handlers
 //! in [`crate::admin::apps`] are thin wrappers over these functions.
@@ -27,9 +34,12 @@ pub mod compile;
 pub mod config;
 pub mod events;
 pub mod intake;
+pub mod migration;
 pub mod mode;
+pub mod proposals;
 pub mod status;
 pub mod sweep;
+pub mod v1;
 
 pub use config::AppConfig;
 pub use mode::AllowlistMode;

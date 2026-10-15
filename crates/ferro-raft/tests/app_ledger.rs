@@ -6,11 +6,12 @@
 #![allow(clippy::too_many_lines)] // each test walks one scenario end to end.
 
 use ferro_raft::apps::{
-    dedup_key, is_pseudonym, ApprovalChoice, ApprovalEdit, ApprovalFilter, ApprovalSnapshot,
-    ApprovalState, ApprovalTerms, Approve, AutoChecks, AutoDowngradeReason, AutoIntake, Continuity,
-    Cursor, Deny, Intake, IntakeChecks, LineageRow, NewRequest, ObservedBinary, PathMatch,
-    RequestFilter, RequestOrigin, RequestState, RevisionChange, Revoke, UpdatePolicy, UserIdentity,
-    UserKind, UserScope, FLAG_PATH_PROTECTED, PSEUDONYM_PREFIX,
+    dedup_key, is_pseudonym, legacy_approval_id, legacy_lineage_id, ApprovalChoice, ApprovalEdit,
+    ApprovalFilter, ApprovalOrigin, ApprovalSnapshot, ApprovalState, ApprovalTerms, Approve,
+    AutoChecks, AutoDowngradeReason, AutoIntake, Continuity, Cursor, Deny, Intake, IntakeChecks,
+    LegacyEntry, LineageRow, NewRequest, ObservedBinary, PathMatch, RequestFilter, RequestOrigin,
+    RequestState, RevisionChange, Revoke, UpdatePolicy, UserIdentity, UserKind, UserScope,
+    FLAG_PATH_PROTECTED, LEGACY_BIN_WILDCARD, MAX_IMPORT_BATCH, PSEUDONYM_PREFIX,
 };
 use ferro_raft::{Cluster, LedgerError};
 use hiqlite::Param;
@@ -173,9 +174,9 @@ fn p(s: &str) -> Param {
 }
 
 #[tokio::test]
-async fn the_ledger_is_schema_migrations_1_and_2() {
+async fn the_ledger_is_schema_migrations_1_to_3() {
     let (c, _d) = cluster("migr").await;
-    assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2]);
+    assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2, 3]);
     c.shutdown().await.unwrap();
 }
 
@@ -1265,5 +1266,334 @@ async fn listing_filters_pages_and_scopes_status_to_the_host() {
             .await
             .unwrap());
     }
+    c.shutdown().await.unwrap();
+}
+
+// ---- legacy import (F19 §11, M38) ------------------------------------------
+
+fn legacy(uid: Option<u32>, bin_sha: &str) -> LegacyEntry {
+    LegacyEntry::new(uid, bin_sha).unwrap()
+}
+
+/// T272: every legacy entry becomes one `legacy_import` approval with the
+/// F19 §11 terms, the uid and `"*"` exactly as stored; a re-run creates
+/// nothing, a revoked import is never recreated, and the generation moves
+/// only when something was created.
+#[tokio::test]
+async fn legacy_import_creates_the_spec_approvals_once() {
+    let (c, _d) = cluster("legacy-import").await;
+    let entries = vec![
+        legacy(Some(1000), &sha(1)),
+        legacy(None, &sha(2)),
+        legacy(Some(1001), LEGACY_BIN_WILDCARD),
+        legacy(None, LEGACY_BIN_WILDCARD),
+    ];
+    assert_eq!(
+        c.app_legacy_imported(HOST, &entries).await.unwrap(),
+        vec![false; 4],
+        "nothing imported yet"
+    );
+    assert_eq!(c.app_allowlist_state(HOST).await.unwrap(), None);
+
+    let first = c
+        .app_import_legacy(HOST, &entries, "admin-op", NOW, NOW * 1000)
+        .await
+        .unwrap();
+    assert_eq!(first.created.len(), 4);
+    assert_eq!(first.already_imported, 0);
+    assert!(first.generation >= u64::try_from(NOW * 1000).unwrap());
+    for e in &entries {
+        let a = c
+            .app_approval(&legacy_approval_id(HOST, e))
+            .await
+            .unwrap()
+            .expect("imported");
+        assert_eq!(a.origin, ApprovalOrigin::LegacyImport);
+        assert_eq!(a.state, ApprovalState::Active);
+        assert_eq!(a.path_match, PathMatch::Any);
+        assert_eq!(a.update_policy, UpdatePolicy::ManualEachTime);
+        assert_eq!(a.expires_at, None, "legacy, no expiry");
+        assert_eq!(a.revision, None);
+        assert_eq!(a.approved_by_admin_id, None);
+        assert_eq!(a.source_request_id, None);
+        assert_eq!(a.bin_sha, e.bin_sha);
+        assert_eq!(a.uid, e.uid);
+        assert_eq!(
+            a.user_scope,
+            if e.uid.is_some() {
+                UserScope::ExactUser
+            } else {
+                UserScope::AnyUser
+            }
+        );
+        assert_eq!(a.lineage_id, legacy_lineage_id(HOST));
+        let revs = c.app_approval_revisions(&a.approval_id).await.unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].change_kind, RevisionChange::Created);
+        assert_eq!(revs[0].changed_by_admin_id.as_deref(), Some("admin-op"));
+    }
+    // The import is part of the compile input, without a path.
+    let live = c.app_live_approvals(HOST, NOW + 1).await.unwrap();
+    assert_eq!(live.len(), 4);
+    assert!(live.iter().all(|l| l.path_key.is_none()));
+
+    // A re-run, even with duplicates, creates nothing and keeps the generation.
+    let mut again = entries.clone();
+    again.push(entries[0].clone());
+    let rerun = c
+        .app_import_legacy(HOST, &again, "admin-op", NOW + 5, NOW * 1000 + 5_000)
+        .await
+        .unwrap();
+    assert_eq!(rerun.created, Vec::new());
+    assert_eq!(rerun.already_imported, 5);
+    assert_eq!(rerun.generation, first.generation);
+
+    // A revoked import stays revoked: re-importing does not bring it back.
+    let id = legacy_approval_id(HOST, &entries[0]);
+    c.app_revoke_approval(
+        &Revoke {
+            approval_id: id.clone(),
+            admin_id: "admin-op".into(),
+            reason_code: 3,
+            expected_row_version: None,
+        },
+        NOW + 10,
+        NOW * 1000 + 10_000,
+    )
+    .await
+    .unwrap();
+    let after_revoke = c
+        .app_import_legacy(HOST, &entries, "admin-op", NOW + 20, NOW * 1000 + 20_000)
+        .await
+        .unwrap();
+    assert_eq!(after_revoke.created, Vec::new());
+    assert_eq!(
+        c.app_approval(&id).await.unwrap().unwrap().state,
+        ApprovalState::Revoked
+    );
+    assert_eq!(
+        c.app_legacy_imported(HOST, &entries).await.unwrap(),
+        vec![true; 4]
+    );
+    let stored = c.app_legacy_imports_of(HOST).await.unwrap();
+    assert_eq!(stored.len(), 4);
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|r| r.state == ApprovalState::Revoked)
+            .map(|r| r.entry.clone())
+            .collect::<Vec<_>>(),
+        vec![entries[0].clone()]
+    );
+    assert_eq!(
+        c.app_hosts_with_open_legacy_imports().await.unwrap(),
+        vec![HOST.to_string()]
+    );
+
+    // Another host's entries are its own approvals.
+    assert_eq!(
+        c.app_legacy_imported(OTHER_HOST, &entries).await.unwrap(),
+        vec![false; 4]
+    );
+    let other = c
+        .app_import_legacy(OTHER_HOST, &entries[..1], "admin-op", NOW, NOW * 1000)
+        .await
+        .unwrap();
+    assert_eq!(other.created.len(), 1);
+    assert_ne!(other.created[0].approval_id, id);
+
+    // What a rollback to legacy would change: the revoked import is
+    // readmitted by the legacy body; no other approval exists yet.
+    let counts = c.app_mode_rollback_counts(NOW + 30).await.unwrap();
+    assert_eq!(counts.approvals_not_reflected, 0);
+    assert_eq!(counts.imports_readmitted, 1);
+    assert!(c.app_host_has_approvals(HOST).await.unwrap());
+    assert!(!c
+        .app_host_has_approvals("8d5e0000-0000-4000-8000-00000000ffff")
+        .await
+        .unwrap());
+
+    // Entries without a path are matched on any path, by hash or wildcard.
+    assert!(c
+        .app_admits_on_some_path(HOST, &sha(2), 4242, NOW + 30)
+        .await
+        .unwrap());
+    assert!(c
+        .app_admits_on_some_path(HOST, &sha(9), 1001, NOW + 30)
+        .await
+        .unwrap());
+    assert!(!c
+        .app_admits_on_some_path(OTHER_HOST, &sha(9), 1001, NOW + 30)
+        .await
+        .unwrap());
+    c.shutdown().await.unwrap();
+}
+
+/// Batches are bounded and malformed entries are refused before any write.
+#[tokio::test]
+async fn legacy_import_validates_before_writing() {
+    let (c, _d) = cluster("legacy-validate").await;
+    let too_many: Vec<LegacyEntry> = (0..=MAX_IMPORT_BATCH)
+        .map(|i| legacy(Some(u32::try_from(i).unwrap()), &sha(1)))
+        .collect();
+    assert!(matches!(
+        c.app_import_legacy(HOST, &too_many, "admin-op", NOW, NOW * 1000)
+            .await,
+        Err(LedgerError::Invalid("entries"))
+    ));
+    let bad = LegacyEntry {
+        uid: Some(1),
+        bin_sha: "ABC".into(),
+    };
+    assert!(matches!(
+        c.app_import_legacy(HOST, &[bad], "admin-op", NOW, NOW * 1000)
+            .await,
+        Err(LedgerError::Invalid("bin_sha"))
+    ));
+    let wide = LegacyEntry {
+        uid: Some(i64::from(u32::MAX) + 1),
+        bin_sha: sha(1),
+    };
+    assert!(matches!(
+        c.app_import_legacy(HOST, &[wide], "admin-op", NOW, NOW * 1000)
+            .await,
+        Err(LedgerError::Invalid("uid"))
+    ));
+    assert_eq!(c.app_allowlist_state(HOST).await.unwrap(), None);
+    assert!(!c.app_host_has_approvals(HOST).await.unwrap());
+    c.shutdown().await.unwrap();
+}
+
+/// Migration 3: the database refuses a `legacy_import` row with any other
+/// terms than F19 §11 step 4 names, or one attached to a real lineage.
+#[tokio::test]
+async fn the_database_holds_legacy_imports_to_their_terms() {
+    let (c, _d) = cluster("legacy-guard").await;
+    let (lineage, _) = c
+        .app_observe_binary(&observed(HOST, "/opt/tool", 1))
+        .await
+        .unwrap();
+    let insert = |lineage_id: String, path_match: i64, policy: i64, expires: Option<i64>| {
+        let c = &c;
+        async move {
+            raw(
+                c,
+                "INSERT INTO app_approvals (approval_id, host_uuid, lineage_id, bin_sha, \
+                 origin, user_scope, path_match, update_policy, continuity, created_at, \
+                 expires_at, state, row_version) \
+                 VALUES (?1, ?2, ?3, '*', 4, 2, ?4, ?5, 1, ?6, ?7, 1, 1)",
+                vec![
+                    p(&format!(
+                        "forged-{path_match}-{policy}-{expires:?}-{lineage_id}"
+                    )),
+                    p(HOST),
+                    p(&lineage_id),
+                    Param::from(path_match),
+                    Param::from(policy),
+                    Param::from(NOW),
+                    Param::from(expires),
+                ],
+            )
+            .await
+        }
+    };
+    let legacy_lineage = legacy_lineage_id(HOST);
+    assert!(
+        insert(legacy_lineage.clone(), 1, 1, None).await.is_err(),
+        "exact path"
+    );
+    assert!(
+        insert(legacy_lineage.clone(), 2, 2, None).await.is_err(),
+        "auto-update"
+    );
+    assert!(
+        insert(legacy_lineage.clone(), 2, 1, Some(NOW + DAY))
+            .await
+            .is_err(),
+        "an expiry"
+    );
+    assert!(
+        insert(lineage.lineage_id.clone(), 2, 1, None)
+            .await
+            .is_err(),
+        "a real lineage"
+    );
+    assert!(
+        insert(legacy_lineage, 2, 1, None).await.is_ok(),
+        "the spec terms are accepted"
+    );
+    c.shutdown().await.unwrap();
+}
+
+/// A legacy write checks the mode in its own transaction, so none lands
+/// after a switch to `approvals` (security review, M38).
+#[tokio::test]
+async fn legacy_writes_are_refused_in_the_same_transaction_as_the_mode() {
+    let (c, _d) = cluster("legacy-guarded").await;
+    let key = "allowlist_mode";
+    assert!(c
+        .upsert_allowlist_unless_setting(HOST, b"v1", NOW, key, "approvals")
+        .await
+        .unwrap());
+    assert_eq!(
+        c.fetch_allowlist_consistent(HOST).await.unwrap(),
+        Some(b"v1".to_vec())
+    );
+    c.put_setting(key, "approvals").await.unwrap();
+    assert!(!c
+        .upsert_allowlist_unless_setting(HOST, b"v2", NOW, key, "approvals")
+        .await
+        .unwrap());
+    assert_eq!(
+        c.delete_allowlist_unless_setting(HOST, key, "approvals")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        c.fetch_allowlist_consistent(HOST).await.unwrap(),
+        Some(b"v1".to_vec()),
+        "nothing written while refused"
+    );
+    assert!(c.app_host_known_local(HOST).await.unwrap());
+    assert!(!c.app_host_known_local(OTHER_HOST).await.unwrap());
+    assert_eq!(
+        c.setting_local(key).await.unwrap().as_deref(),
+        Some("approvals")
+    );
+    c.put_setting(key, "legacy").await.unwrap();
+
+    // A switch decided on a plan commits only if no legacy body changed.
+    let fingerprint = c.legacy_allowlists_fingerprint().await.unwrap();
+    assert_eq!(fingerprint, (1, NOW));
+    assert!(c
+        .upsert_allowlist_unless_setting(OTHER_HOST, b"x", NOW + 1, key, "approvals")
+        .await
+        .unwrap());
+    assert!(!c
+        .put_setting_if_legacy_unchanged(key, "approvals", fingerprint)
+        .await
+        .unwrap());
+    assert_eq!(c.setting(key).await.unwrap().as_deref(), Some("legacy"));
+    let fingerprint = c.legacy_allowlists_fingerprint().await.unwrap();
+    assert!(c
+        .put_setting_if_legacy_unchanged(key, "approvals", fingerprint)
+        .await
+        .unwrap());
+    assert_eq!(c.setting(key).await.unwrap().as_deref(), Some("approvals"));
+    c.put_setting(key, "legacy").await.unwrap();
+
+    assert_eq!(
+        c.delete_allowlist_unless_setting(HOST, key, "approvals")
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        c.delete_allowlist_unless_setting(HOST, key, "approvals")
+            .await
+            .unwrap(),
+        Some(false)
+    );
     c.shutdown().await.unwrap();
 }

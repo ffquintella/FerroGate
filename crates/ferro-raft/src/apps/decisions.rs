@@ -184,7 +184,7 @@ impl<'a> From<&'a NewRequest> for RequestFacts<'a> {
     }
 }
 
-fn insert_approval_stmt(a: &ApprovalRow) -> (&'static str, Vec<Param>) {
+pub(crate) fn insert_approval_stmt(a: &ApprovalRow) -> (&'static str, Vec<Param>) {
     (
         INSERT_APPROVAL,
         vec![

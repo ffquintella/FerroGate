@@ -284,6 +284,12 @@ pub mod paths {
     /// `Admin/AdminRegisterApplication` (F19).
     pub const ADMIN_REGISTER_APPLICATION: &str =
         "/ferrogate.admin.v1.Admin/AdminRegisterApplication";
+    /// `Admin/GetAllowlistMode` (F19 §11).
+    pub const GET_ALLOWLIST_MODE: &str = "/ferrogate.admin.v1.Admin/GetAllowlistMode";
+    /// `Admin/SetAllowlistMode` (F19 §11).
+    pub const SET_ALLOWLIST_MODE: &str = "/ferrogate.admin.v1.Admin/SetAllowlistMode";
+    /// `Admin/ImportLegacyAllowlists` (F19 §11).
+    pub const IMPORT_LEGACY_ALLOWLISTS: &str = "/ferrogate.admin.v1.Admin/ImportLegacyAllowlists";
 }
 
 use Permission as P;
@@ -467,6 +473,21 @@ pub const METHOD_ACCESS: &[(&str, Access)] = &[
     (
         paths::ADMIN_REGISTER_APPLICATION,
         session(Some(P::AppDirectRegister), false, false, false),
+    ),
+    // ---- Admin: allowlist migration (F19 §11, F20 §7; platform operators) ----
+    // The mode is operational state every administrator's client needs to
+    // pick the legacy or the approvals flow; reading it changes nothing.
+    (
+        paths::GET_ALLOWLIST_MODE,
+        session(None, false, false, false),
+    ),
+    (
+        paths::SET_ALLOWLIST_MODE,
+        session(Some(P::SettingsAllowlistMode), true, false, false),
+    ),
+    (
+        paths::IMPORT_LEGACY_ALLOWLISTS,
+        session(Some(P::AllowlistImport), true, false, false),
     ),
 ];
 
@@ -982,6 +1003,32 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// F19 §11 / F20 §7: the switch and the import are platform-operator
+    /// methods behind a recent step-up; reading the mode needs any session.
+    #[test]
+    fn allowlist_migration_rpcs_need_the_spec_permissions() {
+        assert_eq!(
+            access_for(paths::SET_ALLOWLIST_MODE),
+            Some(session(Some(P::SettingsAllowlistMode), true, false, false))
+        );
+        assert_eq!(
+            access_for(paths::IMPORT_LEGACY_ALLOWLISTS),
+            Some(session(Some(P::AllowlistImport), true, false, false))
+        );
+        assert_eq!(
+            access_for(paths::GET_ALLOWLIST_MODE),
+            Some(session(None, false, false, false))
+        );
+        let operators = ferro_raft::admin::BUILTIN_GROUPS
+            .iter()
+            .filter(|(_, perms)| {
+                perms.contains(&"settings.allowlist_mode") || perms.contains(&"allowlist.import")
+            })
+            .map(|(g, _)| *g)
+            .collect::<Vec<_>>();
+        assert_eq!(operators, vec![groups::PLATFORM_OPERATORS]);
     }
 
     /// F20 §7: factor management is open to any session; adding a factor
