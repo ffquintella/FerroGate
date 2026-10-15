@@ -28,7 +28,7 @@ tracing     = { workspace = true }
 
 # Page-locked memory (the `region` crate wraps the platform mlock/VirtualLock
 # syscall in a safe API — no `unsafe` at our boundary).
-region              = "3"
+region              = "4"
 
 # ML-KEM-768 for the peer share-transport PSK channel (FIPS 203).
 ml-kem              = { version = "0.3", default-features = false }
