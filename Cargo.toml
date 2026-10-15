@@ -109,7 +109,7 @@ hyper-util   = { version = "0.1", features = ["tokio"] }
 tower        = { version = "0.5", features = ["util"] }
 rcgen        = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 aws-lc-rs    = "1"
-wycheproof   = "0.6"
+wycheproof   = "0.7"
 
 # TPM 2.0 ESAPI (F02 — MIA-side hardware glue; Linux/Windows only)
 tss-esapi = "7.5"
