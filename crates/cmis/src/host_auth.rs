@@ -1,10 +1,10 @@
 //! Host call authentication — F19 §7.1 `HostCallAuth`, reusable by every
 //! host-facing RPC that carries a signed document.
 //!
-//! First consumer: `AppendAuditEvent` (F20 Phase 0, context
-//! `ferrogate-audit-forward-v1`). F19's `SubmitAppRequest`,
-//! `GetAppRequestStatus` and `SyncAllowlist` will call [`authenticate`] with
-//! their own context, document type and rate limiter.
+//! Consumers: `AppendAuditEvent` (F20 Phase 0, context
+//! `ferrogate-audit-forward-v1`) and F19's `SubmitAppRequest`,
+//! `GetAppRequestStatus` and `SyncAllowlist`, each with its own context,
+//! document type, size bound and rate limiter.
 //!
 //! [`authenticate`] runs the checks in a fixed order and stops at the first
 //! failure:
@@ -26,7 +26,8 @@
 //! Every authentication failure answers `UNAUTHENTICATED (host_auth_failed)`
 //! — one code, so a prober learns nothing about which check tripped — except
 //! a document naming another host (`PERMISSION_DENIED (host_mismatch)`), an
-//! authenticated but malformed document (`INVALID_ARGUMENT (malformed_doc)`)
+//! authenticated but malformed document (`INVALID_ARGUMENT` with the
+//! document's reason code and, when known, the `x-ferrogate-field` it names)
 //! and the rate limit (`RESOURCE_EXHAUSTED (rate_limited)` with
 //! `retry-after`). The precise reason is logged, never returned (NRM §5.3.5).
 //!
@@ -43,7 +44,8 @@ use tonic::Status;
 
 use ferro_crypto::composite::CompositeSignature;
 use ferro_proto::v1::HostCallAuth;
-use ferro_svid::host_call::{HostCallDoc, HostCallDocError, MAX_DOC_BYTES, NONCE_LEN};
+use ferro_svid::app_docs::AppDocError;
+use ferro_svid::host_call::{HostCallDoc, HostCallDocError, NONCE_LEN};
 
 use crate::state::CmisState;
 
@@ -59,6 +61,23 @@ pub const DEFAULT_REPLAY_CAPACITY: usize = 262_144;
 pub const DEFAULT_AUDIT_FORWARD_PER_MIN: u32 = 600;
 /// Upper bound on `CMIS_AUDIT_FORWARD_MAX_PER_MIN`.
 pub const MAX_AUDIT_FORWARD_PER_MIN: u32 = 60_000;
+/// Default `SubmitAppRequest` budget per host per hour (F19 §7.4).
+pub const DEFAULT_APP_SUBMIT_PER_HOUR: u32 = 30;
+/// Default `GetAppRequestStatus` budget per host per hour (F19 §7.4).
+pub const DEFAULT_APP_STATUS_PER_HOUR: u32 = 60;
+/// Default minimum seconds between two `SyncAllowlist` calls of one host
+/// (`CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`, F19 §6.3).
+pub const DEFAULT_SYNC_MIN_INTERVAL_SECS: u32 = 30;
+/// Upper bound on the per-hour app budgets.
+pub const MAX_APP_PER_HOUR: u32 = 100_000;
+/// Upper bound on `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`.
+pub const MAX_SYNC_MIN_INTERVAL_SECS: u32 = 3600;
+
+/// The SVID tier of a host with the software host-key profile (F15/F16);
+/// every other host attested with a TPM.
+pub const TIER_HOST_KEY: &str = "host-key";
+/// The SVID tier of a TPM-attested host.
+pub const TIER_TPM: &str = "tpm";
 
 /// Size bound on `HostCallAuth.svid_jws`.
 pub const MAX_SVID_JWS_BYTES: usize = 16 * 1024;
@@ -67,12 +86,21 @@ pub const MAX_SEP_PUB_BYTES: usize = 256;
 /// Size bound on `HostCallAuth.sig` (a DER P-256 signature is at most 72).
 pub const MAX_SIG_BYTES: usize = 80;
 
-/// Host-call settings (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`).
+/// Host-call settings (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`,
+/// `CMIS_APP_SUBMIT_MAX_PER_HOUR`, `CMIS_APP_STATUS_MAX_PER_HOUR`,
+/// `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostCallConfig {
     /// `AppendAuditEvent` calls each host may make per minute (token bucket
     /// with a burst of one minute's budget).
     pub audit_forward_per_min: u32,
+    /// `SubmitAppRequest` calls each host may make per hour (a retry of an
+    /// already recorded request is answered before the budget is spent).
+    pub app_submit_per_hour: u32,
+    /// `GetAppRequestStatus` calls each host may make per hour.
+    pub app_status_per_hour: u32,
+    /// Minimum seconds between two `SyncAllowlist` calls of one host.
+    pub sync_min_interval_secs: u32,
     /// Replay-cache capacity.
     pub replay_capacity: usize,
 }
@@ -81,9 +109,35 @@ impl Default for HostCallConfig {
     fn default() -> Self {
         Self {
             audit_forward_per_min: DEFAULT_AUDIT_FORWARD_PER_MIN,
+            app_submit_per_hour: DEFAULT_APP_SUBMIT_PER_HOUR,
+            app_status_per_hour: DEFAULT_APP_STATUS_PER_HOUR,
+            sync_min_interval_secs: DEFAULT_SYNC_MIN_INTERVAL_SECS,
             replay_capacity: DEFAULT_REPLAY_CAPACITY,
         }
     }
+}
+
+/// Parse a positive integer setting; zero and garbage are errors, values
+/// above `max` are capped (with a warning).
+fn positive(
+    get: &impl Fn(&str) -> Option<String>,
+    var: &str,
+    max: u32,
+) -> anyhow::Result<Option<u32>> {
+    let Some(v) = get(var) else {
+        return Ok(None);
+    };
+    let n: u32 = v
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{var}: not a positive integer: {v:?}"))?;
+    if n == 0 {
+        anyhow::bail!("{var}: must be at least 1");
+    }
+    if n > max {
+        tracing::warn!(var, value = n, max, "capped to the maximum");
+    }
+    Ok(Some(n.min(max)))
 }
 
 impl HostCallConfig {
@@ -98,22 +152,25 @@ impl HostCallConfig {
     /// capped.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let mut c = Self::default();
-        if let Some(v) = get("CMIS_AUDIT_FORWARD_MAX_PER_MIN") {
-            let n: u32 = v.trim().parse().map_err(|_| {
-                anyhow::anyhow!("CMIS_AUDIT_FORWARD_MAX_PER_MIN: not a positive integer: {v:?}")
-            })?;
-            if n == 0 {
-                anyhow::bail!("CMIS_AUDIT_FORWARD_MAX_PER_MIN: must be at least 1");
-            }
-            if n > MAX_AUDIT_FORWARD_PER_MIN {
-                tracing::warn!(
-                    var = "CMIS_AUDIT_FORWARD_MAX_PER_MIN",
-                    value = n,
-                    max = MAX_AUDIT_FORWARD_PER_MIN,
-                    "capped to the maximum"
-                );
-            }
-            c.audit_forward_per_min = n.min(MAX_AUDIT_FORWARD_PER_MIN);
+        if let Some(n) = positive(
+            &get,
+            "CMIS_AUDIT_FORWARD_MAX_PER_MIN",
+            MAX_AUDIT_FORWARD_PER_MIN,
+        )? {
+            c.audit_forward_per_min = n;
+        }
+        if let Some(n) = positive(&get, "CMIS_APP_SUBMIT_MAX_PER_HOUR", MAX_APP_PER_HOUR)? {
+            c.app_submit_per_hour = n;
+        }
+        if let Some(n) = positive(&get, "CMIS_APP_STATUS_MAX_PER_HOUR", MAX_APP_PER_HOUR)? {
+            c.app_status_per_hour = n;
+        }
+        if let Some(n) = positive(
+            &get,
+            "CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS",
+            MAX_SYNC_MIN_INTERVAL_SECS,
+        )? {
+            c.sync_min_interval_secs = n;
         }
         Ok(c)
     }
@@ -125,6 +182,9 @@ impl HostCallConfig {
 pub struct HostCallGuard {
     replay: Mutex<ReplayCache>,
     audit_forward: HostRateLimiter,
+    app_submit: HostRateLimiter,
+    app_status: HostRateLimiter,
+    allowlist_sync: HostRateLimiter,
 }
 
 impl HostCallGuard {
@@ -134,6 +194,9 @@ impl HostCallGuard {
         Self {
             replay: Mutex::new(ReplayCache::new(cfg.replay_capacity)),
             audit_forward: HostRateLimiter::per_minute(cfg.audit_forward_per_min),
+            app_submit: HostRateLimiter::per_hour(cfg.app_submit_per_hour),
+            app_status: HostRateLimiter::per_hour(cfg.app_status_per_hour),
+            allowlist_sync: HostRateLimiter::new(1, cfg.sync_min_interval_secs),
         }
     }
 
@@ -141,6 +204,24 @@ impl HostCallGuard {
     #[must_use]
     pub fn audit_forward_limiter(&self) -> &HostRateLimiter {
         &self.audit_forward
+    }
+
+    /// The `SubmitAppRequest` rate limiter (F19 §7.4).
+    #[must_use]
+    pub fn app_submit_limiter(&self) -> &HostRateLimiter {
+        &self.app_submit
+    }
+
+    /// The `GetAppRequestStatus` rate limiter (F19 §7.4).
+    #[must_use]
+    pub fn app_status_limiter(&self) -> &HostRateLimiter {
+        &self.app_status
+    }
+
+    /// The `SyncAllowlist` minimum-interval limiter (F19 §6.3).
+    #[must_use]
+    pub fn allowlist_sync_limiter(&self) -> &HostRateLimiter {
+        &self.allowlist_sync
     }
 }
 
@@ -153,6 +234,8 @@ pub struct HostSvid {
     pub cnf_jkt: String,
     /// The SVID subject SPIFFE id.
     pub spiffe_id: String,
+    /// The attestation tier: [`TIER_HOST_KEY`] or [`TIER_TPM`].
+    pub tier: &'static str,
 }
 
 /// A host whose call was authenticated by [`authenticate`].
@@ -162,10 +245,63 @@ pub struct AuthenticatedHost {
     pub host_uuid: String,
     /// The SVID subject SPIFFE id.
     pub spiffe_id: String,
+    /// The attestation tier of the SVID ([`TIER_HOST_KEY`] or [`TIER_TPM`]).
+    pub tier: &'static str,
+}
+
+/// A host call document that decoded but failed validation: the stable
+/// reason code (`x-ferrogate-reason`) and, when known, the field it names
+/// (`x-ferrogate-field`). The `Display` text can quote the document (paths,
+/// user names): log only [`DocError::reason`] and [`DocError::field`].
+pub trait DocError: std::fmt::Display {
+    /// The stable reason code returned to the (authenticated) host.
+    fn reason(&self) -> &'static str;
+    /// The failing field, if one was named.
+    fn field(&self) -> Option<&'static str>;
+}
+
+impl DocError for HostCallDocError {
+    fn reason(&self) -> &'static str {
+        "malformed_doc"
+    }
+
+    fn field(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+impl DocError for AppDocError {
+    fn reason(&self) -> &'static str {
+        AppDocError::reason(self)
+    }
+
+    fn field(&self) -> Option<&'static str> {
+        AppDocError::field(self)
+    }
+}
+
+/// `INVALID_ARGUMENT (reason)` with `x-ferrogate-field: field` when named.
+#[must_use]
+pub fn invalid_field(reason: &'static str, field: Option<&str>) -> Status {
+    let mut s = Status::invalid_argument(reason);
+    if let Some(v) = field.and_then(|f| f.parse().ok()) {
+        s.metadata_mut().insert("x-ferrogate-field", v);
+    }
+    s
+}
+
+/// `RESOURCE_EXHAUSTED (reason)` with `retry-after: wait` seconds.
+#[must_use]
+pub fn exhausted(reason: &'static str, wait: u64) -> Status {
+    let mut s = Status::resource_exhausted(reason);
+    if let Ok(v) = wait.max(1).to_string().parse() {
+        s.metadata_mut().insert("retry-after", v);
+    }
+    s
 }
 
 /// One host call to authenticate.
-pub struct HostCall<'a, D> {
+pub struct HostCall<'a, D, E> {
     /// The proof from the request (`None` when the client sent none).
     pub auth: Option<&'a HostCallAuth>,
     /// The RPC's signing context, e.g.
@@ -173,8 +309,10 @@ pub struct HostCall<'a, D> {
     pub context: &'static [u8],
     /// The exact document bytes the host signed.
     pub doc: &'a [u8],
+    /// Size bound on `doc`, checked before any parsing or crypto.
+    pub max_doc_bytes: usize,
     /// Strict decoder of the RPC's document type.
-    pub decode: fn(&[u8]) -> Result<D, HostCallDocError>,
+    pub decode: fn(&[u8]) -> Result<D, E>,
     /// RPC-specific binding between the document and the rest of the request
     /// (checked before the nonce is consumed). `false` is an authentication
     /// failure.
@@ -232,10 +370,16 @@ pub fn verify_host_svid(state: &CmisState, svid_jws: &str, now: i64) -> Result<H
     if state.is_revoked(&claims.sub, &sha384_hex(svid_jws.as_bytes())) {
         return Err(host_auth_failed("svid_revoked", Some(&host_uuid)));
     }
+    let tier = if claims.attest.policy_id == TIER_HOST_KEY {
+        TIER_HOST_KEY
+    } else {
+        TIER_TPM
+    };
     Ok(HostSvid {
         host_uuid,
         cnf_jkt: claims.cnf.jkt,
         spiffe_id: claims.sub,
+        tier,
     })
 }
 
@@ -243,9 +387,9 @@ pub fn verify_host_svid(state: &CmisState, svid_jws: &str, now: i64) -> Result<H
 /// On success the nonce (if any) is consumed and one unit of the rate limit
 /// is spent.
 #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
-pub fn authenticate<D: HostCallDoc>(
+pub fn authenticate<D: HostCallDoc, E: DocError>(
     state: &CmisState,
-    call: HostCall<'_, D>,
+    call: HostCall<'_, D, E>,
     now: i64,
 ) -> Result<(AuthenticatedHost, D), Status> {
     // 1. Presence and size bounds, before any parsing or crypto.
@@ -259,7 +403,7 @@ pub fn authenticate<D: HostCallDoc>(
         || auth.sig.is_empty()
         || auth.sig.len() > MAX_SIG_BYTES
         || call.doc.is_empty()
-        || call.doc.len() > MAX_DOC_BYTES
+        || call.doc.len() > call.max_doc_bytes
     {
         return Err(host_auth_failed("proof_field_size", None));
     }
@@ -280,10 +424,19 @@ pub fn authenticate<D: HostCallDoc>(
     ferro_sep::verify_p256(&auth.sep_pub, &input, &auth.sig)
         .map_err(|_| host_auth_failed("bad_signature", host))?;
 
-    // 5. The document (authenticated from here on).
+    // 5. The document (authenticated from here on). Only the stable codes
+    // are logged: the decoder's message can quote the document's strings
+    // (an unknown key, an unknown variant), and the document carries paths
+    // and user names (F19 §8 "I", §10).
     let doc = (call.decode)(call.doc).map_err(|e| {
-        tracing::warn!(event = "host_auth.malformed_doc", error = %e, host_uuid = %svid.host_uuid, "signed host document did not decode");
-        Status::invalid_argument("malformed_doc")
+        tracing::warn!(
+            event = "host_auth.malformed_doc",
+            reason = e.reason(),
+            field = e.field().unwrap_or(""),
+            host_uuid = %svid.host_uuid,
+            "signed host document did not decode"
+        );
+        invalid_field(e.reason(), e.field())
     })?;
 
     // 6. The document speaks for the SVID's host.
@@ -328,11 +481,7 @@ pub fn authenticate<D: HostCallDoc>(
                 retry_after = wait,
                 "host call over its rate limit"
             );
-            let mut s = Status::resource_exhausted("rate_limited");
-            if let Ok(v) = wait.to_string().parse() {
-                s.metadata_mut().insert("retry-after", v);
-            }
-            return Err(s);
+            return Err(exhausted("rate_limited", wait));
         }
     }
 
@@ -353,6 +502,7 @@ pub fn authenticate<D: HostCallDoc>(
         AuthenticatedHost {
             host_uuid: svid.host_uuid,
             spiffe_id: svid.spiffe_id,
+            tier: svid.tier,
         },
         doc,
     ))
@@ -425,15 +575,18 @@ impl ReplayCache {
     }
 }
 
-/// Per-host token bucket: a burst of one minute's budget, refilled
+/// Per-host token bucket: a burst of one period's budget, refilled
 /// continuously. Keyed by the **authenticated** host UUID, so one host cannot
 /// spend another's budget.
 #[derive(Debug)]
 pub struct HostRateLimiter {
-    /// Bucket size in units ([`CALL_COST`] per call).
+    /// Bucket size in units (`cost` per call).
     capacity: u64,
-    /// Refill in units per second (exact: `per_min` calls per 60 s).
+    /// Refill in units per second (exact: `calls` calls per period).
     refill_per_sec: u64,
+    /// Units one call costs: the period in seconds, so one call's worth
+    /// accrues every `period / calls` seconds with no rounding.
+    cost: u64,
     buckets: Mutex<HashMap<String, Bucket>>,
 }
 
@@ -445,20 +598,32 @@ struct Bucket {
 
 /// Above this many tracked hosts, idle (full) buckets are dropped.
 const MAX_TRACKED_HOSTS: usize = 65_536;
-/// Units one call costs. With a refill of `per_min` units per second, one
-/// call's worth accrues every `60 / per_min` seconds with no rounding.
-const CALL_COST: u64 = 60;
 
 impl HostRateLimiter {
+    /// A limiter allowing `calls` calls per host per `period_secs` (both at
+    /// least 1), with a burst of the whole budget.
+    #[must_use]
+    pub fn new(calls: u32, period_secs: u32) -> Self {
+        let calls = u64::from(calls.max(1));
+        let period = u64::from(period_secs.max(1));
+        Self {
+            capacity: calls * period,
+            refill_per_sec: calls,
+            cost: period,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// A limiter allowing `per_min` calls per host per minute (minimum 1).
     #[must_use]
     pub fn per_minute(per_min: u32) -> Self {
-        let per_min = u64::from(per_min.max(1));
-        Self {
-            capacity: per_min * CALL_COST,
-            refill_per_sec: per_min,
-            buckets: Mutex::new(HashMap::new()),
-        }
+        Self::new(per_min, 60)
+    }
+
+    /// A limiter allowing `per_hour` calls per host per hour (minimum 1).
+    #[must_use]
+    pub fn per_hour(per_hour: u32) -> Self {
+        Self::new(per_hour, 3600)
     }
 
     fn refilled(&self, b: Bucket, now: i64) -> u64 {
@@ -482,12 +647,12 @@ impl HostRateLimiter {
         });
         let units = self.refilled(*b, now);
         b.last = now.max(b.last);
-        if units >= CALL_COST {
-            b.units = units - CALL_COST;
+        if units >= self.cost {
+            b.units = units - self.cost;
             Ok(())
         } else {
             b.units = units;
-            Err((CALL_COST - units).div_ceil(self.refill_per_sec).max(1))
+            Err((self.cost - units).div_ceil(self.refill_per_sec).max(1))
         }
     }
 }
@@ -516,6 +681,34 @@ mod tests {
         assert!(cfg(&[("CMIS_AUDIT_FORWARD_MAX_PER_MIN", "0")]).is_err());
         assert!(cfg(&[("CMIS_AUDIT_FORWARD_MAX_PER_MIN", "-5")]).is_err());
         assert!(cfg(&[("CMIS_AUDIT_FORWARD_MAX_PER_MIN", "lots")]).is_err());
+        let c = cfg(&[
+            ("CMIS_APP_SUBMIT_MAX_PER_HOUR", "5"),
+            ("CMIS_APP_STATUS_MAX_PER_HOUR", "7"),
+            ("CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS", "99999"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                c.app_submit_per_hour,
+                c.app_status_per_hour,
+                c.sync_min_interval_secs
+            ),
+            (5, 7, MAX_SYNC_MIN_INTERVAL_SECS)
+        );
+        assert!(cfg(&[("CMIS_APP_SUBMIT_MAX_PER_HOUR", "0")]).is_err());
+        assert!(cfg(&[("CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS", "x")]).is_err());
+    }
+
+    #[test]
+    fn a_minimum_interval_limiter_admits_one_call_per_interval() {
+        let l = HostRateLimiter::new(1, 30);
+        assert!(l.check("h", 1_000).is_ok());
+        assert_eq!(l.check("h", 1_010), Err(20));
+        assert!(l.check("h", 1_030).is_ok());
+        let hourly = HostRateLimiter::per_hour(2);
+        assert!(hourly.check("h", 0).is_ok());
+        assert!(hourly.check("h", 0).is_ok());
+        assert_eq!(hourly.check("h", 0), Err(1800));
     }
 
     #[test]

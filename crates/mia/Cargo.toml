@@ -50,6 +50,11 @@ ferro-machineid = { path = "../ferro-machineid" }
 # Status-endpoint wire types (feature F18), shared with the `mia-tray`
 # companion so it never depends on the daemon crate itself.
 mia-status-proto = { path = "../mia-status-proto" }
+# Helper-API wire types (features F08, F19), shared with the Rust SDK's helper
+# client so applications never depend on the daemon crate.
+mia-helper-proto = { path = "../mia-helper-proto" }
+# Read-only binary identification for app registration (feature F19 §4).
+ferro-appid      = { path = "../ferro-appid" }
 
 tokio              = { workspace = true }
 tokio-stream       = { workspace = true }
@@ -120,6 +125,13 @@ ferro-harden = { path = "../ferro-harden" }
 # `#![forbid(unsafe_code)]`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# F19 app registration, through safe wrappers only (`mia` stays
+# `#![forbid(unsafe_code)]`): `rustix` receives the file descriptor a
+# `RegisterFile` client passes with `SCM_RIGHTS` (`OwnedFd`, no raw-fd
+# conversion), reads its flags, path, file system and ACL attribute; `nix`
+# resolves uids to user names (`getpwuid_r`) for the request's user fields.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "net"] }
+nix    = { version = "0.30", default-features = false, features = ["user"] }
 
 # The Windows named-pipe helper transport delegates all FFI (client PID, image
 # attestation, ACL) to `ferro-winauth`, keeping `mia` itself `forbid(unsafe)`.

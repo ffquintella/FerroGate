@@ -8,8 +8,8 @@ use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Semaphore};
 
 use super::{
-    serve_connection, AllowlistReloader, Clock, HelperServerConfig, MinterReloader, ServerError,
-    Shared,
+    fdpass, serve_frame, AllowlistReloader, Clock, HelperServerConfig, MinterReloader,
+    RegistrationHandler, ServerError, Shared,
 };
 use crate::helper::allowlist::Allowlist;
 use crate::helper::auth::{AuthError, CallerAuth, PeerCred};
@@ -95,6 +95,14 @@ impl<A: CallerAuth> HelperServer<A> {
         }
     }
 
+    /// Install the F19 registration handler (once, before serving). Without
+    /// one, registration operations answer `registration_disabled`.
+    pub fn set_registration(&self, handler: Arc<dyn RegistrationHandler>) {
+        if self.shared.registration.set(handler).is_err() {
+            tracing::warn!("registration handler already installed; keeping the first");
+        }
+    }
+
     /// A handle to the observed-caller ledger, for the allowlist-propose task.
     #[must_use]
     pub fn ledger(&self) -> crate::helper::ledger::CallerLedger {
@@ -144,7 +152,21 @@ impl<A: CallerAuth> HelperServer<A> {
                                 gid: u.gid(),
                             })
                             .map_err(|_| AuthError::PeerCredUnavailable);
-                        serve_connection(&shared, stream, cred, read_timeout).await;
+                        // Read the request frame with `recvmsg`, so a
+                        // descriptor passed alongside it (`RegisterFile`)
+                        // is received; a timeout or framing error is not a
+                        // request — drop the connection without an event.
+                        let mut stream = stream;
+                        let Ok(Ok((body, fd))) = tokio::time::timeout(
+                            read_timeout,
+                            fdpass::read_frame_with_fd(&stream),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        let file = fd.map(std::fs::File::from);
+                        serve_frame(&shared, &mut stream, cred, &body, file).await;
                     });
                 }
             }

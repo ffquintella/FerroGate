@@ -658,6 +658,89 @@ fail-closed rules:
 
 `mia test` prints the resolved body (marked `(default)`) and whether it verifies.
 
+#### Allowlist sync (`allowlist.sync`, feature F19)
+
+With `allowlist.sync = true` (opt-in; `FERROGATE_ALLOWLIST_SYNC`) the daemon
+keeps the allowlist current itself instead of the start-only `fetch`: every
+`sync_interval_secs` (default 300, `60..=3600`) ± `sync_jitter_pct` (default
+10 %) it calls the host-authenticated `SyncAllowlist` RPC, verifies the signed
+**v2** body (signature under `ferrogate-allowlist-v2`, freshness, this host's
+UUID, the SVID's trust domain, a generation not below the held one and, at an
+equal generation, the same entry digest) and swaps it into the running helper
+API — no restart, no `SIGHUP`. Any refusal keeps the allowlist in force and
+emits `AllowlistSyncRejected` (`rollback`, `wrong_host`, `generation_conflict`,
+`bad_signature`, …); a success emits `AllowlistSyncApplied`. The first sync
+after a start waits a random part of the interval, or runs at once when nothing
+is in force; transport failures back off (`min(interval, 2^n × 5 s)`), a
+server `retry-after` is honoured, and an approved app request or a
+`mia --reload` / `mia resync-allowlist --reload` syncs immediately. Against a
+CMIS older than F19 (`UNIMPLEMENTED`) the loop falls back to `GetAllowlist`
+(v1) at the same cadence, unless a v2 generation is held.
+
+The synced body and its held generation live in the daemon's **state
+directory** (`/var/lib/ferrogate` on Linux, the configuration directory
+elsewhere): `allowlist[-<env>].synced.cbor` (`0640`) and
+`allowlist[-<env>].state` (`0600`, `allowlist.state_path` to move both). The
+daemon never overwrites `allowlist.path`, and with the sync on a start or
+reload prefers the synced body; a v1 body is not put in force while a v2
+generation is held. Offline, the last verified body stays in force until its
+`not_after` (per-entry expiry is enforced on every request), then every caller
+is denied. `mia status` shows the held generation and whether the sync is
+failing (`allowlist_sync_failing`).
+
+The sync signs with the machine key the SVID's `cnf.jkt` binds, which today is
+the host-key tier: a TPM-attested host (SVID bound to the AIK) keeps the
+start-only `fetch`. Turning `allowlist.sync` off takes a restart.
+
+#### App registration: `mia app` and `[registration]` (feature F19)
+
+Applications ask for their own approval through the helper API
+(`RegisterSelf`, see [helper-api.md](helper-api.md)); users ask from the
+command line, unprivileged:
+
+```sh
+mia app register --exe /opt/tool/bin/tool [--for-user <name|uid>] [--reason "…"] [--json]
+mia app status [<request-id>…] [--json]   # your requests (all of them as root)
+mia app list [--json]                      # the verified allowlist; request paths as root
+```
+
+`register` opens the file as the invoking user and passes the descriptor to
+the daemon, which identifies it (SHA-384, canonical path, declared version,
+risk flags; nothing is executed), signs the request with the host key and
+submits it to CMIS. Exit status: 0 approved, 3 pending or queued, 4 denied, 1
+error, 2 usage. A request CMIS cannot take yet (unreachable, no SVID, CMIS
+still in legacy allowlist mode) stays **queued** in the local ledger and is
+sent on a later sync tick.
+
+```toml
+[registration]
+enable = true                 # FERROGATE_REGISTRATION_ENABLE
+assisted = true               # allow `mia app register --exe` / the tray
+max_per_uid_per_hour = 10     # plus 60 per hour for the whole host
+max_open_per_uid = 50         # open (queued/pending) requests per user, 1..=100
+max_file_size_mib = 2048
+version_sources = ["pe", "plist", "elf-note", "dpkg"]
+ledger_path = ""              # default: app-requests[-<env>].cbor in the state directory (0600)
+```
+
+The ledger holds paths and uids of local requests (personal data): queued
+documents are dropped once CMIS has them, and closed requests are pruned after
+30 days. Requests are kept per requester (uid; the full SID on Windows): each
+may hold at most `max_open_per_uid` open requests, and when the 1000-entry
+ledger is full the requester with the most closed requests loses its oldest
+one. Registering for another user (`--for-user`) needs root; Windows supports
+`RegisterSelf` but not yet `RegisterFile`.
+
+The path MIA reports for a binary, and matches against path-constrained
+allowlist entries, must name the hashed file in MIA's own mount namespace
+(same device and inode), and a calling process must share MIA's mount
+namespace and root. Applications in containers or other mount namespaces
+(Flatpak, Snap, `unshare`) therefore cannot register and never match a path
+constraint, and the `mia` service must run in the host's initial mount
+namespace: do not add `PrivateTmp=`, `ProtectSystem=` or similar systemd
+drop-ins. `path_protected` is reported on Linux only; macOS and Windows never
+set it until their ACL and DACL checks exist.
+
 #### Installing `allowlist.key`: `mia allowlist-key`
 
 Nothing installs the key by itself — not the daemon, not the installers, not

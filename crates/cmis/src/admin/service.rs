@@ -31,6 +31,14 @@ use ferro_proto::admin_v1::{
     UpdateAdminAccountRequest, UpdateAdminAccountResponse, WebAuthnAssertion, WhoAmIRequest,
     WhoAmIResponse,
 };
+use ferro_proto::admin_v1::{
+    AdminRegisterApplicationRequest, AdminRegisterApplicationResponse, ApproveAppRequestRequest,
+    ApproveAppRequestResponse, DenyAppRequestRequest, DenyAppRequestResponse, GetAppRequestRequest,
+    GetAppRequestResponse, GetApprovalRequest, GetApprovalResponse, ListAppRequestsRequest,
+    ListAppRequestsResponse, ListApprovalsRequest, ListApprovalsResponse, RevokeApprovalRequest,
+    RevokeApprovalResponse, SetLineageAutoUpdateFrozenRequest, SetLineageAutoUpdateFrozenResponse,
+    UpdateApprovalRequest, UpdateApprovalResponse,
+};
 use ferro_raft::admin::{
     AdminAccountRow, EnrollmentCompletion, EnrollmentTokenRow, MfaVerification, PasswordUpdate,
     ACCOUNT_ACTIVE, ACCOUNT_DISABLED, ACCOUNT_PENDING, TOKEN_BOOTSTRAP, TOKEN_ENROLL, TOKEN_RESET,
@@ -603,6 +611,78 @@ impl AdminSvc {
 
 #[tonic::async_trait]
 impl Admin for AdminSvc {
+    // ---- F19 application approvals (see `super::apps`) ----
+
+    async fn list_app_requests(
+        &self,
+        request: Request<ListAppRequestsRequest>,
+    ) -> Result<Response<ListAppRequestsResponse>, Status> {
+        super::apps::list_app_requests(&self.authz, request).await
+    }
+
+    async fn get_app_request(
+        &self,
+        request: Request<GetAppRequestRequest>,
+    ) -> Result<Response<GetAppRequestResponse>, Status> {
+        super::apps::get_app_request(&self.authz, request).await
+    }
+
+    async fn approve_app_request(
+        &self,
+        request: Request<ApproveAppRequestRequest>,
+    ) -> Result<Response<ApproveAppRequestResponse>, Status> {
+        super::apps::approve_app_request(&self.authz, request).await
+    }
+
+    async fn deny_app_request(
+        &self,
+        request: Request<DenyAppRequestRequest>,
+    ) -> Result<Response<DenyAppRequestResponse>, Status> {
+        super::apps::deny_app_request(&self.authz, request).await
+    }
+
+    async fn list_approvals(
+        &self,
+        request: Request<ListApprovalsRequest>,
+    ) -> Result<Response<ListApprovalsResponse>, Status> {
+        super::apps::list_approvals(&self.authz, request).await
+    }
+
+    async fn get_approval(
+        &self,
+        request: Request<GetApprovalRequest>,
+    ) -> Result<Response<GetApprovalResponse>, Status> {
+        super::apps::get_approval(&self.authz, request).await
+    }
+
+    async fn update_approval(
+        &self,
+        request: Request<UpdateApprovalRequest>,
+    ) -> Result<Response<UpdateApprovalResponse>, Status> {
+        super::apps::update_approval(&self.authz, request).await
+    }
+
+    async fn revoke_approval(
+        &self,
+        request: Request<RevokeApprovalRequest>,
+    ) -> Result<Response<RevokeApprovalResponse>, Status> {
+        super::apps::revoke_approval(&self.authz, request).await
+    }
+
+    async fn set_lineage_auto_update_frozen(
+        &self,
+        request: Request<SetLineageAutoUpdateFrozenRequest>,
+    ) -> Result<Response<SetLineageAutoUpdateFrozenResponse>, Status> {
+        super::apps::set_lineage_auto_update_frozen(&self.authz, request).await
+    }
+
+    async fn admin_register_application(
+        &self,
+        request: Request<AdminRegisterApplicationRequest>,
+    ) -> Result<Response<AdminRegisterApplicationResponse>, Status> {
+        super::apps::admin_register_application(&self.authz, request).await
+    }
+
     async fn begin_login(
         &self,
         request: Request<BeginLoginRequest>,

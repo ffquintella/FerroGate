@@ -216,6 +216,58 @@ pub struct StatusSnapshot {
     /// address. Absent from older daemons ⇒ `false`.
     #[serde(default)]
     pub default_address: bool,
+    /// The allowlist sync loop (feature F19 §6.5): counters and the
+    /// `allowlist_sync_failing` condition. `None` when the sync is off, and
+    /// from daemons older than F19.
+    #[serde(default)]
+    pub sync: Option<AllowlistSyncSummary>,
+    /// Local app-registration requests (feature F19 §7.6): counts only.
+    /// `None` when registration is off, and from daemons older than F19.
+    #[serde(default)]
+    pub registrations: Option<RegistrationCounts>,
+}
+
+/// The allowlist sync loop's state (feature F19 §6.5). Counts, times and
+/// stable codes only — never entries, hashes or paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowlistSyncSummary {
+    /// The v2 generation in force (0: none yet, or a v1 body).
+    pub generation: u64,
+    /// The last sync that ended well (applied or not modified), Unix seconds.
+    pub last_ok_at: Option<i64>,
+    /// The last attempt, Unix seconds.
+    pub last_attempt_at: Option<i64>,
+    /// Bodies applied since start.
+    pub applied: u64,
+    /// `not_modified` answers since start.
+    pub not_modified: u64,
+    /// Bodies refused (rollback, wrong host, bad signature, …) since start.
+    pub rejected: u64,
+    /// Failed attempts (CMIS unreachable, refused, no SVID) since start.
+    pub failures: u64,
+    /// Failed or refused attempts in a row.
+    pub consecutive_failures: u32,
+    /// `allowlist_sync_failing`: the last attempt failed or was refused; the
+    /// allowlist in force stays until its `not_after`.
+    pub failing: bool,
+    /// The last failure's stable code (`rollback`, `wrong_host`,
+    /// `cmis_unreachable`, `no_svid`, …).
+    pub last_reason: Option<String>,
+    /// CMIS does not serve `SyncAllowlist`; the v1 `GetAllowlist` is used.
+    pub legacy: bool,
+}
+
+/// Counts of local app-registration requests by state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistrationCounts {
+    /// Waiting in the outbox (CMIS unreachable or in legacy mode).
+    pub queued: u32,
+    /// Submitted, waiting for an administrator.
+    pub pending: u32,
+    /// Approved (by an administrator or automatically).
+    pub approved: u32,
+    /// Denied, expired or refused.
+    pub closed: u32,
 }
 
 /// Every state an environment can be in. Ordered by [`AgentState::severity`]
@@ -638,6 +690,25 @@ mod tests {
             }),
             version: "0.0.0-test".into(),
             default_address: true,
+            sync: Some(AllowlistSyncSummary {
+                generation: 1_700_000_000_123,
+                last_ok_at: Some(1_700_000_000),
+                last_attempt_at: Some(1_700_000_000),
+                applied: 2,
+                not_modified: 5,
+                rejected: 1,
+                failures: 0,
+                consecutive_failures: 0,
+                failing: false,
+                last_reason: Some("rollback".into()),
+                legacy: false,
+            }),
+            registrations: Some(RegistrationCounts {
+                queued: 1,
+                pending: 2,
+                approved: 3,
+                closed: 4,
+            }),
         }
     }
 
@@ -678,8 +749,25 @@ mod tests {
             "last_error",
             "last_error.code",
             "last_error.message",
+            "registrations",
+            "registrations.approved",
+            "registrations.closed",
+            "registrations.pending",
+            "registrations.queued",
             "since",
             "state",
+            "sync",
+            "sync.applied",
+            "sync.consecutive_failures",
+            "sync.failing",
+            "sync.failures",
+            "sync.generation",
+            "sync.last_attempt_at",
+            "sync.last_ok_at",
+            "sync.last_reason",
+            "sync.legacy",
+            "sync.not_modified",
+            "sync.rejected",
             "svid",
             "svid.not_after",
             "svid.renew_at",

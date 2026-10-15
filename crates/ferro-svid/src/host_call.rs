@@ -21,6 +21,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha384};
 
+use crate::cbor_bytes::fixed as fixed_bytes;
+
 /// Signing context of the `AppendAuditEvent` host proof (F20 Phase 0).
 /// Distinct from every other FerroGate context and prefix-free with them.
 pub const AUDIT_FORWARD_CONTEXT: &[u8] = b"ferrogate-audit-forward-v1";
@@ -170,43 +172,6 @@ pub fn signing_input(context: &[u8], doc: &[u8]) -> Vec<u8> {
     input.extend_from_slice(context);
     input.extend_from_slice(doc);
     input
-}
-
-/// Serde for fixed-size byte arrays as a single CBOR byte string. Only the
-/// byte-string form is accepted on decode.
-mod fixed_bytes {
-    use serde::de::Visitor;
-    use serde::{Deserializer, Serializer};
-    use std::fmt;
-
-    pub(super) fn serialize<S: Serializer, const N: usize>(
-        v: &[u8; N],
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        s.serialize_bytes(v)
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
-        d: D,
-    ) -> Result<[u8; N], D::Error> {
-        struct V<const N: usize>;
-        impl<const N: usize> Visitor<'_> for V<N> {
-            type Value = [u8; N];
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "a byte string of length {N}")
-            }
-
-            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
-            }
-
-            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                self.visit_bytes(&v)
-            }
-        }
-        d.deserialize_bytes(V::<N>)
-    }
 }
 
 #[cfg(test)]

@@ -25,12 +25,7 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn actor() -> CallerIdentity {
-    CallerIdentity {
-        pid: 4321,
-        uid: 1002,
-        gid: 1002,
-        bin_sha: [0xCD; 48],
-    }
+    CallerIdentity::new(4321, 1002, 1002, [0xCD; 48])
 }
 
 /// Build a DPoP proof under `ed_sk` for `(htm, htu, iat)`; return `(proof, jkt)`.

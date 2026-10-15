@@ -14,6 +14,7 @@
 //! | [`svid`]         | `ferro-svid`         | `svid`     | SVID envelope, claims schema, SPIFFE-ID derivation, JWKS, lifecycle policy. |
 //! | [`attest`]       | `ferro-attest`       | `attest`   | TPM 2.0 quote verification, RIM matching, host-key profile. |
 //! | [`proto`]        | `ferro-proto`        | `proto`    | Generated gRPC stubs for the `MachineIdentity` service. |
+//! | `helper`         | `mia-helper-proto`   | `helper-client` | Local MIA helper-API client: child tokens and app registration. |
 //!
 //! # Features
 //!
@@ -97,6 +98,14 @@ pub use ferro_attest as attest;
 /// Requires the `proto` feature, which adds a `protoc` build dependency.
 #[cfg(feature = "proto")]
 pub use ferro_proto as proto;
+
+/// The local MIA helper-API client (features F08, F19): request a DPoP-bound
+/// child token, register the running application for approval, and query
+/// the registration.
+///
+/// Requires the `helper-client` feature.
+#[cfg(feature = "helper-client")]
+pub mod helper;
 
 #[cfg(test)]
 mod tests {

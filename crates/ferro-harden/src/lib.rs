@@ -168,6 +168,15 @@ pub const ALLOWED_SYSCALLS: &[&str] = &[
     // that resolves to `None`.
     "mkdir",
     "mkdirat",
+    // `rename`/`renameat2`: replace a daemon-owned file in the state directory
+    // atomically (temp file + rename) — the synced allowlist, its
+    // `allowlist.state` and the app-request ledger (feature F19). `rename` is
+    // x86_64-only; glibc's `rename` issues `renameat2` on arm64.
+    "rename",
+    "renameat2",
+    // `lgetxattr`: read (never write) the POSIX access ACL of a binary and its
+    // ancestors when classifying an app-registration request (F19 §4.5).
+    "lgetxattr",
     "getdents64",
     "newfstatat",
     "fstat",
@@ -383,9 +392,7 @@ mod tests {
         // a regression in the allow-list. (`chmod` is intentionally *not* here:
         // mia legitimately sets its helper socket's mode after bind — see the
         // allow-list comment. Process-execution and tracing stay forbidden.)
-        for forbidden in [
-            "execve", "execveat", "ptrace", "mount", "fork", "vfork",
-        ] {
+        for forbidden in ["execve", "execveat", "ptrace", "mount", "fork", "vfork"] {
             assert!(
                 !ALLOWED_SYSCALLS.contains(&forbidden),
                 "allow-list should not contain {forbidden}"

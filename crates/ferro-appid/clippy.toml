@@ -1,0 +1,11 @@
+# F19 §4.1: ferro-appid never executes the target, its interpreter, or any
+# helper or system tool. Spawning a process from this crate is a lint error
+# (`make lint` runs clippy with -D warnings); `tests/no_exec.rs` checks the
+# sources as well.
+disallowed-types = [
+    { path = "std::process::Command", reason = "ferro-appid never executes anything (F19 §4.1)" },
+]
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "ferro-appid never executes anything (F19 §4.1)" },
+    { path = "std::os::unix::process::CommandExt::exec", reason = "ferro-appid never executes anything (F19 §4.1)" },
+]

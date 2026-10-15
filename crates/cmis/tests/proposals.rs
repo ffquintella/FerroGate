@@ -208,6 +208,7 @@ async fn bootstrap_auto_adopts_when_no_allowlist() {
     let got = svc
         .get_allowlist(tonic::Request::new(GetAllowlistRequest {
             host_uuid: host.clone(),
+            accept_formats: Vec::new(),
         }))
         .await
         .unwrap()
@@ -273,6 +274,7 @@ async fn existing_allowlist_queues_proposal_for_review() {
     let got = svc
         .get_allowlist(tonic::Request::new(GetAllowlistRequest {
             host_uuid: host.clone(),
+            accept_formats: Vec::new(),
         }))
         .await
         .unwrap()
@@ -316,6 +318,7 @@ async fn off_policy_never_auto_adopts() {
     let got = svc
         .get_allowlist(tonic::Request::new(GetAllowlistRequest {
             host_uuid: host.clone(),
+            accept_formats: Vec::new(),
         }))
         .await
         .unwrap()

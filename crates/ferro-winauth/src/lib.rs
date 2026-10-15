@@ -39,7 +39,7 @@ mod imp;
 #[cfg(windows)]
 pub use imp::{
     client_process_id, create_server_pipe, open_client_pipe, process_image_path, process_user_rid,
-    verify_authenticode,
+    process_user_sid, verify_authenticode,
 };
 
 pub mod pipe_acl;

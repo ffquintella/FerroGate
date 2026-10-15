@@ -32,13 +32,18 @@ use ferro_audit::{AuditEvent, Bytes16, Hash384};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, RwLock};
 
-use crate::helper::allowlist::Allowlist;
+use crate::helper::allowlist::{Allowlist, CallerFacts};
 use crate::helper::auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
 use crate::helper::crl::{CrlCache, CrlGate};
 use crate::helper::ledger::CallerLedger;
-use crate::helper::proto::{self, ChildToken, ErrorCode, HelperReq, HelperResp};
+use crate::helper::proto::{
+    self, ChildToken, ErrorCode, HelperOp, HelperReq, HelperResp, RegErrorCode, RegistrationResp,
+    Request,
+};
 use crate::helper::token::ChildTokenMinter;
 
+#[cfg(unix)]
+mod fdpass;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -143,6 +148,24 @@ struct Shared<A: CallerAuth> {
     /// other caller. The host SVID and CRL gates still apply — self-trust only
     /// substitutes for the allowlist membership check.
     self_sha: Option<[u8; 48]>,
+    /// The F19 registration handler, installed once before serving
+    /// ([`HelperServer::set_registration`]). Unset ⇒ registration operations
+    /// answer `registration_disabled`.
+    registration: std::sync::OnceLock<Arc<dyn RegistrationHandler>>,
+}
+
+/// Handles the helper protocol v2 registration operations (F19 §7.6) for an
+/// authenticated caller: `RegisterSelf`, `RegisterFile` (with the descriptor
+/// the client passed, Unix) and `RequestStatus`. Implemented by
+/// [`crate::registration::Registrar`].
+pub trait RegistrationHandler: Send + Sync + 'static {
+    /// Answer `op` for `caller`.
+    fn handle(
+        &self,
+        caller: CallerIdentity,
+        op: HelperOp,
+        file: Option<std::fs::File>,
+    ) -> futures::future::BoxFuture<'_, RegistrationResp>;
 }
 
 impl<A: CallerAuth> Shared<A> {
@@ -163,6 +186,7 @@ impl<A: CallerAuth> Shared<A> {
             clock,
             ledger: CallerLedger::new(),
             self_sha: running_exe_sha(),
+            registration: std::sync::OnceLock::new(),
         }
     }
 
@@ -242,10 +266,12 @@ impl<A: CallerAuth> MinterReloader<A> {
     }
 }
 
-/// Drive one already-accepted connection through the request/response exchange.
+/// Drive one already-accepted connection through the request/response exchange
+/// (the Windows transport, and any stream that cannot carry a descriptor).
 ///
 /// `cred` is the caller's `SO_PEERCRED` / named-pipe credentials, read cheaply
 /// on the async side before this is called (or an error if that failed).
+#[cfg_attr(unix, allow(dead_code))] // the UDS transport reads with `fdpass`
 async fn serve_connection<A, S>(
     shared: &Arc<Shared<A>>,
     mut stream: S,
@@ -257,27 +283,92 @@ async fn serve_connection<A, S>(
 {
     // Read the single request frame under a deadline. A timeout or framing
     // error is not a "request" — drop the connection without an audit event.
-    let req: HelperReq =
-        match tokio::time::timeout(read_timeout, proto::read_frame(&mut stream)).await {
-            Ok(Ok(req)) => req,
-            Ok(Err(_)) | Err(_) => return,
-        };
+    let Ok(Ok(body)) =
+        tokio::time::timeout(read_timeout, proto::read_frame_bytes(&mut stream)).await
+    else {
+        return;
+    };
+    serve_frame(shared, &mut stream, cred, &body, None).await;
+}
 
+/// Answer one request frame `body`, read from `stream`, with the descriptor
+/// the client passed alongside it (Unix `SCM_RIGHTS`), if any.
+///
+/// A v1 request and a v2 `Token` operation take the token path (exactly one
+/// audit event each); the v2 registration operations go to the registration
+/// handler. A body that is neither shape is not a request: the connection is
+/// dropped without a reply (an agent older than v2 does the same with a v2
+/// frame, which clients report as "agent too old").
+async fn serve_frame<A, S>(
+    shared: &Arc<Shared<A>>,
+    stream: &mut S,
+    cred: Result<PeerCred, AuthError>,
+    body: &[u8],
+    file: Option<std::fs::File>,
+) where
+    A: CallerAuth,
+    S: AsyncWrite + Unpin,
+{
+    let Ok(request) = proto::decode_request(body) else {
+        return;
+    };
+    match request {
+        Request::Legacy(req) => serve_token(shared, stream, cred, &req).await,
+        Request::V2(frame) => match frame.op {
+            HelperOp::Token {
+                audience,
+                dpop_jkt,
+                ttl_secs,
+            } => {
+                let req = HelperReq {
+                    audience,
+                    dpop_jkt,
+                    ttl_secs,
+                };
+                serve_token(shared, stream, cred, &req).await;
+            }
+            op => {
+                let resp = serve_registration(shared, cred, op, file).await;
+                let _ = proto::write_frame(stream, &resp).await;
+            }
+        },
+    }
+}
+
+/// Authenticate the caller on the blocking pool.
+async fn identify<A: CallerAuth>(
+    shared: &Arc<Shared<A>>,
+    cred: PeerCred,
+) -> Option<Result<CallerIdentity, AuthError>> {
+    // The authenticator's blocking work (IMA log / `/proc` on Unix; image
+    // hashing on Windows) runs on the blocking pool so it never stalls a
+    // runtime worker thread. `None` ⇒ the task panicked.
+    let auth_shared = Arc::clone(shared);
+    tokio::task::spawn_blocking(move || auth_shared.auth.identify(cred))
+        .await
+        .ok()
+}
+
+/// The token path: exactly one audit event per request.
+async fn serve_token<A, S>(
+    shared: &Arc<Shared<A>>,
+    stream: &mut S,
+    cred: Result<PeerCred, AuthError>,
+    req: &HelperReq,
+) where
+    A: CallerAuth,
+    S: AsyncWrite + Unpin,
+{
     let cred = match cred {
         Ok(cred) => cred,
         Err(e) => {
-            let resp = process_request(shared, Err(e), &req).await;
-            let _ = proto::write_frame(&mut stream, &resp).await;
+            let resp = process_request(shared, Err(e), req).await;
+            let _ = proto::write_frame(stream, &resp).await;
             return;
         }
     };
 
-    // The authenticator's blocking work (IMA log / `/proc` on Unix; image
-    // hashing on Windows) runs on the blocking pool so it never stalls a
-    // runtime worker thread.
-    let auth_shared = Arc::clone(shared);
-    let Ok(id_result) = tokio::task::spawn_blocking(move || auth_shared.auth.identify(cred)).await
-    else {
+    let Some(id_result) = identify(shared, cred).await else {
         // The authenticator task panicked. Fail closed, but still record
         // exactly one audit event so the request is accounted for.
         deny(
@@ -288,13 +379,47 @@ async fn serve_connection<A, S>(
             "auth-internal",
         )
         .await;
-        let _ = proto::write_frame(&mut stream, &err(ErrorCode::Internal, None)).await;
+        let _ = proto::write_frame(stream, &err(ErrorCode::Internal, None)).await;
         return;
     };
 
-    let resp = process_request(shared, id_result, &req).await;
+    let resp = process_request(shared, id_result, req).await;
     // Best-effort reply; the audit event has already been recorded.
-    let _ = proto::write_frame(&mut stream, &resp).await;
+    let _ = proto::write_frame(stream, &resp).await;
+}
+
+/// The registration path (F19 §7.6). The caller is authenticated exactly as
+/// on the token path; the handler decides the rest. Registration outcomes
+/// are recorded by CMIS (`AppRequestSubmitted`, …) and in the local ledger,
+/// not as `LocalGrant`/`LocalDenied`.
+async fn serve_registration<A: CallerAuth>(
+    shared: &Arc<Shared<A>>,
+    cred: Result<PeerCred, AuthError>,
+    op: HelperOp,
+    file: Option<std::fs::File>,
+) -> RegistrationResp {
+    let refuse = |code| RegistrationResp::Error {
+        code,
+        retry_after: None,
+    };
+    let Some(handler) = shared.registration.get().cloned() else {
+        return refuse(RegErrorCode::RegistrationDisabled);
+    };
+    let caller = match cred {
+        Ok(cred) => match identify(shared, cred).await {
+            Some(Ok(id)) => id,
+            Some(Err(e)) => {
+                tracing::warn!(reason = e.reason(), "registration caller not authenticated");
+                return refuse(RegErrorCode::PermissionDenied);
+            }
+            None => return refuse(RegErrorCode::Internal),
+        },
+        Err(e) => {
+            tracing::warn!(reason = e.reason(), "registration caller not authenticated");
+            return refuse(RegErrorCode::PermissionDenied);
+        }
+    };
+    handler.handle(caller, op, file).await
 }
 
 /// Authorize and mint (or refuse) for one decoded request given the caller
@@ -365,7 +490,7 @@ async fn process_request<A: CallerAuth>(
     let is_self = shared.self_sha == Some(id.bin_sha);
     let permitted = is_self
         || match &*shared.allowlist.read().await {
-            Some(al) => al.permits(id.uid, &id.bin_sha),
+            Some(al) => al.permits_caller(&CallerFacts::of(&id), now),
             None => false,
         };
     if !permitted {

@@ -346,6 +346,8 @@ pub fn not_running_snapshots(environment: Option<&str>) -> Vec<StatusSnapshot> {
             version: env!("CARGO_PKG_VERSION").to_string(),
             // A stopped agent serves no address.
             default_address: false,
+            sync: None,
+            registrations: None,
         })
         .collect()
 }
@@ -457,6 +459,7 @@ pub fn render_human(snapshots: &[StatusSnapshot], now: i64) -> String {
             }
         };
         let _ = writeln!(out, "  allowlist:    {allowlist}");
+        render_f19(&mut out, s, now);
         if let Some(store) = s.x509_store {
             let _ = writeln!(
                 out,
@@ -489,6 +492,42 @@ pub(crate) fn human_duration(secs: i64) -> String {
         s if s < 3600 => format!("{}m", s / 60),
         s if s < 86_400 => format!("{}h{}m", s / 3600, (s % 3600) / 60),
         s => format!("{}d{}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+/// The F19 lines of one snapshot: the allowlist sync and the local app
+/// requests, when the daemon reports them.
+fn render_f19(out: &mut String, s: &StatusSnapshot, now: i64) {
+    use std::fmt::Write as _;
+    if let Some(sync) = &s.sync {
+        let last = sync
+            .last_ok_at
+            .map_or_else(|| "never".to_string(), |t| relative(t - now));
+        let mut line = format!(
+            "generation {}, last ok {last}{}",
+            sync.generation,
+            if sync.legacy {
+                ", legacy GetAllowlist"
+            } else {
+                ""
+            }
+        );
+        if sync.failing {
+            let _ = write!(
+                line,
+                " — FAILING ({}, {} in a row)",
+                sync.last_reason.as_deref().unwrap_or("unknown"),
+                sync.consecutive_failures
+            );
+        }
+        let _ = writeln!(out, "  sync:         {line}");
+    }
+    if let Some(r) = s.registrations {
+        let _ = writeln!(
+            out,
+            "  app requests: {} queued, {} pending, {} approved, {} closed",
+            r.queued, r.pending, r.approved, r.closed
+        );
     }
 }
 

@@ -8,7 +8,12 @@
 //! This crate owns:
 //!
 //! - [`allowlist`] — the signed caller-allowlist wire model CMIS serves and the
-//!   MIA verifies.
+//!   MIA verifies (format v1, unchanged).
+//! - [`allowlist_v2`] — allowlist format v2 (ADR-0004): host-bound, with a
+//!   generation and per-entry uid / SID-hash / path-hash / expiry
+//!   constraints, under its own signing context; `path_hash` and `sid_hash`.
+//! - [`app_docs`] — the host-signed documents of `SubmitAppRequest`,
+//!   `GetAppRequestStatus` and `SyncAllowlist` (F19 §7).
 //! - [`claims`] — the `ferrogate-svid-v1` payload schema.
 //! - [`envelope`] — compact-JWS encode/decode and the signing transcript.
 //! - [`host_call`] — the signed documents of host-authenticated RPCs (F19
@@ -29,6 +34,9 @@
 #![forbid(unsafe_code)]
 
 pub mod allowlist;
+pub mod allowlist_v2;
+pub mod app_docs;
+mod cbor_bytes;
 pub mod claims;
 pub mod crl;
 pub mod envelope;
@@ -65,6 +73,14 @@ pub use allowlist::{
     AllowEntry, AllowlistDoc, AllowlistError, ProposalDoc, SignedAllowlist,
     ALLOWLIST_SIGNING_CONTEXT, PROPOSAL_SIGNING_CONTEXT,
 };
+pub use allowlist_v2::{
+    path_hash, sid_hash, AllowEntryV2, AllowlistDocV2, AllowlistV2Error,
+    ALLOWLIST_V2_SIGNING_CONTEXT,
+};
+pub use app_docs::{
+    AllowlistSyncDoc, AppDocError, AppRequestDoc, AppStatusDoc, ALLOWLIST_SYNC_CONTEXT,
+    APP_REQUEST_CONTEXT, APP_STATUS_CONTEXT,
+};
 pub use claims::{AttestClaims, Cnf, SvidClaims};
 pub use crl::{
     CrlBody, CrlEntry, CrlError, RevocationTarget, SignedCrl, CRL_ENTRY_TTL_SECS, CRL_MAX_AGE_SECS,
@@ -78,3 +94,42 @@ pub use lifecycle::{
 };
 pub use spiffe::{host_uuid_from_ek_digest, spiffe_host_id, spiffe_issuer_id, SpiffeError};
 pub use x509::{X509Error, X509Svid, ALT_SIGNATURE_CONTEXT as X509_ALT_SIGNATURE_CONTEXT};
+
+#[cfg(test)]
+mod context_tests {
+    /// Every signing context is distinct from, and prefix-free with, every
+    /// other: a signature over `context ‖ document` can never be replayed
+    /// under another context (F19 §7.1).
+    #[test]
+    fn signing_contexts_are_pairwise_prefix_free() {
+        let all: [&[u8]; 10] = [
+            crate::SVID_SIGNING_CONTEXT,
+            crate::ALLOWLIST_SIGNING_CONTEXT,
+            crate::ALLOWLIST_V2_SIGNING_CONTEXT,
+            crate::PROPOSAL_SIGNING_CONTEXT,
+            crate::CRL_SIGNING_CONTEXT,
+            crate::X509_ALT_SIGNATURE_CONTEXT,
+            crate::host_call::AUDIT_FORWARD_CONTEXT,
+            crate::APP_REQUEST_CONTEXT,
+            crate::APP_STATUS_CONTEXT,
+            crate::ALLOWLIST_SYNC_CONTEXT,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert!(!a.starts_with(b), "{a:?} / {b:?}");
+                }
+            }
+        }
+        assert_eq!(
+            crate::ALLOWLIST_V2_SIGNING_CONTEXT,
+            b"ferrogate-allowlist-v2"
+        );
+        assert_eq!(crate::APP_REQUEST_CONTEXT, b"ferrogate-app-request-v1");
+        assert_eq!(crate::APP_STATUS_CONTEXT, b"ferrogate-app-status-v1");
+        assert_eq!(
+            crate::ALLOWLIST_SYNC_CONTEXT,
+            b"ferrogate-allowlist-sync-v1"
+        );
+    }
+}

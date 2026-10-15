@@ -305,6 +305,8 @@ struct EnvStatus {
     allowlist: AllowlistLoad,
     x509_store: Option<StoreBackend>,
     default_address: bool,
+    sync: Option<mia_status_proto::AllowlistSyncSummary>,
+    registrations: Option<mia_status_proto::RegistrationCounts>,
     last_state: Option<AgentState>,
     since: i64,
 }
@@ -342,6 +344,8 @@ impl StatusHandle {
                 allowlist: AllowlistLoad::Missing,
                 x509_store: None,
                 default_address: false,
+                sync: None,
+                registrations: None,
                 last_state: None,
                 since: now,
             })),
@@ -423,6 +427,17 @@ impl StatusHandle {
         self.with(|s| s.allowlist = load);
     }
 
+    /// Update the allowlist sync loop's summary (feature F19 §6.5), creating
+    /// it on first use.
+    pub fn update_sync(&self, f: impl FnOnce(&mut mia_status_proto::AllowlistSyncSummary)) {
+        self.with(|s| f(s.sync.get_or_insert_with(Default::default)));
+    }
+
+    /// Record the local app-registration counts (feature F19 §7.6).
+    pub fn set_registrations(&self, counts: mia_status_proto::RegistrationCounts) {
+        self.with(|s| s.registrations = Some(counts));
+    }
+
     /// The X.509-SVID store backend (a `credstore` sealer name). Unknown names
     /// are ignored.
     pub fn set_x509_store(&self, backend_name: &str) {
@@ -481,6 +496,8 @@ impl StatusHandle {
                 last_error,
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 default_address: s.default_address,
+                sync: s.sync.clone(),
+                registrations: s.registrations,
             }
         })
     }

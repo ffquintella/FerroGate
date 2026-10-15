@@ -213,12 +213,7 @@ mod tests {
     }
 
     fn actor() -> CallerIdentity {
-        CallerIdentity {
-            pid: 1234,
-            uid: 1001,
-            gid: 1001,
-            bin_sha: [0xAB; 48],
-        }
+        CallerIdentity::new(1234, 1001, 1001, [0xAB; 48])
     }
 
     /// Decode a compact JWS into (header, claims, signing_input, sig_bytes).

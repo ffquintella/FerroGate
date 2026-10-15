@@ -126,6 +126,7 @@ async fn set_then_get_serves_a_verifiable_signed_allowlist() {
     let got = svc
         .get_allowlist(tonic::Request::new(GetAllowlistRequest {
             host_uuid: host.into(),
+            accept_formats: Vec::new(),
         }))
         .await
         .expect("get ok")
@@ -149,6 +150,7 @@ async fn get_unknown_host_returns_empty_not_error() {
     let got = svc
         .get_allowlist(tonic::Request::new(GetAllowlistRequest {
             host_uuid: "nobody".into(),
+            accept_formats: Vec::new(),
         }))
         .await
         .expect("get ok")

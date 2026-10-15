@@ -8,6 +8,11 @@
 //! thin wrapper that assembles [`state::CmisState`] and calls
 //! [`server::run`].
 //!
+//! F19 application registration and approval ([`apps`]) adds the
+//! host-authenticated `SubmitAppRequest`, `GetAppRequestStatus` and
+//! `SyncAllowlist` RPCs, the per-host signed allowlist v2, the leader-only
+//! sweepers, and the administrator decisions served by the admin service.
+//!
 //! TEE residency, Raft replication, and the audit log are layered on in later
 //! milestones; the seams (the credential maker, the issued-SVID store) are
 //! called out where they will be replaced.
@@ -15,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod apps;
 pub mod cluster_store;
 pub mod credential;
 pub mod crl_publisher;

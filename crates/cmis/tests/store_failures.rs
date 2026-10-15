@@ -208,6 +208,7 @@ async fn set_allowlist_fails_when_the_store_refuses_the_write() {
         .svc
         .get_allowlist(tonic::Request::new(GetAllowlistRequest {
             host_uuid: f.host.clone(),
+            accept_formats: Vec::new(),
         }))
         .await
         .unwrap()

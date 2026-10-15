@@ -132,6 +132,34 @@ service MachineIdentity {
   // host-originated event types are accepted; calls are rate-limited per host.
   rpc AppendAuditEvent (AppendAuditRequest) returns (AppendAuditResponse);
 
+  // ---- Application registration and allowlist sync (F19 §7) ----
+  //
+  // Host-authenticated like AppendAuditEvent: every request carries the
+  // canonical CBOR document the host signed (`doc`) and a `HostCallAuth`
+  // proof over `context ‖ doc`, with the context named per RPC below. The
+  // response never reveals another host's records.
+
+  // Ask for one binary to be approved for one user on this host. `doc` is
+  // `ferro_svid::app_docs::AppRequestDoc`, context `ferrogate-app-request-v1`.
+  // Idempotent through the document's `client_request_id` (no nonce). Never
+  // replaces or removes an approval (ADR-0004 INV-1): the request is
+  // deduplicated onto an existing record, auto-approved under its lineage's
+  // `AutoSamePathUser` policy, or queued for an administrator. Refused with
+  // FAILED_PRECONDITION `mode_legacy` while `allowlist_mode` is `legacy`.
+  rpc SubmitAppRequest (SubmitAppRequestRequest) returns (SubmitAppRequestResponse);
+
+  // Status of this host's own requests. `doc` is
+  // `ferro_svid::app_docs::AppStatusDoc`, context `ferrogate-app-status-v1`,
+  // at most 100 ids; ids of other hosts and unknown ids are omitted.
+  rpc GetAppRequestStatus (GetAppRequestStatusRequest) returns (GetAppRequestStatusResponse);
+
+  // Fetch this host's signed allowlist v2 (context `ferrogate-allowlist-v2`)
+  // when it changed since `have_generation`. `doc` is
+  // `ferro_svid::app_docs::AllowlistSyncDoc`, context
+  // `ferrogate-allowlist-sync-v1`. One call per host per
+  // `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS` (RESOURCE_EXHAUSTED otherwise).
+  rpc SyncAllowlist (SyncAllowlistRequest) returns (SyncAllowlistResponse);
+
   // ---- Cluster health (F05) ----
 
   // Coarse readiness probe for L4/L7 load balancers. Reports the local node's
@@ -300,6 +328,10 @@ message AllowEntryMsg {
 
 message GetAllowlistRequest {
   string host_uuid = 1; // EK-derived host UUID
+  // Formats the caller accepts (F19 §6.4, additive). Ignored: this
+  // unauthenticated RPC only ever serves v1; v2 is served through the
+  // host-authenticated SyncAllowlist.
+  repeated uint32 accept_formats = 2;
 }
 
 message GetAllowlistResponse {
@@ -501,6 +533,89 @@ message AppendAuditRequest {
   bytes doc = 3;
 }
 message AppendAuditResponse { uint64 leaf_index = 1; }
+
+// ---- Application registration and allowlist sync (F19 §7.3) ---------------
+
+// Request state (F19 §3). Every state but PENDING is final.
+enum AppRequestState {
+  APP_REQUEST_STATE_UNSPECIFIED = 0;
+  APP_REQUEST_STATE_PENDING = 1;
+  APP_REQUEST_STATE_APPROVED = 2;
+  APP_REQUEST_STATE_AUTO_APPROVED = 3;
+  APP_REQUEST_STATE_DENIED = 4;
+  APP_REQUEST_STATE_EXPIRED = 5;
+}
+
+message SubmitAppRequestRequest {
+  // Canonical CBOR of `ferro_svid::app_docs::AppRequestDoc` (≤ 16 KiB).
+  bytes doc = 1;
+  // Host proof over `doc`, context `ferrogate-app-request-v1`.
+  HostCallAuth auth = 2;
+}
+message SubmitAppRequestResponse {
+  // The request (UUID text); empty when deduplicated onto an approval.
+  string request_id = 1;
+  AppRequestState state = 2;
+  // Set when APPROVED / AUTO_APPROVED.
+  string approval_id = 3;
+  // Sequential version of the binary in its lineage.
+  uint32 revision = 4;
+  // An existing record was returned and nothing changed.
+  bool deduplicated = 5;
+  // The host's allowlist generation that includes the approval; sync when it
+  // is above the one held.
+  uint64 allowlist_generation = 6;
+  // Why auto-update was not applied (stable code, F19 §5.3); empty otherwise.
+  string auto_downgrade_reason = 7;
+  // DENIED only.
+  uint32 deny_reason_code = 8;
+  string deny_message = 9;
+  // DENIED within the cool-down: seconds until a new request is accepted.
+  int64 retry_after_secs = 10;
+}
+
+message GetAppRequestStatusRequest {
+  // Canonical CBOR of `ferro_svid::app_docs::AppStatusDoc`.
+  bytes doc = 1;
+  // Host proof over `doc`, context `ferrogate-app-status-v1`.
+  HostCallAuth auth = 2;
+}
+message AppRequestStatus {
+  string request_id = 1;
+  AppRequestState state = 2;
+  string approval_id = 3;
+  uint32 revision = 4;
+  int64 decided_at = 5;
+  uint32 deny_reason_code = 6;
+  string deny_message = 7;
+}
+// Unknown ids and ids of other hosts are omitted.
+message GetAppRequestStatusResponse { repeated AppRequestStatus items = 1; }
+
+message SyncAllowlistRequest {
+  // Canonical CBOR of `ferro_svid::app_docs::AllowlistSyncDoc`.
+  bytes doc = 1;
+  // Host proof over `doc`, context `ferrogate-allowlist-sync-v1`.
+  HostCallAuth auth = 2;
+}
+message SyncAllowlistResponse {
+  oneof result {
+    // The host already holds `generation` and its body has more than half
+    // its lifetime left.
+    NotModified not_modified = 1;
+    // CBOR `SignedAllowlist` envelope whose body is `AllowlistDocV2`,
+    // signed under `ferrogate-allowlist-v2`.
+    bytes signed_allowlist_v2 = 2;
+  }
+  // Generation of the served (or unchanged) body.
+  uint64 generation = 3;
+  // Advisory poll interval; MIA clamps it to its configured range.
+  uint32 next_poll_hint_secs = 4;
+}
+message NotModified {
+  // `not_after` of the body the host holds.
+  int64 not_after = 1;
+}
 
 // ---- Cluster health ------------------------------------------------------
 

@@ -565,3 +565,207 @@ async fn factors_list_and_remove_with_a_totp_proof() {
         .await;
     assert!(!ok && stderr.contains("last_factor"), "{stderr}");
 }
+
+/// `ferrogate admin apps`: register an application directly (fresh TOTP
+/// proof), list it, revoke it and read the revoked state back with its
+/// revision history. A typo is refused before any sign-in prompt.
+#[tokio::test]
+async fn apps_register_list_revoke_and_show_the_history() {
+    let cmis = spawn_cmis("apps").await;
+    let secret = cmis.bootstrap().await;
+    let session = cmis.dir.join("session");
+    cmis.login(&secret, &session).await;
+    let s = session.to_str().unwrap();
+    let host = "22222222-2222-8222-8222-222222222222";
+    let sha = hex::encode([0xBB; 48]);
+
+    // Parsed before the sign-in: no stdin needed to learn it is a typo.
+    let (ok, _, stderr) = cmis
+        .run(&["--session-file", s, "admin", "apps", "frobnicate"], &[])
+        .await;
+    assert!(!ok && stderr.contains("unknown apps action"), "{stderr}");
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "admin", "apps", "register", "--host", host, "--sha384", "abc",
+            ],
+            &[],
+        )
+        .await;
+    assert!(!ok && stderr.contains("is required"), "{stderr}");
+
+    cmis.clock.advance(30);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "apps",
+                "register",
+                "--host",
+                host,
+                "--path",
+                "/opt/tool/bin/tool",
+                "--sha384",
+                &sha,
+                "--platform",
+                "linux",
+                "--uid",
+                "1000",
+                "--user",
+                "alice",
+                "--size",
+                "2048",
+                "--version",
+                "2.1.0",
+                "--reason",
+                "line-of-business tool",
+            ],
+            &[&cmis.code(&secret)],
+        )
+        .await;
+    assert!(ok, "register: {stderr}");
+    let id_after = |text: &str, key: &str| -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no `{key}` in {text}"))
+            .trim()
+            .to_string()
+    };
+    let approval_id = id_after(&stdout, "approval: ");
+    let request_id = id_after(&stdout, "request: ");
+    assert!(
+        !approval_id.is_empty() && !request_id.is_empty(),
+        "{stdout}"
+    );
+
+    // Registering the same binary again is covered by the active approval.
+    cmis.clock.advance(30);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "apps",
+                "register",
+                "--host",
+                host,
+                "--path",
+                "/opt/tool/bin/tool",
+                "--sha384",
+                &sha.to_uppercase(),
+                "--platform",
+                "linux",
+                "--uid",
+                "1000",
+                "--user",
+                "alice",
+            ],
+            &[&cmis.code(&secret)],
+        )
+        .await;
+    assert!(ok, "second register: {stderr}");
+    assert!(
+        stdout.contains(&format!("already approved by {approval_id}")),
+        "{stdout}"
+    );
+
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "apps",
+                "approvals",
+                "--host",
+                host,
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "approvals: {stderr}");
+    assert!(
+        stdout.contains(&approval_id) && stdout.contains("active") && stdout.contains("alice"),
+        "{stdout}"
+    );
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "apps",
+                "requests",
+                "--state",
+                "approved",
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "requests: {stderr}");
+    assert!(
+        stdout.contains(&request_id) && stdout.contains("/opt/tool/bin/tool"),
+        "{stdout}"
+    );
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &["--session-file", s, "admin", "apps", "request", &request_id],
+            &[],
+        )
+        .await;
+    assert!(ok, "request: {stderr}");
+    assert!(
+        stdout.contains(&sha) && stdout.contains(&approval_id),
+        "{stdout}"
+    );
+
+    // The revoke is a decision: it needs a recent step-up, so a code is on
+    // stdin in case the server asks for one.
+    cmis.clock.advance(30);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "apps",
+                "revoke",
+                &approval_id,
+                "--reason-code",
+                "2",
+            ],
+            &[&cmis.code(&secret)],
+        )
+        .await;
+    assert!(ok, "revoke: {stderr}");
+    assert!(stdout.contains("revoked"), "{stdout}");
+
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "apps",
+                "approval",
+                &approval_id,
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "approval: {stderr}");
+    assert!(
+        stdout.contains("state:              revoked") && stdout.contains("created"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("revisions:"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("revoked") && l.contains("by ")),
+        "{stdout}"
+    );
+}

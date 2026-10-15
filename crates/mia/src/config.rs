@@ -460,6 +460,8 @@ pub struct Config {
     pub attestation: AttestationConfig,
     /// The read-only status endpoint and log ring buffer (feature F18).
     pub status: StatusConfig,
+    /// Application registration through the helper API (feature F19).
+    pub registration: RegistrationConfig,
     /// The environment this configuration belongs to (`None` ⇒ the default
     /// environment). Not a TOML key — a file cannot claim another
     /// environment's identity: the loader sets it from the `--environment`
@@ -579,6 +581,50 @@ pub struct AllowlistConfig {
     /// How often (seconds) to propose the observed caller set when `propose` is
     /// enabled. `None` ⇒ [`DEFAULT_ALLOWLIST_PROPOSE_INTERVAL_SECS`].
     pub propose_interval_secs: Option<u64>,
+    /// Keep the allowlist current by polling CMIS `SyncAllowlist` every
+    /// [`sync_interval_secs`](Self::sync_interval_secs) ± jitter (feature F19
+    /// §6.5): signed v2 bodies, verified (host binding, generation, rollback)
+    /// and swapped in without a restart. Supersedes the start-only
+    /// [`fetch`](Self::fetch); against a CMIS older than F19 it falls back to
+    /// `GetAllowlist` at the same cadence. Needs `cmis.*`, `allowlist.key`
+    /// and a host SVID bound to the machine key. `None` ⇒ off (opt-in,
+    /// F19-OQ1).
+    pub sync: Option<bool>,
+    /// Sync interval in seconds, `60..=3600`; `None` ⇒ 300.
+    pub sync_interval_secs: Option<u64>,
+    /// ± jitter on the sync interval in percent, `0..=50`; `None` ⇒ 10.
+    pub sync_jitter_pct: Option<u8>,
+    /// Where the sync records the held generation (`allowlist.state`); the
+    /// synced body is kept beside it (`<name>.synced.cbor`). `None` or blank
+    /// ⇒ `allowlist[-<env>].state` in the daemon's state directory (writable
+    /// after the Linux privilege drop; root-owned `0600`).
+    pub state_path: Option<PathBuf>,
+}
+
+/// `[registration]` — application registration requests through the helper
+/// API and `mia app` (feature F19 §7.6).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegistrationConfig {
+    /// Accept registration requests. `None` ⇒ on.
+    pub enable: Option<bool>,
+    /// Accept assisted requests for a file (`mia app register --exe`, the
+    /// tray: `RegisterFile`). `None` ⇒ on.
+    pub assisted: Option<bool>,
+    /// Requests per uid per hour; `None` ⇒ 10.
+    pub max_per_uid_per_hour: Option<u32>,
+    /// Open (queued or pending) requests one requester (uid; Windows SID)
+    /// may hold, `1..=100`; `None` ⇒ 50. Keeps one local user from filling
+    /// the request ledger.
+    pub max_open_per_uid: Option<u32>,
+    /// Largest file identified, in MiB, at most 2048; `None` ⇒ 2048.
+    pub max_file_size_mib: Option<u64>,
+    /// Version sources consulted, of `pe`, `plist`, `elf-note`, `dpkg`;
+    /// `None` ⇒ all.
+    pub version_sources: Option<Vec<String>>,
+    /// The local request ledger. `None` or blank ⇒ `app-requests[-<env>].cbor`
+    /// in the daemon's state directory (root-owned `0600`).
+    pub ledger_path: Option<PathBuf>,
 }
 
 /// `[attestation]` — attestation inputs.
@@ -732,6 +778,17 @@ pub const ENV_OVERRIDES: &[EnvOverride] = &[
     env_override(
         "FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS",
         "allowlist.propose_interval_secs",
+        false,
+    ),
+    env_override("FERROGATE_ALLOWLIST_SYNC", "allowlist.sync", false),
+    env_override(
+        "FERROGATE_ALLOWLIST_SYNC_INTERVAL_SECS",
+        "allowlist.sync_interval_secs",
+        false,
+    ),
+    env_override(
+        "FERROGATE_REGISTRATION_ENABLE",
+        "registration.enable",
         false,
     ),
     env_override("FERROGATE_IMA_LOG", "attestation.ima_log", false),
@@ -1000,6 +1057,19 @@ impl Config {
                 .parse()
                 .context("FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS is not an integer")?;
             self.allowlist.propose_interval_secs = Some(n);
+        }
+        if let Some(v) = get("FERROGATE_ALLOWLIST_SYNC") {
+            self.allowlist.sync = Some(parse_bool_env("FERROGATE_ALLOWLIST_SYNC", &v)?);
+        }
+        if let Some(v) = get("FERROGATE_ALLOWLIST_SYNC_INTERVAL_SECS") {
+            let n: u64 = v
+                .trim()
+                .parse()
+                .context("FERROGATE_ALLOWLIST_SYNC_INTERVAL_SECS is not an integer")?;
+            self.allowlist.sync_interval_secs = Some(n);
+        }
+        if let Some(v) = get("FERROGATE_REGISTRATION_ENABLE") {
+            self.registration.enable = Some(parse_bool_env("FERROGATE_REGISTRATION_ENABLE", &v)?);
         }
         if let Some(v) = get("FERROGATE_IMA_LOG") {
             self.attestation.ima_log = Some(PathBuf::from(v));
@@ -1314,6 +1384,136 @@ impl Config {
                 .log_buffer_bytes
                 .unwrap_or(DEFAULT_LOG_BUFFER_BYTES)
                 .min(MAX_LOG_BUFFER_BYTES),
+        )
+    }
+
+    /// Whether the allowlist sync loop runs (`allowlist.sync`, default off).
+    #[must_use]
+    pub fn allowlist_sync_enabled(&self) -> bool {
+        self.allowlist.sync.unwrap_or(false)
+    }
+
+    /// The sync interval, clamped to `60..=3600` s; default 300 s.
+    #[must_use]
+    pub fn allowlist_sync_interval(&self) -> std::time::Duration {
+        crate::allowlist_sync::schedule::clamp_interval(
+            self.allowlist
+                .sync_interval_secs
+                .unwrap_or(crate::allowlist_sync::schedule::DEFAULT_INTERVAL_SECS),
+        )
+    }
+
+    /// The sync jitter in percent, clamped to `0..=50`; default 10.
+    #[must_use]
+    pub fn allowlist_sync_jitter_pct(&self) -> u8 {
+        self.allowlist
+            .sync_jitter_pct
+            .unwrap_or(crate::allowlist_sync::schedule::DEFAULT_JITTER_PCT)
+            .min(crate::allowlist_sync::schedule::MAX_JITTER_PCT)
+    }
+
+    /// The sync's held-generation state file: `allowlist.state_path`, else
+    /// `allowlist[-<env>].state` in the daemon's state directory.
+    #[must_use]
+    pub fn allowlist_state_path(&self) -> PathBuf {
+        non_blank_path(self.allowlist.state_path.as_deref()).map_or_else(
+            || {
+                let name = match self.environment() {
+                    Some(env) => format!("allowlist-{env}.state"),
+                    None => "allowlist.state".to_string(),
+                };
+                crate::credstore::state_dir().join(name)
+            },
+            Path::to_path_buf,
+        )
+    }
+
+    /// Whether registration requests are accepted (`registration.enable`,
+    /// default on).
+    #[must_use]
+    pub fn registration_enabled(&self) -> bool {
+        self.registration.enable.unwrap_or(true)
+    }
+
+    /// Whether assisted (`RegisterFile`) requests are accepted
+    /// (`registration.assisted`, default on).
+    #[must_use]
+    pub fn registration_assisted(&self) -> bool {
+        self.registration.assisted.unwrap_or(true)
+    }
+
+    /// Registration requests per uid per hour (default 10, at least 1).
+    #[must_use]
+    pub fn registration_max_per_uid_per_hour(&self) -> u32 {
+        self.registration.max_per_uid_per_hour.unwrap_or(10).max(1)
+    }
+
+    /// Open requests one requester may hold (`registration.max_open_per_uid`,
+    /// default 50, clamped to `1..=100` so that filling the 1000-entry
+    /// ledger with open requests takes at least ten requesters).
+    #[must_use]
+    pub fn registration_max_open_per_uid(&self) -> u32 {
+        self.registration
+            .max_open_per_uid
+            .unwrap_or(50)
+            .clamp(1, 100)
+    }
+
+    /// The largest file identified, in bytes (`registration.max_file_size_mib`,
+    /// default and maximum 2048 MiB).
+    #[must_use]
+    pub fn registration_max_file_size(&self) -> u64 {
+        self.registration
+            .max_file_size_mib
+            .unwrap_or(2048)
+            .clamp(1, 2048)
+            * 1024
+            * 1024
+    }
+
+    /// The version sources to consult (`registration.version_sources`).
+    ///
+    /// # Errors
+    ///
+    /// An unknown source name.
+    pub fn registration_version_sources(&self) -> anyhow::Result<ferro_appid::VersionSources> {
+        let Some(names) = &self.registration.version_sources else {
+            return Ok(ferro_appid::VersionSources::default());
+        };
+        let mut sources = ferro_appid::VersionSources {
+            pe: false,
+            plist: false,
+            elf_note: false,
+            dpkg: false,
+        };
+        for name in names {
+            match name.trim() {
+                "pe" => sources.pe = true,
+                "plist" => sources.plist = true,
+                "elf-note" => sources.elf_note = true,
+                "dpkg" => sources.dpkg = true,
+                other => anyhow::bail!(
+                    "registration.version_sources: unknown source {other:?} (expected pe, plist, \
+                     elf-note or dpkg)"
+                ),
+            }
+        }
+        Ok(sources)
+    }
+
+    /// The local request ledger: `registration.ledger_path`, else
+    /// `app-requests[-<env>].cbor` in the daemon's state directory.
+    #[must_use]
+    pub fn registration_ledger_path(&self) -> PathBuf {
+        non_blank_path(self.registration.ledger_path.as_deref()).map_or_else(
+            || {
+                let name = match self.environment() {
+                    Some(env) => format!("app-requests-{env}.cbor"),
+                    None => "app-requests.cbor".to_string(),
+                };
+                crate::credstore::state_dir().join(name)
+            },
+            Path::to_path_buf,
         )
     }
 
@@ -1783,9 +1983,12 @@ mod tests {
                 | "FERROGATE_HELPER_ENABLE"
                 | "FERROGATE_ALLOWLIST_FETCH"
                 | "FERROGATE_ALLOWLIST_PROPOSE"
+                | "FERROGATE_ALLOWLIST_SYNC"
+                | "FERROGATE_REGISTRATION_ENABLE"
                 | "FERROGATE_STATUS_ENABLE" => "1",
                 "FERROGATE_ALLOWLIST_MAX_AGE_SECS"
                 | "FERROGATE_ALLOWLIST_PROPOSE_INTERVAL_SECS"
+                | "FERROGATE_ALLOWLIST_SYNC_INTERVAL_SECS"
                 | "FERROGATE_STATUS_RATE_LIMIT"
                 | "FERROGATE_STATUS_LOG_RECORDS"
                 | "FERROGATE_STATUS_LOG_BYTES"

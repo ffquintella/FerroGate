@@ -27,14 +27,19 @@
 //!   longer has to be pinned to a private network. PQC peer TLS specifically
 //!   remains upstream; the design point is tracked in the F05 doc.
 //! - **Schema is SQL.** Issued-SVID rows are JSON blobs keyed by SPIFFE id; a
-//!   one-row `rim_state` table tracks the active policy epoch. Migrations
-//!   are inline `CREATE TABLE IF NOT EXISTS` — small enough not to need a
-//!   migration manager yet.
+//!   one-row `rim_state` table tracks the active policy epoch. The tables
+//!   that predate F19 are created by inline `CREATE TABLE IF NOT EXISTS`;
+//!   everything from F19 on goes through the ordered `schema_migrations`
+//!   runner (`migrations`), starting with the app approval ledger
+//!   ([`apps`]).
 
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod apps;
 pub mod cluster;
+mod migrations;
 mod peer_cert;
 
+pub use apps::LedgerError;
 pub use cluster::{Cluster, ClusterConfig, ClusterError, NodeRole, PeerNode, PeerTls};

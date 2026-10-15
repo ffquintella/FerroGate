@@ -35,8 +35,29 @@ pub mod allowlist_key;
 /// caller (uid + binary) is or is not permitted by the signed allowlist.
 pub mod allowlist_diagnose;
 
+/// `mia app register | status | list` — application registration from the
+/// command line (feature F19 §7.7).
+#[cfg(any(unix, windows))]
+pub mod app_cli;
+
+/// The daemon's F19 host services wired together: registration and the
+/// allowlist sync loop.
+#[cfg(any(unix, windows))]
+pub mod app_services;
+
+/// The allowlist sync loop (feature F19 §6.5): poll `SyncAllowlist`, verify
+/// the signed v2 body (host binding, generation, rollback) and swap it in.
+pub mod allowlist_sync;
+
+/// Crash-safe replacement of daemon-owned files (temp + `fsync` + rename).
+pub mod atomic_file;
+
 pub mod audit_client;
 pub mod client;
+
+/// Host-authenticated CMIS calls (feature F19 §7.1) and the credentials that
+/// sign them.
+pub mod host_api;
 
 /// The TOML configuration file and its merge with the environment.
 pub mod config;
@@ -67,6 +88,11 @@ pub mod machine_id;
 
 /// `mia x509-svid` — inspect the machine-bound X.509-SVID store.
 pub mod x509_svid;
+
+/// Application registration requests through the helper API (feature F19
+/// §7.6): identify, sign, submit, local ledger and outbox.
+#[cfg(any(unix, windows))]
+pub mod registration;
 
 /// `mia resync-allowlist` on-demand allowlist re-fetch.
 pub mod resync;

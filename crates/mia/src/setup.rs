@@ -238,9 +238,14 @@ pub(crate) struct Carried {
     helper_socket_gid: Option<String>,
     helper_require_authenticode: Option<bool>,
     allowlist_propose_interval_secs: Option<u64>,
+    allowlist_sync: Option<bool>,
+    allowlist_sync_interval_secs: Option<u64>,
+    allowlist_sync_jitter_pct: Option<u8>,
+    allowlist_state_path: Option<String>,
     tpm_ek_cert: Option<String>,
     tpm_ek_intermediates: Vec<String>,
     status: crate::config::StatusConfig,
+    registration: crate::config::RegistrationConfig,
 }
 
 impl Carried {
@@ -251,6 +256,10 @@ impl Carried {
             helper_socket_gid: existing.helper.socket_gid.clone(),
             helper_require_authenticode: existing.helper.require_authenticode,
             allowlist_propose_interval_secs: existing.allowlist.propose_interval_secs,
+            allowlist_sync: existing.allowlist.sync,
+            allowlist_sync_interval_secs: existing.allowlist.sync_interval_secs,
+            allowlist_sync_jitter_pct: existing.allowlist.sync_jitter_pct,
+            allowlist_state_path: existing.allowlist.state_path.as_deref().map(path),
             tpm_ek_cert: existing.attestation.tpm.ek_cert.as_deref().map(path),
             tpm_ek_intermediates: existing
                 .attestation
@@ -260,6 +269,7 @@ impl Carried {
                 .map(|p| path(p))
                 .collect(),
             status: existing.status.clone(),
+            registration: existing.registration.clone(),
         }
     }
 }
@@ -1146,6 +1156,7 @@ pub(crate) fn render(
         out.push_str("# Kept from the previous file (not edited by `mia setup`).\n");
         let _ = writeln!(out, "propose_interval_secs = {n}");
     }
+    render_carried_sync(&mut out, c);
     out.push('\n');
 
     out.push_str("[attestation]\n");
@@ -1163,6 +1174,32 @@ pub(crate) fn render(
     render_carried_tail(&mut out, c);
 
     out
+}
+
+/// Emit the carried-over allowlist sync keys (feature F19), if the edited
+/// file had them.
+fn render_carried_sync(out: &mut String, c: &Carried) {
+    use std::fmt::Write as _;
+    if c.allowlist_sync.is_none()
+        && c.allowlist_sync_interval_secs.is_none()
+        && c.allowlist_sync_jitter_pct.is_none()
+        && c.allowlist_state_path.is_none()
+    {
+        return;
+    }
+    out.push_str("# Kept from the previous file (not edited by `mia setup`).\n");
+    if let Some(v) = c.allowlist_sync {
+        let _ = writeln!(out, "sync = {v}");
+    }
+    if let Some(v) = c.allowlist_sync_interval_secs {
+        let _ = writeln!(out, "sync_interval_secs = {v}");
+    }
+    if let Some(v) = c.allowlist_sync_jitter_pct {
+        let _ = writeln!(out, "sync_jitter_pct = {v}");
+    }
+    if let Some(v) = &c.allowlist_state_path {
+        let _ = writeln!(out, "state_path = {}", basic_str(v));
+    }
 }
 
 /// Emit the carried-over `[attestation.tpm]` and `[status]` tables, if the
@@ -1209,6 +1246,33 @@ fn render_carried_tail(out: &mut String, c: &Carried) {
         }
         if let Some(v) = st.log_buffer_bytes {
             let _ = writeln!(out, "log_buffer_bytes = {v}");
+        }
+    }
+    let reg = &c.registration;
+    if *reg != crate::config::RegistrationConfig::default() {
+        out.push_str("\n# Kept from the previous file (not edited by `mia setup`).\n");
+        out.push_str("[registration]\n");
+        if let Some(v) = reg.enable {
+            let _ = writeln!(out, "enable = {v}");
+        }
+        if let Some(v) = reg.assisted {
+            let _ = writeln!(out, "assisted = {v}");
+        }
+        if let Some(v) = reg.max_per_uid_per_hour {
+            let _ = writeln!(out, "max_per_uid_per_hour = {v}");
+        }
+        if let Some(v) = reg.max_open_per_uid {
+            let _ = writeln!(out, "max_open_per_uid = {v}");
+        }
+        if let Some(v) = reg.max_file_size_mib {
+            let _ = writeln!(out, "max_file_size_mib = {v}");
+        }
+        if let Some(v) = &reg.version_sources {
+            let list: Vec<String> = v.iter().map(|s| basic_str(s)).collect();
+            let _ = writeln!(out, "version_sources = [{}]", list.join(", "));
+        }
+        if let Some(v) = &reg.ledger_path {
+            let _ = writeln!(out, "ledger_path = {}", basic_str(&v.display().to_string()));
         }
     }
 }

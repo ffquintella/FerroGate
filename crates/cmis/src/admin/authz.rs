@@ -261,6 +261,29 @@ pub mod paths {
     pub const SET_ADMIN_ACCOUNT_STATE: &str = "/ferrogate.admin.v1.Admin/SetAdminAccountState";
     /// `Admin/ResetAdminCredentials`.
     pub const RESET_ADMIN_CREDENTIALS: &str = "/ferrogate.admin.v1.Admin/ResetAdminCredentials";
+
+    /// `Admin/ListAppRequests` (F19).
+    pub const LIST_APP_REQUESTS: &str = "/ferrogate.admin.v1.Admin/ListAppRequests";
+    /// `Admin/GetAppRequest` (F19).
+    pub const GET_APP_REQUEST: &str = "/ferrogate.admin.v1.Admin/GetAppRequest";
+    /// `Admin/ApproveAppRequest` (F19).
+    pub const APPROVE_APP_REQUEST: &str = "/ferrogate.admin.v1.Admin/ApproveAppRequest";
+    /// `Admin/DenyAppRequest` (F19).
+    pub const DENY_APP_REQUEST: &str = "/ferrogate.admin.v1.Admin/DenyAppRequest";
+    /// `Admin/ListApprovals` (F19).
+    pub const LIST_APPROVALS: &str = "/ferrogate.admin.v1.Admin/ListApprovals";
+    /// `Admin/GetApproval` (F19).
+    pub const GET_APPROVAL: &str = "/ferrogate.admin.v1.Admin/GetApproval";
+    /// `Admin/UpdateApproval` (F19).
+    pub const UPDATE_APPROVAL: &str = "/ferrogate.admin.v1.Admin/UpdateApproval";
+    /// `Admin/RevokeApproval` (F19).
+    pub const REVOKE_APPROVAL: &str = "/ferrogate.admin.v1.Admin/RevokeApproval";
+    /// `Admin/SetLineageAutoUpdateFrozen` (F19).
+    pub const SET_LINEAGE_AUTO_UPDATE_FROZEN: &str =
+        "/ferrogate.admin.v1.Admin/SetLineageAutoUpdateFrozen";
+    /// `Admin/AdminRegisterApplication` (F19).
+    pub const ADMIN_REGISTER_APPLICATION: &str =
+        "/ferrogate.admin.v1.Admin/AdminRegisterApplication";
 }
 
 use Permission as P;
@@ -300,6 +323,16 @@ pub const METHOD_ACCESS: &[(&str, Access)] = &[
         "/ferrogate.v1.MachineIdentity/AppendAuditEvent",
         Access::Host,
     ),
+    // F19 §7.1 host proof, each under its own context and per-host budget.
+    (
+        "/ferrogate.v1.MachineIdentity/SubmitAppRequest",
+        Access::Host,
+    ),
+    (
+        "/ferrogate.v1.MachineIdentity/GetAppRequestStatus",
+        Access::Host,
+    ),
+    ("/ferrogate.v1.MachineIdentity/SyncAllowlist", Access::Host),
     // ---- MachineIdentity: legacy admin RPCs (F20 Phase 0) ----
     (
         paths::LIST_ALLOWLISTS,
@@ -390,6 +423,50 @@ pub const METHOD_ACCESS: &[(&str, Access)] = &[
     (
         paths::RESET_ADMIN_CREDENTIALS,
         session(Some(P::AccountReset), false, false, false),
+    ),
+    // ---- Admin: application approvals (F19 §5.4; S = step-up, M in handler) ----
+    (
+        paths::LIST_APP_REQUESTS,
+        session(Some(P::AppRequestList), false, false, false),
+    ),
+    (
+        paths::GET_APP_REQUEST,
+        session(Some(P::AppRequestRead), false, false, false),
+    ),
+    (
+        paths::LIST_APPROVALS,
+        session(Some(P::ApprovalList), false, false, false),
+    ),
+    (
+        paths::GET_APPROVAL,
+        session(Some(P::ApprovalRead), false, false, false),
+    ),
+    (
+        paths::APPROVE_APP_REQUEST,
+        session(Some(P::AppRequestApprove), true, false, false),
+    ),
+    (
+        paths::DENY_APP_REQUEST,
+        session(Some(P::AppRequestDeny), true, false, false),
+    ),
+    (
+        paths::UPDATE_APPROVAL,
+        session(Some(P::ApprovalUpdate), true, false, false),
+    ),
+    (
+        paths::SET_LINEAGE_AUTO_UPDATE_FROZEN,
+        session(Some(P::ApprovalUpdate), true, false, false),
+    ),
+    (
+        paths::REVOKE_APPROVAL,
+        session(Some(P::ApprovalRevoke), true, false, false),
+    ),
+    // Single step also needs `app_request.approve` (checked in the handler
+    // unless the strict policy queues the request); a per-operation MfaProof
+    // replaces the step-up window.
+    (
+        paths::ADMIN_REGISTER_APPLICATION,
+        session(Some(P::AppDirectRegister), false, false, false),
     ),
 ];
 
@@ -851,7 +928,13 @@ mod tests {
     /// session and the handler's host proof is the gate.
     #[test]
     fn host_methods_are_host_authenticated() {
-        for m in ["AppendAuditEvent", "ProposeAllowlist"] {
+        for m in [
+            "AppendAuditEvent",
+            "ProposeAllowlist",
+            "SubmitAppRequest",
+            "GetAppRequestStatus",
+            "SyncAllowlist",
+        ] {
             let path = format!("{}{m}", paths::MI);
             assert_eq!(access_for(&path), Some(Access::Host), "{path}");
         }
@@ -862,9 +945,43 @@ mod tests {
             .collect();
         assert_eq!(
             hosts.len(),
-            2,
+            5,
             "no other method is host-authenticated: {hosts:?}"
         );
+    }
+
+    /// F19 §5.4 / F20 §7: the app-management RPCs need their permission;
+    /// decisions and edits a recent step-up; the direct registration its
+    /// per-operation proof (handler) instead.
+    #[test]
+    fn app_management_rpcs_need_the_spec_permissions() {
+        let want = [
+            (paths::LIST_APP_REQUESTS, P::AppRequestList, false),
+            (paths::GET_APP_REQUEST, P::AppRequestRead, false),
+            (paths::LIST_APPROVALS, P::ApprovalList, false),
+            (paths::GET_APPROVAL, P::ApprovalRead, false),
+            (paths::APPROVE_APP_REQUEST, P::AppRequestApprove, true),
+            (paths::DENY_APP_REQUEST, P::AppRequestDeny, true),
+            (paths::UPDATE_APPROVAL, P::ApprovalUpdate, true),
+            (
+                paths::SET_LINEAGE_AUTO_UPDATE_FROZEN,
+                P::ApprovalUpdate,
+                true,
+            ),
+            (paths::REVOKE_APPROVAL, P::ApprovalRevoke, true),
+            (
+                paths::ADMIN_REGISTER_APPLICATION,
+                P::AppDirectRegister,
+                false,
+            ),
+        ];
+        for (path, perm, step_up) in want {
+            assert_eq!(
+                access_for(path),
+                Some(session(Some(perm), step_up, false, false)),
+                "{path}"
+            );
+        }
     }
 
     /// F20 §7: factor management is open to any session; adding a factor

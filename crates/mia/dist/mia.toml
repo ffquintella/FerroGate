@@ -107,6 +107,28 @@
 #propose = false
 # How often (seconds) to propose when `propose` is set. Default: 300.
 #propose_interval_secs = 300
+# Keep the allowlist current by polling CMIS SyncAllowlist (signed allowlist v2:
+# host-bound, rollback-protected) every sync_interval_secs ± sync_jitter_pct, and
+# swap it in without a restart. Supersedes `fetch`. The synced body and its state
+# live in the daemon's state directory (state_path). Needs cmis.* and
+# allowlist.key. Default: false.
+#sync = false
+#sync_interval_secs = 300
+#sync_jitter_pct = 10
+#state_path = ""
+
+# --- App registration (F19) -------------------------------------------------
+# Applications (helper API) and users (`mia app register --exe`) ask CMIS for
+# approval of a binary. Requests CMIS cannot take yet stay queued locally.
+#[registration]
+#enable = true
+#assisted = true
+#max_per_uid_per_hour = 10
+# Open (queued or pending) requests one user may hold, 1..=100.
+#max_open_per_uid = 50
+#max_file_size_mib = 2048
+#version_sources = ["pe", "plist", "elf-note", "dpkg"]
+#ledger_path = ""
 
 # --- Attestation ------------------------------------------------------------
 [attestation]

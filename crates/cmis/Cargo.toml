@@ -29,6 +29,8 @@ ferro-svid   = { path = "../ferro-svid" }
 ferro-raft   = { path = "../ferro-raft" }
 ferro-tee    = { path = "../ferro-tee" }
 ferro-sep    = { path = "../ferro-sep" }
+# F19: `path_key` and the risk-flag table, shared with MIA (no I/O used here).
+ferro-appid  = { path = "../ferro-appid" }
 
 serde              = { workspace = true }
 

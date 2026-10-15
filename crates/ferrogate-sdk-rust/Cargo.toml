@@ -28,7 +28,11 @@ verify  = ["dep:ferro-svid-verify", "dep:ferro-child-verify"]
 svid    = ["dep:ferro-svid"]
 attest  = ["dep:ferro-attest"]
 proto   = ["dep:ferro-proto"]
-full    = ["verify", "svid", "attest", "proto"]
+# The local MIA helper-API client (features F08, F19): request a child token,
+# register the running application, query its registration. Blocking std I/O
+# over the helper Unix socket / named pipe; no async runtime required.
+helper-client = ["dep:mia-helper-proto", "dep:getrandom", "dep:rand_core", "dep:serde", "dep:thiserror"]
+full    = ["verify", "svid", "attest", "proto", "helper-client"]
 
 [dependencies]
 ferro-crypto       = { path = "../ferro-crypto" }
@@ -37,3 +41,14 @@ ferro-child-verify = { path = "../ferro-child-verify", optional = true }
 ferro-svid         = { path = "../ferro-svid",         optional = true }
 ferro-attest       = { path = "../ferro-attest",       optional = true }
 ferro-proto        = { path = "../ferro-proto",        optional = true }
+mia-helper-proto   = { path = "../mia-helper-proto",   optional = true }
+getrandom          = { workspace = true, optional = true }
+rand_core          = { workspace = true, optional = true }
+serde              = { workspace = true, optional = true }
+thiserror          = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Self dev-dependency with `helper-client` on, so the crate's own tests (and
+# `cargo clippy --all-targets`) cover the helper client without making it a
+# default feature. It needs no protoc, unlike `proto`.
+ferrogate-sdk-rust = { path = ".", features = ["helper-client"] }
