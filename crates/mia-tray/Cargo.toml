@@ -76,7 +76,7 @@ notify-rust = { version = "4.17", optional = true }
 arboard     = { version = "3.6", optional = true }
 # GTK 3 file dialog on Linux (the tray already needs GTK there), native
 # dialogs on macOS / Windows.
-rfd         = { version = "0.15", optional = true, default-features = false, features = ["gtk3"] }
+rfd         = { version = "0.17", optional = true, default-features = false, features = ["gtk3"] }
 
 # The tray process's event loop: winit on macOS / Windows; GTK on Linux, where
 # the StatusNotifierItem menu lives in a GTK main loop.
