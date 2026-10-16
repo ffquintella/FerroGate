@@ -31,7 +31,8 @@ use tracing_subscriber::EnvFilter;
 
 /// Read the host-call limits (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`,
 /// `CMIS_APP_SUBMIT_MAX_PER_HOUR`, `CMIS_APP_STATUS_MAX_PER_HOUR`,
-/// `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`) and log what is in force.
+/// `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`, `CMIS_ROTATE_MAX_PER_HOUR`) and
+/// log what is in force.
 fn load_host_call_limits() -> anyhow::Result<cmis::host_auth::HostCallConfig> {
     let limits = cmis::host_auth::HostCallConfig::from_env()?;
     tracing::info!(
@@ -39,6 +40,7 @@ fn load_host_call_limits() -> anyhow::Result<cmis::host_auth::HostCallConfig> {
         app_submit_max_per_hour = limits.app_submit_per_hour,
         app_status_max_per_hour = limits.app_status_per_hour,
         sync_min_interval_secs = limits.sync_min_interval_secs,
+        rotate_max_per_hour = limits.rotate_per_hour,
         "host call limits"
     );
     Ok(limits)

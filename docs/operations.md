@@ -106,6 +106,7 @@ than falling back to a weaker default.
 | `CMIS_ADMIN_WEBAUTHN_ORIGINS` | `https://ferrogate-admin.<trust domain>` | Comma-separated `https://` origins a WebAuthn `clientDataJSON` may name; each must be the RP ID `ferrogate-admin.<CMIS_TRUST_DOMAIN>` or a subdomain |
 | `CMIS_TRUST_DOMAIN` | `ferrogate.dev` | Also fixes the WebAuthn RP ID and is forbidden inside passwords |
 | `CMIS_AUDIT_FORWARD_MAX_PER_MIN` | `600` | `AppendAuditEvent` calls each host may make per minute, per CMIS node (1–60000) — see [Audit forwarding from hosts](#audit-forwarding-from-hosts) |
+| `CMIS_ROTATE_MAX_PER_HOUR` | `6` | Host-signed `Rotate` calls each host may make per hour, per CMIS node (1–3600; zero or garbage aborts startup). Every authenticated call spends one, refused or not — see [SVID rotation](#svid-rotation) |
 
 The key files (secrets, pseudonym, pepper) are credentials kept in
 configuration: keep them root-owned and unreadable by group and others (CMIS
@@ -212,11 +213,24 @@ revocation, epoch bump). `ferrogate admin groups` prints their permissions.
 
 ## SVID rotation
 
-- At 60% of TTL the MIA performs a `Rotate` RPC. If PCRs and `policy_id` are
-  unchanged and the previous full attestation was less than 24 h ago, no TPM
-  interaction is required.
-- At 24 h since last full attestation, the next rotation forces the full
-  four-phase handshake regardless of PCR drift.
+- `Rotate` is a host method (0.30.0, T293): the request carries the host
+  proof (SVID, machine key matching `cnf.jkt`, signature over a fresh
+  single-use `RotateDoc` under `ferrogate-rotate-v1`) and must name the
+  host's latest stored SVID. Budget: `CMIS_ROTATE_MAX_PER_HOUR` (6) per host
+  and node. A client calling `Rotate` without the proof gets
+  `UNAUTHENTICATED host_auth_failed` and must run `Attest` instead.
+- Only the **host-key** tier renews on the short path: same signed machine
+  fingerprint, same `policy_id` epoch, and less than 24 h since the last full
+  attestation. A TPM-tier host is always answered `FAILED_PRECONDITION` and
+  re-attests (its PCRs need a fresh quote).
+- With the 96 h SVID TTL floor, a renewal at 60 % of TTL is past the 24 h
+  window, so it is normally a full re-attestation. The MIA daemon does not
+  renew in the background yet: a restart re-attests (ROADMAP T291 follow-up).
+- Refusals after authentication are audited as `AttestFail`
+  (`rotate-tier-requires-attest`, `rotate-superseded`,
+  `rotate-reattest-state-drift|epoch-bump|window-expired`,
+  `rotate-unknown-subject`); renewals as `SvidIssued`. Proof failures are
+  only logged (`host_auth.failed`), like the other host methods.
 - Any PCR change detected at boot invalidates the cached SVID (sealing breaks)
   and forces full re-attestation.
 

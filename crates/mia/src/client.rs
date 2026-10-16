@@ -8,6 +8,8 @@
 //! the phase-3 credential, and AIK-signing the composite CSR — is supplied
 //! through the [`AttestEvidence`] trait so the same handshake logic runs
 //! against a real TPM (Linux) or a software stand-in (tests).
+//!
+//! [`rotate`] renews a host-key SVID with one host-signed `Rotate` (T293).
 
 use ferro_crypto::composite::{CompositePublicKey, CompositeSecretKey};
 use ferro_crypto::pin::SpkiPin;
@@ -16,8 +18,11 @@ use ferro_proto::v1::attest_response::Phase as RespPhase;
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
 use ferro_proto::v1::{
     AttestInit, AttestRequest, ChallengeResponse, Csr, HostKeyEvidence, MachineFacts, PcrValue,
-    SvidBundle,
+    RotateRequest, SvidBundle,
 };
+use ferro_svid::host_call::{self, HostCallDocError, RotateDoc, NONCE_LEN, ROTATE_CONTEXT};
+
+use crate::audit_client::{host_call_auth, HostProofSigner};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
@@ -421,4 +426,98 @@ fn unexpected(want: &str, got: &RespPhase) -> AttestClientError {
         RespPhase::Svid(_) => "svid",
     };
     AttestClientError::Protocol(format!("expected {want}, got {got}"))
+}
+
+/// Errors from [`rotate`] and [`rotate_request`].
+#[derive(Debug, thiserror::Error)]
+pub enum RotateClientError {
+    /// CBOR encoding of the `RotateDoc` failed.
+    #[error("proof document: {0}")]
+    Doc(#[from] HostCallDocError),
+    /// The machine key refused to sign the proof.
+    #[error("sign: {0}")]
+    Sign(#[from] ferro_sep::SepError),
+    /// The RPC failed. `FAILED_PRECONDITION` means a full attestation is
+    /// required (TPM tier, superseded SVID, drift, epoch bump or window).
+    #[error("transport: {0}")]
+    Transport(#[from] tonic::Status),
+}
+
+/// Build the host-signed `Rotate` request renewing `signer.svid_jws`
+/// (T293), reporting `state_digest` (host-key tier: the machine fingerprint
+/// `H`), issued at `issued_at` under `nonce`. `current_svid` is left empty:
+/// the SVID travels once, in the proof.
+pub fn rotate_request(
+    signer: &HostProofSigner<'_>,
+    state_digest: &[u8; 48],
+    issued_at: i64,
+    nonce: [u8; NONCE_LEN],
+) -> Result<RotateRequest, RotateClientError> {
+    let doc = RotateDoc::new(
+        signer.host_uuid,
+        issued_at,
+        nonce,
+        signer.svid_jws,
+        *state_digest,
+    );
+    let doc = host_call::encode_rotate(&doc)?;
+    let auth = host_call_auth(signer, ROTATE_CONTEXT, &doc)?;
+    Ok(RotateRequest {
+        auth: Some(auth),
+        doc,
+        ..RotateRequest::default()
+    })
+}
+
+/// Renew the host's SVID with one host-signed `Rotate` (T293): a fresh
+/// random nonce, signed now. Only the host-key tier renews this way, and
+/// only from its latest SVID; any refusal is the caller's cue to re-attest.
+pub async fn rotate(
+    client: &mut MachineIdentityClient<Channel>,
+    signer: &HostProofSigner<'_>,
+    state_digest: &[u8; 48],
+) -> Result<SvidBundle, RotateClientError> {
+    use rand_core::{Rng as _, UnwrapErr};
+    let mut nonce = [0u8; NONCE_LEN];
+    UnwrapErr(getrandom::SysRng).fill_bytes(&mut nonce);
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let req = rotate_request(signer, state_digest, issued_at, nonce)?;
+    Ok(client.rotate(Request::new(req)).await?.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferro_sep::MachineKey as _;
+
+    #[test]
+    fn rotate_request_carries_a_verifiable_host_proof() {
+        let key = ferro_sep::SoftwareMachineKey::generate().unwrap();
+        let signer = HostProofSigner {
+            key: &key,
+            svid_jws: "header.claims.sig",
+            host_uuid: "1b4e28ba-2fa1-4d2a-883f-0016d3cca427",
+        };
+        let req = rotate_request(&signer, &[5; 48], 1_700_000_000, [9; 16]).unwrap();
+
+        assert_eq!(req.current_svid, "", "the SVID travels in the proof");
+        assert_eq!(req.pcr_values, Vec::new());
+        let auth = req.auth.expect("a host proof");
+        assert_eq!(auth.svid_jws, "header.claims.sig");
+        assert_eq!(auth.sep_pub, key.public_spki_der());
+        ferro_sep::verify_p256(
+            &auth.sep_pub,
+            &host_call::signing_input(ROTATE_CONTEXT, &req.doc),
+            &auth.sig,
+        )
+        .expect("signature over ferrogate-rotate-v1 ‖ doc");
+        let doc = host_call::decode_rotate(&req.doc).unwrap();
+        assert_eq!(doc.host_uuid, "1b4e28ba-2fa1-4d2a-883f-0016d3cca427");
+        assert_eq!(doc.issued_at, 1_700_000_000);
+        assert_eq!(doc.nonce, [9; 16]);
+        assert_eq!(doc.state_digest, [5; 48]);
+        assert!(doc.binds_svid("header.claims.sig"));
+    }
 }

@@ -114,7 +114,7 @@ A representative subset (the authoritative service is
 service MachineIdentity {
   rpc Attest           (stream AttestRequest) returns (stream AttestResponse);
   rpc FetchSVID        (FetchRequest)         returns (SVIDBundle);
-  rpc Rotate           (RotateRequest)        returns (SVIDBundle);
+  rpc Rotate           (RotateRequest)        returns (SVIDBundle);   // host proof (T293)
   rpc JWKS             (JWKSRequest)          returns (JWKSResponse);
 
   // Caller-allowlist provisioning (see allowlist-provisioning.md).
@@ -143,9 +143,17 @@ service Admin {
 - `Attest` is the only RPC that does not require an existing valid SVID; the
   client authenticates anonymously at the TLS layer and proves identity in-band
   via the four-phase protocol.
-- `Rotate` requires presenting the current SVID; if PCRs and `policy_id` are
-  unchanged and the SVID is within its 24 h re-attestation window, no TPM
-  interaction is needed.
+- `Rotate` is a host method (T293): it needs the F19 §7.1 host proof over a
+  `{v, host_uuid, issued_at, nonce, svid_sha384, state_digest}` document
+  (context `ferrogate-rotate-v1`) naming the host's **latest** stored SVID,
+  and is rate-limited per host (`CMIS_ROTATE_MAX_PER_HOUR`, default 6/h).
+  Only the host-key tier renews, and only when the signed state digest (the
+  machine fingerprint) and `policy_id` epoch are unchanged and the last full
+  attestation is within 24 h; the TPM tier, a superseded SVID, drift, an
+  epoch bump or an expired window answer `FAILED_PRECONDITION` (audited as
+  `AttestFail`), and the host runs a full `Attest`. A renewal is audited as
+  `SvidIssued`; the store write re-checks that the record still holds the
+  presented SVID. The unsigned `pcr_values` / `known_epoch` are ignored.
 - `JWKS` carries the composite verification key set plus an extension
   `x-ferrogate-crl` containing a signed CRL delta.
 - `GetEnrollmentKey`/`GetAllowlist` are unauthenticated (public key material and
@@ -278,6 +286,7 @@ secrets_key          = "/var/lib/ferrogate/admin/secrets.key"          # CMIS_AD
 audit_pseudonym_key  = "/var/lib/ferrogate/admin/audit-pseudonym.key"  # CMIS_AUDIT_PSEUDONYM_KEY_FILE
 tray_fido2_groups    = ["ferrogate-approvers"]  # CMIS_ADMIN_TRAY_FIDO2_GROUPS
 audit_forward_max_per_min = 600                 # CMIS_AUDIT_FORWARD_MAX_PER_MIN (host proof RPC)
+rotate_max_per_hour       = 6                   # CMIS_ROTATE_MAX_PER_HOUR (host proof RPC, 1–3600)
 
 [apps]
 # F19 (full table: operations.md "Application approvals").
@@ -312,6 +321,8 @@ parentheses below) — for example every host-authentication failure is the same
 | Host over its rate limit | `RESOURCE_EXHAUSTED` (`rate_limited`, `retry-after`) |
 | Host at its open-request cap (F19) | `RESOURCE_EXHAUSTED` (`too_many_pending`, `retry-after`) |
 | F19 field invalid (with `x-ferrogate-field`) | `INVALID_ARGUMENT` (`field_too_long`, `path_not_absolute`, `bad_sha`, …) |
+| `Rotate` from the TPM tier, a superseded SVID, or with state drift, an epoch bump or an expired 24 h window (T293) | `FAILED_PRECONDITION` (`re-attestation required`) |
+| `Rotate` for a host with no stored record | `NOT_FOUND` |
 | F19 submission while `allowlist_mode` is `legacy` | `FAILED_PRECONDITION` (`mode_legacy`) |
 | `SetAllowlist` / `DeleteAllowlist` while `allowlist_mode` is `approvals` | `FAILED_PRECONDITION` (`mode_approvals`) |
 | `GetAllowlist` while `CMIS_LEGACY_GETALLOWLIST=off` | `FAILED_PRECONDITION` (`legacy_getallowlist_disabled`) |

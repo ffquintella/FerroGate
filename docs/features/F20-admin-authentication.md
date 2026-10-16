@@ -420,8 +420,8 @@ MFA.
 | legacy `BumpEpoch` (S) | `policy.epoch_bump` | | | | ✓ |
 | `SetAllowlistMode` (S), `ImportLegacyAllowlists` (S) (F19 §11) | `settings.allowlist_mode`, `allowlist.import` | | | | ✓ |
 | `GetAllowlistMode` (F19 §11; read-only, lets every client pick the legacy or approvals flow) | any authenticated session | ✓ | ✓ | ✓ | ✓ |
-| `MachineIdentity` host methods (`SubmitAppRequest`, `GetAppRequestStatus`, `SyncAllowlist`, `ProposeAllowlist`, `AppendAuditEvent`) | host proof (F19 §7.1) | | | | |
-| `Attest`, `FetchSVID`, `Rotate`, `JWKS`, `GetEnrollmentKey`, `GetAllowlist` (legacy), `Health`, `LatestSth`, `InclusionProof`, `ConsistencyProof` | public (unchanged) | | | | |
+| `MachineIdentity` host methods (`SubmitAppRequest`, `GetAppRequestStatus`, `SyncAllowlist`, `ProposeAllowlist`, `AppendAuditEvent`, `Rotate` (T293, context `ferrogate-rotate-v1`)) | host proof (F19 §7.1) | | | | |
+| `Attest`, `FetchSVID`, `JWKS`, `GetEnrollmentKey`, `GetAllowlist` (legacy), `Health`, `LatestSth`, `InclusionProof`, `ConsistencyProof` | public (unchanged) | | | | |
 
 V = viewers, A = approvers, AA = account-admins, P = platform-operators. Groups
 are the only way permissions reach an account. Custom groups with any subset of

@@ -110,8 +110,26 @@ record them.
   ratatui lays them out, with middle-ellipsis truncation for paths. Unit
   table plus proptests over arbitrary bytes, strings and width-tricky
   sequences in `make test`.
+- Bound host-signed `Rotate` calls per host and node with `CMIS_ROTATE_MAX_PER_HOUR` (default 6) and add `mia::client::rotate` (S4, S51, M33, T293)
+  Parsed with the other host-call limits (`HostCallConfig::rotate_per_hour`,
+  1–3600; zero or garbage aborts startup, larger values are capped). Every
+  authenticated call spends one unit, refused or not. `mia::client::rotate`
+  and `rotate_request` build the host-signed request from the machine key,
+  the current SVID and the state digest; the MIA daemon does not call them
+  yet (background renewal is the T291 follow-up).
 
 ### Changed
+
+- Add the host proof to `RotateRequest` (`auth = 4`, `doc = 5`) and stop reading its unsigned fields (S4, S51, M33, T293)
+  `doc` is the canonical CBOR of `ferro_svid::host_call::RotateDoc`
+  `{v, host_uuid, issued_at, nonce, svid_sha384, state_digest}`, signed under
+  `ferrogate-rotate-v1`. `current_svid` is optional and must be empty or equal
+  `auth.svid_jws`; `pcr_values` and `known_epoch` are deprecated and ignored.
+  The fields are wire-compatible additions, but a client that does not send
+  the proof is now refused (see Security); no shipped MIA calls `Rotate`.
+  `CmisState::update_bundle` is deprecated in favour of
+  `replace_bundle_if_current`, which re-checks the stored SVID inside the
+  write (`Cluster::replace_svid_if_unchanged`, a compare-and-swap).
 
 - Retire the legacy allowlist writes in approvals mode and map the legacy commands and proposals onto the approval ledger (S50, M38, T273)
   In `approvals` mode `SetAllowlist` and `DeleteAllowlist` answer
@@ -178,6 +196,23 @@ record them.
   `mia setup` is still not forwarded (T226).
 ### Security
 
+- Require a host proof on `Rotate` and refuse the TPM tier and revoked, expired or superseded SVIDs, closing an SVID issuance oracle (S4, S51, S11, M33, T293)
+  `Rotate` was public, decoded the presented SVID without checking its
+  signature, expiry or revocation, trusted unsigned PCR values and
+  overwrote the stored record: anyone with a host's SPIFFE id and PCR values
+  could have CMIS mint a fresh SVID for that host. It is now a host method
+  (`Access::Host`) behind the shared F19 §7.1 verifier (SVID issued here,
+  valid, unrevoked; `cnf.jkt`; signature; ±300 s; single-use nonce; per-host
+  budget). Only the host-key tier renews; the TPM tier answers
+  `FAILED_PRECONDITION` and re-attests. Only the latest stored SVID renews,
+  re-checked inside the store write, so two racing renewals cannot both
+  land. The signed state digest replaces the PCR list, which also fixes
+  host-key hosts always being refused for PCR drift. Renewals are audited
+  as `SvidIssued`, refusals after authentication as `AttestFail`
+  (`rotate-tier-requires-attest`, `rotate-superseded`,
+  `rotate-reattest-<reason>`, `rotate-unknown-subject`); proof failures
+  are logged, never audited. The 24 h window is unchanged. Breaking for any
+  client calling `Rotate` without the proof.
 - Upgrade rustls to 0.23.46 to fix RUSTSEC-2026-0346, -0347, -0348 and -0349 (S1, T5)
   `cargo deny check advisories` failed on rustls 0.23.45. The worst of the four
   advisories, RUSTSEC-2026-0349, lets an unauthenticated ServerHello push later

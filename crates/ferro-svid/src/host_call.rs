@@ -1,6 +1,6 @@
 //! Host call documents — the signed body of a host-authenticated RPC
 //! (feature F19 §7.1 `HostCallAuth`, first used by `AppendAuditEvent` in F20
-//! Phase 0).
+//! Phase 0, and by `Rotate` since T293).
 //!
 //! A host proves who is calling by signing a small canonical-CBOR document with
 //! its **machine key** (the ECDSA-P256 key its SVID is bound to through
@@ -26,6 +26,11 @@ use crate::cbor_bytes::fixed as fixed_bytes;
 /// Signing context of the `AppendAuditEvent` host proof (F20 Phase 0).
 /// Distinct from every other FerroGate context and prefix-free with them.
 pub const AUDIT_FORWARD_CONTEXT: &[u8] = b"ferrogate-audit-forward-v1";
+
+/// Signing context of the `Rotate` host proof (T293). Distinct from every
+/// other FerroGate context and prefix-free with them, so a renewal proof can
+/// never be replayed as, or made from, another RPC's signature.
+pub const ROTATE_CONTEXT: &[u8] = b"ferrogate-rotate-v1";
 
 /// The only document version this build reads or writes.
 pub const DOC_VERSION: u8 = 1;
@@ -114,6 +119,78 @@ impl HostCallDoc for AuditForwardDoc {
     }
 }
 
+/// The document a host signs to renew its SVID through `Rotate` (T293).
+///
+/// It names the SVID being renewed by digest (`svid_sha384 =
+/// SHA-384(svid_jws)`) and carries the host's current state digest (host-key
+/// tier: the machine fingerprint `H` attested in phase 2). Both are signed;
+/// the unsigned `RotateRequest.pcr_values` is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateDoc {
+    /// Document version, [`DOC_VERSION`].
+    pub v: u8,
+    /// Host UUID; must equal the presenting SVID's.
+    pub host_uuid: String,
+    /// Unix seconds the host signed the document.
+    pub issued_at: i64,
+    /// Random replay-protection nonce.
+    #[serde(with = "fixed_bytes")]
+    pub nonce: [u8; NONCE_LEN],
+    /// SHA-384 of the compact-JWS SVID being renewed (the one carried in
+    /// `HostCallAuth.svid_jws`).
+    #[serde(with = "fixed_bytes")]
+    pub svid_sha384: [u8; 48],
+    /// The host's current attested-state digest (host-key tier: the machine
+    /// fingerprint).
+    #[serde(with = "fixed_bytes")]
+    pub state_digest: [u8; 48],
+}
+
+impl RotateDoc {
+    /// A document from `host_uuid` renewing the SVID `svid_jws`, reporting
+    /// `state_digest`.
+    #[must_use]
+    pub fn new(
+        host_uuid: impl Into<String>,
+        issued_at: i64,
+        nonce: [u8; NONCE_LEN],
+        svid_jws: &str,
+        state_digest: [u8; 48],
+    ) -> Self {
+        let mut svid_sha384 = [0u8; 48];
+        svid_sha384.copy_from_slice(&Sha384::digest(svid_jws.as_bytes()));
+        Self {
+            v: DOC_VERSION,
+            host_uuid: host_uuid.into(),
+            issued_at,
+            nonce,
+            svid_sha384,
+            state_digest,
+        }
+    }
+
+    /// Whether this document names exactly the SVID `svid_jws`.
+    #[must_use]
+    pub fn binds_svid(&self, svid_jws: &str) -> bool {
+        Sha384::digest(svid_jws.as_bytes()).as_slice() == self.svid_sha384
+    }
+}
+
+impl HostCallDoc for RotateDoc {
+    fn host_uuid(&self) -> &str {
+        &self.host_uuid
+    }
+
+    fn issued_at(&self) -> i64 {
+        self.issued_at
+    }
+
+    fn nonce(&self) -> Option<&[u8; NONCE_LEN]> {
+        Some(&self.nonce)
+    }
+}
+
 /// Failure modes for host call documents.
 #[derive(Debug, thiserror::Error)]
 pub enum HostCallDocError {
@@ -154,6 +231,37 @@ pub fn decode_audit_forward(bytes: &[u8]) -> Result<AuditForwardDoc, HostCallDoc
         return Err(HostCallDocError::TooLarge(bytes.len()));
     }
     let doc: AuditForwardDoc =
+        ciborium::from_reader(bytes).map_err(|e| HostCallDocError::Decode(e.to_string()))?;
+    if doc.v != DOC_VERSION {
+        return Err(HostCallDocError::Version(doc.v));
+    }
+    if doc.host_uuid.is_empty() || doc.host_uuid.len() > MAX_HOST_UUID_LEN {
+        return Err(HostCallDocError::HostUuid);
+    }
+    Ok(doc)
+}
+
+/// Encode a [`RotateDoc`] to the canonical CBOR the host signs.
+///
+/// # Errors
+/// [`HostCallDocError::Encode`] if CBOR serialisation fails.
+pub fn encode_rotate(doc: &RotateDoc) -> Result<Vec<u8>, HostCallDocError> {
+    let mut out = Vec::with_capacity(224);
+    ciborium::into_writer(doc, &mut out).map_err(|e| HostCallDocError::Encode(e.to_string()))?;
+    Ok(out)
+}
+
+/// Decode and validate a [`RotateDoc`]: size bound, known fields only,
+/// version 1, a non-empty `host_uuid` of at most 64 bytes, and digests of
+/// exactly 48 bytes.
+///
+/// # Errors
+/// Any [`HostCallDocError`] variant describing the first check that failed.
+pub fn decode_rotate(bytes: &[u8]) -> Result<RotateDoc, HostCallDocError> {
+    if bytes.len() > MAX_DOC_BYTES {
+        return Err(HostCallDocError::TooLarge(bytes.len()));
+    }
+    let doc: RotateDoc =
         ciborium::from_reader(bytes).map_err(|e| HostCallDocError::Decode(e.to_string()))?;
     if doc.v != DOC_VERSION {
         return Err(HostCallDocError::Version(doc.v));
@@ -307,6 +415,150 @@ mod tests {
             decode_audit_forward(&big),
             Err(HostCallDocError::TooLarge(_))
         ));
+    }
+
+    fn rotate_doc() -> RotateDoc {
+        RotateDoc::new(
+            "8d5e-host",
+            1_700_000_000,
+            [9u8; 16],
+            "header.claims.sig",
+            [3u8; 48],
+        )
+    }
+
+    #[test]
+    fn rotate_doc_roundtrip() {
+        let d = rotate_doc();
+        assert_eq!(d.v, DOC_VERSION);
+        let bytes = encode_rotate(&d).unwrap();
+        assert!(bytes.len() < 256, "small document: {} bytes", bytes.len());
+        assert_eq!(decode_rotate(&bytes).unwrap(), d);
+        // The SVID is bound by SHA-384 of its compact JWS.
+        assert_eq!(
+            hex::encode(d.svid_sha384),
+            hex::encode(Sha384::digest(b"header.claims.sig"))
+        );
+        assert!(d.binds_svid("header.claims.sig"));
+        assert!(!d.binds_svid("header.claims.sih"));
+        assert!(!d.binds_svid(""));
+        // Neither document type decodes as the other.
+        let fwd = encode_audit_forward(&doc()).unwrap();
+        assert!(decode_rotate(&fwd).is_err());
+        assert!(decode_audit_forward(&bytes).is_err());
+    }
+
+    #[test]
+    fn rotate_doc_rejects_unknown_keys() {
+        #[derive(Serialize)]
+        struct WithUnknownField {
+            v: u8,
+            host_uuid: String,
+            issued_at: i64,
+            #[serde(with = "fixed_bytes")]
+            nonce: [u8; 16],
+            #[serde(with = "fixed_bytes")]
+            svid_sha384: [u8; 48],
+            #[serde(with = "fixed_bytes")]
+            state_digest: [u8; 48],
+            pcr_values: u8,
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &WithUnknownField {
+                v: 1,
+                host_uuid: "h".into(),
+                issued_at: 1,
+                nonce: [0; 16],
+                svid_sha384: [0; 48],
+                state_digest: [0; 48],
+                pcr_values: 1,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_rotate(&bytes),
+            Err(HostCallDocError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn rotate_doc_rejects_bad_versions_and_host_uuids() {
+        let mut d = rotate_doc();
+        d.v = 2;
+        assert!(matches!(
+            decode_rotate(&encode_rotate(&d).unwrap()),
+            Err(HostCallDocError::Version(2))
+        ));
+        let mut d = rotate_doc();
+        d.host_uuid = String::new();
+        assert!(matches!(
+            decode_rotate(&encode_rotate(&d).unwrap()),
+            Err(HostCallDocError::HostUuid)
+        ));
+        let mut d = rotate_doc();
+        d.host_uuid = "h".repeat(MAX_HOST_UUID_LEN + 1);
+        assert!(matches!(
+            decode_rotate(&encode_rotate(&d).unwrap()),
+            Err(HostCallDocError::HostUuid)
+        ));
+    }
+
+    /// A 32-byte "digest" is not a SHA-384, and oversize input is refused
+    /// before parsing.
+    #[test]
+    fn rotate_doc_rejects_short_digests_and_oversize_docs() {
+        #[derive(Serialize)]
+        struct ShortDigest {
+            v: u8,
+            host_uuid: String,
+            issued_at: i64,
+            #[serde(with = "fixed_bytes")]
+            nonce: [u8; 16],
+            #[serde(with = "fixed_bytes")]
+            svid_sha384: [u8; 32],
+            #[serde(with = "fixed_bytes")]
+            state_digest: [u8; 48],
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &ShortDigest {
+                v: 1,
+                host_uuid: "h".into(),
+                issued_at: 1,
+                nonce: [0; 16],
+                svid_sha384: [0; 32],
+                state_digest: [0; 48],
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_rotate(&bytes),
+            Err(HostCallDocError::Decode(_))
+        ));
+
+        assert!(matches!(
+            decode_rotate(&vec![0u8; MAX_DOC_BYTES + 1]),
+            Err(HostCallDocError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn the_rotate_context_is_distinct_and_prefix_free() {
+        assert_eq!(ROTATE_CONTEXT, b"ferrogate-rotate-v1");
+        let others: [&[u8]; 4] = [
+            AUDIT_FORWARD_CONTEXT,
+            crate::SVID_SIGNING_CONTEXT,
+            crate::PROPOSAL_SIGNING_CONTEXT,
+            crate::APP_REQUEST_CONTEXT,
+        ];
+        for o in others {
+            assert_ne!(ROTATE_CONTEXT, o);
+            assert!(!ROTATE_CONTEXT.starts_with(o), "{o:?}");
+            assert!(!o.starts_with(ROTATE_CONTEXT), "{o:?}");
+        }
     }
 
     #[test]

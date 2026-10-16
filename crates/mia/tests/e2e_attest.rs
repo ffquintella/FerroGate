@@ -6,10 +6,9 @@
 //!
 //! - `Attest` issues a JWS that the independent reference verifier accepts
 //!   against the JWKS the server publishes;
-//! - `Rotate` takes the short path (no re-attestation) when PCRs and the policy
-//!   epoch are unchanged;
-//! - `Rotate` is refused (full re-attestation required) when the reported PCRs
-//!   drift.
+//! - a host-key host renews with a host-signed `Rotate` on the short path
+//!   (T293), and an epoch bump forces it back through `Attest`;
+//! - a TPM-tier host is always sent back to a full `Attest`.
 
 #![allow(clippy::cast_possible_truncation)]
 // The handshake future holds a composite key (incl. a ~4 KB ML-DSA secret)
@@ -18,17 +17,21 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
 use ferro_attest::{PolicyId, RimStore, TpmQuoteVerifier, Vendor, VendorTrustStore};
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore};
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
-use ferro_proto::v1::{BumpEpochRequest, PcrValue, RotateRequest};
+use ferro_proto::v1::{BumpEpochRequest, RotateRequest};
+use ferro_sep::{MachineKey as _, SoftwareMachineKey};
 use ferro_svid::Issuer;
-use mia::client::run_attest;
-use mia::virtual_tpm::{expected_pcr_digest, pcr_values, software_credential_blob, VirtualTpm};
+use mia::audit_client::HostProofSigner;
+use mia::client::{run_attest, run_attest_host_key, AttestedSvid, RotateClientError};
+use mia::host_api::split_host_spiffe_id;
+use mia::virtual_tpm::{expected_pcr_digest, software_credential_blob, VirtualTpm};
 
-use sha2::{Digest, Sha384};
+use sha2::{Digest, Sha256, Sha384};
 
 // --- software credential channel --------------------------------------------
 
@@ -175,67 +178,129 @@ async fn attest_issues_svid_that_reference_verifier_accepts() {
     );
 }
 
-#[tokio::test]
-async fn rotate_short_path_when_pcrs_unchanged() {
-    let mut evidence = VirtualTpm::ephemeral().unwrap();
-    let state = build_state(&evidence).await;
-    let mut client = spawn_server(state).await;
+// --- T293: host-signed Rotate --------------------------------------------------
 
-    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+/// `base64url(SHA-256(SPKI))`: the `cnf.jkt` binding an SVID to `key`.
+fn jkt_of(key: &SoftwareMachineKey) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(key.public_spki_der()))
+}
+
+/// Synthetic hardware identifiers for the host-key tier.
+fn sample_facts() -> ferro_machineid::MachineFacts {
+    ferro_machineid::MachineFacts {
+        board_serial: "WT3QF2J3YL".to_string(),
+        platform_uuid: "38D33B14-6DDD-51DD-B8CD-9854CAF977D5".to_string(),
+        disk_serial: "0ba0206164386025".to_string(),
+    }
+}
+
+/// A CMIS for the host-key tier (its path never consults the TPM verifier).
+async fn host_key_state() -> Arc<CmisState> {
+    state_with_verifier(TpmQuoteVerifier::new(
+        VendorTrustStore::new(),
+        RimStore::new(),
+    ))
+    .await
+}
+
+/// Attest a host-key host whose SVID is bound to `key`.
+async fn attest_host_key(
+    client: &mut MachineIdentityClient<tonic::transport::Channel>,
+    facts: &ferro_machineid::MachineFacts,
+    key: &SoftwareMachineKey,
+) -> AttestedSvid {
+    run_attest_host_key(client, facts, key, jkt_of(key), None)
         .await
-        .unwrap();
+        .expect("host-key attestation succeeds")
+}
 
-    // Same PCRs, same epoch, inside the window: short path succeeds, no TPM.
-    let rotated = client
-        .rotate(RotateRequest {
-            current_svid: attested.bundle.jws.clone(),
-            pcr_values: pcr_values()
-                .into_iter()
-                .map(|(index, value)| PcrValue {
-                    index: u32::from(index),
-                    value,
-                })
-                .collect(),
-            known_epoch: 1,
-        })
-        .await
-        .expect("short-path rotate succeeds")
-        .into_inner();
+/// One host-signed `Rotate` of `svid`, made with `key`.
+async fn signed_rotate(
+    client: &mut MachineIdentityClient<tonic::transport::Channel>,
+    key: &SoftwareMachineKey,
+    svid: &ferro_proto::v1::SvidBundle,
+    state_digest: &[u8; 48],
+) -> Result<ferro_proto::v1::SvidBundle, RotateClientError> {
+    let (_, host_uuid) = split_host_spiffe_id(&svid.spiffe_id).expect("a host SVID");
+    let signer = HostProofSigner {
+        key,
+        svid_jws: &svid.jws,
+        host_uuid,
+    };
+    mia::client::rotate(client, &signer, state_digest).await
+}
 
-    assert_eq!(rotated.spiffe_id, attested.bundle.spiffe_id);
-    let jwks = ferro_svid_verify::JwkSet::from_json(&fetch_jwks(&mut client).await).unwrap();
-    ferro_svid_verify::verify(&rotated.jws, &jwks, rotated.issued_at + 10, 0).unwrap();
+fn refused_code(err: RotateClientError) -> tonic::Code {
+    match err {
+        RotateClientError::Transport(s) => s.code(),
+        other => panic!("expected an RPC refusal, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn rotate_refused_on_pcr_drift() {
+async fn rotate_short_path_for_host_key_tier() {
+    let mut client = spawn_server(host_key_state().await).await;
+    let facts = sample_facts();
+    let key = SoftwareMachineKey::generate().unwrap();
+    let attested = attest_host_key(&mut client, &facts, &key).await;
+    let fingerprint = facts.fingerprint();
+
+    // Same fingerprint, same epoch, inside the window: short path, no
+    // re-attestation, proven with the machine key.
+    let rotated = signed_rotate(&mut client, &key, &attested.bundle, fingerprint.as_bytes())
+        .await
+        .expect("short-path rotate succeeds");
+    assert_eq!(rotated.spiffe_id, attested.bundle.spiffe_id);
+    assert_ne!(rotated.jws, attested.bundle.jws);
+    let jwks = ferro_svid_verify::JwkSet::from_json(&fetch_jwks(&mut client).await).unwrap();
+    let verified =
+        ferro_svid_verify::verify(&rotated.jws, &jwks, rotated.issued_at + 10, 0).unwrap();
+    assert_eq!(
+        verified.claims.cnf.jkt,
+        jkt_of(&key),
+        "still bound to the key"
+    );
+    assert_eq!(verified.claims.attest.policy_id, "host-key");
+
+    // The renewed SVID renews again; the one it replaced no longer does.
+    signed_rotate(&mut client, &key, &rotated, fingerprint.as_bytes())
+        .await
+        .expect("the latest SVID renews");
+    let err = signed_rotate(&mut client, &key, &attested.bundle, fingerprint.as_bytes())
+        .await
+        .expect_err("a superseded SVID must not renew");
+    assert_eq!(refused_code(err), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn rotate_refused_for_tpm_tier() {
     let mut evidence = VirtualTpm::ephemeral().unwrap();
     let state = build_state(&evidence).await;
     let mut client = spawn_server(state).await;
-
-    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+    // Bind the TPM-tier SVID to a machine key so the host can sign the proof.
+    let key = SoftwareMachineKey::generate().unwrap();
+    let attested = run_attest(&mut client, &mut evidence, jkt_of(&key))
         .await
         .unwrap();
 
-    // Tamper one PCR value -> drift -> server forces full re-attestation.
-    let mut drifted = pcr_values();
-    drifted[0].1[0] ^= 0xFF;
+    // The pre-T293 request (an SVID and unsigned PCRs) is not even
+    // considered.
     let status = client
         .rotate(RotateRequest {
             current_svid: attested.bundle.jws.clone(),
-            pcr_values: drifted
-                .into_iter()
-                .map(|(index, value)| PcrValue {
-                    index: u32::from(index),
-                    value,
-                })
-                .collect(),
             known_epoch: 1,
+            ..Default::default()
         })
         .await
-        .expect_err("rotate must be refused on drift");
+        .expect_err("an unauthenticated rotate must be refused");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    // A valid host proof still renews nothing on the TPM tier: its PCRs
+    // need a fresh quote, so it is sent back to a full Attest.
+    let err = signed_rotate(&mut client, &key, &attested.bundle, &expected_pcr_digest())
+        .await
+        .expect_err("the TPM tier must re-attest");
+    assert_eq!(refused_code(err), tonic::Code::FailedPrecondition);
 }
 
 // --- F10: RIM bundle / loader / status mapping ------------------------------
@@ -591,28 +656,16 @@ impl Drop for RemoveOnDrop {
 
 #[tokio::test]
 async fn bump_epoch_forces_full_reattestation_on_next_rotate() {
-    let mut evidence = VirtualTpm::ephemeral().unwrap();
-    let state = build_state(&evidence).await;
+    let state = host_key_state().await;
     let mut client = spawn_server(Arc::clone(&state)).await;
+    let facts = sample_facts();
+    let fingerprint = facts.fingerprint();
+    let key = SoftwareMachineKey::generate().unwrap();
 
-    // Attest under epoch 1, then confirm a same-epoch rotate takes the short
-    // path (no re-attestation) — the control for the assertion below.
-    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
-        .await
-        .unwrap();
-    let pcrs: Vec<PcrValue> = pcr_values()
-        .into_iter()
-        .map(|(index, value)| PcrValue {
-            index: u32::from(index),
-            value,
-        })
-        .collect();
-    client
-        .rotate(RotateRequest {
-            current_svid: attested.bundle.jws.clone(),
-            pcr_values: pcrs.clone(),
-            known_epoch: 1,
-        })
+    // Attest under epoch 1, then confirm a same-epoch, host-signed rotate
+    // takes the short path — the control for the assertion below.
+    let attested = attest_host_key(&mut client, &facts, &key).await;
+    let renewed = signed_rotate(&mut client, &key, &attested.bundle, fingerprint.as_bytes())
         .await
         .expect("short-path rotate succeeds before the bump");
 
@@ -632,17 +685,24 @@ async fn bump_epoch_forces_full_reattestation_on_next_rotate() {
     let (_old, new_epoch) = state.bump_epoch();
     assert_eq!(new_epoch, 2, "epoch advanced 1 -> 2");
 
-    // The SVID was attested under epoch 1; with the live epoch now 2, the next
-    // rotate must be refused so the host is driven back through full Attest.
-    let status = client
-        .rotate(RotateRequest {
-            current_svid: attested.bundle.jws.clone(),
-            pcr_values: pcrs,
-            known_epoch: 2,
-        })
+    // The host was attested under epoch 1; with the live epoch now 2, its
+    // next rotate (from its latest SVID) must be refused so it is driven back
+    // through a full Attest.
+    let err = signed_rotate(&mut client, &key, &renewed, fingerprint.as_bytes())
         .await
         .expect_err("rotate must be refused after an epoch bump");
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(refused_code(err), tonic::Code::FailedPrecondition);
+
+    // A full re-attestation under the new epoch makes renewal possible again.
+    let reattested = attest_host_key(&mut client, &facts, &key).await;
+    signed_rotate(
+        &mut client,
+        &key,
+        &reattested.bundle,
+        fingerprint.as_bytes(),
+    )
+    .await
+    .expect("renewal works again after re-attesting under epoch 2");
 }
 
 // --- F13: fleet enrolment pre-admission -------------------------------------

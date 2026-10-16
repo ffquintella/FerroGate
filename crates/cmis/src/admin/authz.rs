@@ -176,9 +176,9 @@ pub enum Access {
     /// A host method, never an admin one: authenticated in band by the
     /// handler with the host's SVID and machine-key signature — the F19 §7.1
     /// `HostCallAuth` proof ([`crate::host_auth::authenticate`]) for
-    /// `AppendAuditEvent`, the equivalent SVID + `cnf.jkt` + signature check
-    /// for `ProposeAllowlist`. Allowed on any listener, TLS or not: the proof
-    /// is a signature, not a transport property.
+    /// `AppendAuditEvent`, the F19 RPCs and `Rotate`, the equivalent SVID +
+    /// `cnf.jkt` + signature check for `ProposeAllowlist`. Allowed on any
+    /// listener: the proof is a signature, not a transport property.
     Host,
     /// Admin login and enrollment: TLS only, no session, throttled by the
     /// handler.
@@ -300,7 +300,6 @@ pub const METHOD_ACCESS: &[(&str, Access)] = &[
     // ---- MachineIdentity: host-facing and public (unchanged) ----
     ("/ferrogate.v1.MachineIdentity/Attest", Access::Public),
     ("/ferrogate.v1.MachineIdentity/FetchSVID", Access::Public),
-    ("/ferrogate.v1.MachineIdentity/Rotate", Access::Public),
     ("/ferrogate.v1.MachineIdentity/JWKS", Access::Public),
     (
         "/ferrogate.v1.MachineIdentity/GetEnrollmentKey",
@@ -339,6 +338,9 @@ pub const METHOD_ACCESS: &[(&str, Access)] = &[
         Access::Host,
     ),
     ("/ferrogate.v1.MachineIdentity/SyncAllowlist", Access::Host),
+    // F19 §7.1 host proof, context `ferrogate-rotate-v1`, rate-limited per
+    // host (`CMIS_ROTATE_MAX_PER_HOUR`); public until T293.
+    ("/ferrogate.v1.MachineIdentity/Rotate", Access::Host),
     // ---- MachineIdentity: legacy admin RPCs (F20 Phase 0) ----
     (
         paths::LIST_ALLOWLISTS,
@@ -955,6 +957,9 @@ mod tests {
             "SubmitAppRequest",
             "GetAppRequestStatus",
             "SyncAllowlist",
+            // T293: no longer public; an unauthenticated Rotate was an
+            // issuance oracle.
+            "Rotate",
         ] {
             let path = format!("{}{m}", paths::MI);
             assert_eq!(access_for(&path), Some(Access::Host), "{path}");
@@ -966,7 +971,7 @@ mod tests {
             .collect();
         assert_eq!(
             hosts.len(),
-            5,
+            6,
             "no other method is host-authenticated: {hosts:?}"
         );
     }

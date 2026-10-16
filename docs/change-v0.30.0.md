@@ -4,8 +4,9 @@
 > Obrigatório em toda mudança de versão, especificando o que foi alterado e onde.
 >
 > **Situação: rascunho, versão ainda não publicada.** O conteúdo está em
-> `[Unreleased]` no `CHANGELOG.md`; a versão do workspace continua 0.29.0 até o
-> commit de release (`chore(release): v0.30.0`), como nas versões anteriores.
+> `[Unreleased]` no `CHANGELOG.md`. A versão do workspace passou a 0.30.0 com
+> o T293 (mudança de comportamento de segurança em `Rotate`, como a 0.29.0 fez
+> com a F20 Fase 0); a tag sai no commit de release.
 
 ## Identificação
 
@@ -13,11 +14,11 @@
 |---|---|
 | Sistema | FerroGate / CMIS, MIA, CLI `ferrogate`, TUI `ferrogate-tui` (novo binário) e SDK |
 | Nível de classificação (1–4) | Proposta: 4 para a superfície administrativa e o ledger de aprovações (contém nomes de usuário, SIDs e caminhos — dado pessoal, F19 §10) — pendente de confirmação pelo ESI |
-| Versão | 0.30.0 — funcionalidade nova; **sem quebra** enquanto o modo permanecer `legacy` |
+| Versão | 0.30.0 — funcionalidade nova; **sem quebra** enquanto o modo permanecer `legacy`, exceto `Rotate`, que passa a exigir prova de host (T293; nenhum MIA publicado chama `Rotate`) |
 | Tag no controle de versão | `releases/v0.30.0` (a criar no release) |
 | Data prevista de publicação | A definir |
 | Requisição de mudança (nº) | Não informada |
-| Especificação | F19 (`docs/features/F19-app-registration-approval.md`, §2–§11), ADR-0004, F20 §7 (tabela de permissões); marcos M37 (T263–T271), M38 (T272–T274) e M39 (T275–T279; F21, `docs/features/F21-admin-tui.md`) do `ROADMAP.md` |
+| Especificação | F19 (`docs/features/F19-app-registration-approval.md`, §2–§11), ADR-0004, F20 §7 (tabela de permissões); marcos M37 (T263–T271), M38 (T272–T274) e M39 (T275–T279; F21, `docs/features/F21-admin-tui.md`) do `ROADMAP.md`; T293 (M33; F04, `docs/protocol.md` §"Renewal vs re-attestation") |
 
 O ROADMAP previa F19 na 0.29; a 0.29.0 foi publicada só com a Fase 0 da F20
 (autenticação administrativa), por isso F19 sai na 0.30.0.
@@ -74,7 +75,29 @@ nova e nenhuma alteração de autorização no servidor.
 | `crates/ferrogate-tui/tests/admin_tui.rs` | Teste de ponta a ponta contra a CMIS em processo (harness de `crates/cmis/tests/support`) atrás de um listener TLS real | Login → lista → aprovação com step-up; negação, edição com conflito (`ABORTED`), revogação e congelamento auditados; inclusão direta com TOTP novo; pin errado; visualizador recusado pelo servidor |
 | `docs/operations.md` ("Administering approvals with `ferrogate-tui`"), `CHANGELOG.md`, `ROADMAP.md`, este documento | Guia de operação e registro da mudança | NRM §5.3.1 |
 
+### T293 — prova de host em `Rotate` (M33)
+
+Correção de segurança: `Rotate` era pública e não verificava assinatura,
+validade nem revogação da SVID apresentada (oráculo de emissão).
+
+| Arquivo / módulo | Natureza da alteração | Motivo |
+|---|---|---|
+| `crates/ferro-svid/src/host_call.rs`, `lib.rs` | `RotateDoc`, `encode_rotate`/`decode_rotate` (CBOR canônico, chaves desconhecidas recusadas), contexto `ferrogate-rotate-v1` | Documento assinado pelo host |
+| `crates/ferro-proto/proto/machine_identity.proto` | `RotateRequest` ganha `auth` (4) e `doc` (5); `pcr_values`/`known_epoch` ignorados | Contrato de rede |
+| `crates/cmis/src/service.rs` (`rotate_with_host_proof`) | Autenticação pelo verificador único de host; recusa do nível TPM, de SVID superada e de deriva/época/janela; auditoria de emissão e recusas | Falha segura (NRM §5.3.5) e trilha (§5.3.1) |
+| `crates/cmis/src/host_auth.rs`, `main.rs` | Limitador `rotate` e `CMIS_ROTATE_MAX_PER_HOUR` (padrão 6) | Limite por host |
+| `crates/cmis/src/state.rs`, `crates/ferro-raft/src/cluster.rs` | `replace_bundle_if_current` / `replace_svid_if_unchanged` (comparar-e-trocar); `update_bundle` descontinuado | Duas renovações concorrentes não gravam ambas |
+| `crates/cmis/src/admin/authz.rs` | `Rotate` passa a `Access::Host` | Ponto único de autorização |
+| `crates/mia/src/client.rs` | `rotate` / `rotate_request` | Cliente da prova (reuso na Parte 2) |
+| `crates/cmis/tests/rotate_host_auth.rs` (novo), `crates/mia/tests/e2e_attest.rs` | 21 testes de integração; e2e migrado para o nível host-key | NRM §5.3.7 |
+| `docs/protocol.md`, `cmis.md`, `operations.md`, `networking.md`, F04, F20, `CHANGELOG.md`, `ROADMAP.md`, este documento | Documentação | NRM §5.3.1 |
+
 ## Impacto e compatibilidade
+
+- **`Rotate` (T293):** um cliente que chame `Rotate` sem a prova recebe
+  `UNAUTHENTICATED host_auth_failed`; o nível TPM sempre recebe
+  `FAILED_PRECONDITION` e refaz o `Attest`. Nenhum MIA publicado chama
+  `Rotate` (a renovação em segundo plano no daemon é a Parte 2).
 
 - **Nada muda até a troca de modo.** O cluster continua em `legacy`
   (`cmis_settings.allowlist_mode`); `SetAllowlist`, `GetAllowlist` e as
@@ -111,7 +134,7 @@ nova e nenhuma alteração de autorização no servidor.
 
 | Campo | Valor |
 |---|---|
-| Algum componente de segurança foi alterado? | Sim — autorização (novas permissões em uso: `settings.allowlist_mode`, `allowlist.import`), allowlists de chamadores (origem da autorização dos aplicativos), auditoria |
+| Algum componente de segurança foi alterado? | Sim — autorização (novas permissões em uso: `settings.allowlist_mode`, `allowlist.import`), allowlists de chamadores (origem da autorização dos aplicativos), auditoria; emissão de SVID por `Rotate` (T293: autenticação de host, revogação, auditoria) |
 | O que foi alterado | Ver tabelas acima. Negação por padrão: as três RPCs novas estão na tabela única `METHOD_ACCESS`; troca de modo e importação exigem operador de plataforma e step-up; falhas do armazenamento respondem `UNAVAILABLE` sem registrar evento |
 | Desvio registrado | Risco aceito D4 (registro direto em um passo pelo mesmo aprovador, F19 §8), já registrado no M37 — a confirmar com o ESI |
 | Responsável oficial pelo versionamento do componente | Não informado |
@@ -158,6 +181,10 @@ pseudonimização do ledger seguem pendentes de definição pelo DPO (T289).
   na CLI) ficam para depois. Os códigos
   de motivo de negação (1–6) e de revogação (1–5) são definidos pela TUI e
   documentados em `docs/operations.md`.
+- `Rotate` (T293): o cache de nonces, o limitador e o conjunto de revogação
+  são por nó, como nos demais métodos de host. Com o piso de 96 h da SVID e a
+  janela de 24 h, a renovação agendada é normalmente um `Attest` completo. A
+  SVID substituída continua válida até expirar (só não renova mais).
 
 ## Verificações
 
@@ -170,6 +197,7 @@ pseudonimização do ledger seguem pendentes de definição pelo DPO (T289).
 | Revisão de segurança do diff (agente revisor) | 1 achado alto (importação obsoleta reativada na troca), 2 médios e 4 baixos — todos corrigidos e cobertos por testes | 2026-10-15 |
 | Ledger (`cargo test -p ferro-raft --test app_ledger legacy`) | Aprovada — termos da importação, idempotência, validação, trigger da migração 3 | 2026-10-15 |
 | CLI (`cargo test -p ferrogate-cli --test admin_cli migrate`) | Aprovada | 2026-10-15 |
+| T293 (`cargo test -p cmis rotate`, `-p ferro-svid host_call`, `-p mia --test e2e_attest`, `make lint`) | Aprovada (ver relatório do T293) | 2026-10-16 |
 | Verificação de segurança do ESI antes da produção | Pendente | — |
 
 ## Autorizações

@@ -15,9 +15,11 @@ In:
 - SPIFFE ID derivation from `SHA-384(ek_cert)`.
 - `cnf.jkt` binding to a DPoP thumbprint.
 - 1-hour maximum TTL; configurable lower in policy.
-- `Rotate` RPC for in-window renewal.
-- Forced re-attestation triggers: 24 h elapsed, PCR drift, `policy_id` epoch
-  bump.
+- `Rotate` RPC for in-window renewal: a host method since T293 (host proof
+  over a `RotateDoc`, context `ferrogate-rotate-v1`), host-key tier only,
+  from the latest stored SVID only.
+- Forced re-attestation triggers: 24 h elapsed, state (PCR / fingerprint)
+  drift, `policy_id` epoch bump, and always for the TPM tier.
 - Local sealing of SVID and private key to PCRs `{0, 4, 7, 8}`.
 
 Out:
@@ -47,10 +49,17 @@ and [../cmis.md](../cmis.md) §"gRPC surface".
 - [x] CMIS `issue_svid` returns a JWS that validates against the published
       JWKS and matches the documented payload schema.
       (`ferro-svid` issuance + the `JWKS` RPC; `mia/tests/e2e_attest.rs::attest_issues_svid_that_reference_verifier_accepts`.)
-- [x] `Rotate` succeeds without TPM I/O when within the 24 h window and PCRs
-      are unchanged. (`rotate_short_path_when_pcrs_unchanged`.)
-- [x] `Rotate` forces re-attestation when PCRs differ or epoch differs.
-      (`lifecycle::decide_renewal`; `rotate_refused_on_pcr_drift`.)
+- [x] `Rotate` succeeds without TPM I/O when within the 24 h window and the
+      signed state digest is unchanged (host-key tier, T293).
+      (`mia/tests/e2e_attest.rs::rotate_short_path_for_host_key_tier`,
+      `cmis/tests/rotate_host_auth.rs::rotate_succeeds_short_path`.)
+- [x] `Rotate` forces re-attestation when the state digest or epoch differs,
+      the window expired, or the host is on the TPM tier.
+      (`lifecycle::decide_renewal`; `rotate_refused_for_tpm_tier`,
+      `rotate_refuses_state_digest_drift`, `rotate_refuses_after_epoch_bump`,
+      `rotate_refuses_outside_the_reattest_window`.)
+- [x] `Rotate` needs a host proof and refuses forged, foreign, expired,
+      revoked and superseded SVIDs (T293). (`cmis/tests/rotate_host_auth.rs`.)
 - [x] MIA seals the SVID under PCR policy `{0,4,7,8}`; reboot into a different
       PCR state silently invalidates the cache. (`mia::seal`, Linux-only;
       `mia/tests/swtpm_seal.rs` extends a sealed PCR and shows the unseal fails.)
@@ -78,3 +87,13 @@ Two seams are deliberately left for later milestones:
   with a 60 s lookback.
 - **Sealing brittleness.** Legitimate firmware updates may change PCR 0.
   Mitigation: PCR-drift triggers a re-attestation, not a hard failure.
+- **Issuance oracle (fixed in T293).** Until 0.30.0, `Rotate` was public,
+  never verified the presented SVID's signature, expiry or revocation, and
+  trusted unsigned PCR values: anyone with a host's SPIFFE id and PCR values
+  could have CMIS mint and store a fresh SVID for it (still bound to the
+  host's key). It now requires the host proof and refuses the TPM tier and
+  superseded, expired and revoked SVIDs (see [../protocol.md](../protocol.md)
+  §"Renewal vs re-attestation").
+- **Short path rarely used.** With the 96 h TTL floor and the 24 h window, a
+  scheduled renewal is normally a full re-attestation; renewing in the
+  running MIA daemon is a follow-up (ROADMAP T291 note).

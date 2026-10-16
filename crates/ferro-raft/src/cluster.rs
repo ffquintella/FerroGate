@@ -568,6 +568,33 @@ impl Cluster {
         Ok(())
     }
 
+    /// Replace one issued-SVID record only while its stored payload is still
+    /// exactly `expected` (compare-and-swap in a single statement). Returns
+    /// whether it was replaced; `false` means another writer changed or
+    /// removed the row first and nothing was written.
+    pub async fn replace_svid_if_unchanged(
+        &self,
+        spiffe_id: &str,
+        expected: &[u8],
+        payload: &[u8],
+        now_unix: i64,
+    ) -> Result<bool, ClusterError> {
+        let affected = self
+            .client
+            .execute(
+                "UPDATE issued_svids SET payload = $1, updated_at = $2 \
+                 WHERE spiffe_id = $3 AND payload = $4",
+                vec![
+                    Param::from(payload.to_vec()),
+                    Param::from(now_unix),
+                    Param::from(spiffe_id.to_string()),
+                    Param::from(expected.to_vec()),
+                ],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
     /// Fetch one issued-SVID payload by SPIFFE id.
     pub async fn fetch_svid(&self, spiffe_id: &str) -> Result<Option<Vec<u8>>, ClusterError> {
         let row: Option<RawSvidRow> = self

@@ -45,17 +45,18 @@ use ferro_proto::v1::{
     SvidBundle, SvidSummary, SyncAllowlistRequest, SyncAllowlistResponse,
 };
 use ferro_raft::NodeRole;
+use ferro_svid::host_call::{decode_rotate, RotateDoc, ROTATE_CONTEXT};
 use ferro_svid::{
-    decide_renewal, IssueParams, IssuedSvid, LastAttestation, RenewalDecision, RevocationTarget,
+    decide_renewal, IssueParams, IssuedSvid, LastAttestation, ReattestReason, RenewalDecision,
+    RevocationTarget,
 };
 use sha2::{Digest, Sha256, Sha384};
 
 use crate::admin::authz::{paths, require};
 use crate::apps::{self, AllowlistMode};
 use crate::fleet_manifest::EnrollmentDecision;
-use crate::host_auth::{authenticate, invalid_field, HostCall};
-use crate::pcr::aggregate_digest;
-use crate::state::{CmisState, HostKeyBinding, IssuedRecord, ProposalPolicy};
+use crate::host_auth::{authenticate, invalid_field, HostCall, TIER_HOST_KEY};
+use crate::state::{BundleSwap, CmisState, HostKeyBinding, IssuedRecord, ProposalPolicy};
 
 /// gRPC front end over a shared [`CmisState`].
 #[derive(Clone)]
@@ -729,6 +730,136 @@ async fn run_attest_host_key(
     Ok(())
 }
 
+/// The answer to every authenticated `Rotate` refusal that a full `Attest`
+/// resolves (tier, superseded SVID, drift, epoch, window).
+fn reattest_required() -> Status {
+    Status::failed_precondition("re-attestation required")
+}
+
+/// The stable `AttestFail` opcode of a forced re-attestation (T293).
+fn reattest_opcode(reason: ReattestReason) -> &'static str {
+    match reason {
+        ReattestReason::EpochBump => "rotate-reattest-epoch-bump",
+        // Host-key tier: the signed state digest is the machine fingerprint.
+        ReattestReason::PcrDrift => "rotate-reattest-state-drift",
+        ReattestReason::WindowExpired => "rotate-reattest-window-expired",
+    }
+}
+
+/// `Rotate` (T293): renew a host-key SVID on the short path, for a host that
+/// proves possession of the machine key its **latest** SVID is bound to.
+/// Fails closed; every authenticated refusal is audited as `AttestFail` and
+/// every renewal as `SvidIssued`. Logs name the SPIFFE id, never the JWS.
+#[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
+async fn rotate_with_host_proof(
+    state: &CmisState,
+    req: &RotateRequest,
+    now: i64,
+) -> Result<SvidBundle, Status> {
+    // `pcr_values` and `known_epoch` are ignored (unsigned); `current_svid`
+    // is bounded like `auth.svid_jws` before anything else.
+    if req.current_svid.len() > crate::host_auth::MAX_SVID_JWS_BYTES {
+        return Err(Status::invalid_argument("field_too_long"));
+    }
+
+    // a. The F19 §7.1 proof: SVID issued here, unexpired, unrevoked; key
+    //    bound by `cnf.jkt`; signature; fresh, unreplayed, within budget.
+    //    The document must name the presented SVID, as must `current_svid`.
+    let presented = req.auth.as_ref().map(|a| a.svid_jws.as_str());
+    let current = req.current_svid.as_str();
+    let bind = |doc: &RotateDoc| {
+        presented.is_some_and(|jws| doc.binds_svid(jws) && (current.is_empty() || current == jws))
+    };
+    let (host, doc) = authenticate(
+        state,
+        HostCall {
+            auth: req.auth.as_ref(),
+            context: ROTATE_CONTEXT,
+            doc: &req.doc,
+            max_doc_bytes: ferro_svid::host_call::MAX_DOC_BYTES,
+            decode: decode_rotate,
+            bind: &bind,
+            limiter: Some(state.host_calls.rotate_limiter()),
+        },
+        now,
+    )?;
+    let spiffe_id = host.spiffe_id.as_str();
+
+    // b. Only the host-key tier renews here (D2): a TPM host re-attests.
+    if host.tier != TIER_HOST_KEY {
+        tracing::info!(
+            spiffe_id,
+            tier = host.tier,
+            "rotate refused: tier re-attests"
+        );
+        audit_fail(state, "rotate-tier-requires-attest", now);
+        return Err(reattest_required());
+    }
+
+    // c. The stored record is the source of truth for what was attested.
+    let Some(record) = state.lookup(spiffe_id).await else {
+        tracing::warn!(spiffe_id, "rotate refused: no stored record");
+        audit_fail(state, "rotate-unknown-subject", now);
+        return Err(Status::not_found(
+            "unknown subject; full attestation required",
+        ));
+    };
+
+    // d. Only the latest issued SVID renews (D4).
+    if sha384(record.bundle.jws.as_bytes()) != doc.svid_sha384 {
+        tracing::warn!(spiffe_id, "rotate refused: superseded SVID");
+        audit_fail(state, "rotate-superseded", now);
+        return Err(reattest_required());
+    }
+
+    // e. Signed state digest, live epoch, 24 h window.
+    let epoch = state.current_epoch();
+    if let RenewalDecision::FullReattest(reason) =
+        decide_renewal(&record.last_attestation, now, &doc.state_digest, epoch)
+    {
+        tracing::info!(
+            spiffe_id,
+            ?reason,
+            "rotate refused: full re-attestation required"
+        );
+        audit_fail(state, reattest_opcode(reason), now);
+        return Err(reattest_required());
+    }
+
+    // f. Issue, then store only if the record still holds the presented
+    //    SVID (re-checked inside the write); an unstored SVID is never sent.
+    let issued = state.issuer.issue(&record.params, now).map_err(|e| {
+        tracing::error!(error = %e, spiffe_id, "rotate: SVID issuance failed");
+        audit_fail(state, "issuance-failed", now);
+        Status::unavailable("issuer temporarily unavailable")
+    })?;
+    match state
+        .replace_bundle_if_current(spiffe_id, &doc.svid_sha384, issued.clone())
+        .await
+    {
+        BundleSwap::Replaced => {}
+        BundleSwap::Superseded => {
+            tracing::warn!(spiffe_id, "rotate refused: superseded during renewal");
+            audit_fail(state, "rotate-superseded", now);
+            return Err(reattest_required());
+        }
+        BundleSwap::StoreFailed => {
+            audit_fail(state, "rotate-store-failed", now);
+            return Err(store_unavailable());
+        }
+    }
+    audit_record(
+        state,
+        AuditEvent::SvidIssued {
+            cert_sha: Hash384(sha384(issued.jws.as_bytes())),
+            spiffe_id: issued.spiffe_id.clone(),
+        },
+        now,
+    );
+    tracing::info!(spiffe_id, "renewed SVID (short path, host proof)");
+    Ok(to_bundle(&issued, state))
+}
+
 /// Shape an issued SVID for the wire, carrying **both** profiles.
 ///
 /// The X.509 fields are left empty when the issuance produced no certificate
@@ -788,53 +919,8 @@ impl MachineIdentity for MachineIdentitySvc {
         &self,
         request: Request<RotateRequest>,
     ) -> Result<Response<SvidBundle>, Status> {
-        let req = request.into_inner();
-        let now = unix_now();
-
-        // Identify the subject from the presented SVID without trusting it yet:
-        // the stored record is the source of truth for what was attested.
-        let decoded = ferro_svid::envelope::decode(&req.current_svid)
-            .map_err(|_| Status::invalid_argument("malformed SVID"))?;
-        let subject = decoded.claims.sub;
-
-        let record = self
-            .state
-            .lookup(&subject)
-            .await
-            .ok_or_else(|| Status::not_found("unknown subject; full attestation required"))?;
-
-        let current_digest = aggregate_digest(
-            &req.pcr_values
-                .iter()
-                .map(|pv| (u8::try_from(pv.index).unwrap_or(u8::MAX), pv.value.clone()))
-                .collect::<Vec<_>>(),
-        );
-
-        match decide_renewal(
-            &record.last_attestation,
-            now,
-            &current_digest,
-            self.state.current_epoch(),
-        ) {
-            RenewalDecision::ShortPath => {
-                let issued = self
-                    .state
-                    .issuer
-                    .issue(&record.params, now)
-                    .map_err(|_| Status::unavailable("issuer temporarily unavailable"))?;
-                self.state.update_bundle(&subject, issued.clone()).await;
-                tracing::info!(spiffe_id = %subject, "renewed SVID (short path)");
-                Ok(Response::new(to_bundle(&issued, &self.state)))
-            }
-            RenewalDecision::FullReattest(reason) => {
-                tracing::info!(
-                    spiffe_id = %subject,
-                    reason = ?reason,
-                    "rotate refused; full re-attestation required"
-                );
-                Err(Status::failed_precondition("re-attestation required"))
-            }
-        }
+        let bundle = rotate_with_host_proof(&self.state, &request.into_inner(), unix_now()).await?;
+        Ok(Response::new(bundle))
     }
 
     async fn jwks(&self, request: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {

@@ -102,7 +102,7 @@ mod context_tests {
     /// under another context (F19 §7.1).
     #[test]
     fn signing_contexts_are_pairwise_prefix_free() {
-        let all: [&[u8]; 10] = [
+        let all: [&[u8]; 11] = [
             crate::SVID_SIGNING_CONTEXT,
             crate::ALLOWLIST_SIGNING_CONTEXT,
             crate::ALLOWLIST_V2_SIGNING_CONTEXT,
@@ -110,6 +110,7 @@ mod context_tests {
             crate::CRL_SIGNING_CONTEXT,
             crate::X509_ALT_SIGNATURE_CONTEXT,
             crate::host_call::AUDIT_FORWARD_CONTEXT,
+            crate::host_call::ROTATE_CONTEXT,
             crate::APP_REQUEST_CONTEXT,
             crate::APP_STATUS_CONTEXT,
             crate::ALLOWLIST_SYNC_CONTEXT,

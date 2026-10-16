@@ -111,7 +111,44 @@ together.
 
 ## Renewal vs re-attestation
 
-- **Renewal** (≤24 h since last full attestation, PCRs unchanged): a single
-  `Rotate` RPC over the existing PQC TLS channel returns a fresh SVID.
-- **Re-attestation** (>24 h, or PCRs changed, or `policy_id` epoch bumped):
-  full four-phase handshake required.
+- **Renewal** (host-key tier only, ≤24 h since the last full attestation,
+  state digest and policy epoch unchanged): a single `Rotate` RPC over the
+  existing PQC TLS channel returns a fresh SVID.
+- **Re-attestation** (>24 h, or state changed, or `policy_id` epoch bumped,
+  or any TPM-tier host): full four-phase handshake required.
+
+`Rotate` is a host method (T293). The request carries the F19 §7.1 host proof
+(`HostCallAuth`) over a canonical-CBOR `RotateDoc`:
+
+```text
+RotateDoc = { v: 1, host_uuid, issued_at, nonce[16],
+              svid_sha384 = SHA-384(svid_jws), state_digest[48] }
+sig       = ECDSA-P256(machine key, "ferrogate-rotate-v1" ‖ doc)
+```
+
+CMIS refuses, in order:
+
+1. a missing or invalid proof — an SVID not issued by this CMIS, expired or
+   revoked (by SVID digest or host), a key not matching `cnf.jkt`, a bad
+   signature, a document naming another SVID or host, `issued_at` more than
+   300 s off, a replayed nonce, or a host over `CMIS_ROTATE_MAX_PER_HOUR`
+   (`UNAUTHENTICATED host_auth_failed`, `PERMISSION_DENIED host_mismatch`,
+   `RESOURCE_EXHAUSTED rate_limited`); nothing is audited, the reason is
+   logged;
+2. a TPM-tier SVID: PCRs cannot be proven without a fresh quote, so the host
+   re-attests (`FAILED_PRECONDITION`, audited `rotate-tier-requires-attest`);
+3. an SVID that is not the latest one stored for the host
+   (`rotate-superseded`), re-checked inside the store write so two racing
+   renewals cannot both land;
+4. a signed `state_digest` (the machine fingerprint) different from the last
+   attestation, a bumped epoch or an expired window
+   (`rotate-reattest-state-drift|epoch-bump|window-expired`).
+
+A renewal is audited as `SvidIssued` and keeps the 24 h window anchored at the
+last full attestation. `RotateRequest.pcr_values` and `known_epoch` are
+ignored: they are unsigned.
+
+Because every SVID lifetime, the host-key one included, is floored at 96 h
+(`MIN_TTL_SECS`) while the window is 24 h, a host that rotates at 60 % of its
+TTL is past the window: renewal is then normally a full re-attestation, and
+the short path only serves renewals inside the first 24 h after an `Attest`.
