@@ -503,7 +503,9 @@ mod tests {
         let req = rotate_request(&signer, &[5; 48], 1_700_000_000, [9; 16]).unwrap();
 
         assert_eq!(req.current_svid, "", "the SVID travels in the proof");
-        assert_eq!(req.pcr_values, Vec::new());
+        #[allow(deprecated)] // checking the deprecated field stays unset
+        let no_pcrs = req.pcr_values.is_empty();
+        assert!(no_pcrs);
         let auth = req.auth.expect("a host proof");
         assert_eq!(auth.svid_jws, "header.claims.sig");
         assert_eq!(auth.sep_pub, key.public_spki_der());

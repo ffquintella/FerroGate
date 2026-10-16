@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::host_auth::HostCallConfig;
+use cmis::state::BundleSwap;
 use cmis::{CmisConfig, CmisState, IssuedRecord, MachineIdentitySvc};
 use ferro_attest::{RimStore, TpmQuoteVerifier, VendorTrustStore};
 use ferro_audit::{AuditEvent, AuditLog, AuditStore, Hash384, InProcessSigner};
@@ -264,14 +265,13 @@ impl<'a> Proof<'a> {
             .unwrap();
         RotateRequest {
             current_svid: self.current_svid.clone(),
-            pcr_values: Vec::new(),
-            known_epoch: 0,
             auth: Some(HostCallAuth {
                 svid_jws: self.auth_svid.to_string(),
                 sep_pub: self.signer.public_spki_der(),
                 sig,
             }),
             doc,
+            ..Default::default()
         }
     }
 }
@@ -385,8 +385,10 @@ async fn rotate_accepts_an_empty_current_svid() {
 
 // ---- authentication ----------------------------------------------------------
 
-/// The pre-T293 attack: an envelope naming a known host, with the attacker's
-/// key in `cnf.jkt` and a far `exp`, used to mint a genuine SVID.
+/// The pre-T293 oracle needed only an envelope naming a known host (never
+/// verified) plus that host's PCR values: CMIS re-issued from the stored
+/// record (still bound to the host's key) and overwrote it. Below, an
+/// attacker-made envelope with its own `cnf.jkt` and a far `exp`.
 #[tokio::test]
 async fn rotate_rejects_forged_unsigned_svid() {
     let f = setup().await;
@@ -410,6 +412,49 @@ async fn rotate_rejects_forged_unsigned_svid() {
         p.current_svid.clone_from(&forged);
         refused_unauthenticated(&f, &h, p.request()).await;
     }
+}
+
+/// The exact pre-T293 request: a TPM host's record, a forged unsigned SVID
+/// naming it, the victim's correct PCR values, and no proof at all.
+#[tokio::test]
+async fn rotate_rejects_forged_svid_with_the_victims_pcr_values() {
+    let f = setup().await;
+    let pcrs: Vec<(u8, Vec<u8>)> = vec![(0, vec![0x11; 48]), (7, vec![0x77; 48])];
+    let mut h = f.host(0x42, "test-fleet");
+    h.params.pcr_digest = cmis::pcr::aggregate_digest(&pcrs);
+    f.state
+        .record(IssuedRecord {
+            params: h.params.clone(),
+            last_attestation: LastAttestation {
+                at: now_unix(),
+                pcr_digest: h.params.pcr_digest,
+                policy_epoch: f.state.current_epoch(),
+            },
+            bundle: h.issued.clone(),
+            hostname: None,
+            child_pub: None,
+        })
+        .await;
+    let decoded = envelope::decode(h.jws()).unwrap();
+    let mut claims = decoded.claims.clone();
+    claims.exp += 86_400;
+    let input = envelope::signing_input(&JwsHeader::new(KID), &claims).unwrap();
+    let forged = envelope::compact(&input, &[]);
+
+    #[allow(deprecated)] // the deprecated, ignored field is the point here
+    let req = RotateRequest {
+        current_svid: forged,
+        pcr_values: pcrs
+            .iter()
+            .map(|(index, value)| ferro_proto::v1::PcrValue {
+                index: u32::from(*index),
+                value: value.clone(),
+            })
+            .collect(),
+        known_epoch: f.state.current_epoch(),
+        ..Default::default()
+    };
+    refused_unauthenticated(&f, &h, req).await;
 }
 
 #[tokio::test]
@@ -695,6 +740,95 @@ async fn rotate_of_an_unknown_subject_is_not_found() {
         reason: "rotate-unknown-subject".to_string(),
     });
     assert!(f.stored_jws(&h).await.is_none(), "nothing stored");
+}
+
+/// A record that cannot be read is a store failure, not an unknown host. The
+/// seam: an undecodable row fails the read exactly like an unreachable store.
+#[tokio::test]
+async fn rotate_store_error_is_unavailable_not_not_found() {
+    let f = setup().await;
+    let h = f.host(0x42, "host-key");
+    f.state
+        .cluster()
+        .upsert_svid(h.spiffe_id(), b"not a record", now_unix())
+        .await
+        .unwrap();
+    assert!(f.state.lookup_checked(h.spiffe_id()).await.is_err());
+    assert!(f.state.lookup(h.spiffe_id()).await.is_none());
+
+    let before = f.state.audit.len();
+    let e = rotate(&f, Proof::honest(&h).request())
+        .await
+        .expect_err("unreadable record");
+    assert_eq!(
+        (e.code(), e.message()),
+        (Code::Unavailable, "store_unavailable")
+    );
+    assert_eq!(f.state.audit.len(), before + 1);
+    f.assert_last_event(&AuditEvent::AttestFail {
+        reason: "rotate-store-failed".to_string(),
+    });
+    assert_eq!(
+        f.state
+            .cluster()
+            .fetch_svid(h.spiffe_id())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"not a record"[..]),
+        "nothing overwritten"
+    );
+}
+
+/// The in-write re-check on its own: a record changed after the handler's
+/// lookup (another renewal or a re-attestation landed) is never overwritten.
+#[tokio::test]
+async fn rotate_store_swap_refuses_a_record_changed_after_lookup() {
+    let f = setup().await;
+    let h = f.attested(0x42).await;
+    let looked_up = f.state.lookup_checked(h.spiffe_id()).await.unwrap();
+    let expected = sha384(looked_up.unwrap().bundle.jws.as_bytes());
+    assert_eq!(expected, sha384(h.jws().as_bytes()), "step d would pass");
+
+    // A re-attestation of the same host lands in between.
+    let other = mint_host(&f.state.issuer, 0x42, "host-key", now_unix());
+    f.seed(&other, now_unix()).await;
+    let mine = f.state.issuer.issue(&h.params, now_unix()).unwrap();
+    assert_eq!(
+        f.state
+            .replace_bundle_if_current(h.spiffe_id(), &expected, mine)
+            .await,
+        BundleSwap::Superseded
+    );
+    assert_eq!(f.stored_jws(&h).await.as_deref(), Some(other.jws()));
+
+    // Unchanged since the lookup: replaced.
+    let fresh = f.state.issuer.issue(&other.params, now_unix()).unwrap();
+    assert_eq!(
+        f.state
+            .replace_bundle_if_current(
+                h.spiffe_id(),
+                &sha384(other.jws().as_bytes()),
+                fresh.clone()
+            )
+            .await,
+        BundleSwap::Replaced
+    );
+    assert_eq!(f.stored_jws(&h).await, Some(fresh.jws));
+
+    // Gone: nothing is created.
+    let gone = f.host(0x44, "host-key");
+    assert_eq!(
+        f.state
+            .replace_bundle_if_current(
+                gone.spiffe_id(),
+                &sha384(gone.jws().as_bytes()),
+                gone.issued.clone()
+            )
+            .await,
+        BundleSwap::Superseded
+    );
+    assert!(f.stored_jws(&gone).await.is_none());
 }
 
 /// Two renewals racing from one SVID: the stored-SVID check is repeated

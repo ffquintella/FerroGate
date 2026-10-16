@@ -72,7 +72,8 @@ async fn cmis(evidence: &VirtualTpm, dir: &Path) -> Arc<CmisState> {
         .add_root_der(evidence.ek_root_der(), Vendor::Infineon)
         .unwrap();
     let rim = RimStore::new();
-    rim.approve(expected_pcr_digest(), PolicyId("test-fleet".into()));
+    rim.approve(expected_pcr_digest(), PolicyId("test-fleet".into()))
+        .unwrap();
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(dir.join("audit")).unwrap());
     let (signer, _) = InProcessSigner::generate("audit-test").unwrap();
     let audit = AuditLog::new(store, Arc::new(signer)).unwrap();

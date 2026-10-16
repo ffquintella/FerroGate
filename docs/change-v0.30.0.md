@@ -88,8 +88,10 @@ validade nem revogação da SVID apresentada (oráculo de emissão).
 | `crates/cmis/src/host_auth.rs`, `main.rs` | Limitador `rotate` e `CMIS_ROTATE_MAX_PER_HOUR` (padrão 6) | Limite por host |
 | `crates/cmis/src/state.rs`, `crates/ferro-raft/src/cluster.rs` | `replace_bundle_if_current` / `replace_svid_if_unchanged` (comparar-e-trocar); `update_bundle` descontinuado | Duas renovações concorrentes não gravam ambas |
 | `crates/cmis/src/admin/authz.rs` | `Rotate` passa a `Access::Host` | Ponto único de autorização |
+| `crates/ferro-attest/src/rim.rs`, `crates/cmis/src/rim_watcher.rs`, `host_auth.rs` | `host-key` reservado no RIM (`HOST_KEY_POLICY_ID`, definição única; `apply`/`approve` recusam; log `rim.reserved_policy_id`); `RimStore::approve` passa a retornar `Result` | Um TPM não pode cair no nível host-key (revisão de segurança) |
+| `crates/cmis/src/state.rs` (`lookup_checked`) | Falha de leitura do armazenamento em `Rotate` vira `UNAVAILABLE` auditado, não `NOT_FOUND` | Erro tratado e registrado (NRM §5.3.5) |
 | `crates/mia/src/client.rs` | `rotate` / `rotate_request` | Cliente da prova (reuso na Parte 2) |
-| `crates/cmis/tests/rotate_host_auth.rs` (novo), `crates/mia/tests/e2e_attest.rs` | 21 testes de integração; e2e migrado para o nível host-key | NRM §5.3.7 |
+| `crates/cmis/tests/rotate_host_auth.rs` (novo), `crates/mia/tests/e2e_attest.rs` | 24 testes de integração; e2e migrado para o nível host-key | NRM §5.3.7 |
 | `docs/protocol.md`, `cmis.md`, `operations.md`, `networking.md`, F04, F20, `CHANGELOG.md`, `ROADMAP.md`, este documento | Documentação | NRM §5.3.1 |
 
 ## Impacto e compatibilidade

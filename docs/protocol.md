@@ -146,7 +146,12 @@ CMIS refuses, in order:
 
 A renewal is audited as `SvidIssued` and keeps the 24 h window anchored at the
 last full attestation. `RotateRequest.pcr_values` and `known_epoch` are
-ignored: they are unsigned.
+deprecated and ignored: they are unsigned.
+
+The nonce replay cache is per CMIS node, so a captured, still-fresh `Rotate`
+replayed to another node can win the store swap before the real host's call:
+the attacker gains only public material bound to the host's key (`cnf.jkt`),
+and the real host gets `FAILED_PRECONDITION` and re-attests.
 
 Because every SVID lifetime, the host-key one included, is floored at 96 h
 (`MIN_TTL_SECS`) while the window is 24 h, a host that rotates at 60 % of its

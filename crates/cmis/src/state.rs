@@ -129,6 +129,13 @@ pub enum BundleSwap {
     StoreFailed,
 }
 
+/// A stored issued-SVID record could not be read: the replicated store failed
+/// or the row did not decode. The cause is logged by the state layer, never
+/// returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("issued-SVID store unavailable")]
+pub struct RecordUnavailable;
+
 /// Everything needed to re-issue and gate renewals for one host.
 #[derive(Debug, Clone)]
 pub struct IssuedRecord {
@@ -636,20 +643,30 @@ impl CmisState {
 
     /// Look up the stored record for a subject. Reads are strongly-consistent
     /// so a follower never serves a stale record after a successful `record`
-    /// on the leader.
+    /// on the leader. A store or decode failure reads as `None` (logged); a
+    /// caller that must tell them apart uses [`Self::lookup_checked`].
     pub async fn lookup(&self, spiffe_id: &str) -> Option<IssuedRecord> {
+        self.lookup_checked(spiffe_id).await.ok().flatten()
+    }
+
+    /// [`Self::lookup`], telling a missing record (`Ok(None)`) from a store
+    /// that could not be read (`Err`, cause logged here).
+    pub async fn lookup_checked(
+        &self,
+        spiffe_id: &str,
+    ) -> Result<Option<IssuedRecord>, RecordUnavailable> {
         match self.cluster.fetch_svid_consistent(spiffe_id).await {
             Ok(Some(bytes)) => match cluster_store::decode(&bytes) {
-                Ok(rec) => Some(rec),
+                Ok(rec) => Ok(Some(rec)),
                 Err(e) => {
                     tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
-                    None
+                    Err(RecordUnavailable)
                 }
             },
-            Ok(None) => None,
+            Ok(None) => Ok(None),
             Err(e) => {
                 tracing::error!(error = %e, %spiffe_id, "cluster fetch failed");
-                None
+                Err(RecordUnavailable)
             }
         }
     }

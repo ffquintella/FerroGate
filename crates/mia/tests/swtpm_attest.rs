@@ -175,7 +175,7 @@ fn swtpm_quote_is_accepted_end_to_end() {
     digest.copy_from_slice(&agg.finalize());
 
     let rim = RimStore::new();
-    rim.approve(digest, PolicyId("swtpm-test".into()));
+    rim.approve(digest, PolicyId("swtpm-test".into())).unwrap();
     let verifier = TpmQuoteVerifier::new(trust, rim);
 
     let good = QuoteVerification {
@@ -258,7 +258,8 @@ fn tpm_evidence_adapter_quote_is_accepted() {
     let mut digest = [0u8; 48];
     digest.copy_from_slice(&agg.finalize());
     let rim = RimStore::new();
-    rim.approve(digest, PolicyId("swtpm-adapter-test".into()));
+    rim.approve(digest, PolicyId("swtpm-adapter-test".into()))
+        .unwrap();
     let verifier = TpmQuoteVerifier::new(trust, rim);
 
     let good = QuoteVerification {

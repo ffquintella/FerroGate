@@ -64,7 +64,8 @@ async fn build_state(evidence: &VirtualTpm) -> Arc<CmisState> {
         .unwrap();
     let pcr_digest = expected_pcr_digest();
     let rim = RimStore::new();
-    rim.approve(pcr_digest, PolicyId("test-fleet".into()));
+    rim.approve(pcr_digest, PolicyId("test-fleet".into()))
+        .unwrap();
     let verifier = TpmQuoteVerifier::new(trust, rim);
     state_with_verifier(verifier).await
 }
@@ -283,14 +284,16 @@ async fn rotate_refused_for_tpm_tier() {
         .await
         .unwrap();
 
-    // The pre-T293 request (an SVID and unsigned PCRs) is not even
-    // considered.
+    // The pre-T293 request (an SVID and the deprecated unsigned fields) is
+    // not even considered.
+    #[allow(deprecated)]
+    let legacy = RotateRequest {
+        current_svid: attested.bundle.jws.clone(),
+        known_epoch: 1,
+        ..Default::default()
+    };
     let status = client
-        .rotate(RotateRequest {
-            current_svid: attested.bundle.jws.clone(),
-            known_epoch: 1,
-            ..Default::default()
-        })
+        .rotate(legacy)
         .await
         .expect_err("an unauthenticated rotate must be refused");
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
@@ -421,7 +424,8 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
             .unwrap();
         let pcr_digest = expected_pcr_digest();
         let rim = RimStore::new();
-        rim.approve(pcr_digest, PolicyId("test-fleet".into()));
+        rim.approve(pcr_digest, PolicyId("test-fleet".into()))
+            .unwrap();
         TpmQuoteVerifier::new(trust, rim)
     })
     .await;

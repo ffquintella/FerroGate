@@ -19,7 +19,9 @@ In:
   band; the composite signature, not the transport, gates what is admitted.)
 - Retention of 6 prior generations.
 - `policy_id` epoch bump as a first-class admin operation, audited.
-- Mapping at attestation time from PCR digest to `policy_id`.
+- Mapping at attestation time from PCR digest to `policy_id`. The id
+  `host-key` is reserved for the host-key tier (T293 review) and refused by
+  `RimStore::{apply, approve}` (`ApplyError::ReservedPolicyId`).
 
 Out:
 

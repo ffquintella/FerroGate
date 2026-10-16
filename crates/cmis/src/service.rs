@@ -56,7 +56,9 @@ use crate::admin::authz::{paths, require};
 use crate::apps::{self, AllowlistMode};
 use crate::fleet_manifest::EnrollmentDecision;
 use crate::host_auth::{authenticate, invalid_field, HostCall, TIER_HOST_KEY};
-use crate::state::{BundleSwap, CmisState, HostKeyBinding, IssuedRecord, ProposalPolicy};
+use crate::state::{
+    BundleSwap, CmisState, HostKeyBinding, IssuedRecord, ProposalPolicy, RecordUnavailable,
+};
 
 /// gRPC front end over a shared [`CmisState`].
 #[derive(Clone)]
@@ -546,13 +548,6 @@ async fn run_attest(
     Ok(())
 }
 
-/// The synthetic policy id stamped on SVIDs issued through the TPM-less
-/// host-key profile (F15). It records, in the issued credential and the audit
-/// log, that this host proved a hardware-bound key but **not** measured boot —
-/// a lower assurance tier than an EK-rooted, RIM-checked TPM quote. Policy can
-/// key on this prefix to refuse host-key SVIDs in sensitive trust domains.
-const HOST_KEY_POLICY_ID: &str = "host-key";
-
 /// Drive the 3-phase host-key handshake (feature F15): the nonce was already
 /// sent, here we verify the phase-2 evidence, gate on the fleet manifest, then
 /// take the phase-4 CSR (there is no phase-3 credential activation) and issue.
@@ -653,7 +648,7 @@ async fn run_attest_host_key(
         AuditEvent::AttestStart {
             ek_sha: fp_sha,
             aik_sha: Hash384(sha384(&evidence.sep_pub)),
-            policy_id: HOST_KEY_POLICY_ID.to_string(),
+            policy_id: TIER_HOST_KEY.to_string(),
         },
         now,
     );
@@ -685,7 +680,7 @@ async fn run_attest_host_key(
     let params = IssueParams {
         ek_cert_sha384: verified.fingerprint,
         pcr_digest: verified.fingerprint,
-        policy_id: HOST_KEY_POLICY_ID.to_string(),
+        policy_id: TIER_HOST_KEY.to_string(),
         dpop_jkt: csr.dpop_jkt,
         // The software host-key tier may carry a shorter lifetime so its
         // lower-assurance identities re-attest more often.
@@ -796,13 +791,21 @@ async fn rotate_with_host_proof(
         return Err(reattest_required());
     }
 
-    // c. The stored record is the source of truth for what was attested.
-    let Some(record) = state.lookup(spiffe_id).await else {
-        tracing::warn!(spiffe_id, "rotate refused: no stored record");
-        audit_fail(state, "rotate-unknown-subject", now);
-        return Err(Status::not_found(
-            "unknown subject; full attestation required",
-        ));
+    // c. The stored record is the source of truth for what was attested. A
+    //    store that cannot be read is UNAVAILABLE, never "unknown subject".
+    let record = match state.lookup_checked(spiffe_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            tracing::warn!(spiffe_id, "rotate refused: no stored record");
+            audit_fail(state, "rotate-unknown-subject", now);
+            return Err(Status::not_found(
+                "unknown subject; full attestation required",
+            ));
+        }
+        Err(RecordUnavailable) => {
+            audit_fail(state, "rotate-store-failed", now);
+            return Err(store_unavailable());
+        }
     };
 
     // d. Only the latest issued SVID renews (D4).

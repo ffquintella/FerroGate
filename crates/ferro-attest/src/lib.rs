@@ -36,7 +36,7 @@ pub use host_key::{
 };
 pub use rim::{
     ApplyError, ApplyOutcome, PolicyId, RimGeneration, RimGenerationSummary, RimStore,
-    MAX_GENERATIONS,
+    HOST_KEY_POLICY_ID, MAX_GENERATIONS,
 };
 pub use rim_bundle::{BundleError, RimBundle, SignedRimBundle, TrustedKeys, RIM_SIGNING_CONTEXT};
 pub use rim_loader::{ReloadError, ReloadOutcome, RimLoader};

@@ -80,9 +80,10 @@ pub const MAX_ROTATE_PER_HOUR: u32 = 3600;
 /// Upper bound on `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`.
 pub const MAX_SYNC_MIN_INTERVAL_SECS: u32 = 3600;
 
-/// The SVID tier of a host with the software host-key profile (F15/F16);
-/// every other host attested with a TPM.
-pub const TIER_HOST_KEY: &str = "host-key";
+/// The SVID tier, and the `policy_id` CMIS stamps, of a host with the
+/// software host-key profile (F15/F16); every other host attested with a TPM.
+/// The one definition: reserved in the RIM, so no TPM policy can carry it.
+pub use ferro_attest::HOST_KEY_POLICY_ID as TIER_HOST_KEY;
 /// The SVID tier of a TPM-attested host.
 pub const TIER_TPM: &str = "tpm";
 

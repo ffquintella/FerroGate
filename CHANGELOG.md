@@ -130,6 +130,11 @@ record them.
   `CmisState::update_bundle` is deprecated in favour of
   `replace_bundle_if_current`, which re-checks the stored SVID inside the
   write (`Cluster::replace_svid_if_unchanged`, a compare-and-swap).
+  `pcr_values` and `known_epoch` carry `[deprecated = true]`, so Rust code
+  naming them gets a deprecation warning. `CmisState::lookup_checked` tells
+  a missing record from an unreadable store (`RecordUnavailable`).
+  `ferro_attest::RimStore::approve` now returns `Result<(), ApplyError>`
+  (source-breaking for callers, which were tests only).
 
 - Retire the legacy allowlist writes in approvals mode and map the legacy commands and proposals onto the approval ledger (S50, M38, T273)
   In `approvals` mode `SetAllowlist` and `DeleteAllowlist` answer
@@ -210,9 +215,21 @@ record them.
   host-key hosts always being refused for PCR drift. Renewals are audited
   as `SvidIssued`, refusals after authentication as `AttestFail`
   (`rotate-tier-requires-attest`, `rotate-superseded`,
-  `rotate-reattest-<reason>`, `rotate-unknown-subject`); proof failures
-  are logged, never audited. The 24 h window is unchanged. Breaking for any
-  client calling `Rotate` without the proof.
+  `rotate-reattest-<reason>`, `rotate-unknown-subject`, and
+  `rotate-store-failed` with `UNAVAILABLE store_unavailable` when the record
+  cannot be read); proof failures are logged, never audited. The 24 h window
+  is unchanged. Breaking for any client calling `Rotate` without the proof.
+- Reserve the `host-key` policy id so no RIM policy can put TPM hosts on the host-key tier (S10, S4, M33, T293)
+  The tier is derived from the SVID `policy_id`, and TPM SVIDs carry the RIM
+  policy id, so a RIM generation or manual approval named `host-key` would
+  have treated TPM hosts as host-key hosts (`Rotate`, `SubmitAppRequest`
+  auto-approval, admin tier display). `ferro_attest::HOST_KEY_POLICY_ID` is
+  now the single definition (`cmis::host_auth::TIER_HOST_KEY` re-exports it)
+  and `RimStore::apply` / `approve` refuse it, trimmed and in any case, with
+  `ApplyError::ReservedPolicyId`: a signed bundle using it aborts startup or
+  is refused on hot reload (`rim.reserved_policy_id` error log), keeping the
+  previous generations. Follow-up, out of scope here: derive the tier from a
+  dedicated issuance claim instead of `policy_id`.
 - Upgrade rustls to 0.23.46 to fix RUSTSEC-2026-0346, -0347, -0348 and -0349 (S1, T5)
   `cargo deny check advisories` failed on rustls 0.23.45. The worst of the four
   advisories, RUSTSEC-2026-0349, lets an unauthenticated ServerHello push later

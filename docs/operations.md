@@ -243,7 +243,10 @@ revocation, epoch bump). `ferrogate admin groups` prints their permissions.
   as concat-bytes hex). CMIS loads it fail-closed at startup and a watcher
   hot-swaps any strictly-newer signed bundle (verified before apply, atomic).
   With `CMIS_RIM_BUNDLE` unset the allowlist is empty and every quote fails the
-  RIM lookup (`FAILED_PRECONDITION`) — fail-closed by default.
+  RIM lookup (`FAILED_PRECONDITION`) — fail-closed by default. The policy id
+  `host-key` (any case) is reserved for the host-key tier: a bundle using it is
+  refused (startup aborts; a hot reload keeps the previous generations and
+  logs `rim.reserved_policy_id`).
 - **Native S3 sourcing is dropped** (see [roadmap.md](roadmap.md) §"Dropped
   scope"). The bundle is read from a local file; a deployment that keeps it in
   object storage syncs it to that path out of band. Because the bundle is

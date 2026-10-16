@@ -306,9 +306,9 @@ message RotateRequest {
   string current_svid = 1;
   // Deprecated, ignored since T293: unsigned, so never trusted. The state
   // digest CMIS compares is `RotateDoc.state_digest`, inside the signature.
-  repeated PcrValue pcr_values = 2;
+  repeated PcrValue pcr_values = 2 [deprecated = true];
   // Deprecated, ignored: CMIS compares its own live epoch.
-  uint64 known_epoch = 3;
+  uint64 known_epoch = 3 [deprecated = true];
   // Host proof over `doc` (context `ferrogate-rotate-v1`), made with the
   // machine key the SVID in `auth.svid_jws` is bound to (`cnf.jkt`).
   HostCallAuth auth = 4;

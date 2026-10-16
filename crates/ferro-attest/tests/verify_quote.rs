@@ -170,7 +170,8 @@ fn verifier_for(ek: &Ek, pcr_digest: [u8; 48]) -> TpmQuoteVerifier {
     let mut trust = VendorTrustStore::new();
     trust.add_root_der(&ek.root_der, Vendor::Infineon).unwrap();
     let rim = RimStore::new();
-    rim.approve(pcr_digest, PolicyId("test-fleet".into()));
+    rim.approve(pcr_digest, PolicyId("test-fleet".into()))
+        .unwrap();
     TpmQuoteVerifier::new(trust, rim)
 }
 
@@ -368,7 +369,7 @@ fn unknown_pcr_state_not_in_rim_is_rejected() {
     let mut trust = VendorTrustStore::new();
     trust.add_root_der(&f.ek.root_der, Vendor::Nuvoton).unwrap();
     let rim = RimStore::new();
-    rim.approve([0xEE; 48], PolicyId("other".into()));
+    rim.approve([0xEE; 48], PolicyId("other".into())).unwrap();
     let verifier = TpmQuoteVerifier::new(trust, rim);
     let v = QuoteVerification {
         ek_cert_der: &f.ek.leaf_der,

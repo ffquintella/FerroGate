@@ -112,7 +112,8 @@ fn build_clustered_state(
         .unwrap();
     let pcr_digest = expected_pcr_digest();
     let rim = RimStore::new();
-    rim.approve(pcr_digest, PolicyId("test-fleet".into()));
+    rim.approve(pcr_digest, PolicyId("test-fleet".into()))
+        .unwrap();
     let verifier = TpmQuoteVerifier::new(trust, rim);
 
     let issuer = Issuer::generate(kid, "ferrogate.test").unwrap();
