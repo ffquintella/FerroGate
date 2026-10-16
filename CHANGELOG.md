@@ -176,7 +176,6 @@ record them.
   waits for room instead of dropping an event, but the forwarder drains its
   channel without waiting on disk or CMIS. `config-audit.jsonl` from
   `mia setup` is still not forwarded (T226).
-
 ### Security
 
 - Upgrade rustls to 0.23.46 to fix RUSTSEC-2026-0346, -0347, -0348 and -0349 (S1, T5)
