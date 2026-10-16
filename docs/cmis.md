@@ -313,6 +313,7 @@ parentheses below) — for example every host-authentication failure is the same
 | PCRs not in RIM | `FAILED_PRECONDITION` |
 | Credential activation mismatch | `PERMISSION_DENIED` |
 | AIK signature over CSR invalid | `PERMISSION_DENIED` |
+| `Attest` by a host whose SPIFFE id is revoked (T295) | `PERMISSION_DENIED` (`host_revoked`) |
 | Replay of nonce | `ABORTED` |
 | Internal (signer unavailable, …) | `UNAVAILABLE` |
 | Replicated-store write failed | `UNAVAILABLE` (`store_unavailable`) |

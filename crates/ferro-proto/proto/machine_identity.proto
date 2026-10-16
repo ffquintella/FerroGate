@@ -12,6 +12,8 @@ package ferrogate.v1;
 service MachineIdentity {
   // Four-phase streaming attestation handshake. The server speaks first with
   // a Nonce, then drives challenge/response and finally returns the SVID.
+  // A host whose SPIFFE id is revoked ends with `PERMISSION_DENIED
+  // host_revoked` before anything is issued (T295).
   rpc Attest (stream AttestRequest) returns (stream AttestResponse);
 
   // Fetch the most recently issued SVID for a SPIFFE id (debug / cache miss).
@@ -104,7 +106,9 @@ service MachineIdentity {
   // `svid.revoke` and a fresh step-up (F20).
   rpc RevokeSvid (RevokeSvidRequest) returns (RevokeResponse);
 
-  // Admin RPC: revoke every SVID and child token for a host SPIFFE ID.
+  // Admin RPC: revoke every SVID and child token for a host SPIFFE ID. While
+  // the entry is live, `Attest` refuses the host with `PERMISSION_DENIED
+  // host_revoked` (T295). There is no un-revoke RPC (T296).
   // Requires an administrator session with `svid.revoke` and a fresh step-up
   // (F20).
   rpc RevokeHost (RevokeHostRequest) returns (RevokeResponse);

@@ -70,6 +70,8 @@ ed25519-dalek         = { workspace = true }
 x509-parser           = { workspace = true }
 
 [dev-dependencies]
+# T295: host-key evidence (machine fingerprint) for the Attest tests.
+ferro-machineid   = { path = "../ferro-machineid" }
 futures           = { workspace = true }
 ferro-svid-verify = { path = "../ferro-svid-verify" }
 ferro-transport   = { path = "../ferro-transport" }

@@ -262,6 +262,23 @@ record them.
 
 ### Security
 
+- Refuse `Attest` for a host whose SPIFFE id is revoked, so `RevokeHost` cannot be undone by re-attesting (S11, S4, M33, T295)
+  `RevokeHost` only added a CRL entry: the revoked host could run `Attest`
+  again and receive a fresh SVID, and since T294 the MIA renewal loop would
+  have done so on its own at the next renewal. Both tiers now check the
+  subject SPIFFE id (derived through the new `Issuer::host_spiffe_id`,
+  exactly as `issue` stamps it) against the revocation working set
+  (`CmisState::is_host_revoked`) once the CSR signature has verified and
+  before the child key is published or anything is signed. A revoked host
+  gets `PERMISSION_DENIED host_revoked`, audited as `AttestFail { reason:
+  "attest-host-revoked" }`, and its stored record is left as it was. A
+  `RevokeSvid` entry still lets the host re-attest. Known limits, in
+  `docs/protocol.md`: the working set is per node and in memory
+  (replication is T223), a host entry expires 30 days
+  (`CRL_ENTRY_TTL_SECS`) after its last `RevokeHost`, and no RPC lifts a
+  host revocation (T296; operator procedure in `docs/operations.md`
+  §"Revocation"). `docs/operations.md` also no longer claims a 1 h entry
+  lifetime.
 - Require a host proof on `Rotate` and refuse the TPM tier and revoked, expired or superseded SVIDs, closing an SVID issuance oracle (S4, S51, S11, M33, T293)
   `Rotate` was public, decoded the presented SVID without checking its
   signature, expiry or revocation, trusted unsigned PCR values and

@@ -52,13 +52,17 @@ targeted revocation as the secondary path.
 ## Procedure
 
 1. **Authorize.** Incident commander records the decision and the `reason`.
-2. **Bump the epoch** on every CMIS replica:
+2. **Bump the epoch** on every CMIS replica. The admin RPCs need a
+   signed-in administrator with a fresh step-up (F20) and go to the admin
+   listener, so use the CLI rather than a bare `grpcurl`:
    ```sh
+   ferrogate admin login --session-file "$XDG_RUNTIME_DIR/drill.session"
    for n in cmis-a cmis-b cmis-c; do
-     grpcurl -d '{"reason":"DRILL-rim-gen-7-revoked"}' \
-       "$n:8443" ferrogate.MachineIdentity/BumpEpoch
+     ferrogate --admin-endpoint "https://$n:8444" \
+       --session-file "$XDG_RUNTIME_DIR/drill.session" \
+       bump-epoch DRILL-rim-gen-7-revoked
    done
-   # Response carries new_epoch; confirm it advanced by 1 on each.
+   # Each answer carries new_epoch; confirm it advanced by 1 on each.
    ```
 3. **Verify the audit leaf.** Fetch the latest STH and an inclusion proof for
    the `PolicyEpochBumped` event; verify the proof offline.
@@ -73,13 +77,35 @@ targeted revocation as the secondary path.
 ## Secondary path: targeted revocation
 
 ```sh
-grpcurl -d '{"cert_sha":"<96-hex-sha384-of-jws>","reason":"DRILL-leaked"}' \
-  cmis-a:8443 ferrogate.MachineIdentity/RevokeSvid
+ferrogate --admin-endpoint https://cmis-a:8444 \
+  --session-file "$XDG_RUNTIME_DIR/drill.session" \
+  revoke-svid <96-hex-sha384-of-jws> DRILL-leaked
 ```
 
 Confirm: the CRL number advances, the entry appears in the `x-ferrogate-crl`
 JWKS extension within one 60 s publish cycle (it republishes immediately on
 revoke), and the reference verifier (`ferro-svid-verify`) rejects the artefact.
+
+Then revoke a drill host and confirm it cannot come back by re-attesting
+(T295):
+
+```sh
+for n in cmis-a cmis-b cmis-c; do   # the working set is per node until T223
+  ferrogate --admin-endpoint "https://$n:8444" \
+    --session-file "$XDG_RUNTIME_DIR/drill.session" \
+    revoke-host spiffe://<td>/host/<uuid> DRILL-host
+done
+# On the drill host: force a re-attestation (restart the MIA daemon, or wait
+# for its next renewal).
+```
+
+Confirm: the host's `Attest` ends with `PERMISSION_DENIED host_revoked` on
+every replica, an `AttestFail { reason: "attest-host-revoked" }` leaf is
+appended for each attempt, and no `SvidIssued` leaf for that SPIFFE id follows
+the `HostRevoked` leaf. **Use a host you can retire or re-key**: there is no
+un-revoke RPC (T296), and the same hardware stays refused until the entry
+expires 30 days after the last `RevokeHost` (see `docs/operations.md`
+§"Revocation", "Bringing back a revoked host").
 
 ## Pass criteria
 
@@ -90,6 +116,9 @@ revoke), and the reference verifier (`ferro-svid-verify`) rejects the artefact.
 - Fleet attestation rate returns to baseline within ~one TTL.
 - (Secondary) revoked artefact appears in the CRL within one cycle and is
   rejected by the verifier.
+- (Secondary) a revoked host's re-attestation is refused with
+  `PERMISSION_DENIED host_revoked` on every replica and audited
+  `attest-host-revoked`; no new SVID is issued to it.
 
 ## Abort / rollback
 
@@ -97,6 +126,10 @@ An epoch bump is **not reversible** — there is no "un-bump". If issued in
 error, the only remedy is to let the fleet re-attest (it will, under the new
 epoch) and to publish a corrected RIM bundle if the bump was triggered by a
 false alarm. This is why the authorize step is mandatory.
+
+A `RevokeHost` is not reversible either (T296 tracks an un-revoke RPC): the
+host stays refused at `Attest` until the entry expires. Revoke only hosts
+named in the authorize step.
 
 ---
 
@@ -107,7 +140,9 @@ scripts/drills/mass-revocation.sh
 ```
 
 Drives `bump_epoch_forces_full_reattestation_on_next_rotate` (mia e2e) and the
-`cmis` `revocation` integration tests, proving both levers end to end.
+`cmis` `revocation` integration tests, proving both levers end to end. The
+revoked-host refusal is covered by `cmis` `attest_revocation` (host-key tier)
+and `attest_refuses_revoked_host_tpm_tier` (mia e2e).
 
 ## Drill log
 

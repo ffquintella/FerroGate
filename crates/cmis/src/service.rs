@@ -213,6 +213,39 @@ fn audit_fail(state: &CmisState, opcode: &'static str, now: i64) {
     );
 }
 
+/// The stable reason code (the status message) of an `Attest` refused with
+/// `PERMISSION_DENIED` because the host's SPIFFE id is revoked (T295).
+pub const HOST_REVOKED: &str = "host_revoked";
+
+/// The `AttestFail` opcode of an `Attest` refused because the host is
+/// revoked (T295).
+const ATTEST_HOST_REVOKED: &str = "attest-host-revoked";
+
+/// Refuse `Attest` for a host whose SPIFFE id is revoked (T295): without this
+/// a `RevokeHost` is undone by simply re-attesting, which the MIA renewal loop
+/// does on its own. Called once the host has proven possession of its keys and
+/// before its child key is published or anything is signed. The subject is
+/// derived exactly as [`ferro_svid::Issuer::issue`] stamps it. Fails closed:
+/// a subject that cannot be derived is refused as an issuance failure.
+#[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
+fn refuse_revoked_host(
+    state: &CmisState,
+    ek_cert_sha384: &[u8; 48],
+    now: i64,
+) -> Result<(), Status> {
+    let spiffe_id = state.issuer.host_spiffe_id(ek_cert_sha384).map_err(|e| {
+        tracing::error!(error = %e, "attest: host SPIFFE id derivation failed");
+        audit_fail(state, "issuance-failed", now);
+        Status::unavailable("issuer temporarily unavailable")
+    })?;
+    if state.is_host_revoked(&spiffe_id) {
+        tracing::warn!(spiffe_id, "attest refused: host revoked");
+        audit_fail(state, ATTEST_HOST_REVOKED, now);
+        return Err(Status::permission_denied(HOST_REVOKED));
+    }
+    Ok(())
+}
+
 /// Collapse a verifier rejection into the small fixed gRPC status set from
 /// `docs/cmis.md` §"Error model" — the only place CMIS distinguishes
 /// `NotInRim` (a precondition violation) from a quote-validation failure.
@@ -484,6 +517,9 @@ async fn run_attest(
         audit_fail(&state, "aik-sig-invalid", now);
         return Err(Status::permission_denied("attestation failed"));
     }
+    // T295: a revoked host gets nothing, whatever its evidence.
+    let ek_cert_sha384 = sha384(&init.ek_cert);
+    refuse_revoked_host(&state, &ek_cert_sha384, now)?;
 
     // Publish the host's composite key so downstream verifiers can validate the
     // child tokens (F09) the MIA will mint with it. A malformed key here is the
@@ -505,7 +541,7 @@ async fn run_attest(
     };
 
     let params = IssueParams {
-        ek_cert_sha384: sha384(&init.ek_cert),
+        ek_cert_sha384,
         pcr_digest: verified.pcr_digest,
         policy_id: verified.policy_id.as_str().to_string(),
         dpop_jkt: csr.dpop_jkt,
@@ -663,6 +699,8 @@ async fn run_attest_host_key(
         audit_fail(&state, "host-key-csr-sig-invalid", now);
         return Err(Status::permission_denied("attestation failed"));
     }
+    // T295: a revoked host gets nothing, whatever its evidence.
+    refuse_revoked_host(&state, &verified.fingerprint, now)?;
 
     let subject_pub = match CompositePublicKey::from_concat_bytes(&csr.composite_pub) {
         Ok(pk) => {
