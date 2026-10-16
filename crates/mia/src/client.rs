@@ -364,8 +364,9 @@ pub async fn run_attest_host_key(
     // separately proven on this profile.)
     let (svid_secret, svid_public) = match svid_seed {
         Some(seed) => CompositeSecretKey::from_seed(seed),
-        None => CompositeSecretKey::generate()
-            .map_err(|e| AttestClientError::KeyGen(e.to_string()))?,
+        None => {
+            CompositeSecretKey::generate().map_err(|e| AttestClientError::KeyGen(e.to_string()))?
+        }
     };
     let composite_pub = svid_public.to_concat_bytes();
     let aik_sig = key

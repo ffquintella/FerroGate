@@ -66,7 +66,11 @@ fn service_main(_args: Vec<OsString>) {
 }
 
 /// Build a [`ServiceStatus`] in `state`, accepting `controls`, reporting `code`.
-fn status(state: ServiceState, controls: ServiceControlAccept, code: ServiceExitCode) -> ServiceStatus {
+fn status(
+    state: ServiceState,
+    controls: ServiceControlAccept,
+    code: ServiceExitCode,
+) -> ServiceStatus {
     ServiceStatus {
         service_type: SERVICE_TYPE,
         current_state: state,
@@ -81,15 +85,16 @@ fn status(state: ServiceState, controls: ServiceControlAccept, code: ServiceExit
 fn run_service() -> anyhow::Result<()> {
     let hooks = *HOOKS.get().context("service hooks not initialized")?;
 
-    let status_handle = service_control_handler::register(SERVICE_NAME, move |control| match control {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
-            (hooks.request_stop)();
-            ServiceControlHandlerResult::NoError
-        }
-        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-        _ => ServiceControlHandlerResult::NotImplemented,
-    })
-    .context("registering the service control handler")?;
+    let status_handle =
+        service_control_handler::register(SERVICE_NAME, move |control| match control {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                (hooks.request_stop)();
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        })
+        .context("registering the service control handler")?;
 
     status_handle
         .set_service_status(status(
@@ -179,7 +184,9 @@ pub fn start() -> anyhow::Result<()> {
         .open_service(SERVICE_NAME, ServiceAccess::START)
         .context("opening the mia service (is it installed?)")?;
     let no_args: [&OsStr; 0] = [];
-    service.start(&no_args).context("starting the mia service")?;
+    service
+        .start(&no_args)
+        .context("starting the mia service")?;
     Ok(())
 }
 

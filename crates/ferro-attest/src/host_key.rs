@@ -130,16 +130,8 @@ mod tests {
         let key = SoftwareMachineKey::generate().unwrap();
         let nonce = [7u8; 32];
         let sig = key.sign(&host_key_binding(&nonce, &fp)).unwrap();
-        let v = verify_host_key_evidence(
-            &b,
-            &p,
-            &d,
-            &fp,
-            &key.public_spki_der(),
-            &nonce,
-            &sig,
-        )
-        .expect("valid");
+        let v = verify_host_key_evidence(&b, &p, &d, &fp, &key.public_spki_der(), &nonce, &sig)
+            .expect("valid");
         assert_eq!(v.fingerprint, fp);
     }
 
@@ -164,16 +156,9 @@ mod tests {
         let key = SoftwareMachineKey::generate().unwrap();
         // Signed over a different nonce than the one presented.
         let sig = key.sign(&host_key_binding(&[1u8; 32], &fp)).unwrap();
-        let err = verify_host_key_evidence(
-            &b,
-            &p,
-            &d,
-            &fp,
-            &key.public_spki_der(),
-            &[2u8; 32],
-            &sig,
-        )
-        .unwrap_err();
+        let err =
+            verify_host_key_evidence(&b, &p, &d, &fp, &key.public_spki_der(), &[2u8; 32], &sig)
+                .unwrap_err();
         assert_eq!(err, HostKeyRejection::NonceSignatureInvalid);
     }
 
@@ -185,16 +170,9 @@ mod tests {
         let impostor = SoftwareMachineKey::generate().unwrap();
         let nonce = [9u8; 32];
         let sig = signer.sign(&host_key_binding(&nonce, &fp)).unwrap();
-        let err = verify_host_key_evidence(
-            &b,
-            &p,
-            &d,
-            &fp,
-            &impostor.public_spki_der(),
-            &nonce,
-            &sig,
-        )
-        .unwrap_err();
+        let err =
+            verify_host_key_evidence(&b, &p, &d, &fp, &impostor.public_spki_der(), &nonce, &sig)
+                .unwrap_err();
         assert_eq!(err, HostKeyRejection::NonceSignatureInvalid);
     }
 

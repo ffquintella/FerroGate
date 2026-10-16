@@ -11,13 +11,13 @@
 
 | Campo | Valor |
 |---|---|
-| Sistema | FerroGate / CMIS, MIA, CLI `ferrogate` e SDK |
+| Sistema | FerroGate / CMIS, MIA, CLI `ferrogate`, TUI `ferrogate-tui` (novo binário) e SDK |
 | Nível de classificação (1–4) | Proposta: 4 para a superfície administrativa e o ledger de aprovações (contém nomes de usuário, SIDs e caminhos — dado pessoal, F19 §10) — pendente de confirmação pelo ESI |
 | Versão | 0.30.0 — funcionalidade nova; **sem quebra** enquanto o modo permanecer `legacy` |
 | Tag no controle de versão | `releases/v0.30.0` (a criar no release) |
 | Data prevista de publicação | A definir |
 | Requisição de mudança (nº) | Não informada |
-| Especificação | F19 (`docs/features/F19-app-registration-approval.md`, §2–§11), ADR-0004, F20 §7 (tabela de permissões); marcos M37 (T263–T271) e M38 (T272–T274) do `ROADMAP.md` |
+| Especificação | F19 (`docs/features/F19-app-registration-approval.md`, §2–§11), ADR-0004, F20 §7 (tabela de permissões); marcos M37 (T263–T271), M38 (T272–T274) e M39 (T275–T279; F21, `docs/features/F21-admin-tui.md`) do `ROADMAP.md` |
 
 O ROADMAP previa F19 na 0.29; a 0.29.0 foi publicada só com a Fase 0 da F20
 (autenticação administrativa), por isso F19 sai na 0.30.0.
@@ -59,6 +59,20 @@ conseguem aplicar.
 | `crates/ferro-proto/proto/admin.proto`, `machine_identity.proto` | Mensagens das três RPCs; documentação do comportamento em modo `approvals` | Contrato de rede |
 | `crates/ferrogate-cli/src/migration.rs` (novo), `admin.rs`, `allowlist.rs`, `main.rs` | `ferrogate admin migrate-allowlists [--dry-run]`, `ferrogate admin set-allowlist-mode legacy\|approvals [--yes] [--allow-unimported]`; `allowlist add\|remove` mapeados para registro direto e revogação em modo `approvals` | Operação da migração |
 | `docs/operations.md` (runbook), `docs/cmis.md`, `docs/allowlist-provisioning.md`, `docs/audit.md`, `docs/mia.md`, F19/F20, `CHANGELOG.md`, `ROADMAP.md`, este documento | Runbook de migração e rollback, códigos de erro, variável `CMIS_LEGACY_GETALLOWLIST`, anúncio de descontinuação | T274 |
+
+### M39 — TUI de administração do servidor (T275–T279)
+
+Novo binário **`ferrogate-tui`** (F21): interface de terminal em tela cheia
+para visualizadores e aprovadores. Não acessa o banco: toda ação é uma RPC do
+serviço `Admin` autorizada pela CMIS (`AdminAuthz`), como na CLI. Nenhuma RPC
+nova e nenhuma alteração de autorização no servidor.
+
+| Arquivo / módulo | Natureza da alteração | Motivo |
+|---|---|---|
+| `crates/ferrogate-tui/` (novo; `Cargo.toml` do workspace) | Binário `ferrogate-tui` e biblioteca sem terminal: `config` (arquivo `admin.toml` sem segredos, `FERROGATE_ADMIN_ENDPOINT`/`FERROGATE_ADMIN_SPKI_PIN`, recusa sem pin e sem porta explícita, leitura sem seguir symlink), `client` (tarefa tokio dona do canal fixado por SPKI em TLS híbrido PQC e do token de sessão), `app` (máquina de estados, filtros, diálogos, bloqueio por inatividade, nova tentativa única após step-up), `screens` (telas), `sanitize`, `secret` | T275–T278; F21 §1–§6, §8 |
+| `crates/ferrogate-tui/src/sanitize.rs` | Neutralização de controles C0/C1, sequências ESC (OSC 52, OSC 8, CSI, DCS), bidi e largura zero em todo texto vindo do servidor | T279; F21 §7 (injeção de escape de terminal) |
+| `crates/ferrogate-tui/tests/admin_tui.rs` | Teste de ponta a ponta contra a CMIS em processo (harness de `crates/cmis/tests/support`) atrás de um listener TLS real | Login → lista → aprovação com step-up; negação, edição com conflito (`ABORTED`), revogação e congelamento auditados; inclusão direta com TOTP novo; pin errado; visualizador recusado pelo servidor |
+| `docs/operations.md` ("Administering approvals with `ferrogate-tui`"), `CHANGELOG.md`, `ROADMAP.md`, este documento | Guia de operação e registro da mudança | NRM §5.3.1 |
 
 ## Impacto e compatibilidade
 
@@ -107,7 +121,7 @@ conseguem aplicar.
 
 | Campo | Valor |
 |---|---|
-| Frameworks/bibliotecas adicionados nesta versão | `plist` 1.10.1 (M37, `ferro-appid`); nenhum no M38 |
+| Frameworks/bibliotecas adicionados nesta versão | `plist` 1.10.1 (M37, `ferro-appid`); nenhum no M38; no M39, `ratatui` 0.30 (MIT, sem features padrão, backend crossterm 0.29 já presente via `inquire`), `unicode-width` 0.2, `unicode-segmentation` 1.12, `static_assertions` 1.1 e `rustix` 1.1 (MIT/Apache-2.0; `unicode-*` e `rustix` já estavam na árvore) — `cargo deny check licenses bans sources` aprovado |
 | Há componente descontinuado ou sem suporte? | Não avaliado nesta mudança (`make deny` / `make audit` no pipeline de release) |
 | Há vulnerabilidade crítica conhecida pendente? | Não avaliada nesta mudança |
 
@@ -135,6 +149,15 @@ pseudonimização do ledger seguem pendentes de definição pelo DPO (T289).
   gravações legadas já recusadas na própria transação após a troca.
 - A troca de modo não confere a versão dos outros nós da CMIS: o operador deve
   garantir que todos estão na 0.30.0 antes de trocar.
+- `ferrogate-tui` (M39) autentica apenas com senha + TOTP (AAL2, risco F21
+  "TOTP only in the TUI", OQ1 a validar com o ESI). A tela Hosts não está
+  disponível (a CMIS ainda não tem a RPC `ListHosts`); contas e sessões são
+  somente leitura na TUI (administração pela CLI); revogação em lote, gerador
+  de senha, textos em português, `--log-file` e o certificado de cliente do
+  listener administrativo (mTLS opcional, `CMIS_ADMIN_CLIENT_CA`; disponível
+  na CLI) ficam para depois. Os códigos
+  de motivo de negação (1–6) e de revogação (1–5) são definidos pela TUI e
+  documentados em `docs/operations.md`.
 
 ## Verificações
 

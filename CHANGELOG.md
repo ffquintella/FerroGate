@@ -62,6 +62,54 @@ record them.
   `docs/operations.md`; `docs/cmis.md`, `docs/allowlist-provisioning.md`,
   `docs/audit.md`, `docs/mia.md` and the F19/F20 specs describe the
   approvals-mode behaviour, the new error codes and `CMIS_LEGACY_GETALLOWLIST`.
+- Ship the `ferrogate-tui` server administration TUI with password + TOTP sign-in over the pinned admin listener (S52, M39, T275)
+  New binary crate `crates/ferrogate-tui` (ratatui + crossterm, tokio,
+  `#![forbid(unsafe_code)]`). Configuration from
+  `$XDG_CONFIG_HOME/ferrogate/admin.toml` or `/etc/ferrogate/admin.toml` plus
+  `FERROGATE_ADMIN_ENDPOINT` / `FERROGATE_ADMIN_SPKI_PIN`; it refuses to start
+  without an SPKI pin (no trust on first use) and connects only to the admin
+  listener over hybrid-PQC TLS with pinning (`ferro-transport`), so a wrong pin
+  fails before any credential is sent (an endpoint silent for 10 s is
+  reported unreachable, and every call has a 30 s deadline). The endpoint
+  needs an explicit port (`https://host` is refused: it would reach the main
+  listener on 8443). The configuration is opened once without following a
+  symlink and checked on the open handle; a configuration file or directory
+  (or any directory above it)
+  owned by another user or writable by group or others is refused. Forced password change, step-up prompt,
+  client idle lock at the server idle timeout minus 30 s, `Ctrl-L` lock,
+  `Logout` on quit, terminal restored on exit, `Ctrl-C`, signals and panic
+  (a panic in any thread stops the UI, ends the session and clears the
+  screen), screen cleared on lock and exit; lock and quit wipe the token at
+  once and never lose the `Logout` to a full command queue. Password, TOTP codes and the session token
+  are held only in zeroized memory, and a compile-time check proves no type
+  holding them implements `Debug` or `Display`; no logging. `NO_COLOR` /
+  `--monochrome`, 80×24 minimum.
+- List and search requests and approvals in the TUI with server-side filters and paging (S52, M39, T276)
+  Requests, Approvals, their detail views (lineage history, revisions) and a
+  Dashboard; filters map one-to-one to the F19 §7.5 fields and are validated
+  inline (dates, hash prefix, UUID, 128-character text) before anything is
+  sent. Hosts, Accounts and Sessions are read-only or explained (no
+  `ListHosts` RPC on the server yet).
+- Approve, deny, edit, revoke and freeze from the TUI with a review page and typed confirmation (S52, M39, T277)
+  Safe defaults with auto-update preselected only on a protected path or the
+  previous approved signer; an extra `y` for "Any user" or "Path + user only";
+  the single step-up retry reuses the idempotency key; edits send
+  `expected_row_version` and re-ask after `ABORTED`; revocation needs the typed
+  short id. Covered end to end against an in-process CMIS (approve with
+  step-up, deny, edit through a concurrent `ABORTED`, revoke, freeze).
+- Add an application by known hash and path in one step from the TUI, always with a fresh TOTP code (S52, S50, M39, T278)
+  `AdminRegisterApplication` with a 96-hex SHA-384 check; the review page
+  states the single-step or strict-SoD queued outcome and that hash and path
+  are the administrator's assertion; a wrong code changes nothing and the retry
+  reuses the idempotency key.
+- Render every server-supplied string in the TUI through `sanitize::display` (S52, M39, T279)
+  C0/C1 controls, `DEL` and escape sequences (CSI, OSC 52, OSC 8, DCS) become
+  visible `\x1b`-style text; bidi overrides and isolates and every other
+  default-ignorable character (zero-width, variation selectors, Hangul
+  fillers, tags) become `⟨U+XXXX⟩`; widths are measured per grapheme as
+  ratatui lays them out, with middle-ellipsis truncation for paths. Unit
+  table plus proptests over arbitrary bytes, strings and width-tricky
+  sequences in `make test`.
 
 ### Changed
 
@@ -89,6 +137,10 @@ record them.
   round trip. A pre-F19 proposal's coverage and duplicates are checked with
   two reads per call, and more than 4096 distinct entries are refused
   (`INVALID_ARGUMENT too_many_entries`).
+- Document the `cortex-memory` skill for AI assistants in `AGENTS.md` (M28, T292)
+  When to recall and when to store, verifying recalled claims against the
+  repository, superseding rather than deleting, never storing secrets or
+  personal data, and how it composes with `agent-router`.
 
 ### Deprecated
 

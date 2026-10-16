@@ -317,9 +317,15 @@ async fn persistent_seed_keeps_a_stable_child_signing_kid() {
     );
 
     // A different seed derives a different key, hence a different kid.
-    let other = run_attest_host_key(&mut client, &facts, &key, "dpop".to_string(), Some(&[9u8; 32]))
-        .await
-        .expect("attestation with a different seed succeeds");
+    let other = run_attest_host_key(
+        &mut client,
+        &facts,
+        &key,
+        "dpop".to_string(),
+        Some(&[9u8; 32]),
+    )
+    .await
+    .expect("attestation with a different seed succeeds");
     assert_ne!(
         ferro_svid::child_signing_kid(&first.svid_public),
         ferro_svid::child_signing_kid(&other.svid_public),

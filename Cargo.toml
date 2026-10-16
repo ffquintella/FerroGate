@@ -23,6 +23,7 @@ members = [
     "crates/ferro-appid",
     "crates/ferro-sep",
     "crates/ferrogate-cli",
+    "crates/ferrogate-tui",
     "crates/ferrogate-sdk-rust",
     "tools/fleet-manifest",
     "tools/offline-signer",
@@ -154,6 +155,24 @@ once_cell   = "1"
 
 # interactive terminal prompts (mia `setup` configuration wizard)
 inquire = "0.9"
+
+# Server admin TUI (F21, `ferrogate-tui`): a full-screen terminal UI drawn
+# with ratatui through its crossterm 0.29 backend (crossterm is already in the
+# tree through inquire; the TUI uses ratatui's re-export so the two cannot
+# drift). No default features: only the crossterm backend and the stock
+# widgets, no macros or calendar. `unicode-width` and `unicode-segmentation`
+# (both already in the tree through ratatui) measure untrusted strings per
+# grapheme exactly as ratatui's buffer does, for width-aware truncation;
+# `static_assertions` proves at compile time that
+# no type holding a password, TOTP code or session token implements `Debug`
+# or `Display`.
+ratatui           = { version = "0.30", default-features = false, features = ["crossterm"] }
+unicode-width     = "0.2"
+unicode-segmentation = "1.12"
+static_assertions = "1.1"
+# Safe `geteuid` for the TUI's configuration trust check (Unix; the crate
+# stays `#![forbid(unsafe_code)]`). Already in the tree through mia/tempfile.
+rustix            = { version = "1.1", default-features = false }
 
 # TOML configuration file parsing (mia config file)
 toml = "1.1"
