@@ -278,7 +278,9 @@ revocation, epoch bump). `ferrogate admin groups` prints their permissions.
 ## Audit forwarding from hosts
 
 `AppendAuditEvent` lets a MIA host append its own events (`LocalGrant`,
-`LocalDenied`, `ConfigChanged`) to the CMIS audit log. Since 0.29.0 (F20
+`LocalDenied`, `AllowlistSyncApplied`, `AllowlistSyncRejected`; CMIS also
+accepts `ConfigChanged`, which MIA does not send yet) to the CMIS audit log.
+Since 0.29.0 (F20
 Phase 0) each call carries a **host proof** (F19 §7.1 `HostCallAuth`):
 
 - the host's current SVID, issued by this CMIS, unexpired and not revoked
@@ -301,6 +303,66 @@ burst of one minute's budget); beyond that CMIS answers
 `RESOURCE_EXHAUSTED rate_limited` with a `retry-after` header in seconds.
 Keep host clocks synchronised (NTP): a host more than 5 minutes off cannot
 forward.
+
+### On the host: the audit spool
+
+The MIA daemon forwards through an on-disk spool (T291; behaviour in
+[audit.md](audit.md#event-types), "The MIA forwarder"):
+
+- **Where.** `/var/lib/ferrogate/audit-spool.jsonl` on Linux
+  (`audit-spool-<env>.jsonl` for a named environment); on macOS and Windows,
+  the same name in the system configuration directory. Mode `0600`, owned by
+  the daemon's user. It holds caller pids, uids, binary hashes and token
+  `jti`s, so treat it like the daemon log: keep it out of backups that leave
+  the host. It is never created when CMIS is not configured, and a host whose
+  SVID binds no host-call key (TPM tier) only logs its events.
+- **Bounds.** At most 10 000 pending events or 8 MiB of them; beyond that
+  the oldest are dropped. Between compactions the file can reach about twice
+  that size. A busy host must stay under `CMIS_AUDIT_FORWARD_MAX_PER_MIN`
+  (600 per minute per CMIS node by default) on average: the forwarder sends
+  one event per call and waits out `rate_limited`, so a sustained higher rate
+  grows the backlog until the cap drops events. Raise the CMIS limit for such
+  hosts rather than letting the spool overflow.
+- **Watching it.** The daemon log (targets `mia::audit_forward` and
+  `mia::audit_forward::spool`; the status
+  endpoint's log tail shows these lines too, never the events) reports, with
+  counts and stable reason codes only:
+  - `replaying audit events spooled by an earlier run` (`pending`) at start;
+  - `audit forwarding to CMIS failing` (`reason`, `pending`) on the first
+    failure, `still failing` at most every 10 minutes (`pending`,
+    `dropped_total`, `failing_secs`), then `recovered` (`pending`);
+  - `audit forwarding waits for a valid host SVID …` while no credentials
+    exist yet;
+  - `host SVID expired; audit events are held in the spool …` (warning,
+    once): the daemon does not renew its SVID while running, so restart it
+    to re-attest; until then events are spooled and, past the cap, the
+    oldest dropped;
+  - `audit forwarding over the CMIS rate limit` (`wait_secs`, `pending`), at
+    most every 10 minutes;
+  - `audit spool full; oldest events dropped` (`dropped`, `dropped_total`), at
+    most every 10 minutes;
+  - `CMIS refused an audit event for good` (`reason`, `event_type`) for each
+    event dropped on a permanent refusal;
+  - `could not write the audit spool` / `audit spool unusable` (an I/O error):
+    events are then held in memory, within the same bounds, until the file
+    can be written; fix the state directory's permissions or free space;
+  - `audit spool could not be read in full; moved it aside` (`spool`,
+    `moved_to`, `error`): see Recovery.
+
+  `mia status` does not show the backlog yet. Each event is also logged
+  locally on the `mia::audit` target, forwarded or not.
+- **Recovery.** Nothing to do after an outage or a restart: the spool is
+  replayed in order. Do not edit it by hand; deleting it discards the events
+  it holds (they remain in the local log). A damaged line is skipped with a
+  warning (`skipped unreadable audit spool records`). A spool that cannot be
+  read to its end is renamed, unchanged, to
+  `audit-spool[-<env>].jsonl.unreadable-<unix time>` (`0600`) and a fresh
+  one starts. That file is not replayed and nothing removes it. Inspect it
+  (its events are also in the local log), then delete it; it holds the
+  same data as the spool.
+- **Shutdown.** Events received but not yet appended when the daemon stops
+  are not spooled (they are in the local `mia::audit` log); an event still
+  queued in the helper channel at that instant is in neither.
 
 ## Caller allowlists
 

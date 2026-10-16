@@ -18,9 +18,9 @@
 //! Audit contract: **every decoded request produces exactly one audit event**
 //! (`LocalGrant` on success, `LocalDenied` otherwise). A connection that never
 //! delivers a well-formed request frame is not a "request" and is dropped
-//! silently. Events are pushed onto an `mpsc` channel; a forwarder task
-//! (`audit_client`) drains them to CMIS, decoupling minting latency from the
-//! audit network path.
+//! silently. Events are pushed onto an `mpsc` channel; the forwarder
+//! (`audit_forward`) logs, spools and sends them to CMIS, decoupling minting
+//! latency from the audit network path.
 
 #![cfg(any(unix, windows))]
 
@@ -542,6 +542,11 @@ async fn deny<A: CallerAuth>(
     .await;
 }
 
+/// Hand `event` to the audit forwarder, waiting for room rather than
+/// dropping it (`try_send`): the forwarder's intake only logs and stages
+/// events (disk and CMIS work run off that loop), so a full channel means
+/// thousands of events are already staged, and dropping one there would let
+/// a request flood erase its own audit trail.
 async fn record<A: CallerAuth>(shared: &Shared<A>, event: AuditEvent) {
     if shared.audit_tx.send(event).await.is_err() {
         tracing::warn!("helper-api audit sink closed; event dropped");

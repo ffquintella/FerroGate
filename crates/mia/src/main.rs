@@ -2271,16 +2271,10 @@ where
     let max_age = config.allowlist_max_age();
     let clock = system_clock();
 
-    // Audit sink: a forwarder task drains helper events. For now it logs them;
-    // CMIS forwarding rides on F07's `AppendAuditEvent` path (`audit_client`).
-    let (audit_tx, mut audit_rx) = mpsc::channel(256);
-    tokio::spawn(async move {
-        while let Some(event) = audit_rx.recv().await {
-            // Own target: the status endpoint's log buffer never holds audit
-            // events (they carry caller pid/uid/binary hashes and token jtis).
-            tracing::info!(target: mia::logbuf::AUDIT_TARGET, ?event, "helper-api audit event");
-        }
-    });
+    // Audit sink: the helper API and the allowlist sync push their events
+    // here; the forwarder (`mia::audit_forward`, started once the host
+    // credentials exist) logs, spools and forwards them to CMIS.
+    let (audit_tx, audit_rx) = mpsc::channel(mia::audit_forward::CHANNEL_CAPACITY);
 
     // Build the CMIS resolver once (static endpoint or SRV-discovered HA
     // cluster), shared by attestation, the allowlist fetch/propose, and the CRL
@@ -2328,6 +2322,30 @@ where
     // (F19 §7.1); a re-attestation fills them later if this start had none.
     let creds = mia::host_api::CredentialSlot::new();
     creds.set(session.as_ref().and_then(host_credentials));
+
+    // T291: every audit event is logged locally and, with CMIS configured,
+    // spooled (`0600`, state directory) and forwarded through
+    // `AppendAuditEvent`, signed with these credentials once they exist. An
+    // attested SVID binding no host-call key (TPM tier) can never sign one
+    // on this run: log only rather than grow a spool nothing drains.
+    let signs_host_calls = host_spiffe_id.is_none() || creds.get().is_some();
+    if resolver.is_some() && !signs_host_calls {
+        tracing::warn!(
+            "host SVID binds no host-call key; audit events are logged locally, not forwarded to CMIS"
+        );
+    }
+    let _audit_forwarder = mia::audit_forward::spawn(
+        audit_rx,
+        resolver
+            .clone()
+            .filter(|_| signs_host_calls)
+            .map(|r| mia::audit_forward::Forwarding {
+                api: Arc::new(mia::audit_forward::ResolverAuditApi::new(r)),
+                creds: creds.clone(),
+            }),
+        &config.audit_spool_path(),
+        mia::audit_forward::ForwarderConfig::default(),
+    );
     let minter = session.map(|s| s.minter);
     if minter.is_none() {
         tracing::warn!(
