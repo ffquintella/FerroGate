@@ -26,12 +26,15 @@ enum AuditEvent {
 rewrites a MIA configuration file non-interactively. It carries the file path,
 the invoking user id and the dotted *names* of the changed keys — never their
 values. Today it is appended to a local, append-only JSON-lines journal beside
-the configuration file (`config-audit.jsonl`); forwarding that journal to CMIS
-through `AppendAuditEvent` is a follow-up.
+the configuration file (`config-audit.jsonl`), which the daemon does not read:
+forwarding that journal to CMIS through `AppendAuditEvent` is a follow-up
+(T226). The daemon's own events are forwarded, see below.
 
-**Forwarding from hosts.** A MIA appends its own events (`LocalGrant`,
-`LocalDenied`, `ConfigChanged`) through `AppendAuditEvent`. Since 0.29.0 every
-forward is host-authenticated (F19 §7.1 `HostCallAuth`): the host presents its
+**Forwarding from hosts.** The MIA daemon appends its own events
+(`LocalGrant`, `LocalDenied`, `AllowlistSyncApplied`, `AllowlistSyncRejected`)
+through `AppendAuditEvent`. CMIS also accepts `ConfigChanged` from a host,
+but MIA does not send it yet (T226). Since 0.29.0 every forward is
+host-authenticated (F19 §7.1 `HostCallAuth`): the host presents its
 SVID and signs, with the machine key the SVID binds, a fresh single-use
 document `{v, host_uuid, issued_at, nonce, event_sha384}` under the context
 `ferrogate-audit-forward-v1`. CMIS refuses unsigned, stale (more than 300 s
@@ -39,6 +42,67 @@ off), replayed or tampered forwards, forwards from revoked hosts, and every
 event type a host does not produce, and rate-limits each host
 (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`). The leaf is the event bytes exactly as
 forwarded. See [operations.md](operations.md#audit-forwarding-from-hosts).
+
+**The MIA forwarder (T291).** The daemon logs every event it emits on the
+`mia::audit` tracing target, whether or not it can forward it: that local
+trail never reaches the status endpoint. With CMIS configured it also
+appends the event to a spool and forwards the spool to CMIS:
+
+- **Spool.** `audit-spool.jsonl` (`audit-spool-<env>.jsonl` for a named
+  environment) in the daemon's state directory (`/var/lib/ferrogate` on
+  Linux, the system configuration directory elsewhere), mode `0600`. One JSON
+  line per event holds the event's canonical CBOR (base64), a sequence number
+  and the time it was spooled; `{"v":1,"done":N}` lines mark events up to `N`
+  as finished. No SVID, signature or proof is stored: every attempt is signed
+  afresh, with a new nonce. Each append is flushed to disk; once finished
+  records outweigh pending ones the file is rewritten (temporary file,
+  `fsync`, rename).
+- **Order and retries.** One call at a time, oldest event first. When CMIS is
+  unreachable, times out or gives any other error, the event is kept and
+  retried with exponential backoff: 1 s doubling to 5 min, each delay
+  randomised between half and all of its value. `RESOURCE_EXHAUSTED
+  rate_limited` waits the `retry-after` seconds. A refused host proof keeps
+  the event: `UNAUTHENTICATED`, any `PERMISSION_DENIED` other than
+  `event_not_forwardable` (revoked SVID, host clock more than 300 s off,
+  `host_mismatch`) and any `INVALID_ARGUMENT` other than the two below (such
+  as `malformed_doc`, a proof document this CMIS cannot decode). It is retried
+  on the same backoff, and at once when new credentials appear.
+- **SVID expiry.** Forwarding needs an unexpired host SVID, and the daemon
+  does not renew it while running: the background re-attestation only runs
+  when attestation failed at start, and stops at its first success. Once the
+  SVID expires, forwarding holds (one warning, `host SVID expired`) until
+  the daemon re-attests, which today means a restart; events keep
+  being spooled, and beyond the cap the oldest are dropped.
+- **What is dropped.** Only CMIS's answers about the event itself drop it,
+  with a warning, so one bad event cannot block the queue:
+  `INVALID_ARGUMENT field_too_long` or `malformed audit event`, and
+  `PERMISSION_DENIED event_not_forwardable`. An event over 64 KiB of CBOR is
+  never spooled. Once the spool holds 10 000 events or 8 MiB, the oldest are
+  dropped, with a warning that gives the counts. Dropped events stay in the
+  local log.
+- **Restarts.** The spool is replayed before new events. A torn last line
+  (a crash mid-append) or a line that does not parse is skipped, never
+  fatal, and the file is rewritten clean. A file that cannot be read to its
+  end (an I/O error; on Windows, a file that is not administrator-only) is
+  never rewritten: it is renamed, unchanged, to
+  `<name>.unreadable-<unix time>` beside it (`0600`, not replayed, logged
+  at error with both paths) and a fresh spool starts. Until that rename
+  succeeds, new events are held in memory. Delivery is at least once: an event
+  acknowledged just before a crash can be sent again.
+- **Shutdown.** An event the forwarder has received but not yet appended
+  when the daemon stops is not spooled; it is already in the local log.
+  An event still queued in the channel at that instant is in neither (the
+  forwarder keeps the channel drained, so this is rare).
+- **No CMIS.** When CMIS is not configured (or misconfigured), events are
+  only logged: no spool is created or grown, and one left by an earlier run
+  is kept. An
+  attested SVID that binds no host-call key (the TPM tier today) cannot sign
+  forwards, so such a host also only logs.
+- **Back-pressure.** The helper API hands events over through a 256-slot
+  channel, which the forwarder drains at memory speed: disk writes and CMIS
+  calls run elsewhere, so issuing a token never waits on CMIS. The helper
+  waits only once a whole spool's worth of events is staged behind a stalled
+  disk. It never drops an event to keep going.
 
 **Application approvals (F19 §9).** CMIS records `AppRequestSubmitted`,
 `AppRequestAutoApproved`, `AppRequestApproved`, `AppRequestDenied`,
@@ -124,7 +188,7 @@ by checking the consistency proof; any deletion or reordering breaks it.
 | Cannot rewrite history | STH signed inside TEE with a key whose private half is not extractable |
 | Cross-replica consistency | Raft quorum must co-sign each STH before publication |
 | Public verifiability | STHs anchored to an external Merkle transparency log |
-| Local audit reaches global log | MIA-side events are forwarded to CMIS and absorbed into the same tree |
+| Local audit reaches global log | The MIA daemon spools its events (`0600`, bounded) and forwards them in order to CMIS, which absorbs them into the same tree; `ConfigChanged` from `mia setup` stays in its local journal for now (T226) |
 
 ## What is *not* audited
 

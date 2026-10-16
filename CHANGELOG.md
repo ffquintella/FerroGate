@@ -150,6 +150,33 @@ record them.
   allowlist file until that file's `not_after` and then fails closed. The RPC
   will be removed in a later release.
 
+### Fixed
+
+- Forward the MIA daemon's audit events to CMIS through a durable on-disk spool (S7, M33, T291)
+  The daemon only logged its `LocalGrant`, `LocalDenied`,
+  `AllowlistSyncApplied` and `AllowlistSyncRejected` events; nothing called
+  `AppendAuditEvent`, although `docs/audit.md` said MIA-side events reached
+  the CMIS tree. The new forwarder (`mia::audit_forward`) still logs every
+  event locally, appends it to `audit-spool[-<env>].jsonl` (`0600`, state
+  directory, flushed per append, at most 10 000 events or 8 MiB with the
+  oldest dropped first) and sends the spool in order, each attempt signed
+  afresh with the host's machine key. CMIS outages, timeouts and
+  `rate_limited` are retried (backoff 1 s to 5 min, jittered); refused host
+  proofs (`malformed_doc` and `host_mismatch` included) keep the event until
+  new credentials or the next retry; only CMIS's answers about the event
+  itself (`field_too_long`, `malformed audit event`,
+  `event_not_forwardable`) drop it, with a warning. The daemon does not
+  renew its SVID: once it expires, forwarding holds (one warning) until a
+  restart re-attests, and the cap drops the oldest events meanwhile. A
+  restart replays the spool; a torn last line is skipped, and a spool that
+  cannot be read to its end is renamed aside unchanged
+  (`.unreadable-<unix time>`), never rewritten. Without CMIS, or with an
+  SVID that binds no host-call key (TPM tier), events are only logged and no
+  spool is kept. The helper API still
+  waits for room instead of dropping an event, but the forwarder drains its
+  channel without waiting on disk or CMIS. `config-audit.jsonl` from
+  `mia setup` is still not forwarded (T226).
+
 ### Security
 
 - Upgrade rustls to 0.23.46 to fix RUSTSEC-2026-0346, -0347, -0348 and -0349 (S1, T5)
