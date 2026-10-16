@@ -39,11 +39,29 @@ following ones on this repository:
   FerroGate does (TEE sealing, attestation, SVID issuance, ceremonies),
   assume most changes fall in scope. Security findings from the skill
   are blocking: fix them or record the justification in the PR.
+- **`cortex-memory`** (persistent memory, Cortex MCP server
+  `hypermnesia-mcp`) — invoke it before answering "what did we decide",
+  "have we hit this before" or "why is X like this", and search once up
+  front when starting work in an area with history (a subsystem, a
+  recurring bug, a migration). Store with `remember` only decisions whose
+  reason will not survive in the diff, non-obvious fixes, costly dead ends
+  and user corrections; never routine progress. The repository, `git log`,
+  `ROADMAP.md` and `CHANGELOG.md` are authoritative: treat a recalled
+  memory as "true when written" and confirm any file, flag or symbol it
+  names before acting on it. Correct outdated memories by superseding
+  them, not deleting. Never store secrets, key material, tokens, TOTP
+  seeds or personal data (LGPD) in memory; if one slips in, remove it
+  with a hard `forget`. If the Cortex tools are not available in the
+  session, say so and continue without memory.
 
-The two compose: `agent-router` picks who does the work; the delegated
+The skills compose: `agent-router` picks who does the work; the delegated
 agent (or the coordinator, if inline) applies `fgv-desenvolvimento-seguro`
 while doing it. Security-sensitive reviews should be routed to the
-stronger model tier.
+stronger model tier. `cortex-memory` supplies prior context before the
+routing decision and records the lasting decisions once the work is
+verified. Lookups follow the router's rule of one code graph per
+project: Graphify when `graphify-out/` exists, otherwise Cortex's
+`unified_search`.
 
 ## Workflow
 
