@@ -224,8 +224,8 @@ revocation, epoch bump). `ferrogate admin groups` prints their permissions.
   attestation. A TPM-tier host is always answered `FAILED_PRECONDITION` and
   re-attests (its PCRs need a fresh quote).
 - With the 96 h SVID TTL floor, a renewal at 60 % of TTL is past the 24 h
-  window, so it is normally a full re-attestation. The MIA daemon does not
-  renew in the background yet: a restart re-attests (ROADMAP T291 follow-up).
+  window, so it is normally a full re-attestation. See
+  [Host SVID renewal in the daemon](#host-svid-renewal-in-the-daemon).
 - Refusals after authentication are audited as `AttestFail`
   (`rotate-tier-requires-attest`, `rotate-superseded`,
   `rotate-reattest-state-drift|epoch-bump|window-expired`,
@@ -233,6 +233,82 @@ revocation, epoch bump). `ferrogate admin groups` prints their permissions.
   only logged (`host_auth.failed`), like the other host methods.
 - Any PCR change detected at boot invalidates the cached SVID (sealing breaks)
   and forces full re-attestation.
+
+### Host SVID renewal in the daemon
+
+Since 0.30.0 (T294) the MIA daemon renews its host SVID while running; no
+restart is needed. Each environment runs one renewal task whenever CMIS is
+configured:
+
+- **When.** At 60 % of the SVID's lifetime, ±10 % jitter drawn per SVID, so
+  a fleet attested together does not renew together. After a renewal the
+  next one is at least 30 s away.
+- **How.** A host-key host whose last *full* attestation is more than 10
+  minutes inside CMIS's 24 h window renews with one host-signed `Rotate`
+  (same key, same child-signing `kid`; the sealed X.509-SVID is re-sealed).
+  Otherwise — always with real TTLs (96 h floor), always on the TPM tier —
+  it runs a full attestation with the configured backend. A refused
+  `Rotate` (`FAILED_PRECONDITION`, `NOT_FOUND`, `UNAUTHENTICATED`,
+  `PERMISSION_DENIED`, or any undocumented code) falls back to a full
+  attestation in the same attempt.
+- **Retries.** `UNAVAILABLE` (`store_unavailable`, CMIS unreachable),
+  time-outs and internal errors retry after 30 s × 2ⁿ⁻¹, jittered to
+  `[½, 1]`, at most 15 minutes and a quarter of the time left, and never
+  later than 60 s before expiry; `rate_limited` waits CMIS's `retry-after`
+  (at most 15 minutes, never past expiry). A host with no valid SVID (start-up
+  attestation failed, or the SVID expired) re-attests every 5 minutes; the
+  start-up attempt counts as the first.
+- **Swap.** A new SVID goes in force in a fixed order: host-call credentials
+  (allowlist sync, registration, audit forwarding), the child-token minter,
+  the status endpoint, then an allowlist sync (or, without the F19 sync, the
+  start-only fetch and reload) and, if `allowlist.propose` is on, the
+  proposals, which read the current SVID on every round.
+- **Fail closed.** If the SVID expires before a renewal succeeds (CMIS down
+  for its whole remaining lifetime, a suspended host), minting
+  (`no_host_svid`), host calls and proposals stop at expiry — checked against
+  the wall clock at least every minute — until a full attestation succeeds.
+- **Same key, same identity.** A renewal reopens the machine key and SVID
+  seed the daemon started with and never creates either: a key file that
+  vanished is refused (`machine_key_refused`; restore it from a backup). If a
+  full re-attestation comes back under another SPIFFE id (the host was
+  re-enrolled), the SVID is not put in force, minting stops, and the
+  environment's serve loop exits with an error — the process exits non-zero
+  when it serves one environment, so the service supervisor restarts it under
+  the new identity (with several environments the others keep serving).
+- **Not reloaded.** `SIGHUP` does not re-read the attestation settings
+  (`attestation.*`, `cmis.*`): renewals use the ones read at start; restart
+  to change them.
+- **Status.** A failing renewal leaves the phase *attested*: before the
+  renewal point the state stays `healthy`; past it, `svid_expiring` with the
+  failure's code (`cmis_unreachable`, `attestation_failed`, `host_rejected`,
+  `pin_mismatch`, `tpm_unavailable`, `machine_key_refused`), or
+  `svid_renewal_due` while an attempt is in flight. After expiry the state is
+  the attestation failure itself. The renewal point shown (`renews …`) is the
+  un-jittered 60 %, so a healthy host can report `svid_renewal_due` for up to
+  10 % of the TTL before its jittered renewal runs.
+- **Log lines** (target `mia`, never the JWS, keys or nonces):
+  - `host SVID renewal scheduled (60% of its lifetime, ±10% jitter)`
+    (`spiffe_id`, `expires_at`, `rotate`) at start, or
+    `no host SVID at startup; scheduling background re-attestation`
+    (`interval_secs`);
+  - `host SVID renewed; token minting and host calls use it` (`spiffe_id`,
+    `path` = `rotate` | `full_attestation`, `expires_at`,
+    `next_renewal_in_secs`);
+  - `CMIS refused the Rotate renewal; renewing with a full attestation`
+    (`code`, `reason`);
+  - `host SVID renewal (Rotate) failed; retrying` (warning; `code`,
+    `reason`) and `host SVID renewal (Rotate) rate limited; retrying later`
+    (warning; `retry_after_secs`); a failed full attestation logs its cause
+    as at start (`host-key attestation failed`, `could not connect to CMIS
+    for attestation`, …);
+  - `host SVID expired before it was renewed; token minting and host calls
+    are off until a full attestation succeeds` (warning; `spiffe_id`,
+    `expired_at`);
+  - `CMIS issued an SVID that is not valid now (check the host clock);
+    keeping the current one` (error);
+  - `CMIS issued an SVID for another host identity; it is not put in force …`
+    (error; `held`, `issued`), then `stopping the helper API: the host
+    identity changed`.
 
 ## RIM policy and epoch bump
 
@@ -351,9 +427,10 @@ The MIA daemon forwards through an on-disk spool (T291; behaviour in
   - `audit forwarding waits for a valid host SVID …` while no credentials
     exist yet;
   - `host SVID expired; audit events are held in the spool …` (warning,
-    once): the daemon does not renew its SVID while running, so restart it
-    to re-attest; until then events are spooled and, past the cap, the
-    oldest dropped;
+    once): the SVID ran out before the renewal task replaced it (see
+    [Host SVID renewal in the daemon](#host-svid-renewal-in-the-daemon)); it
+    keeps re-attesting every 5 minutes, and until it succeeds events are
+    spooled and, past the cap, the oldest dropped;
   - `audit forwarding over the CMIS rate limit` (`wait_secs`, `pending`), at
     most every 10 minutes;
   - `audit spool full; oldest events dropped` (`dropped`, `dropped_total`), at

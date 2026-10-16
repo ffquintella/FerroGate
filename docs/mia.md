@@ -50,6 +50,23 @@ Environment toggles for staged rollout and development:
 
 ## Operational state machine
 
+### Renewal while running
+
+The daemon renews its host SVID without a restart (T294, `mia::renewal`): one
+task per environment wakes at 60 % of the SVID's lifetime (±10 % jitter),
+renews with a host-signed `Rotate` when the host-key tier is still inside
+CMIS's 24 h window, and otherwise — the normal case with the 96 h TTL floor,
+and always on the TPM tier — runs a full attestation with the configured
+backend. The new SVID replaces, in order, the host-call credentials (allowlist
+sync, registration, audit forwarding), the child-token minter, the status
+endpoint's SVID, then triggers an allowlist sync. Failures retry with a
+bounded back-off; if the SVID expires anyway, minting and host calls stop
+until a full attestation succeeds (every 5 minutes). A renewal only reopens
+the machine key and seed the daemon started with, never creates them, and an
+SVID for another SPIFFE id is never put in force: the daemon exits with an
+error instead so its supervisor restarts it. Details, timings, status codes
+and log lines: [operations.md](operations.md#host-svid-renewal-in-the-daemon).
+
 ```
                 ┌──────────────────────────────┐
                 ▼                              │
@@ -98,7 +115,7 @@ The SVID and its composite private key are sealed using `TPM2_Create` against
 a policy over PCRs `{0, 4, 7, 8}`. On reboot:
 
 - If the unseal succeeds, the MIA continues with the cached SVID until
-  rotation is due.
+  rotation is due (see [Renewal while running](#renewal-while-running)).
 - If the unseal fails (PCR drift, lid open, kernel update), the cached SVID
   is treated as gone and a full re-attestation runs.
 
@@ -223,6 +240,7 @@ therefore treats `host-key.bin` and `svid-seed.bin` as follows
 | a file that is a symlink or not a regular file, group/other-accessible, owned by anyone else, unreadable, refused by the Windows trust check, the wrong length, or sealed to another fingerprint | **refuses it (fail closed)** and leaves it untouched: no SVID, status code `machine_key_refused`, and an `error` log naming the file and the fix (e.g. `chown`/`chmod 0600`, restore from backup) |
 | nothing, but the file is at a former location (Linux before 0.20.19: `/etc/ferrogate`) | the daemon moves it at start while still root — exclusive copy, `0600`, handed to `_ferrogate`, verified, then the old copy removed — and uses it; if the move fails it refuses rather than mint |
 | no key, but `svid-seed.bin` is still there (it is only ever created after the key, so the key was lost) | **refuses** to create a key: restore `host-key.bin` from backup, or — only for a deliberate re-enrollment after the CMIS operator cleared the pin — delete the seed too |
+| the key is gone while the daemon runs (seen by a renewal, T294) | **refuses** (`machine_key_refused`) and never creates one; the SVID in force keeps serving until it expires. A seed gone mid-run leaves the composite key ephemeral (the child-signing `kid` changes) and is never re-created |
 | nothing anywhere | creates it exclusively (`O_EXCL`, `0600`) and logs at `warn` that a new host identity was created |
 
 A refused file is retried at every re-attestation (every 5 minutes), so
@@ -1068,8 +1086,8 @@ Queued proposals are reviewed by an operator with `ferrogate allowlist
 proposals` / `review <host>` / `approve <host>` / `reject <host>`. Because a
 deny-all host denies (and therefore records) every legitimate caller, those
 denials are exactly the entries a first proposal carries. The presented SVID is
-the one obtained at startup, so proposals stop being accepted once it expires
-until mia restarts.
+the one in force when each proposal is sent, so a renewal (T294) reaches the
+proposals without a restart; a round without a valid SVID is skipped.
 
 The interactive wizard requires a TTY; for unattended provisioning
 (configuration management), write the TOML file directly from the template in
@@ -1266,7 +1284,12 @@ A snapshot carries the environment, its **state** (`healthy`, `attesting`,
 there is no endpoint), when it entered it, the SVID's SPIFFE ID / expiry /
 renewal point, the attestation backend, the CMIS node in use, the CRL age, the
 allowlist state (entry *count* and expiry only), the X.509-SVID store backend,
-a stable error code with a fixed message, and the agent version. It never
+a stable error code with a fixed message, and the agent version. The renewal
+point is the un-jittered 60 % of the SVID's lifetime and moves forward with
+every renewal. A failing renewal keeps the state `healthy` until that point;
+past it the state is `svid_expiring`, with the failure's code (for example
+`cmis_unreachable`) once an attempt failed, or `svid_renewal_due` while one
+is in flight; after expiry the attestation failure itself is reported. It never
 carries SVID or token bytes, signatures, key material, SPKI pins, `jti`s,
 helper-audit caller identities or allowlist contents.
 
@@ -1409,3 +1432,5 @@ allowlist           = "/etc/ferrogate/allowlist.toml"
 | SPKI pin mismatch | abort immediately; no TPM operations performed |
 | IMA disabled at runtime | abort immediately |
 | Cached SVID unseal fails | full re-attestation; not an error |
+| Host SVID renewal fails (T294) | retried with a bounded back-off while the SVID in force keeps serving; at expiry minting and host calls stop until a full attestation succeeds (every 5 min) |
+| Re-attestation returns another SPIFFE id | not put in force; minting stops; exit non-zero so the service manager restarts under the new identity |

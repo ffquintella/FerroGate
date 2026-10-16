@@ -65,6 +65,10 @@ and [../cmis.md](../cmis.md) §"gRPC surface".
       `mia/tests/swtpm_seal.rs` extends a sealed PCR and shows the unseal fails.)
 - [x] Rotation scheduler triggers at 60% of TTL with jitter.
       (`lifecycle::rotation_delay_secs`, `mia::scheduler`.)
+- [x] The MIA daemon renews its host SVID while running — `Rotate` inside
+      the window on the host-key tier, full attestation otherwise — and fails
+      closed at expiry (T294). (`mia::renewal::tests`,
+      `e2e_attest.rs::daemon_renews_host_svid_before_expiry`.)
 - [x] An expired SVID is refused by a reference verifier.
       (`ferro-svid-verify`; `ferro-svid/tests/verify_roundtrip.rs::expired_svid_is_refused`.)
 
@@ -95,5 +99,12 @@ Two seams are deliberately left for later milestones:
   superseded, expired and revoked SVIDs (see [../protocol.md](../protocol.md)
   §"Renewal vs re-attestation").
 - **Short path rarely used.** With the 96 h TTL floor and the 24 h window, a
-  scheduled renewal is normally a full re-attestation; renewing in the
-  running MIA daemon is a follow-up (ROADMAP T291 note).
+  scheduled renewal is normally a full re-attestation (decision D1 of T294:
+  the window stays; the daemon tries `Rotate` only inside it).
+- **Renewal in the running daemon (T294).** One task per environment
+  (`mia::renewal`) renews at the jittered 60 % point, swaps credentials,
+  minter, status and allowlist sync in a fixed order, retries with a bounded
+  back-off, switches minting off at expiry and stops the daemon if CMIS
+  issues another identity (see [../operations.md](../operations.md)
+  §"Host SVID renewal in the daemon"). Before 0.30.0 only a restart renewed
+  an expired SVID.

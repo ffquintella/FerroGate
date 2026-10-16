@@ -157,3 +157,13 @@ Because every SVID lifetime, the host-key one included, is floored at 96 h
 (`MIN_TTL_SECS`) while the window is 24 h, a host that rotates at 60 % of its
 TTL is past the window: renewal is then normally a full re-attestation, and
 the short path only serves renewals inside the first 24 h after an `Attest`.
+
+**Client behaviour (MIA, T294).** The daemon renews at 60 % of the TTL ±10 %
+jitter. It sends `Rotate` only on the host-key tier and only while its own
+record of the last full attestation is more than 10 minutes inside the 24 h
+window; otherwise it runs `Attest` directly. `FAILED_PRECONDITION`,
+`NOT_FOUND`, `UNAUTHENTICATED`, `PERMISSION_DENIED` and any undocumented code
+send it to `Attest` at once; `UNAVAILABLE` and time-outs retry with a capped,
+jittered back-off (30 s doubling, ≤ 15 min, never later than 60 s before
+expiry); `RESOURCE_EXHAUSTED` waits `retry-after`. It never retries the
+superseded SVID and never sends `current_svid`.

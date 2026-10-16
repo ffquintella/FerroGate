@@ -10,6 +10,8 @@
 //! `BASE64URL(header) "." BASE64URL(payload)` — but under a distinct signing
 //! context and `typ` so an SVID and a child token can never be confused.
 
+use std::sync::Arc;
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ferro_crypto::composite::{CompositeError, CompositeSecretKey, COMPOSITE_JOSE_ALG};
@@ -104,8 +106,13 @@ pub struct MintedToken {
 }
 
 /// Mints child tokens with the host composite SVID key.
+///
+/// The key is shared, never copied: [`Self::with_parent`] and `clone` hand
+/// out another minter over the same key (an SVID renewal re-parents the
+/// minter without moving the secret, T294).
+#[derive(Clone)]
 pub struct ChildTokenMinter {
-    secret: CompositeSecretKey,
+    secret: Arc<CompositeSecretKey>,
     cfg: MinterConfig,
 }
 
@@ -113,7 +120,34 @@ impl ChildTokenMinter {
     /// Build a minter from the host SVID secret key and its config.
     #[must_use]
     pub fn new(secret: CompositeSecretKey, cfg: MinterConfig) -> Self {
+        Self::from_shared(Arc::new(secret), cfg)
+    }
+
+    /// Build a minter over a key shared with its owner (the renewal state
+    /// keeps the same key to re-seal the X.509-SVID after a `Rotate`).
+    #[must_use]
+    pub fn from_shared(secret: Arc<CompositeSecretKey>, cfg: MinterConfig) -> Self {
         Self { secret, cfg }
+    }
+
+    /// The same minter, naming `parent_svid_sha384` as its parent SVID: what a
+    /// `Rotate` renewal needs, since the renewed SVID certifies the same
+    /// composite key (same `kid`) under a new JWS.
+    #[must_use]
+    pub fn with_parent(&self, parent_svid_sha384: [u8; 48]) -> Self {
+        Self {
+            secret: Arc::clone(&self.secret),
+            cfg: MinterConfig {
+                parent_svid_sha384,
+                ..self.cfg.clone()
+            },
+        }
+    }
+
+    /// `SHA-384` of the parent host SVID, raw.
+    #[must_use]
+    pub fn parent_svid_sha384(&self) -> [u8; 48] {
+        self.cfg.parent_svid_sha384
     }
 
     /// The host SPIFFE id this minter issues under (used by the F11 CRL gate to
@@ -273,6 +307,24 @@ mod tests {
         let a = m.mint("aud", "jkt", 60, &actor(), 0).unwrap();
         let b = m.mint("aud", "jkt", 60, &actor(), 0).unwrap();
         assert_ne!(a.jti, b.jti);
+    }
+
+    #[test]
+    fn with_parent_keeps_the_key_and_names_the_new_parent() {
+        // A renewed SVID (T294) certifies the same composite key: the minter
+        // keeps signing with it and only the parent digest changes.
+        let (m, pk) = minter();
+        let renewed = m.with_parent([0x44; 48]);
+        assert_eq!(renewed.parent_cert_sha_hex(), hex::encode([0x44; 48]));
+        assert_eq!(m.parent_cert_sha_hex(), hex::encode([0x33; 48]));
+        assert_eq!(renewed.host_spiffe_id(), m.host_spiffe_id());
+        let t = renewed.mint("aud", "jkt", 60, &actor(), 0).unwrap();
+        let (header, claims, si, sig_bytes) = split(&t.jws);
+        assert_eq!(header.kid, "host-kid-1");
+        assert_eq!(claims.ferrogate.parent_svid, hex::encode([0x44; 48]));
+        let sig = CompositeSignature::from_concat_bytes(&sig_bytes).unwrap();
+        pk.verify(CHILD_TOKEN_SIGNING_CONTEXT, si.as_bytes(), &sig)
+            .expect("still signed by the host key");
     }
 
     #[test]

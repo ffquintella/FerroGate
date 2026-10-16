@@ -628,7 +628,8 @@ async fn sleep_or_new_creds(
 enum CredsWait {
     /// No credentials yet (attestation pending or failed).
     Missing,
-    /// The host SVID expired; MIA does not renew it while running.
+    /// The host SVID in the slot expired: the renewal task (T294) has not
+    /// replaced it yet and takes it out of the slot at expiry.
     Expired,
 }
 
@@ -654,7 +655,7 @@ fn log_creds_wait(why: CredsWait, pending: usize) {
         ),
         CredsWait::Expired => tracing::warn!(
             pending,
-            "host SVID expired; audit events are held in the spool until the daemon re-attests (restart it), the oldest dropped beyond the cap"
+            "host SVID expired; audit events are held in the spool until the agent renews it (it keeps re-attesting in the background), the oldest dropped beyond the cap"
         ),
     }
 }

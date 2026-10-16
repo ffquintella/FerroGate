@@ -14,11 +14,11 @@
 |---|---|
 | Sistema | FerroGate / CMIS, MIA, CLI `ferrogate`, TUI `ferrogate-tui` (novo binário) e SDK |
 | Nível de classificação (1–4) | Proposta: 4 para a superfície administrativa e o ledger de aprovações (contém nomes de usuário, SIDs e caminhos — dado pessoal, F19 §10) — pendente de confirmação pelo ESI |
-| Versão | 0.30.0 — funcionalidade nova; **sem quebra** enquanto o modo permanecer `legacy`, exceto `Rotate`, que passa a exigir prova de host (T293; nenhum MIA publicado chama `Rotate`) |
+| Versão | 0.30.0 — funcionalidade nova; **sem quebra** enquanto o modo permanecer `legacy`, exceto `Rotate`, que passa a exigir prova de host (T293; nenhum MIA publicado antes chama `Rotate`; o daemon desta versão envia a prova, T294) |
 | Tag no controle de versão | `releases/v0.30.0` (a criar no release) |
 | Data prevista de publicação | A definir |
 | Requisição de mudança (nº) | Não informada |
-| Especificação | F19 (`docs/features/F19-app-registration-approval.md`, §2–§11), ADR-0004, F20 §7 (tabela de permissões); marcos M37 (T263–T271), M38 (T272–T274) e M39 (T275–T279; F21, `docs/features/F21-admin-tui.md`) do `ROADMAP.md`; T293 (M33; F04, `docs/protocol.md` §"Renewal vs re-attestation") |
+| Especificação | F19 (`docs/features/F19-app-registration-approval.md`, §2–§11), ADR-0004, F20 §7 (tabela de permissões); marcos M37 (T263–T271), M38 (T272–T274) e M39 (T275–T279; F21, `docs/features/F21-admin-tui.md`) do `ROADMAP.md`; T293 e T294 (M33; F04, `docs/protocol.md` §"Renewal vs re-attestation") |
 
 O ROADMAP previa F19 na 0.29; a 0.29.0 foi publicada só com a Fase 0 da F20
 (autenticação administrativa), por isso F19 sai na 0.30.0.
@@ -94,7 +94,29 @@ validade nem revogação da SVID apresentada (oráculo de emissão).
 | `crates/cmis/tests/rotate_host_auth.rs` (novo), `crates/mia/tests/e2e_attest.rs` | 24 testes de integração; e2e migrado para o nível host-key | NRM §5.3.7 |
 | `docs/protocol.md`, `cmis.md`, `operations.md`, `networking.md`, F04, F20, `CHANGELOG.md`, `ROADMAP.md`, este documento | Documentação | NRM §5.3.1 |
 
+### T294 — renovação da SVID do host no daemon MIA (M33)
+
+O daemon atestava só na partida; ao expirar a SVID continuava emitindo
+tokens filhos sob um pai expirado, e o encaminhamento de auditoria, a
+sincronização de allowlist e o registro paravam até um reinício.
+
+| Arquivo / módulo | Natureza da alteração | Motivo |
+|---|---|---|
+| `crates/mia/src/renewal/` (novo: `mod.rs`, `schedule.rs`, `swap.rs`, `tests.rs`) | Máquina de estados da renovação (60 % do TTL ±10 %; `Rotate` só no nível host-key dentro da janela de 24 h, senão `Attest` completo; novas tentativas limitadas; desligamento na expiração; troca de identidade fatal) e a troca de credenciais em ordem fixa | Falha segura (NRM §5.3.5), tentativas limitadas |
+| `crates/mia/src/main.rs` | `DaemonRenewer` e `spawn_renewal_task` substituem `spawn_reattest_task`; inicialização reporta o estado; propostas leem a SVID corrente; `serve` retorna erro em troca de identidade | Integração no daemon |
+| `crates/mia/src/machine_key.rs` | `open_machine_key` / `load_seed` (só abrem, nunca criam); motivo `Vanished` | A renovação nunca cria uma identidade nova |
+| `crates/mia/src/helper/token.rs` | Chave compartilhada (`Arc`) e `ChildTokenMinter::with_parent` | Re-parentar o emissor sem copiar a chave |
+| `crates/mia/src/status.rs`, `audit_forward/mod.rs` | `renewal_started` / `renewal_failed` (fase continua *attested*; códigos estáveis); texto da espera por SVID expirada | Estado e log sem dados sensíveis (NRM §5.3.10) |
+| `crates/mia/tests/e2e_attest.rs` | `daemon_renews_host_svid_before_expiry` (CMIS real) | NRM §5.3.7 |
+| `docs/operations.md`, `mia.md`, `audit.md`, `protocol.md`, F04, `CHANGELOG.md`, `ROADMAP.md`, este documento | Documentação, inclusive as linhas de log | NRM §5.3.1 |
+
 ## Impacto e compatibilidade
+
+- **Renovação no daemon (T294):** sem configuração nova. Um host com CMIS
+  configurada renova sozinho; com o piso de 96 h, normalmente por `Attest`
+  completo a cada ~2,4 dias (±10 %), o que aumenta a carga de atestação na
+  CMIS em relação a hosts que nunca reiniciavam. Ao expirar sem renovação,
+  o MIA deixa de emitir tokens (`no_host_svid`) em vez de continuar.
 
 - **`Rotate` (T293):** um cliente que chame `Rotate` sem a prova recebe
   `UNAUTHENTICATED host_auth_failed`; o nível TPM sempre recebe
@@ -183,6 +205,10 @@ pseudonimização do ledger seguem pendentes de definição pelo DPO (T289).
   na CLI) ficam para depois. Os códigos
   de motivo de negação (1–6) e de revogação (1–5) são definidos pela TUI e
   documentados em `docs/operations.md`.
+- Renovação (T294): o ponto de renovação mostrado pelo status é o de 60 %
+  sem jitter, então um host saudável pode mostrar `svid_renewal_due` por até
+  10 % do TTL; com vários ambientes, uma troca de identidade encerra só o
+  ambiente afetado; o `SIGHUP` não relê as configurações de atestação.
 - `Rotate` (T293): o cache de nonces, o limitador e o conjunto de revogação
   são por nó, como nos demais métodos de host. Com o piso de 96 h da SVID e a
   janela de 24 h, a renovação agendada é normalmente um `Attest` completo. A
@@ -200,6 +226,7 @@ pseudonimização do ledger seguem pendentes de definição pelo DPO (T289).
 | Ledger (`cargo test -p ferro-raft --test app_ledger legacy`) | Aprovada — termos da importação, idempotência, validação, trigger da migração 3 | 2026-10-15 |
 | CLI (`cargo test -p ferrogate-cli --test admin_cli migrate`) | Aprovada | 2026-10-15 |
 | T293 (`cargo test -p cmis rotate`, `-p ferro-svid host_call`, `-p mia --test e2e_attest`, `make lint`) | Aprovada (ver relatório do T293) | 2026-10-16 |
+| T294 (`cargo test -p mia renew`, `-p mia --lib`, `-p mia --test e2e_attest`, `make lint`, `make test`) | Ver relatório do T294 | 2026-10-16 |
 | Verificação de segurança do ESI antes da produção | Pendente | — |
 
 ## Autorizações

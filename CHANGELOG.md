@@ -57,6 +57,32 @@ record them.
   imports they admit again, and needs confirmation (`--yes` when not on a
   terminal; `confirm_rollback` on the RPC). `GetAllowlistMode` lets any
   administrator session read the mode.
+- Renew the MIA daemon's host SVID while it runs, and fail closed if it expires anyway (S4, S7, S18, M33, T294)
+  Until now the daemon attested once at start (the background task only
+  retried a failed start) and, at expiry, kept minting child tokens under
+  the expired parent while audit forwarding, the allowlist sync and
+  registration stopped until a restart. One long-lived task per environment
+  (`mia::renewal`, `main.rs::DaemonRenewer`) now renews at 60 % of the TTL
+  ±10 % jitter: with a host-signed `Rotate` on the host-key tier while the
+  last full attestation is more than 10 minutes inside the 24 h window,
+  with a full attestation otherwise (the usual case with the 96 h TTL floor,
+  and always on the TPM tier). Refusals fall back to a full attestation;
+  transient errors retry after 30 s doubling, at most 15 min and a quarter
+  of the time left, never later than 60 s before expiry; `rate_limited`
+  waits `retry-after`; without a valid SVID it re-attests every 5 min. A new
+  SVID swaps the host-call credentials, the minter
+  (`ChildTokenMinter::with_parent`, same key and `kid` after a `Rotate`, the
+  X.509-SVID re-sealed), the status and the allowlist sync in that order; the
+  allowlist proposals read the current SVID every round. At expiry minting
+  and host calls stop until a full attestation succeeds, checked against the
+  wall clock at least every minute. Renewals reopen the machine key and seed
+  the daemon started with and never create them
+  (`machine_key::{open_machine_key, load_seed}`, `Unusable::Vanished`). A
+  full re-attestation under another SPIFFE id is never put in force: minting
+  stops and the environment's serve loop returns an error so the supervisor
+  restarts the daemon. The status endpoint keeps a host whose renewal fails
+  *attested* (`StatusHandle::renewal_started` / `renewal_failed`) and, past
+  the renewal point, reports `svid_expiring` with the failure's stable code.
 - Write the 0.30.0 change document and the legacy-allowlist migration runbook (S56, M38, T274)
   `docs/change-v0.30.0.md` (FGV *documento de mudança*) and the runbook in
   `docs/operations.md`; `docs/cmis.md`, `docs/allowlist-provisioning.md`,
@@ -115,8 +141,8 @@ record them.
   1–3600; zero or garbage aborts startup, larger values are capped). Every
   authenticated call spends one unit, refused or not. `mia::client::rotate`
   and `rotate_request` build the host-signed request from the machine key,
-  the current SVID and the state digest; the MIA daemon does not call them
-  yet (background renewal is the T291 follow-up).
+  the current SVID and the state digest; the MIA daemon calls them for its
+  background renewal (T294).
 
 ### Changed
 
@@ -126,7 +152,8 @@ record them.
   `ferrogate-rotate-v1`. `current_svid` is optional and must be empty or equal
   `auth.svid_jws`; `pcr_values` and `known_epoch` are deprecated and ignored.
   The fields are wire-compatible additions, but a client that does not send
-  the proof is now refused (see Security); no shipped MIA calls `Rotate`.
+  the proof is now refused (see Security); no earlier MIA calls `Rotate`,
+  and this release's daemon sends the proof (T294).
   `CmisState::update_bundle` is deprecated in favour of
   `replace_bundle_if_current`, which re-checks the stored SVID inside the
   write (`Cluster::replace_svid_if_unchanged`, a compare-and-swap).
@@ -188,9 +215,10 @@ record them.
   proofs (`malformed_doc` and `host_mismatch` included) keep the event until
   new credentials or the next retry; only CMIS's answers about the event
   itself (`field_too_long`, `malformed audit event`,
-  `event_not_forwardable`) drop it, with a warning. The daemon does not
-  renew its SVID: once it expires, forwarding holds (one warning) until a
-  restart re-attests, and the cap drops the oldest events meanwhile. A
+  `event_not_forwardable`) drop it, with a warning. The daemon renews its
+  SVID while running (T294); if it expires anyway, forwarding holds (one
+  warning) until a re-attestation succeeds, and the cap drops the oldest
+  events meanwhile. A
   restart replays the spool; a torn last line is skipped, and a spool that
   cannot be read to its end is renamed aside unchanged
   (`.unreadable-<unix time>`), never rewritten. Without CMIS, or with an
