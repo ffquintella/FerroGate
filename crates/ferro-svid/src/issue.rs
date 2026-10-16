@@ -155,6 +155,14 @@ impl Issuer {
         &self.public
     }
 
+    /// The host SPIFFE id [`Issuer::issue`] stamps as `sub` for an EK
+    /// certificate digest (or host-key fingerprint), in this issuer's trust
+    /// domain. Lets a caller check the subject (e.g. against revocations)
+    /// before anything is signed.
+    pub fn host_spiffe_id(&self, ek_cert_sha384: &[u8; 48]) -> Result<String, SpiffeError> {
+        spiffe::spiffe_host_id(&self.trust_domain, ek_cert_sha384)
+    }
+
     /// The X.509-SVID trust bundle: this issuer's self-signed signing
     /// certificate, DER-encoded.
     ///
@@ -249,7 +257,7 @@ impl Issuer {
         let nbf = iat - crate::NBF_LOOKBACK_SECS;
         let exp = iat + i64::try_from(ttl).unwrap_or(i64::from(u32::MAX));
 
-        let sub = spiffe::spiffe_host_id(&self.trust_domain, &params.ek_cert_sha384)?;
+        let sub = self.host_spiffe_id(&params.ek_cert_sha384)?;
         let iss = spiffe::spiffe_issuer_id(&self.trust_domain)?;
 
         let claims = SvidClaims {
@@ -349,6 +357,16 @@ mod tests {
                 &sig,
             )
             .expect("signature verifies under issuer key");
+    }
+
+    #[test]
+    fn host_spiffe_id_is_the_subject_issue_stamps() {
+        let issuer = Issuer::generate("kid-1", "ferrogate.test").unwrap();
+        let svid = issuer.issue(&params(), 1_000_000).unwrap();
+        assert_eq!(
+            issuer.host_spiffe_id(&params().ek_cert_sha384).unwrap(),
+            svid.spiffe_id
+        );
     }
 
     #[test]

@@ -109,6 +109,45 @@ under is in `SVIDBundle.x509_bundle` and in the JWKS
 A client may use either profile or both; they name the same identity and expire
 together.
 
+### Revoked hosts (T295)
+
+On both tiers, once the CSR signature has verified (the host has proven
+possession of its keys) and before its child key is published or anything is
+signed, CMIS derives the subject SPIFFE id exactly as it would stamp it and
+refuses the attestation when the revocation working set holds a `RevokeHost`
+entry for it:
+
+- the stream ends with `PERMISSION_DENIED host_revoked`;
+- the refusal is audited as `AttestFail { reason: "attest-host-revoked" }`;
+- nothing is issued and the stored record is left as it was.
+
+The reason code is returned, unlike other quote failures, because the host has
+already authenticated and the CRL that names it is public. A `RevokeSvid`
+entry does not block re-attestation: that is how a host recovers from one
+leaked SVID. The SPIFFE id comes from the EK certificate digest (TPM tier) or
+the machine fingerprint (host-key tier), so re-imaging or re-enrolling the same
+hardware keeps the same id, and the host stays refused.
+
+Known limits:
+
+- **Per node.** The revocation working set is in memory on each CMIS node
+  (`CmisState::revoke`; replication is T223). A replica that did not receive
+  the `RevokeHost` still issues to the host, and a node restart clears its
+  set. Until T223 lands, issue `RevokeHost` on every replica, and again on a
+  replica after it restarts.
+- **Expiry.** A host entry expires `CRL_ENTRY_TTL_SECS` (30 days, the maximum
+  SVID lifetime) after its `revoked_at` and is pruned at the next CRL publish.
+  The host can attest again after that. Issuing `RevokeHost` again refreshes
+  `revoked_at`.
+- **No un-revoke.** No RPC lifts a host revocation (follow-up T296). See
+  `docs/operations.md` §"Revocation" for the operator procedure.
+- **Client retries.** The MIA treats `PERMISSION_DENIED` from `Attest` as
+  "not enrolled" and keeps trying; each attempt is refused and audited.
+  While its revoked SVID is still valid, the renewal loop backs off from 30 s,
+  doubling up to 15 minutes and never more than a quarter of the time left
+  (`Rotate` is refused by host authentication, which sends it to `Attest`).
+  Once the SVID has expired it retries about every 5 minutes (±10 %).
+
 ## Renewal vs re-attestation
 
 - **Renewal** (host-key tier only, ≤24 h since the last full attestation,

@@ -10,7 +10,8 @@
 //!   (T293), and an epoch bump forces it back through `Attest`;
 //! - a TPM-tier host is always sent back to a full `Attest`;
 //! - the daemon's renewal loop renews before expiry and keeps minting and
-//!   forwarding under the renewed SVID (T294).
+//!   forwarding under the renewed SVID (T294);
+//! - a host revoked by SPIFFE id cannot re-attest on the TPM tier (T295).
 
 #![allow(clippy::cast_possible_truncation)]
 // The handshake future holds a composite key (incl. a ~4 KB ML-DSA secret)
@@ -709,6 +710,44 @@ async fn bump_epoch_forces_full_reattestation_on_next_rotate() {
     )
     .await
     .expect("renewal works again after re-attesting under epoch 2");
+}
+
+// --- T295: a revoked host cannot re-attest ------------------------------------
+
+#[tokio::test]
+async fn attest_refuses_revoked_host_tpm_tier() {
+    let mut evidence = VirtualTpm::ephemeral().unwrap();
+    let state = build_state(&evidence).await;
+    let mut client = spawn_server(Arc::clone(&state)).await;
+
+    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+        .await
+        .expect("an unrevoked TPM host attests");
+    state.revoke(
+        ferro_svid::RevocationTarget::Host {
+            spiffe_id: attested.bundle.spiffe_id.clone(),
+        },
+        "compromised",
+        attested.bundle.issued_at,
+    );
+
+    // The full four-phase handshake runs (the quote and credential are
+    // genuine), but no SVID is issued to the revoked SPIFFE id and its new
+    // child key is not published.
+    let keys_before = state.published_jwks().keys.len();
+    let Err(mia::client::AttestClientError::Transport(status)) =
+        run_attest(&mut client, &mut evidence, "dpop-thumb".to_string()).await
+    else {
+        panic!("a revoked host must be refused by the RPC");
+    };
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(status.message(), cmis::service::HOST_REVOKED);
+    let stored = state
+        .lookup(&attested.bundle.spiffe_id)
+        .await
+        .expect("record kept");
+    assert_eq!(stored.bundle.jws, attested.bundle.jws, "nothing new stored");
+    assert_eq!(state.published_jwks().keys.len(), keys_before);
 }
 
 // --- F13: fleet enrolment pre-admission -------------------------------------

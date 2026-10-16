@@ -545,6 +545,22 @@ impl CmisState {
         }
     }
 
+    /// Whether the revocation working set names the host `spiffe_id` itself
+    /// (a [`RevocationTarget::Host`] entry; an SVID-only revocation does not
+    /// count). Consulted by `Attest` before issuing, so a revoked host cannot
+    /// obtain a fresh SVID by re-attesting (T295).
+    ///
+    /// Process-local like the working set itself (see [`CmisState::revoke`]),
+    /// and an entry stops counting once [`CmisState::publish_crl`] prunes it.
+    #[must_use]
+    pub fn is_host_revoked(&self, spiffe_id: &str) -> bool {
+        self.revocations
+            .lock()
+            .entries
+            .iter()
+            .any(|e| matches!(&e.target, RevocationTarget::Host { spiffe_id: s } if s == spiffe_id))
+    }
+
     /// Whether the revocation working set names the host `spiffe_id` or the
     /// SVID whose compact-JWS digest is `svid_cert_sha` (lowercase-hex
     /// SHA-384). Consulted by host call authentication ([`crate::host_auth`])

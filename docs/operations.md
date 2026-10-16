@@ -375,7 +375,11 @@ configured:
   - `RevokeSvid(cert_sha, reason)` — revoke one SVID by the lowercase-hex
     `SHA-384` of its compact JWS.
   - `RevokeHost(spiffe_id, reason)` — revoke every SVID and child token for a
-    host.
+    host. It also stops the host from obtaining a new SVID: `Attest` refuses
+    a revoked host with `PERMISSION_DENIED host_revoked`, audited
+    `AttestFail { reason: "attest-host-revoked" }` (T295), so the host
+    cannot undo the revocation by re-attesting or through the MIA renewal
+    loop.
   Each revocation is recorded in the audit log (`SvidRevoked` / `HostRevoked`,
   with the reason opcode) and republishes the CRL immediately, so the change
   reaches consumers within one publish cycle rather than after the next tick.
@@ -384,9 +388,25 @@ configured:
   host. The independent reference verifier (`ferro-svid-verify`) likewise
   rejects a revoked SVID, requiring a fresh, signature-valid CRL to make the
   decision.
-- CRL entries are pruned once they age past the 1 h max SVID TTL: a revoked
-  artefact can never reappear after expiry, so dropping the entry bounds CRL
-  growth.
+- CRL entries are pruned once they age past `CRL_ENTRY_TTL_SECS` (30 days,
+  the maximum SVID lifetime) after `revoked_at`: a revoked artefact can never
+  reappear after expiry, so dropping the entry bounds CRL growth. For a host
+  entry this also ends the `Attest` refusal: the host can attest again after
+  30 days unless `RevokeHost` is issued again, which refreshes `revoked_at`.
+- The revocation working set is in memory on each CMIS node (replication is
+  T223). Issue `RevokeHost` / `RevokeSvid` on every replica, and again on a
+  replica after it restarts, or a replica without the entry keeps issuing to
+  the host.
+- **Bringing back a revoked host.** No RPC lifts a revocation (follow-up
+  T296). The host's SPIFFE id comes from its EK certificate digest (TPM) or
+  machine fingerprint (host-key), so re-imaging or re-enrolling the same
+  hardware keeps the revoked id. Until T296, the host attests again only once
+  the entry expires (30 days after the last `RevokeHost`), or under a new
+  identity (replacement TPM or hardware, which also means updating the fleet
+  manifest and, on the host-key tier, the pre-registered key). Restarting
+  CMIS nodes to clear the in-memory set also drops every other revocation, so
+  it is not a recovery procedure. Record the decision and the evidence that
+  the host is clean before it attests again.
 - For mass revocation (compromised RIM generation, vulnerable kernel image),
   the operator bumps the policy epoch via `BumpEpoch` — see "RIM policy and
   epoch bump" above. Every host attested under the old epoch re-attests at its

@@ -1358,6 +1358,7 @@ dependencies = [
  "ferro-attest",
  "ferro-audit",
  "ferro-crypto",
+ "ferro-machineid",
  "ferro-proto",
  "ferro-raft",
  "ferro-sep",
