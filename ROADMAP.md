@@ -787,8 +787,8 @@ changes on workstations.
   - note: Phase 2: worst state wins, per-environment detail; endpoint → `mia status` → `NotRunning` fallback; notifications with de-duplication and rate limiting.
 - [x] T210 Add tray windows for status, recovery, setup, logs and diagnostics (S18)
   - note: Phase 2: egui, no web view; guided recovery over a closed set of fixed `mia` commands with OS-consent elevation (`pkexec` / macOS admin prompt / UAC; cancel ⇒ "cancelled"), setup wizard on private `0600` drafts, log viewer, diagnostics bundle; English and Portuguese.
-- [/] T211 Ship `mia-tray` in the macOS, Windows and Linux packages (S18)
-  - note: Wired into `pkg-macos` (LaunchAgent), `pkg-win` (Startup entry) and the opt-in Linux `ferrogate-mia-tray` package (XDG autostart, polkit policy, status group); the package builds have not been run yet.
+- [x] T211 Ship `mia-tray` in the macOS, Windows and Linux packages (S18)
+  - note: Builds run 2026-10-16 at 0.29.0. `pkg-macos`: `FerroGate MIA.app` (signature verified), LaunchAgent, postinstall status group. `pkg-win`: `mia-tray.exe` (now GUI-subsystem, build-gated) plus the HKLM `Run` entry in the MSI. `pkg-deb`: tray inside `ferrogate-mia`, checked by `check-deb-package.sh` in the v0.29.0 release run. `pkg-rpm-tray`: built and `dnf install`ed next to the agent RPM on Fedora 41 (deps resolve, `%post` adds the installer to `ferrogate-status`, `rpm -V` clean). Not run on real desktops: that is T213–T215.
 - [x] T212 Ship the macOS tray as the `FerroGate MIA.app` bundle (S18, S30)
 - [ ] T213 Drive every `AgentState` from the daemon's e2e harness (S18)
 - [ ] T214 Test per platform that a peer outside the status group cannot connect (S18)

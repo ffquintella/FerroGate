@@ -176,6 +176,24 @@ record them.
   waits for room instead of dropping an event, but the forwarder drains its
   channel without waiting on disk or CMIS. `config-audit.jsonl` from
   `mia setup` is still not forwarded (T226).
+
+- Stop the Windows tray from opening console windows at logon and on every `mia` call (S18, M31, T211)
+  `mia-tray.exe` was linked for the console subsystem, so the `Run` entry the
+  MSI installs opened a console window next to the tray at every logon, and
+  each `--window` it opened got one too. It is now a GUI-subsystem binary
+  (`--help` / `--version` print only when stdout is redirected), and the
+  captured children it starts (`mia status --json`, recovery and setup
+  commands, the UAC wrapper) run with `CREATE_NO_WINDOW`.
+  `scripts/build-msi-amd64.sh` fails the build if `mia-tray.exe` is not a
+  GUI-subsystem PE.
+
+- Make the Windows package build work again by installing its tools with `--locked` (S18, M31, T211)
+  `make pkg-win` stopped at `cargo install cargo-xwin`: every `zip` 8.x
+  release that cargo-xwin's `xwin` dependency accepts has been yanked, so an
+  unlocked install could not resolve. cargo-xwin, cargo-generate-rpm and
+  cargo-deb are now installed with `--locked` (their published lock files) in
+  the build scripts, `make pkg-tools` and the release workflow.
+
 ### Security
 
 - Upgrade rustls to 0.23.46 to fix RUSTSEC-2026-0346, -0347, -0348 and -0349 (S1, T5)

@@ -223,7 +223,9 @@ it as `ferrogate-mia` in the hicolor icon theme on Linux. The menu-bar icon
 itself is the state disc drawn in `src/icon.rs`.
 
 `MIA_TRAY=0 make pkg-macos` / `MIA_TRAY=0 make pkg-win` build the agent
-packages without the tray. On Linux the tray needs a StatusNotifierItem host:
+packages without the tray. On Windows `mia-tray.exe` is a GUI-subsystem
+program (no console window at logon), so `mia-tray --help` / `--version` print
+only when stdout is redirected (`mia-tray --version | more`). On Linux the tray needs a StatusNotifierItem host:
 KDE, Xfce, Cinnamon and most others have one; GNOME needs the
 "AppIndicator and KStatusNotifierItem Support" extension.
 

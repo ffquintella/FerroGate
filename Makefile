@@ -395,7 +395,7 @@ MIA_TRAY  ?= 1
 TRAY_DIST := crates/mia-tray/dist
 
 pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
-	cargo install cargo-deb cargo-generate-rpm
+	cargo install --locked cargo-deb cargo-generate-rpm
 	@echo "NOTE: the Windows MSI + NuGet package build in a linux/amd64 container ('make pkg-win'); only Docker is required."
 	@echo "NOTE: the macOS .pkg builds on macOS ('make pkg-macos')."
 

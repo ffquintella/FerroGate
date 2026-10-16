@@ -4,6 +4,10 @@
 //! from the library (see `mia_tray::gui`).
 
 #![forbid(unsafe_code)]
+// A GUI-subsystem binary on Windows: started from the `Run` key at logon (or
+// as `--window <kind>` by the tray itself) it must not open a console window.
+// `--help` / `--version` then print only when stdout is redirected.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::process::ExitCode;
 

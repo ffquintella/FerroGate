@@ -17,7 +17,7 @@ docker run --rm --platform linux/amd64 \
   rust:bookworm bash -euo pipefail -c '
     apt-get update -qq
     apt-get install -y -qq libtss2-dev pkg-config protobuf-compiler >/dev/null
-    cargo install cargo-generate-rpm --quiet
+    cargo install cargo-generate-rpm --locked --quiet
     cargo build --release -p mia --bin mia ${MIA_FEATURES:+--features "$MIA_FEATURES"}
     strip target/release/mia
     cargo generate-rpm -p crates/mia -a x86_64

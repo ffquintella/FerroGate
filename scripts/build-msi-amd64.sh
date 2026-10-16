@@ -59,7 +59,7 @@ docker run --rm --platform linux/amd64 \
     apt-get update -qq
     apt-get install -y -qq clang lld llvm nasm cmake pkg-config protobuf-compiler ca-certificates >/dev/null
     rustup target add x86_64-pc-windows-msvc
-    cargo install cargo-xwin --quiet
+    cargo install cargo-xwin --locked --quiet
     cargo xwin build --release -p mia --bin mia --target x86_64-pc-windows-msvc
     # The mia-tray desktop companion (feature F18). Optional: MIA_TRAY=0
     # skips it, and a failed cross-compile only drops it from the MSI.
@@ -71,6 +71,15 @@ docker run --rm --platform linux/amd64 \
   '
 BINDIR=target/x86_64-pc-windows-msvc/release
 [ -f "$BINDIR/mia.exe" ] || { echo "ERROR: $BINDIR/mia.exe was not produced" >&2; exit 1; }
+
+# The tray starts from the Run key at logon: a console-subsystem build would
+# open a console window next to it. PE Subsystem (u16 at e_lfanew + 0x5C):
+# 2 = Windows GUI, 3 = console.
+if [ -f "$BINDIR/mia-tray.exe" ]; then
+  pe_off=$(od -An -tu4 -j60 -N4 "$BINDIR/mia-tray.exe" | tr -d ' ')
+  subsystem=$(od -An -tu2 -j$((pe_off + 92)) -N2 "$BINDIR/mia-tray.exe" | tr -d ' ')
+  [ "$subsystem" = 2 ] || { echo "ERROR: $BINDIR/mia-tray.exe has PE subsystem $subsystem, expected 2 (Windows GUI)" >&2; exit 1; }
+fi
 
 # ── Stage 2: build the MSI (wixl) and the Chocolatey/NuGet package ────────────
 echo "==> [2/2] building MSI + NuGet package in fedora…"

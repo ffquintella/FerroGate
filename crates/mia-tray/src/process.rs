@@ -90,6 +90,7 @@ pub fn run_bounded(mut cmd: Command, limits: Limits) -> std::io::Result<Captured
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    hide_console(&mut cmd);
     let mut child = cmd.spawn()?;
     let (tx, rx) = mpsc::channel::<(bool, Vec<u8>, bool)>();
     for (is_out, pipe) in [
@@ -174,6 +175,38 @@ pub fn run_bounded(mut cmd: Command, limits: Limits) -> std::io::Result<Captured
         }
     }
     Ok(out)
+}
+
+/// `CREATE_NO_WINDOW` (`winbase.h`): the child gets no console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// On Windows, start a captured console child (`mia.exe`, `sc.exe`,
+/// `powershell.exe`) without a console window of its own: the tray is a
+/// GUI-subsystem process, so Windows would otherwise flash one up for every
+/// `mia status` poll or action. Elsewhere this does nothing.
+fn hide_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn captures_a_child_started_without_a_console() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "echo out& exit 3"]);
+        let r = run_bounded(cmd, Limits::QUICK).unwrap();
+        assert_eq!(r.code, Some(3));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("out"));
+    }
 }
 
 #[cfg(all(test, unix))]
