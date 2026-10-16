@@ -714,6 +714,7 @@ milestone has no single release; it includes unreleased work.
 - [x] T182 Upgrade hiqlite to 0.15.0 in `ferro-raft` (S5)
 - [x] T183 Raise the workspace MSRV to 1.95
 - [x] T184 Make the `mia-tray` workflow and `cargo deny` pass again (#44, #45)
+- [x] T292 Document the `cortex-memory` skill in `AGENTS.md`
 
 ## [M29] TPM-less host-key attestation (F15)
 > outcome: A host without a TPM attests with a hardware-fingerprint identity and a non-exportable Secure Enclave key, its SVID cache is sealed by the Enclave, and the daemon's Enclave key persists across restarts.

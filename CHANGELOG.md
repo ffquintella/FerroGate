@@ -137,6 +137,10 @@ record them.
   round trip. A pre-F19 proposal's coverage and duplicates are checked with
   two reads per call, and more than 4096 distinct entries are refused
   (`INVALID_ARGUMENT too_many_entries`).
+- Document the `cortex-memory` skill for AI assistants in `AGENTS.md` (M28, T292)
+  When to recall and when to store, verifying recalled claims against the
+  repository, superseding rather than deleting, never storing secrets or
+  personal data, and how it composes with `agent-router`.
 
 ### Deprecated
 
