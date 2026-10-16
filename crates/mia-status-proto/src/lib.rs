@@ -381,7 +381,8 @@ pub struct SvidSummary {
     pub spiffe_id: String,
     /// Expiry, Unix seconds.
     pub not_after: i64,
-    /// The proactive renewal point (60% of the TTL), Unix seconds.
+    /// The proactive renewal point, Unix seconds: 60% of the TTL, ±10%
+    /// jitter as the daemon scheduled it (un-jittered from older daemons).
     pub renew_at: i64,
 }
 
@@ -481,6 +482,9 @@ pub mod error_codes {
     /// refuses to replace it. An operator must repair or restore the file; the
     /// daemon log names the file and the fix.
     pub const MACHINE_KEY_REFUSED: &str = "machine_key_refused";
+    /// CMIS issued this host an SVID for another SPIFFE id (it was
+    /// re-enrolled): the environment stopped serving; restart the agent.
+    pub const HOST_IDENTITY_CHANGED: &str = "host_identity_changed";
     /// IMA appraisal is required but not enforced.
     pub const IMA_DISABLED: &str = "ima_disabled";
     /// The cached CRL is stale or absent.

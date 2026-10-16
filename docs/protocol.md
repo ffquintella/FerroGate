@@ -165,5 +165,8 @@ window; otherwise it runs `Attest` directly. `FAILED_PRECONDITION`,
 `NOT_FOUND`, `UNAUTHENTICATED`, `PERMISSION_DENIED` and any undocumented code
 send it to `Attest` at once; `UNAVAILABLE` and time-outs retry with a capped,
 jittered back-off (30 s doubling, ≤ 15 min, never later than 60 s before
-expiry); `RESOURCE_EXHAUSTED` waits `retry-after`. It never retries the
-superseded SVID and never sends `current_svid`.
+expiry); `RESOURCE_EXHAUSTED` waits `retry-after`. After 3 consecutive
+transient failures, or in the last quarter of the SVID's lifetime, it runs
+`Attest` instead. A `Rotate` gets 60 s and an `Attest` 2 minutes, both cut
+short at expiry. It never retries the superseded SVID and never sends
+`current_svid`.

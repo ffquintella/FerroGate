@@ -90,8 +90,22 @@ pub struct MinterConfig {
     pub host_spiffe_id: String,
     /// `SHA-384` of the parent host SVID.
     pub parent_svid_sha384: [u8; 48],
+    /// The parent SVID's expiry (Unix seconds): no token is minted from it
+    /// on, and none outlives it.
+    pub parent_expires_at: i64,
     /// Key id of the host SVID signing key in the published JWKS.
     pub kid: String,
+}
+
+/// Why a token was not minted.
+#[derive(Debug, thiserror::Error)]
+pub enum MintError {
+    /// The parent host SVID has expired (fail closed: `no_host_svid`).
+    #[error("the parent host SVID has expired")]
+    ParentExpired,
+    /// Signing failed.
+    #[error("sign: {0}")]
+    Sign(#[from] CompositeError),
 }
 
 /// A minted token plus the bits the helper server needs for audit and reply.
@@ -130,18 +144,37 @@ impl ChildTokenMinter {
         Self { secret, cfg }
     }
 
-    /// The same minter, naming `parent_svid_sha384` as its parent SVID: what a
-    /// `Rotate` renewal needs, since the renewed SVID certifies the same
-    /// composite key (same `kid`) under a new JWS.
+    /// The same minter, parented on the SVID with digest `parent_svid_sha384`
+    /// expiring at `parent_expires_at`: what a `Rotate` renewal needs, since
+    /// the renewed SVID certifies the same composite key (same `kid`).
     #[must_use]
-    pub fn with_parent(&self, parent_svid_sha384: [u8; 48]) -> Self {
+    pub fn with_parent(&self, parent_svid_sha384: [u8; 48], parent_expires_at: i64) -> Self {
         Self {
             secret: Arc::clone(&self.secret),
             cfg: MinterConfig {
                 parent_svid_sha384,
+                parent_expires_at,
                 ..self.cfg.clone()
             },
         }
+    }
+
+    /// The parent SVID's expiry, Unix seconds.
+    #[must_use]
+    pub fn parent_expires_at(&self) -> i64 {
+        self.cfg.parent_expires_at
+    }
+
+    /// Whether the parent SVID is still valid at `now`.
+    #[must_use]
+    pub fn parent_valid_at(&self, now: i64) -> bool {
+        now < self.cfg.parent_expires_at
+    }
+
+    /// The key id tokens are published under.
+    #[must_use]
+    pub fn kid(&self) -> &str {
+        &self.cfg.kid
     }
 
     /// `SHA-384` of the parent host SVID, raw.
@@ -166,8 +199,9 @@ impl ChildTokenMinter {
 
     /// Mint a token for `actor`, bound to `audience` and `dpop_jkt`.
     ///
-    /// `ttl_secs` is clamped to [`MAX_CHILD_TTL_SECS`]; `now` is the reference
-    /// clock in Unix seconds. The `jti` is freshly drawn from the OS CSPRNG.
+    /// `ttl_secs` is clamped to [`MAX_CHILD_TTL_SECS`] and the token never
+    /// outlives its parent SVID; `now` is the reference clock in Unix
+    /// seconds. The `jti` is freshly drawn from the OS CSPRNG.
     ///
     /// # Panics
     ///
@@ -180,9 +214,12 @@ impl ChildTokenMinter {
         ttl_secs: u32,
         actor: &CallerIdentity,
         now: i64,
-    ) -> Result<MintedToken, CompositeError> {
+    ) -> Result<MintedToken, MintError> {
+        if !self.parent_valid_at(now) {
+            return Err(MintError::ParentExpired);
+        }
         let ttl = ttl_secs.min(MAX_CHILD_TTL_SECS);
-        let exp = now + i64::from(ttl);
+        let exp = (now + i64::from(ttl)).min(self.cfg.parent_expires_at);
 
         let mut jti = [0u8; 16];
         UnwrapErr(SysRng).fill_bytes(&mut jti);
@@ -241,6 +278,7 @@ mod tests {
         let cfg = MinterConfig {
             host_spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
             parent_svid_sha384: [0x33; 48],
+            parent_expires_at: i64::MAX,
             kid: "host-kid-1".into(),
         };
         (ChildTokenMinter::new(sk, cfg), pk)
@@ -314,7 +352,8 @@ mod tests {
         // A renewed SVID (T294) certifies the same composite key: the minter
         // keeps signing with it and only the parent digest changes.
         let (m, pk) = minter();
-        let renewed = m.with_parent([0x44; 48]);
+        let renewed = m.with_parent([0x44; 48], 5000);
+        assert_eq!(renewed.parent_expires_at(), 5000);
         assert_eq!(renewed.parent_cert_sha_hex(), hex::encode([0x44; 48]));
         assert_eq!(m.parent_cert_sha_hex(), hex::encode([0x33; 48]));
         assert_eq!(renewed.host_spiffe_id(), m.host_spiffe_id());
@@ -325,6 +364,30 @@ mod tests {
         let sig = CompositeSignature::from_concat_bytes(&sig_bytes).unwrap();
         pk.verify(CHILD_TOKEN_SIGNING_CONTEXT, si.as_bytes(), &sig)
             .expect("still signed by the host key");
+    }
+
+    #[test]
+    fn mint_refuses_once_the_parent_svid_expired() {
+        // T294 review: the minter itself fails closed at its parent's expiry,
+        // whatever the renewal task is doing.
+        let (m, _pk) = minter();
+        let m = m.with_parent([0x33; 48], 1000);
+        assert!(m.parent_valid_at(999) && !m.parent_valid_at(1000));
+        assert!(m.mint("aud", "jkt", 60, &actor(), 999).is_ok());
+        assert!(matches!(
+            m.mint("aud", "jkt", 60, &actor(), 1000),
+            Err(MintError::ParentExpired)
+        ));
+    }
+
+    #[test]
+    fn child_exp_is_clamped_to_the_parent_expiry() {
+        let (m, _pk) = minter();
+        let m = m.with_parent([0x33; 48], 1000);
+        let t = m.mint("aud", "jkt", 300, &actor(), 900).unwrap();
+        assert_eq!(t.exp, 1000);
+        let (_h, claims, _si, _sig) = split(&t.jws);
+        assert_eq!(claims.exp, 1000);
     }
 
     #[test]

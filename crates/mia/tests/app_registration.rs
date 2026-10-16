@@ -152,6 +152,7 @@ fn minter() -> ChildTokenMinter {
         MinterConfig {
             host_spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
             parent_svid_sha384: [0x33; 48],
+            parent_expires_at: i64::MAX,
             kid: "host-kid-1".into(),
         },
     )

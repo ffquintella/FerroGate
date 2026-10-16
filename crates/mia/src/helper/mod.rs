@@ -37,7 +37,7 @@ pub use auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
 pub use crl::{CrlCache, CrlGate};
 pub use ledger::CallerLedger;
 pub use proto::{ChildToken, ErrorCode, HelperReq, HelperResp};
-pub use token::{ChildTokenMinter, MintedToken, MinterConfig, MAX_CHILD_TTL_SECS};
+pub use token::{ChildTokenMinter, MintError, MintedToken, MinterConfig, MAX_CHILD_TTL_SECS};
 
 #[cfg(any(unix, windows))]
 pub use server::{

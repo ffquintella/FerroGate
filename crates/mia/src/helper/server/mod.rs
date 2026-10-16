@@ -463,6 +463,12 @@ async fn process_request<A: CallerAuth>(
     };
 
     let now = (shared.clock)();
+    // An expired parent SVID mints nothing (fail closed), even before the
+    // renewal task takes it out (T294).
+    if !minter.parent_valid_at(now) {
+        deny(shared, id.pid, id.uid, id.bin_sha, "no-host-svid").await;
+        return err(ErrorCode::NoHostSvid, None);
+    }
 
     // 3.5 CRL gate (feature F11). Fail closed on a missing/stale CRL, and refuse
     //     to mint if this host has been revoked. Checked before allowlisting so

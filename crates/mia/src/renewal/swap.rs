@@ -77,6 +77,7 @@ impl HostSvid {
             MinterConfig {
                 host_spiffe_id: bundle.spiffe_id.clone(),
                 parent_svid_sha384: jws_sha384(&bundle.jws),
+                parent_expires_at: bundle.expires_at,
                 kid,
             },
         );
@@ -99,7 +100,9 @@ impl HostSvid {
     #[must_use]
     pub fn rotated(&self, bundle: SvidBundle) -> Self {
         Self {
-            minter: self.minter.with_parent(jws_sha384(&bundle.jws)),
+            minter: self
+                .minter
+                .with_parent(jws_sha384(&bundle.jws), bundle.expires_at),
             spiffe_id: bundle.spiffe_id,
             jws: bundle.jws,
             issued_at: bundle.issued_at,

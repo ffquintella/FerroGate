@@ -54,6 +54,9 @@ pub enum AttestFailure {
     /// pinned the key's public half — so an operator must repair or restore
     /// the file. See [`crate::machine_key`].
     MachineKey,
+    /// A full attestation returned an SVID for another SPIFFE id (the host
+    /// was re-enrolled, T294): not put in force; the environment stops.
+    IdentityChanged,
     /// Anything else (protocol error, an unexpected local problem).
     Other,
 }
@@ -227,6 +230,10 @@ fn failure_state(f: AttestFailure) -> (AgentState, Option<ErrorSummary>) {
             AgentState::CmisUnreachable,
             error_codes::MACHINE_KEY_REFUSED,
         ),
+        AttestFailure::IdentityChanged => (
+            AgentState::CmisUnreachable,
+            error_codes::HOST_IDENTITY_CHANGED,
+        ),
         AttestFailure::Other => (AgentState::CmisUnreachable, error_codes::ATTESTATION_FAILED),
     };
     (state, Some(summary(code)))
@@ -254,6 +261,10 @@ pub fn message_for(code: &str) -> &'static str {
         error_codes::MACHINE_KEY_REFUSED => {
             "the machine key or SVID seed exists but cannot be used; the agent will not \
              replace it (CMIS has pinned it) — repair or restore the file named in the agent log"
+        }
+        error_codes::HOST_IDENTITY_CHANGED => {
+            "CMIS issued this host a new identity; this environment stopped serving — restart \
+             the mia service to serve the new identity"
         }
         error_codes::IMA_DISABLED => {
             "IMA appraisal is required but not enforced; the agent refuses to start"
@@ -441,6 +452,16 @@ impl StatusHandle {
                 not_after: expires_at,
                 renew_at,
             });
+        });
+    }
+
+    /// Report `at` (Unix seconds) as the SVID's renewal point: the jittered
+    /// time the renewal task actually renews at (T294). No-op without an SVID.
+    pub fn set_renew_at(&self, at: i64) {
+        self.with(|s| {
+            if let Some(svid) = s.svid.as_mut() {
+                svid.renew_at = at;
+            }
         });
     }
 
@@ -647,6 +668,7 @@ mod tests {
             (AttestFailure::PinMismatch, AgentState::PinMismatch),
             (AttestFailure::TpmUnavailable, AgentState::TpmUnavailable),
             (AttestFailure::MachineKey, AgentState::CmisUnreachable),
+            (AttestFailure::IdentityChanged, AgentState::CmisUnreachable),
             (AttestFailure::Other, AgentState::CmisUnreachable),
         ] {
             let mut o = h.clone();
@@ -715,6 +737,30 @@ mod tests {
         assert_eq!(err.code, error_codes::MACHINE_KEY_REFUSED);
         assert_ne!(err.message, message_for("no-such-code"));
         assert!(err.message.contains("will not"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_identity_change_has_its_own_code_and_fixed_message() {
+        // T294 review: an environment that stopped because CMIS issued
+        // another identity says so (the tray shows the message).
+        let (state, err) = failure_state(AttestFailure::IdentityChanged);
+        let err = err.unwrap();
+        assert_eq!(state, AgentState::CmisUnreachable);
+        assert_eq!(err.code, error_codes::HOST_IDENTITY_CHANGED);
+        assert!(err.message.contains("restart"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn the_renewal_point_follows_the_renewal_schedule() {
+        let h = attested_handle();
+        h.set_renew_at(NOW + 2300);
+        assert_eq!(h.observe().await.svid.unwrap().renew_at, NOW + 2300);
+        // Not "renewal due" before the scheduled (jittered) point.
+        assert_eq!(h.snapshot(NOW + 2200).await.state, AgentState::Healthy);
+        // Without an SVID there is nothing to move.
+        let empty = StatusHandle::new(DEFAULT_ENVIRONMENT_LABEL, NOW);
+        empty.set_renew_at(NOW);
+        assert!(empty.observe().await.svid.is_none());
     }
 
     #[test]

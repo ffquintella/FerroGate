@@ -978,19 +978,23 @@ pub fn load_or_create_seed(path: &Path) -> Result<Seed, SeedError> {
 }
 
 /// Read the existing SVID seed at `path` for an SVID renewal in the running
-/// daemon (T294); never create one. `None` when there is none — the run fell
-/// back to an ephemeral composite key and keeps doing so.
+/// daemon (T294); never create one. `None` when there is none and the run
+/// does not depend on one (it uses an ephemeral composite key).
 ///
 /// # Errors
 ///
-/// [`SeedError::Refused`] for a seed that exists but cannot be used, or one
-/// stranded at a legacy location.
-pub fn load_seed(path: &Path) -> Result<Option<[u8; 32]>, SeedError> {
-    load_seed_with(path, &StateFile::SvidSeed.legacy_paths())
+/// [`SeedError::Refused`] for a seed that exists but cannot be used, one
+/// stranded at a legacy location, or — with `required` — one that vanished.
+pub fn load_seed(path: &Path, required: bool) -> Result<Option<[u8; 32]>, SeedError> {
+    load_seed_with(path, &StateFile::SvidSeed.legacy_paths(), required)
 }
 
 /// [`load_seed`] with explicit legacy locations.
-fn load_seed_with(path: &Path, legacy: &[PathBuf]) -> Result<Option<[u8; 32]>, SeedError> {
+fn load_seed_with(
+    path: &Path,
+    legacy: &[PathBuf],
+    required: bool,
+) -> Result<Option<[u8; 32]>, SeedError> {
     let file = StateFile::SvidSeed;
     let refused = |reason: Unusable| {
         SeedError::Refused(Refusal {
@@ -1001,6 +1005,7 @@ fn load_seed_with(path: &Path, legacy: &[PathBuf]) -> Result<Option<[u8; 32]>, S
     };
     match plan_at(file, path, legacy) {
         Plan::Open { .. } => read_seed(path).map(Some).map_err(refused),
+        Plan::Create if required => Err(refused(Unusable::Vanished)),
         Plan::Create => Ok(None),
         Plan::Migrate { from } => Err(refused(Unusable::NotMigrated { legacy: from })),
         Plan::Refuse(r) => Err(SeedError::Refused(r)),
@@ -1501,16 +1506,25 @@ mod tests {
         let dir = scratch("seed-open-only");
         let path = dir.join("svid-seed.bin");
         // Absent (this run fell back to an ephemeral key): stays absent.
-        assert!(load_seed_with(&path, &[]).unwrap().is_none());
+        assert!(load_seed_with(&path, &[], false).unwrap().is_none());
+        assert!(!path.exists(), "nothing was created");
+        // Absent although the SVID in force came from it: refused.
+        assert!(matches!(
+            load_seed_with(&path, &[], true),
+            Err(SeedError::Refused(Refusal {
+                reason: Unusable::Vanished,
+                ..
+            }))
+        ));
         assert!(!path.exists(), "nothing was created");
         let Seed::Created(created) = load_or_create_seed_with(&path, &[]).unwrap() else {
             panic!("first call creates");
         };
-        assert_eq!(load_seed_with(&path, &[]).unwrap(), Some(created));
+        assert_eq!(load_seed_with(&path, &[], true).unwrap(), Some(created));
         std::fs::remove_file(&path).unwrap();
         create_exclusive(&path, b"short").unwrap();
         assert!(matches!(
-            load_seed_with(&path, &[]),
+            load_seed_with(&path, &[], false),
             Err(SeedError::Refused(Refusal {
                 reason: Unusable::Malformed { .. },
                 ..

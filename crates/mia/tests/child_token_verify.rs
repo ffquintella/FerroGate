@@ -63,6 +63,7 @@ fn minted_token_verifies_under_reference_verifier_and_enforces_dpop() {
         MinterConfig {
             host_spiffe_id: "spiffe://ferrogate.prod/host/abc".into(),
             parent_svid_sha384: [0x55; 48],
+            parent_expires_at: i64::MAX,
             kid: kid.clone(),
         },
     );

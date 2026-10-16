@@ -4,7 +4,7 @@
 //! Healthy: the jittered 60 % point of the TTL. After `n` failures with the
 //! SVID still valid: [`RETRY_BASE`] × 2ⁿ⁻¹, jittered, capped at [`RETRY_CAP`]
 //! and a quarter of the time left, never later than [`EXPIRY_MARGIN_SECS`]
-//! before expiry. Without a valid SVID: every [`REATTEST_INTERVAL`].
+//! before expiry. Without a valid SVID: every [`REATTEST_INTERVAL`] ±10 %.
 
 use std::time::Duration;
 
@@ -89,7 +89,7 @@ pub fn rotate_allowed(now: i64, last_full_attest_at: i64) -> bool {
 )] // whole seconds of a back-off capped at 15 min
 pub fn next_wait(now: i64, iat: i64, exp: i64, failures: u32, jitter_unit: f64) -> Duration {
     if now >= exp {
-        return REATTEST_INTERVAL;
+        return reattest_wait(jitter_unit);
     }
     if failures == 0 {
         return delay_until_rotation(now, iat, exp, jitter_unit);
@@ -97,10 +97,24 @@ pub fn next_wait(now: i64, iat: i64, exp: i64, failures: u32, jitter_unit: f64) 
     let left = exp - now;
     let base = RETRY_BASE
         .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
-        .min(RETRY_CAP);
+        .min(RETRY_CAP)
+        .min(secs(left / 4));
+    // Jittered after the caps, so a fleet near expiry does not retry in step.
     let jittered = (base.as_secs() as f64 * (0.5 + 0.5 * jitter_unit.clamp(0.0, 1.0))) as u64;
-    let cap = RETRY_CAP.min(secs(left / 4));
-    bound_before_expiry(Duration::from_secs(jittered).min(cap), left)
+    bound_before_expiry(Duration::from_secs(jittered), left)
+}
+
+/// The wait between full attestations of a host without a valid SVID:
+/// [`REATTEST_INTERVAL`] ±10 %, whole seconds.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)] // whole seconds around 300
+pub fn reattest_wait(jitter_unit: f64) -> Duration {
+    let factor = 0.9 + 0.2 * jitter_unit.clamp(0.0, 1.0);
+    Duration::from_secs((REATTEST_INTERVAL.as_secs() as f64 * factor) as u64)
 }
 
 /// The wait after a rate-limited `Rotate`: the server's `retry-after`,

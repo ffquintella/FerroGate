@@ -780,95 +780,67 @@ async fn unenrolled_host_is_rejected_before_quote_verification() {
 
 // --- T294: the daemon renews its host SVID while running -------------------
 
-/// The daemon's renewal wiring against a real CMIS: `Rotate` and full
-/// attestation with the host-key tier, swapped through [`mia::renewal::Swap`].
-struct E2eRenewer {
+/// The host-key backend against the in-process CMIS, as the daemon's
+/// attestor: records the key policy of every call; `facts` can be switched
+/// to make CMIS issue another identity.
+struct E2eAttestor {
     client: MachineIdentityClient<tonic::transport::Channel>,
-    facts: ferro_machineid::MachineFacts,
+    facts: std::sync::Mutex<ferro_machineid::MachineFacts>,
     key: Arc<SoftwareMachineKey>,
     seed: [u8; 32],
-    swap: mia::renewal::Swap,
-    current: mia::renewal::HostSvid,
-    paths: Arc<std::sync::Mutex<Vec<mia::renewal::RenewalPath>>>,
+    policies: Arc<std::sync::Mutex<Vec<mia::renewal::KeyPolicy>>>,
 }
 
-/// The [`mia::renewal::HostSvid`] a host-key attestation yields.
-fn host_svid_of(attested: AttestedSvid, key: &Arc<SoftwareMachineKey>) -> mia::renewal::HostSvid {
+/// The [`mia::renewal::Attested`] a seeded host-key attestation yields.
+fn attested_of(attested: AttestedSvid, key: &Arc<SoftwareMachineKey>) -> mia::renewal::Attested {
     let kid = ferro_svid::child_signing_kid(&attested.svid_public);
     let key: Arc<dyn ferro_sep::MachineKey + Send + Sync> = key.clone();
-    mia::renewal::HostSvid::new(
-        attested.bundle,
-        Arc::new(attested.svid_secret),
-        kid,
-        Some(key),
-    )
+    mia::renewal::Attested {
+        svid: mia::renewal::HostSvid::new(
+            attested.bundle,
+            Arc::new(attested.svid_secret),
+            kid,
+            Some(key),
+        ),
+        seeded: true,
+    }
 }
 
-impl mia::renewal::Renewer for E2eRenewer {
-    type Credential = mia::renewal::HostSvid;
-
-    fn rotate(
-        &mut self,
-    ) -> futures::future::BoxFuture<
-        '_,
-        Result<mia::renewal::Issued<mia::renewal::HostSvid>, tonic::Status>,
-    > {
-        Box::pin(async move {
-            let digest = *self.facts.fingerprint().as_bytes();
-            let svid =
-                mia::renewal::rotate_host_svid(&mut self.client, &self.current, &digest).await?;
-            Ok(mia::renewal::Issued {
-                info: svid.info(),
-                credential: svid,
-            })
-        })
-    }
-
-    fn full_attest(
-        &mut self,
-    ) -> futures::future::BoxFuture<
-        '_,
-        Result<mia::renewal::Issued<mia::renewal::HostSvid>, mia::status::AttestFailure>,
-    > {
+impl mia::renewal::HostAttestor for E2eAttestor {
+    fn attest(
+        &self,
+        policy: mia::renewal::KeyPolicy,
+    ) -> futures::future::BoxFuture<'_, Result<mia::renewal::Attested, mia::status::AttestFailure>>
+    {
+        self.policies.lock().unwrap().push(policy);
+        let facts = self.facts.lock().unwrap().clone();
+        let mut client = self.client.clone();
         Box::pin(async move {
             let attested = run_attest_host_key(
-                &mut self.client,
-                &self.facts,
+                &mut client,
+                &facts,
                 &*self.key,
                 jkt_of(&self.key),
                 Some(&self.seed),
             )
             .await
             .map_err(|e| mia::status::AttestFailure::from_attest_error(&e, false))?;
-            let svid = host_svid_of(attested, &self.key);
-            Ok(mia::renewal::Issued {
-                info: svid.info(),
-                credential: svid,
-            })
+            Ok(attested_of(attested, &self.key))
         })
     }
+}
 
-    fn install(
-        &mut self,
-        svid: mia::renewal::HostSvid,
-        path: mia::renewal::RenewalPath,
-    ) -> futures::future::BoxFuture<'_, ()> {
-        Box::pin(async move {
-            self.swap.install(&svid).await;
-            self.current = svid;
-            self.paths.lock().unwrap().push(path);
-        })
-    }
+/// Records the SVIDs the refresh after a swap saw.
+#[derive(Clone, Default)]
+struct RecordingHooks(Arc<std::sync::Mutex<Vec<String>>>);
 
-    fn after_install(
-        &mut self,
-        _path: mia::renewal::RenewalPath,
-    ) -> futures::future::BoxFuture<'_, ()> {
+impl mia::renewal::RenewalHooks for RecordingHooks {
+    fn after_install<'a>(
+        &'a mut self,
+        svid: &'a mia::renewal::HostSvid,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        self.0.lock().unwrap().push(svid.jws.clone());
         Box::pin(async {})
-    }
-
-    fn disable(&mut self) -> futures::future::BoxFuture<'_, ()> {
-        Box::pin(async move { self.swap.disable().await })
     }
 }
 
@@ -905,22 +877,43 @@ fn mint_with(live: &LiveMinter, now: i64) -> (String, String) {
     (header.kid, claims.ferrogate.parent_svid)
 }
 
+/// The sealed X.509 leaf at `path`, opened with `fingerprint`.
+fn sealed_leaf(path: &std::path::Path, fingerprint: &[u8], now: i64) -> Vec<u8> {
+    mia::credstore::with_sealer(Some(fingerprint), |sealer| {
+        mia::credstore::load(path, sealer, now)
+    })
+    .expect("a sealer")
+    .expect("the store opens")
+    .expect("a credential is stored")
+    .credential
+    .leaf_der
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one renewal lifecycle, step by step.
 async fn daemon_renews_host_svid_before_expiry() {
     use ferro_audit::{AuditEvent, Hash384};
+    use mia::renewal::{KeyPolicy, RenewalPath, X509Sealer as _};
 
     let state = host_key_state().await;
     let mut client = spawn_server(Arc::clone(&state)).await;
     let facts = sample_facts();
+    let fingerprint = facts.fingerprint().as_bytes().to_vec();
     let key = Arc::new(SoftwareMachineKey::generate().unwrap());
     let seed = [7u8; 32];
+    let dir = std::env::temp_dir().join(format!("mia-e2e-renew-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    let store_path = dir.join("x509-svid.sealed");
 
-    // Start-up: a full host-key attestation; the swap puts it in force.
+    // Start-up, as `serve` does it: attest, seal, swap in.
     let attested = run_attest_host_key(&mut client, &facts, &*key, jkt_of(&key), Some(&seed))
         .await
         .unwrap();
-    let first = host_svid_of(attested, &key);
+    let first = attested_of(attested, &key);
+    let store = mia::renewal::X509Store::new(store_path.clone(), Some(fingerprint.clone()));
+    store.seal(&first.svid).expect("sealed at start");
     let creds = mia::host_api::CredentialSlot::new();
     let live = Arc::new(LiveMinter::default());
     let cell = mia::renewal::SvidCell::new();
@@ -929,18 +922,11 @@ async fn daemon_renews_host_svid_before_expiry() {
         Arc::clone(&live) as Arc<dyn mia::renewal::MinterSink>,
         cell.clone(),
     );
-    swap.install(&first).await;
-    let (start_kid, start_parent) = mint_with(&live, first.issued_at);
-    assert_eq!(
-        start_parent,
-        hex::encode(Sha384::digest(first.jws.as_bytes()))
-    );
+    swap.install(&first.svid).await;
+    let (start_kid, _) = mint_with(&live, first.svid.issued_at);
 
     // Audit forwarding signs with whatever the slot holds.
-    let spool_dir =
-        std::env::temp_dir().join(format!("mia-e2e-renew-spool-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&spool_dir);
-    let _cleanup = RemoveOnDrop(spool_dir.clone());
+    let spool_dir = dir.join("spool");
     let (tx, rx) = tokio::sync::mpsc::channel(mia::audit_forward::CHANNEL_CAPACITY);
     let forwarder = mia::audit_forward::spawn(
         rx,
@@ -952,38 +938,48 @@ async fn daemon_renews_host_svid_before_expiry() {
         mia::audit_forward::ForwarderConfig::default(),
     );
 
-    let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let status = mia::status::StatusHandle::new("default", first.issued_at);
-    let (iat, exp) = (first.issued_at, first.expires_at);
-    let mut renewal = mia::renewal::Renewal::new(
-        E2eRenewer {
-            client: client.clone(),
-            facts: facts.clone(),
-            key: Arc::clone(&key),
-            seed,
-            swap,
-            current: first.clone(),
-            paths: Arc::clone(&paths),
-        },
+    // The daemon's renewer over the real Rotate, swap and X.509 store.
+    let policies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hooks = RecordingHooks::default();
+    let status = mia::status::StatusHandle::new("default", first.svid.issued_at);
+    let (iat, exp) = (first.svid.issued_at, first.svid.expires_at);
+    let attestor = E2eAttestor {
+        client: client.clone(),
+        facts: std::sync::Mutex::new(facts.clone()),
+        key: Arc::clone(&key),
+        seed,
+        policies: Arc::clone(&policies),
+    };
+    let host_renewer = mia::renewal::HostRenewer::new(
+        attestor,
+        client.clone(),
+        mia::renewal::X509Store::new(store_path.clone(), Some(fingerprint.clone())),
+        hooks.clone(),
+        swap.clone(),
         status.clone(),
+        Some(*facts.fingerprint().as_bytes()),
     )
-    .with_jitter(|| 0.5)
-    .with_current(first.info(), iat);
+    .with_current(&first);
+    let mut renewal = mia::renewal::Renewal::new(host_renewer, status.clone())
+        .with_jitter(|| 0.5)
+        .with_current(first.svid.info(), iat);
 
     // The daemon's clock reaches the renewal point (60 % of a 1 h test TTL)
     // well before expiry: inside the 24 h window it renews with Rotate.
     let due = iat + (exp - iat) * 6 / 10;
     let wait = renewal.step(due).await.expect("renewal succeeds");
-    assert_eq!(*paths.lock().unwrap(), [mia::renewal::RenewalPath::Rotate]);
     let renewed = creds.get().expect("credentials stay in force");
-    assert_ne!(renewed.svid_jws, first.jws, "a new SVID is in force");
+    assert_ne!(renewed.svid_jws, first.svid.jws, "a new SVID is in force");
     assert!(renewed.valid_at(due));
-    // Even an SVID whose own renewal point has already passed on this clock
-    // (issued within the same second here) is not renewed again at once.
     assert!(wait >= mia::renewal::schedule::RETRY_BASE, "{wait:?}");
+    assert!(policies.lock().unwrap().is_empty(), "no full attestation");
+    assert_eq!(
+        *hooks.0.lock().unwrap(),
+        std::slice::from_ref(&renewed.svid_jws)
+    );
     let jwks = ferro_svid_verify::JwkSet::from_json(&fetch_jwks(&mut client).await).unwrap();
     let verified = ferro_svid_verify::verify(&renewed.svid_jws, &jwks, iat + 10, 0).unwrap();
-    assert_eq!(verified.claims.sub, first.spiffe_id);
+    assert_eq!(verified.claims.sub, first.svid.spiffe_id);
     assert_eq!(verified.claims.cnf.jkt, jkt_of(&key));
 
     // Minting continues under the same key (kid), parented on the new SVID.
@@ -998,6 +994,9 @@ async fn daemon_renews_host_svid_before_expiry() {
         cell.jws_valid_at(due).as_deref(),
         Some(renewed.svid_jws.as_str())
     );
+    // The sealed X.509-SVID was replaced by the renewed leaf.
+    let leaf = sealed_leaf(&store_path, &fingerprint, iat + 10);
+    assert_ne!(leaf, first.svid.x509_svid, "re-sealed after Rotate");
 
     // Forwarding signs with the renewed credentials and CMIS accepts them.
     tx.send(AuditEvent::LocalDenied {
@@ -1017,25 +1016,90 @@ async fn daemon_renews_host_svid_before_expiry() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    forwarder.abort();
 
     // An operator epoch bump makes CMIS refuse the next Rotate: the same step
-    // falls back to a full attestation, under the same identity and kid.
+    // falls back to a full attestation that only reopens the seeded key, and
+    // keeps the same identity and kid.
     state.bump_epoch();
     let next_due = due + i64::try_from(wait.as_secs()).unwrap();
     renewal.step(next_due).await.expect("fallback succeeds");
     assert_eq!(
-        *paths.lock().unwrap(),
-        [
-            mia::renewal::RenewalPath::Rotate,
-            mia::renewal::RenewalPath::FullAttest
-        ]
+        *policies.lock().unwrap(),
+        [KeyPolicy::OpenOnly {
+            seed_required: true
+        }]
     );
     let reattested = creds.get().unwrap();
     assert_ne!(reattested.svid_jws, renewed.svid_jws);
     assert_eq!(mint_with(&live, next_due).0, start_kid);
+    assert_eq!(hooks.0.lock().unwrap().len(), 2);
     assert_eq!(
         status.observe().await.phase,
         mia::status::AttestPhase::Attested
     );
-    forwarder.abort();
+    let _ = RenewalPath::FullAttest;
+}
+
+#[tokio::test]
+async fn an_identity_change_stops_the_daemon_and_minting() {
+    // A re-enrolled host: CMIS issues an SVID for another SPIFFE id. The
+    // renewal task stops with a fatal exit (`serve` then returns an error)
+    // and minting is off; nothing is sealed.
+    let state = host_key_state().await;
+    let mut client = spawn_server(Arc::clone(&state)).await;
+    let facts = sample_facts();
+    let key = Arc::new(SoftwareMachineKey::generate().unwrap());
+    let seed = [9u8; 32];
+    let attested = run_attest_host_key(&mut client, &facts, &*key, jkt_of(&key), Some(&seed))
+        .await
+        .unwrap();
+    let first = attested_of(attested, &key);
+    let creds = mia::host_api::CredentialSlot::new();
+    let live = Arc::new(LiveMinter::default());
+    let swap = mia::renewal::Swap::new(
+        creds.clone(),
+        Arc::clone(&live) as Arc<dyn mia::renewal::MinterSink>,
+        mia::renewal::SvidCell::new(),
+    );
+    swap.install(&first.svid).await;
+    let mut other = facts.clone();
+    other.board_serial = "ANOTHER-BOARD".into();
+    let attestor = E2eAttestor {
+        client: client.clone(),
+        facts: std::sync::Mutex::new(other),
+        key: Arc::new(SoftwareMachineKey::generate().unwrap()),
+        seed,
+        policies: Arc::default(),
+    };
+    let status = mia::status::StatusHandle::new("default", first.svid.issued_at);
+    // No fingerprint: no Rotate, straight to the full attestation.
+    let renewer = mia::renewal::HostRenewer::new(
+        attestor,
+        client.clone(),
+        (),
+        (),
+        swap.clone(),
+        status.clone(),
+        None,
+    )
+    .with_current(&first);
+    let due = first.svid.issued_at + 2160;
+    let renewal = mia::renewal::Renewal::new(renewer, status.clone())
+        .with_jitter(|| 0.5)
+        .with_current(first.svid.info(), first.svid.issued_at);
+    let rx = mia::renewal::spawn(renewal, swap, move || due, std::future::pending::<()>());
+    let fatal = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        mia::renewal::next_fatal(Some(rx)),
+    )
+    .await
+    .expect("the renewal stops the daemon");
+    assert!(matches!(fatal, mia::renewal::Fatal::IdentityChanged { .. }));
+    assert!(live.0.lock().unwrap().is_none(), "minting is off");
+    assert!(creds.get().is_none(), "host calls are off");
+    assert_eq!(
+        status.observe().await.phase,
+        mia::status::AttestPhase::Failed(mia::status::AttestFailure::IdentityChanged)
+    );
 }

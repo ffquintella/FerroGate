@@ -77,6 +77,7 @@ fn minter() -> ChildTokenMinter {
         MinterConfig {
             host_spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
             parent_svid_sha384: [0x33; 48],
+            parent_expires_at: i64::MAX,
             kid: "host-kid-1".into(),
         },
     )
@@ -621,6 +622,31 @@ async fn malformed_request_is_rejected_with_one_audit_event() {
 }
 
 #[tokio::test]
+async fn expired_parent_svid_refuses_to_mint() {
+    // T294 review: a minter whose parent SVID has expired refuses with
+    // `no_host_svid`, even before the renewal task takes it out.
+    let m = minter().with_parent([0x33; 48], 1000);
+    let (path, mut rx, _stop) = spawn_server(
+        FixedAuth(Ok(id(APP_UID, APP_BIN))),
+        Some(m),
+        Some(allowlist_with_app(1000)),
+        1000,
+    );
+    let resp = round_trip(&path, &good_req()).await;
+    assert!(matches!(
+        resp,
+        HelperResp::Error {
+            code: ErrorCode::NoHostSvid,
+            ..
+        }
+    ));
+    match rx.recv().await.unwrap() {
+        AuditEvent::LocalDenied { reason, .. } => assert_eq!(reason, "no-host-svid"),
+        other => panic!("expected LocalDenied, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn minted_token_verifies_against_published_jwks_key() {
     // Mint a token, then verify its composite signature under the host key —
     // exactly what a downstream verifier does via the CMIS JWKS endpoint.
@@ -630,6 +656,7 @@ async fn minted_token_verifies_against_published_jwks_key() {
         MinterConfig {
             host_spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
             parent_svid_sha384: [0x33; 48],
+            parent_expires_at: i64::MAX,
             kid: "host-kid-1".into(),
         },
     );

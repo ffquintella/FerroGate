@@ -62,27 +62,40 @@ record them.
   retried a failed start) and, at expiry, kept minting child tokens under
   the expired parent while audit forwarding, the allowlist sync and
   registration stopped until a restart. One long-lived task per environment
-  (`mia::renewal`, `main.rs::DaemonRenewer`) now renews at 60 % of the TTL
-  ±10 % jitter: with a host-signed `Rotate` on the host-key tier while the
-  last full attestation is more than 10 minutes inside the 24 h window,
-  with a full attestation otherwise (the usual case with the 96 h TTL floor,
-  and always on the TPM tier). Refusals fall back to a full attestation;
-  transient errors retry after 30 s doubling, at most 15 min and a quarter
-  of the time left, never later than 60 s before expiry; `rate_limited`
-  waits `retry-after`; without a valid SVID it re-attests every 5 min. A new
-  SVID swaps the host-call credentials, the minter
-  (`ChildTokenMinter::with_parent`, same key and `kid` after a `Rotate`, the
-  X.509-SVID re-sealed), the status and the allowlist sync in that order; the
-  allowlist proposals read the current SVID every round. At expiry minting
-  and host calls stop until a full attestation succeeds, checked against the
-  wall clock at least every minute. Renewals reopen the machine key and seed
-  the daemon started with and never create them
-  (`machine_key::{open_machine_key, load_seed}`, `Unusable::Vanished`). A
-  full re-attestation under another SPIFFE id is never put in force: minting
-  stops and the environment's serve loop returns an error so the supervisor
-  restarts the daemon. The status endpoint keeps a host whose renewal fails
-  *attested* (`StatusHandle::renewal_started` / `renewal_failed`) and, past
-  the renewal point, reports `svid_expiring` with the failure's stable code.
+  (`mia::renewal`: the `Renewal` state machine over the daemon's
+  `HostRenewer`) now renews at 60 % of the TTL ±10 % jitter: with a
+  host-signed `Rotate` on the host-key tier while the last full attestation
+  is more than 10 minutes inside the 24 h window, `Rotate` has failed
+  transiently fewer than 3 times in a row and more than a quarter of the
+  lifetime is left; with a full attestation otherwise (the usual case with
+  the 96 h TTL floor, and always on the TPM tier). Refusals fall back to a
+  full attestation; transient errors retry after 30 s doubling, at most
+  15 min and a quarter of the time left, jittered, never later than 60 s
+  before expiry; `rate_limited` waits `retry-after`; without a valid SVID it
+  re-attests every 5 min ±10 %. Every call has a deadline (`Rotate` 60 s,
+  attestation 2 min, refresh 1 min) cut short at expiry, which abandons the
+  attempt and switches minting off. A new SVID with less than 30 s or 10 % of
+  its lifetime left (clock skew) is refused. An accepted SVID swaps the
+  host-call credentials, the minter (`ChildTokenMinter::with_parent`, same
+  key and `kid` after a `Rotate`), the status (with the jittered renewal
+  point) and the allowlist sync in that order, and only then seals its
+  X.509-SVID; the allowlist proposals read the current SVID every round.
+  The minter refuses to mint once its parent SVID has expired
+  (`MinterConfig::parent_expires_at`, `MintError::ParentExpired`, helper
+  answer `no_host_svid`) and clamps child tokens to it; the task also takes
+  the host-call credentials out at expiry. Renewals reopen the machine key
+  and seed the daemon started with and never create them
+  (`machine_key::{open_machine_key, load_seed}`, `Unusable::Vanished`), and
+  refuse a re-attestation under another child-signing `kid` while the seed is
+  in use. A full re-attestation under another SPIFFE id is never put in
+  force: minting stops, the status reports `host_identity_changed`, and the
+  environment's serve loop returns an error so the supervisor restarts the
+  daemon; a renewal task that dies does the same. The status endpoint keeps
+  a host whose renewal fails *attested* (`StatusHandle::renewal_started` /
+  `renewal_failed`) and, past the renewal point, reports `svid_expiring` with
+  the failure's stable code. `MinterConfig` gains a field and
+  `ChildTokenMinter::mint` returns `MintError`; `mia-tray` no longer advises
+  a restart for a failing renewal.
 - Write the 0.30.0 change document and the legacy-allowlist migration runbook (S56, M38, T274)
   `docs/change-v0.30.0.md` (FGV *documento de mudança*) and the runbook in
   `docs/operations.md`; `docs/cmis.md`, `docs/allowlist-provisioning.md`,

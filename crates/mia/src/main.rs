@@ -1112,16 +1112,19 @@ fn prepare_and_harden(
 ///
 /// With [`KeyPolicy::OpenOnly`] (a renewal after this run attested, T294) the
 /// pinned key and seed are only reopened, never created.
+///
+/// [`KeyPolicy::OpenOnly`]: mia::renewal::KeyPolicy::OpenOnly
 #[allow(clippy::too_many_lines)] // linear bootstrap: dial → attest → build minter
 #[allow(clippy::large_futures)] // holds a composite key (~4 KB ML-DSA) across awaits
 async fn bootstrap_host_svid_host_key(
     resolver: &mia::endpoint::CmisResolver,
     status: &mia::status::StatusHandle,
-    policy: KeyPolicy,
-) -> Result<HostSession, mia::status::AttestFailure> {
+    policy: mia::renewal::KeyPolicy,
+) -> Result<mia::renewal::Attested, mia::status::AttestFailure> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use ferro_sep::MachineKey as _;
+    use mia::renewal::KeyPolicy;
     use mia::status::AttestFailure;
     use sha2::{Digest, Sha256};
 
@@ -1141,7 +1144,7 @@ async fn bootstrap_host_svid_host_key(
             &key_path,
             Some(facts.fingerprint().as_bytes()),
         ),
-        KeyPolicy::OpenOnly => {
+        KeyPolicy::OpenOnly { .. } => {
             mia::machine_key::open_machine_key(&key_path, Some(facts.fingerprint().as_bytes())).map(
                 |key| mia::machine_key::MachineKey {
                     key,
@@ -1202,7 +1205,9 @@ async fn bootstrap_host_svid_host_key(
             }
             Some(*s.bytes())
         }),
-        KeyPolicy::OpenOnly => mia::machine_key::load_seed(&seed_path),
+        KeyPolicy::OpenOnly { seed_required } => {
+            mia::machine_key::load_seed(&seed_path, seed_required)
+        }
     };
     let seed = match seed {
         Ok(s) => s,
@@ -1256,22 +1261,11 @@ async fn bootstrap_host_svid_host_key(
         "host SVID obtained via host-key attestation; token minting enabled"
     );
     // The SVID's `cnf.jkt` binds this key, so it signs host calls.
-    Ok(host_session_from_attested(
+    Ok(attested_from(
         attested,
         Some(std::sync::Arc::new(key)),
+        seed.is_some(),
     ))
-}
-
-/// Whether an attestation may create the host's machine key and SVID seed.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyPolicy {
-    /// Before this run attested: open what exists, create only what exists
-    /// nowhere ([`mia::machine_key`]).
-    OpenOrCreate,
-    /// A renewal (T294): reopen the key CMIS pinned; never create a key or
-    /// seed — a missing key fails closed.
-    OpenOnly,
 }
 
 /// The owned attestation inputs the bootstrap and re-attestation paths need:
@@ -1334,8 +1328,8 @@ async fn bootstrap_host_svid(
     resolver: &mia::endpoint::CmisResolver,
     attest: &HostAttestConfig,
     status: &mia::status::StatusHandle,
-    policy: KeyPolicy,
-) -> Result<HostSession, mia::status::AttestFailure> {
+    policy: mia::renewal::KeyPolicy,
+) -> Result<mia::renewal::Attested, mia::status::AttestFailure> {
     use mia::config::AttestBackend;
     let effective = match attest.backend {
         AttestBackend::Auto if tpm_available() && attest.tpm_ek_cert.is_some() => {
@@ -1367,24 +1361,27 @@ async fn bootstrap_host_svid(
         AttestBackend::HostKey => bootstrap_host_svid_host_key(resolver, status, policy).await,
         AttestBackend::VirtualTpm => bootstrap_host_svid_virtual_tpm(resolver, status).await,
     };
-    if let Ok(Some(backend)) = session.as_ref().map(|s| s.x509_store) {
-        status.set_x509_store(backend);
-    }
     session
 }
 
-/// Attest at start-up, reporting the attestation phase.
+/// Attest at start-up, reporting the attestation phase, and seal the
+/// X.509-SVID issued with it.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[allow(clippy::large_futures)] // attestation future holds a composite key
 async fn startup_attest(
     resolver: &mia::endpoint::CmisResolver,
     attest: &HostAttestConfig,
     status: &mia::status::StatusHandle,
-) -> Option<HostSession> {
+) -> Option<mia::renewal::Attested> {
+    use mia::renewal::X509Sealer as _;
     status.attest_started();
-    match bootstrap_host_svid(resolver, attest, status, KeyPolicy::OpenOrCreate).await {
+    let policy = mia::renewal::KeyPolicy::OpenOrCreate;
+    match bootstrap_host_svid(resolver, attest, status, policy).await {
         Ok(session) => {
             let svid = &session.svid;
+            if let Some(backend) = x509_store().seal(svid) {
+                status.set_x509_store(backend);
+            }
             status.attest_succeeded(&svid.spiffe_id, svid.issued_at, svid.expires_at);
             Some(session)
         }
@@ -1409,7 +1406,7 @@ async fn bootstrap_host_svid_tpm(
     resolver: &mia::endpoint::CmisResolver,
     attest: &HostAttestConfig,
     status: &mia::status::StatusHandle,
-) -> Result<HostSession, mia::status::AttestFailure> {
+) -> Result<mia::renewal::Attested, mia::status::AttestFailure> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use mia::client::AttestEvidence as _;
@@ -1480,7 +1477,7 @@ async fn bootstrap_host_svid_tpm(
         "host SVID obtained via TPM attestation; token minting enabled"
     );
     // A TPM SVID binds the AIK, not a host-call key: no `Rotate` (D2).
-    Ok(host_session_from_attested(attested, None))
+    Ok(attested_from(attested, None, false))
 }
 
 /// Fallback when the `tpm` backend is selected on a non-Linux host, where mia is
@@ -1492,7 +1489,7 @@ async fn bootstrap_host_svid_tpm(
     _resolver: &mia::endpoint::CmisResolver,
     _attest: &HostAttestConfig,
     _status: &mia::status::StatusHandle,
-) -> Result<HostSession, mia::status::AttestFailure> {
+) -> Result<mia::renewal::Attested, mia::status::AttestFailure> {
     tracing::error!(
         "attestation.backend = \"tpm\" is only supported on Linux (it needs a TSS2 stack); \
          refusing to attest (fail closed). Use \"host-key\" on this platform."
@@ -1500,14 +1497,17 @@ async fn bootstrap_host_svid_tpm(
     Err(mia::status::AttestFailure::TpmUnavailable)
 }
 
-/// Build the running [`HostSession`] (token minter + host identity) from a
-/// completed attestation, regardless of which backend produced it.
-/// `host_call_key` is the machine key the SVID's `cnf.jkt` binds, if any.
+/// The [`mia::renewal::Attested`] of a completed attestation, regardless of
+/// which backend produced it. `host_call_key` is the machine key the SVID's
+/// `cnf.jkt` binds, if any; `seeded` that its composite key came from the
+/// persistent seed. Nothing is written: the X.509-SVID is sealed once the
+/// SVID is accepted (start-up, or the renewal's install).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn host_session_from_attested(
+fn attested_from(
     attested: mia::client::AttestedSvid,
     host_call_key: Option<std::sync::Arc<dyn ferro_sep::MachineKey + Send + Sync>>,
-) -> HostSession {
+    seeded: bool,
+) -> mia::renewal::Attested {
     let kid = ferro_svid::child_signing_kid(&attested.svid_public);
     let svid = mia::renewal::HostSvid::new(
         attested.bundle,
@@ -1515,75 +1515,18 @@ fn host_session_from_attested(
         kid,
         host_call_key,
     );
-    // Put the X.509 half of the issuance somewhere it survives a restart —
-    // sealed so it only opens on this machine. Best-effort: a host that cannot
-    // seal keeps running with the in-memory credential.
-    let x509_store = persist_x509_credential(&svid);
-    HostSession { svid, x509_store }
+    mia::renewal::Attested { svid, seeded }
 }
 
-/// Seal this attestation's X.509-SVID to disk, bound to this machine.
-///
-/// Stores the leaf, the trust bundle CMIS served with it, and the Ed25519
-/// private key the certificate names — the composite key's classical half, the
-/// one a TLS stack needs. The ML-DSA half stays in memory: it is not needed to
-/// use the certificate.
-///
-/// Every failure is logged and swallowed. The daemon has a working credential
-/// in memory either way; losing the *stored* copy costs a restart, not a
-/// session. A host with neither a TPM nor a fingerprint gets no store at all,
-/// because the alternative — writing the key in the clear — is worse than
-/// re-attesting.
-///
-/// Returns the sealing backend's name when the credential was stored (for the
-/// status endpoint, feature F18).
+/// The machine-bound X.509-SVID store: the leaf, its trust bundle and the
+/// Ed25519 key it names, sealed with the strongest backend the host offers
+/// (best-effort: a host that cannot seal keeps the in-memory credential).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn persist_x509_credential(svid: &mia::renewal::HostSvid) -> Option<&'static str> {
-    let leaf_der = svid.x509_svid.clone();
-    let bundle_der = svid.x509_bundle.clone();
-    if leaf_der.is_empty() || bundle_der.is_empty() {
-        tracing::debug!("CMIS issued no X.509-SVID with this SVID; nothing to seal");
-        return None;
-    }
-
-    let credential = mia::credstore::X509Credential {
-        leaf_der,
-        bundle_der,
-        key_pkcs8: svid.svid_secret.to_ed25519_pkcs8_der(),
-    };
-    let path = mia::credstore::store_path();
-    let fingerprint = prefetched_facts().map(|f| f.fingerprint().as_bytes().to_vec());
-
-    let outcome = mia::credstore::with_sealer(fingerprint.as_deref(), |sealer| {
-        (
-            sealer.name(),
-            mia::credstore::store(&path, &credential, sealer),
-        )
-    });
-    match outcome {
-        Some((backend, Ok(()))) => {
-            tracing::info!(
-                path = %path.display(),
-                backend,
-                "sealed the X.509-SVID to disk (opens only on this machine)"
-            );
-            Some(backend)
-        }
-        Some((backend, Err(e))) => {
-            tracing::warn!(
-                error = %e, backend, path = %path.display(),
-                "could not seal the X.509-SVID; it stays in memory for this session only"
-            );
-            None
-        }
-        None => {
-            tracing::warn!(
-                "no TPM and no hardware fingerprint on this host: the X.509-SVID will not be \
-                 stored, since writing its private key unsealed is not an option"
-            );
-            None
-        }
-    }
+fn x509_store() -> mia::renewal::X509Store {
+    mia::renewal::X509Store::new(
+        mia::credstore::store_path(),
+        prefetched_facts().map(|f| f.fingerprint().as_bytes().to_vec()),
+    )
 }
 
 /// Report the sealed X.509-SVID left by a previous run, if it still opens here.
@@ -1651,7 +1594,7 @@ fn virtual_tpm_path() -> std::path::PathBuf {
 async fn bootstrap_host_svid_virtual_tpm(
     resolver: &mia::endpoint::CmisResolver,
     status: &mia::status::StatusHandle,
-) -> Result<HostSession, mia::status::AttestFailure> {
+) -> Result<mia::renewal::Attested, mia::status::AttestFailure> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     use mia::virtual_tpm::{expected_pcr_digest, VirtualTpm};
@@ -1698,7 +1641,7 @@ async fn bootstrap_host_svid_virtual_tpm(
         cmis = %endpoint,
         "host SVID obtained via virtual-TPM attestation; token minting enabled"
     );
-    Ok(host_session_from_attested(attested, None))
+    Ok(attested_from(attested, None, false))
 }
 
 /// Fallback when the daemon was built without the `virtual-tpm` feature but the
@@ -1712,22 +1655,13 @@ async fn bootstrap_host_svid_virtual_tpm(
 async fn bootstrap_host_svid_virtual_tpm(
     _resolver: &mia::endpoint::CmisResolver,
     _status: &mia::status::StatusHandle,
-) -> Result<HostSession, mia::status::AttestFailure> {
+) -> Result<mia::renewal::Attested, mia::status::AttestFailure> {
     tracing::error!(
         "attestation.backend = \"virtual-tpm\" but mia was built without the `virtual-tpm` cargo \
          feature; refusing to attest (fail closed). Rebuild with `--features virtual-tpm` for \
          dev/test, or set attestation.backend = \"host-key\"."
     );
     Err(mia::status::AttestFailure::TpmUnavailable)
-}
-
-/// The outcome of a successful host attestation or renewal: the host SVID in
-/// force (its minter and, on the host-key tier, the host-call key), plus the
-/// X.509-SVID store backend it was sealed under, if any.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-struct HostSession {
-    svid: mia::renewal::HostSvid,
-    x509_store: Option<&'static str>,
 }
 
 /// Extract the host UUID from a host SVID SPIFFE id (`spiffe://<td>/host/<uuid>`)
@@ -2091,9 +2025,9 @@ fn maybe_spawn_crl_puller(
     });
 }
 
-/// The owned configuration the renewal task needs to refresh what depends on
-/// the host SVID (allowlist, proposals) after a renewal. Captured before the
-/// task is spawned because [`mia::config::Config`] is borrowed for the
+/// The owned configuration the renewal hooks need to refresh what depends
+/// on the host SVID (allowlist, proposals) after a renewal. Captured before
+/// the task is spawned because [`mia::config::Config`] is borrowed for the
 /// lifetime of `serve` and the task must be `'static`.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 struct RenewalParams {
@@ -2107,29 +2041,46 @@ struct RenewalParams {
     propose_interval: u64,
     /// The daemon's own executable digest, for the proposal's self entry.
     self_sha: Option<[u8; 48]>,
-    /// The attestation inputs (backend + TPM EK chain) renewals use. Read
-    /// once at start: SIGHUP does not re-read them.
-    attest: HostAttestConfig,
     /// The host-call credentials the sync loop and the registration service
-    /// sign with (also swapped by [`mia::renewal::Swap`]).
+    /// sign with (swapped by [`mia::renewal::Swap`]).
     creds: mia::host_api::CredentialSlot,
     /// The running sync loop (F19), if any: a new SVID makes it sync at once,
     /// and it — not the start-only fetch — refreshes the allowlist.
     sync_trigger: Option<mia::allowlist_sync::SyncTrigger>,
 }
 
-/// The daemon side of the host SVID renewal (T294): `Rotate` and full
-/// attestation against CMIS, and the swap into the running helper API.
+/// The configured attestation backend, for the renewal (T294). The settings
+/// are read once at start: SIGHUP does not re-read them.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-struct DaemonRenewer<A: mia::helper::auth::CallerAuth> {
+struct MainAttestor {
+    resolver: mia::endpoint::CmisResolver,
+    attest: HostAttestConfig,
+    status: mia::status::StatusHandle,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+impl mia::renewal::HostAttestor for MainAttestor {
+    #[allow(clippy::large_futures)] // attestation future holds a composite key
+    fn attest(
+        &self,
+        policy: mia::renewal::KeyPolicy,
+    ) -> futures::future::BoxFuture<'_, Result<mia::renewal::Attested, mia::status::AttestFailure>>
+    {
+        Box::pin(bootstrap_host_svid(
+            &self.resolver,
+            &self.attest,
+            &self.status,
+            policy,
+        ))
+    }
+}
+
+/// What a renewal refreshes in the running daemon: the allowlist (sync loop
+/// or the legacy fetch and reload) and, once, the allowlist proposals.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+struct MainHooks<A: mia::helper::auth::CallerAuth> {
     resolver: mia::endpoint::CmisResolver,
     status: mia::status::StatusHandle,
-    swap: mia::renewal::Swap,
-    /// The SVID in force (what `Rotate` renews); `None` before the first
-    /// attestation and after expiry.
-    current: Option<mia::renewal::HostSvid>,
-    /// `OpenOnly` once this run attested: renewals reopen the pinned key.
-    key_policy: KeyPolicy,
     allowlist_reloader: mia::helper::AllowlistReloader<A>,
     ledger: mia::helper::CallerLedger,
     svid_cell: mia::renewal::SvidCell,
@@ -2140,7 +2091,7 @@ struct DaemonRenewer<A: mia::helper::auth::CallerAuth> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-impl<A: mia::helper::auth::CallerAuth> DaemonRenewer<A> {
+impl<A: mia::helper::auth::CallerAuth> MainHooks<A> {
     /// The legacy start-only allowlist fetch, repeated after a renewal for a
     /// host without the F19 sync loop.
     async fn reload_allowlist(&self, spiffe_id: &str) {
@@ -2181,103 +2132,26 @@ impl<A: mia::helper::auth::CallerAuth> DaemonRenewer<A> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-impl<A: mia::helper::auth::CallerAuth> mia::renewal::Renewer for DaemonRenewer<A> {
-    type Credential = HostSession;
-
-    fn rotate(
-        &mut self,
-    ) -> futures::future::BoxFuture<'_, Result<mia::renewal::Issued<HostSession>, tonic::Status>>
-    {
+impl<A: mia::helper::auth::CallerAuth> mia::renewal::RenewalHooks for MainHooks<A> {
+    fn after_install<'a>(
+        &'a mut self,
+        svid: &'a mia::renewal::HostSvid,
+    ) -> futures::future::BoxFuture<'a, ()> {
         Box::pin(async move {
-            let Some(current) = self.current.clone() else {
-                return Err(tonic::Status::failed_precondition("no_host_svid"));
-            };
-            // Host-key tier: the signed state digest is the fingerprint `H`.
-            let Some(facts) = prefetched_facts() else {
-                return Err(tonic::Status::failed_precondition("no_fingerprint"));
-            };
-            let digest = *facts.fingerprint().as_bytes();
-            let (endpoint, mut client) =
-                match tokio::time::timeout(mia::host_api::CALL_TIMEOUT, self.resolver.connect())
-                    .await
-                {
-                    Ok(Ok(c)) => c,
-                    Ok(Err(e)) => {
-                        tracing::debug!(error = %e, "could not reach CMIS to renew the host SVID");
-                        return Err(tonic::Status::unavailable("cmis_unreachable"));
-                    }
-                    Err(_) => return Err(tonic::Status::unavailable("cmis_unreachable")),
-                };
-            self.status.set_cmis_node(&endpoint);
-            let svid = mia::renewal::rotate_host_svid(&mut client, &current, &digest).await?;
-            // The renewed leaf certifies the same key: re-seal the store.
-            let x509_store = persist_x509_credential(&svid);
-            Ok(mia::renewal::Issued {
-                info: svid.info(),
-                credential: HostSession { svid, x509_store },
-            })
-        })
-    }
-
-    #[allow(clippy::large_futures)] // attestation future holds a composite key
-    fn full_attest(
-        &mut self,
-    ) -> futures::future::BoxFuture<
-        '_,
-        Result<mia::renewal::Issued<HostSession>, mia::status::AttestFailure>,
-    > {
-        Box::pin(async move {
-            let session = bootstrap_host_svid(
-                &self.resolver,
-                &self.params.attest,
-                &self.status,
-                self.key_policy,
-            )
-            .await?;
-            Ok(mia::renewal::Issued {
-                info: session.svid.info(),
-                credential: session,
-            })
-        })
-    }
-
-    fn install(
-        &mut self,
-        session: HostSession,
-        _path: mia::renewal::RenewalPath,
-    ) -> futures::future::BoxFuture<'_, ()> {
-        Box::pin(async move {
-            self.swap.install(&session.svid).await;
-            if let Some(backend) = session.x509_store {
-                self.status.set_x509_store(backend);
-            }
-            self.current = Some(session.svid);
-            self.key_policy = KeyPolicy::OpenOnly;
-        })
-    }
-
-    fn after_install(
-        &mut self,
-        _path: mia::renewal::RenewalPath,
-    ) -> futures::future::BoxFuture<'_, ()> {
-        Box::pin(async move {
-            let Some(spiffe_id) = self.current.as_ref().map(|s| s.spiffe_id.clone()) else {
-                return;
-            };
             // With the sync loop running and host calls signable, it refreshes
             // the allowlist (F19): wake it now. Otherwise re-run the legacy
             // fetch + reload, so a boot-time failure does not leave every
             // non-self caller denied.
             match (&self.params.sync_trigger, self.params.creds.get().is_some()) {
                 (Some(trigger), true) => trigger.sync_now(),
-                _ => self.reload_allowlist(&spiffe_id).await,
+                _ => self.reload_allowlist(&svid.spiffe_id).await,
             }
             // Start proposing the observed callers once (start-up skipped it
             // when there was no host SVID then).
             if self.params.propose && !self.propose_started {
                 self.propose_started = maybe_spawn_propose_task(
                     Some(&self.resolver),
-                    Some(&spiffe_id),
+                    Some(&svid.spiffe_id),
                     self.svid_cell.clone(),
                     self.ledger.clone(),
                     self.params.self_sha,
@@ -2286,33 +2160,39 @@ impl<A: mia::helper::auth::CallerAuth> mia::renewal::Renewer for DaemonRenewer<A
             }
         })
     }
-
-    fn disable(&mut self) -> futures::future::BoxFuture<'_, ()> {
-        Box::pin(async move {
-            self.swap.disable().await;
-            self.current = None;
-        })
-    }
 }
 
-/// The host SVID renewal task (T294), one per environment with CMIS
-/// configured: renews the SVID held (`session`, from start-up) or, when the
-/// start-up attestation failed, re-attests every
-/// [`mia::renewal::schedule::REATTEST_INTERVAL`] (the start-up attempt counts
-/// as the first). Resolves the returned receiver to a [`mia::renewal::Fatal`]
-/// when the daemon must stop; the task ends when `stop` resolves.
+/// Spawn the host SVID renewal (T294), one per environment with CMIS
+/// configured: it renews the start-up SVID (`session`) or, when start-up
+/// failed, re-attests every ~5 minutes (the start-up attempt counts as the
+/// first). The receiver resolves to a [`mia::renewal::Fatal`] when the
+/// daemon must stop; the task ends when `stop` resolves.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-#[allow(clippy::large_futures)] // attestation future holds a composite key
 fn spawn_renewal_task<A: mia::helper::auth::CallerAuth>(
-    renewer: DaemonRenewer<A>,
-    session: Option<&HostSession>,
+    attestor: MainAttestor,
+    hooks: MainHooks<A>,
+    swap: mia::renewal::Swap,
+    session: Option<&mia::renewal::Attested>,
     stop: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::sync::watch::Receiver<Option<mia::renewal::Fatal>> {
-    use mia::renewal::{schedule::REATTEST_INTERVAL, Exit, Renewal};
-    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
-    let clock = std::sync::Arc::clone(&renewer.clock);
-    let status = renewer.status.clone();
-    let cmis = renewer.resolver.describe().to_string();
+    use mia::renewal::{schedule::REATTEST_INTERVAL, HostRenewer, Renewal};
+    let clock = std::sync::Arc::clone(&hooks.clock);
+    let status = hooks.status.clone();
+    let cmis = attestor.resolver.describe().to_string();
+    let dial = attestor.resolver.clone();
+    let digest = prefetched_facts().map(|f| *f.fingerprint().as_bytes());
+    let mut renewer = HostRenewer::new(
+        attestor,
+        dial,
+        x509_store(),
+        hooks,
+        swap.clone(),
+        status.clone(),
+        digest,
+    );
+    if let Some(s) = session {
+        renewer = renewer.with_current(s);
+    }
     let mut renewal = Renewal::new(renewer, status);
     let now = clock();
     if let Some(s) = session {
@@ -2332,16 +2212,10 @@ fn spawn_renewal_task<A: mia::helper::auth::CallerAuth>(
         let wait = i64::try_from(REATTEST_INTERVAL.as_secs()).unwrap_or(i64::MAX);
         renewal = renewal.with_first_attempt_at(now.saturating_add(wait));
     }
-    tokio::spawn(async move {
-        let stop = async {
-            let _ = stop.await;
-        };
-        let first = std::time::Duration::ZERO;
-        if let Exit::Fatal(f) = renewal.run(move || clock(), first, stop).await {
-            let _ = fatal_tx.send(Some(f));
-        }
-    });
-    fatal_rx
+    let stop = async {
+        let _ = stop.await;
+    };
+    mia::renewal::spawn(renewal, swap, move || clock(), stop)
 }
 
 /// Bind and serve the helper API with the given caller authenticator. Shared by
@@ -2594,20 +2468,19 @@ where
     // up yet at boot), and switches minting off if the SVID expires anyway.
     let (stop_renewal, renewal_stopped) = tokio::sync::oneshot::channel();
     let fatal = resolver.clone().map(|r| {
-        let renewer = DaemonRenewer {
+        let swap = mia::renewal::Swap::new(
+            creds.clone(),
+            Arc::new(server.minter_reloader()),
+            svid_cell.clone(),
+        );
+        let attestor = MainAttestor {
+            resolver: r.clone(),
+            attest: HostAttestConfig::from_config(config),
+            status: status.clone(),
+        };
+        let hooks = MainHooks {
             resolver: r,
             status: status.clone(),
-            swap: mia::renewal::Swap::new(
-                creds.clone(),
-                Arc::new(server.minter_reloader()),
-                svid_cell.clone(),
-            ),
-            current: session.as_ref().map(|s| s.svid.clone()),
-            key_policy: if session.is_some() {
-                KeyPolicy::OpenOnly
-            } else {
-                KeyPolicy::OpenOrCreate
-            },
             allowlist_reloader: server.allowlist_reloader(),
             ledger: server.ledger(),
             svid_cell: svid_cell.clone(),
@@ -2619,41 +2492,33 @@ where
                 propose: config.allowlist.propose,
                 propose_interval: config.allowlist_propose_interval(),
                 self_sha: server.self_sha(),
-                attest: HostAttestConfig::from_config(config),
                 creds: creds.clone(),
                 sync_trigger: services.sync_trigger.clone(),
             },
             clock: clock.clone(),
             propose_started,
         };
-        spawn_renewal_task(renewer, session.as_ref(), renewal_stopped)
+        spawn_renewal_task(attestor, hooks, swap, session.as_ref(), renewal_stopped)
     });
     drop(session);
 
-    // Serve until asked to stop, or until the renewal task finds CMIS issued
-    // another identity: then return an error so the supervisor restarts the
-    // daemon under it (what this run bound to the old one must not serve it).
-    let mut fatal_wait = fatal.clone();
+    // Serve until asked to stop, or until the renewal task stops the daemon
+    // (CMIS issued another identity, or the task died): then return an error
+    // so the supervisor restarts it.
+    let fatal_wait = fatal.clone();
     server
         .serve_with_shutdown(async move {
-            let fatal = async {
-                if let Some(rx) = fatal_wait.as_mut() {
-                    if rx.wait_for(Option::is_some).await.is_ok() {
-                        return;
-                    }
-                }
-                // No renewal task, or it ended without a fatal exit.
-                std::future::pending::<()>().await;
-            };
             tokio::select! {
                 () = shutdown_signal() => {}
-                () = fatal => tracing::error!("stopping the helper API: the host identity changed"),
+                f = mia::renewal::next_fatal(fatal_wait) => {
+                    tracing::error!(error = %f, "stopping the helper API");
+                }
             }
         })
         .await;
     drop(stop_renewal);
     if let Some(f) = fatal.and_then(|rx| rx.borrow().clone()) {
-        anyhow::bail!("{f}; restart the agent so it serves the new identity");
+        anyhow::bail!("{f}; restart the agent");
     }
     tracing::info!("helper API shut down cleanly");
     Ok(())

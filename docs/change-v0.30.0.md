@@ -102,10 +102,11 @@ sincronização de allowlist e o registro paravam até um reinício.
 
 | Arquivo / módulo | Natureza da alteração | Motivo |
 |---|---|---|
-| `crates/mia/src/renewal/` (novo: `mod.rs`, `schedule.rs`, `swap.rs`, `tests.rs`) | Máquina de estados da renovação (60 % do TTL ±10 %; `Rotate` só no nível host-key dentro da janela de 24 h, senão `Attest` completo; novas tentativas limitadas; desligamento na expiração; troca de identidade fatal) e a troca de credenciais em ordem fixa | Falha segura (NRM §5.3.5), tentativas limitadas |
-| `crates/mia/src/main.rs` | `DaemonRenewer` e `spawn_renewal_task` substituem `spawn_reattest_task`; inicialização reporta o estado; propostas leem a SVID corrente; `serve` retorna erro em troca de identidade | Integração no daemon |
+| `crates/mia/src/renewal/` (novo: `mod.rs`, `host.rs`, `schedule.rs`, `swap.rs`, `tests.rs`) | Máquina de estados da renovação (60 % do TTL ±10 %; `Rotate` só no nível host-key dentro da janela de 24 h, senão `Attest` completo; prazos em toda chamada, cortados na expiração; novas tentativas limitadas; desligamento na expiração; troca de identidade e morte da tarefa fatais), o renovador do daemon (selagem X.509 só após aceitar) e a troca de credenciais em ordem fixa | Falha segura (NRM §5.3.5), tentativas limitadas |
+| `crates/mia/src/main.rs` | `MainAttestor`, `MainHooks` e `spawn_renewal_task` substituem `spawn_reattest_task`; inicialização reporta o estado; propostas leem a SVID corrente; `serve` retorna erro em troca de identidade | Integração no daemon |
 | `crates/mia/src/machine_key.rs` | `open_machine_key` / `load_seed` (só abrem, nunca criam); motivo `Vanished` | A renovação nunca cria uma identidade nova |
-| `crates/mia/src/helper/token.rs` | Chave compartilhada (`Arc`) e `ChildTokenMinter::with_parent` | Re-parentar o emissor sem copiar a chave |
+| `crates/mia/src/helper/token.rs`, `helper/server/mod.rs` | Chave compartilhada (`Arc`), `ChildTokenMinter::with_parent`; o emissor recusa um pai expirado (`no_host_svid`) e limita o `exp` do token filho a ele | Re-parentar sem copiar a chave; falha segura independente da tarefa |
+| `crates/mia-status-proto`, `crates/mia-tray/src/i18n.rs` | Código `host_identity_changed`; texto do tray sem conselho de reiniciar | Estado com códigos estáveis |
 | `crates/mia/src/status.rs`, `audit_forward/mod.rs` | `renewal_started` / `renewal_failed` (fase continua *attested*; códigos estáveis); texto da espera por SVID expirada | Estado e log sem dados sensíveis (NRM §5.3.10) |
 | `crates/mia/tests/e2e_attest.rs` | `daemon_renews_host_svid_before_expiry` (CMIS real) | NRM §5.3.7 |
 | `docs/operations.md`, `mia.md`, `audit.md`, `protocol.md`, F04, `CHANGELOG.md`, `ROADMAP.md`, este documento | Documentação, inclusive as linhas de log | NRM §5.3.1 |
@@ -205,10 +206,11 @@ pseudonimização do ledger seguem pendentes de definição pelo DPO (T289).
   na CLI) ficam para depois. Os códigos
   de motivo de negação (1–6) e de revogação (1–5) são definidos pela TUI e
   documentados em `docs/operations.md`.
-- Renovação (T294): o ponto de renovação mostrado pelo status é o de 60 %
-  sem jitter, então um host saudável pode mostrar `svid_renewal_due` por até
-  10 % do TTL; com vários ambientes, uma troca de identidade encerra só o
-  ambiente afetado; o `SIGHUP` não relê as configurações de atestação.
+- Renovação (T294): com vários ambientes, uma troca de identidade encerra só
+  o ambiente afetado (status `host_identity_changed`) até um reinício; o
+  `SIGHUP` não relê as configurações de atestação; as credenciais de chamadas
+  de host saem até um minuto após a expiração quando nenhuma tentativa está
+  em curso (o emissor de tokens recusa no instante da expiração).
 - `Rotate` (T293): o cache de nonces, o limitador e o conjunto de revogação
   são por nó, como nos demais métodos de host. Com o piso de 96 h da SVID e a
   janela de 24 h, a renovação agendada é normalmente um `Attest` completo. A

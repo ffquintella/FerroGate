@@ -18,8 +18,9 @@ use super::schedule::{
     ROTATE_WINDOW_MARGIN_SECS,
 };
 use super::{
-    Exit, Fatal, HostSvid, Issued, MinterSink, Renewal, RenewalPath, Renewer, SvidCell, SvidInfo,
-    Swap,
+    next_fatal, spawn, Attested, CmisDial, DialedCmis, Exit, Fatal, HostAttestor, HostRenewer,
+    HostSvid, Issued, KeyPolicy, MinterSink, Renewal, RenewalHooks, RenewalPath, Renewer, SvidCell,
+    SvidInfo, Swap, Timeouts, X509Sealer,
 };
 use crate::helper::auth::CallerIdentity;
 use crate::helper::token::{ChildClaims, ChildTokenMinter};
@@ -51,6 +52,14 @@ enum Call {
     Disable,
 }
 
+/// Which call of the fake never completes (a CMIS that stalls mid-stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stall {
+    Rotate,
+    FullAttest,
+    AfterInstall,
+}
+
 /// A scripted [`Renewer`]: each call pops the next prepared answer. A
 /// credential is a plain number, so the tests can see which one went in.
 #[derive(Default)]
@@ -58,6 +67,8 @@ struct Fake {
     rotations: VecDeque<Result<Issued<u32>, Status>>,
     attestations: VecDeque<Result<Issued<u32>, AttestFailure>>,
     calls: Arc<Mutex<Vec<Call>>>,
+    stall: Option<Stall>,
+    panic_on_rotate: bool,
 }
 
 impl Fake {
@@ -71,6 +82,11 @@ impl Fake {
         self
     }
 
+    fn stalls(mut self, stage: Stall) -> Self {
+        self.stall = Some(stage);
+        self
+    }
+
     fn log(&self, c: Call) {
         self.calls.lock().unwrap().push(c);
     }
@@ -81,6 +97,10 @@ impl Renewer for Fake {
 
     fn rotate(&mut self) -> BoxFuture<'_, Result<Issued<u32>, Status>> {
         self.log(Call::Rotate);
+        assert!(!self.panic_on_rotate, "the renewer panicked");
+        if self.stall == Some(Stall::Rotate) {
+            return Box::pin(futures::future::pending());
+        }
         let r = self
             .rotations
             .pop_front()
@@ -90,6 +110,9 @@ impl Renewer for Fake {
 
     fn full_attest(&mut self) -> BoxFuture<'_, Result<Issued<u32>, AttestFailure>> {
         self.log(Call::FullAttest);
+        if self.stall == Some(Stall::FullAttest) {
+            return Box::pin(futures::future::pending());
+        }
         let r = self
             .attestations
             .pop_front()
@@ -104,6 +127,9 @@ impl Renewer for Fake {
 
     fn after_install(&mut self, path: RenewalPath) -> BoxFuture<'_, ()> {
         self.log(Call::AfterInstall(path));
+        if self.stall == Some(Stall::AfterInstall) {
+            return Box::pin(futures::future::pending());
+        }
         Box::pin(async {})
     }
 
@@ -280,10 +306,12 @@ async fn honours_retry_after() {
     assert_eq!(calls(&log), [Call::Rotate]);
 
     // Even CMIS's retry-after never keeps the daemon asleep past expiry
-    // (it must switch minting off then).
+    // (it must switch minting off then): SVID 0..400, 100 s left.
     let fake = Fake::default().rotates(Err(limited));
-    let (mut r, _, _) = holding(fake, true);
-    assert_eq!(r.step(TTL - 50).await.unwrap(), Duration::from_secs(50));
+    let mut r = Renewal::new(fake, StatusHandle::new("default", 0))
+        .with_jitter(|| 0.5)
+        .with_current(info(ID, 0, 400, true), 0);
+    assert_eq!(r.step(300).await.unwrap(), Duration::from_secs(100));
 }
 
 #[test]
@@ -316,9 +344,27 @@ fn never_sleeps_past_expiry() {
         }
     }
     // Healthy schedules land before expiry too; after it, retry every
-    // REATTEST_INTERVAL.
+    // REATTEST_INTERVAL (jittered ±10 %).
     assert!(next_wait(0, 0, exp, 0, 0.999_999).as_secs() < 345_600);
     assert_eq!(next_wait(exp, 0, exp, 3, 0.5), REATTEST_INTERVAL);
+    for unit in [0.0, 0.5, 0.999_999] {
+        let d = next_wait(exp, 0, exp, 3, unit).as_secs();
+        assert!((270..=330).contains(&d), "{d}");
+        assert_eq!(schedule::reattest_wait(unit).as_secs(), d);
+    }
+    // A rate limit's retry-after never sleeps past expiry either.
+    for after in [0, 1, 30, 120, 900, 86_400] {
+        for now in [0, exp - 600, exp - 61, exp - 1] {
+            let d = schedule::retry_after_wait(now, exp, Duration::from_secs(after));
+            let d = i64::try_from(d.as_secs()).unwrap();
+            assert!(d >= 1 && now + d <= exp, "{after} {now} {d}");
+        }
+    }
+    // The capped back-off is jittered too, so a fleet near expiry spreads.
+    assert_ne!(
+        next_wait(exp - 400, 0, exp, 10, 0.0),
+        next_wait(exp - 400, 0, exp, 10, 0.999_999)
+    );
 }
 
 #[tokio::test]
@@ -470,10 +516,216 @@ async fn identity_change_is_not_swapped() {
 async fn an_svid_already_expired_on_arrival_is_not_installed() {
     let fake = Fake::default().rotates(Ok(issued(14, info(ID, 0, 500, true))));
     let (mut r, log, status) = holding(fake, true);
+    // A clock problem, not a transient error: back off a full interval.
+    assert_eq!(r.step(600).await.unwrap(), REATTEST_INTERVAL);
+    assert_eq!(calls(&log), [Call::Rotate]);
+    assert_eq!(status.observe().await.svid.unwrap().not_after, TTL);
+}
+
+#[tokio::test]
+async fn a_fresh_svid_that_is_almost_expired_counts_as_clock_skew() {
+    // 20 s of life left on arrival (a host clock ahead of CMIS): it is not
+    // put in force, and the host does not hammer CMIS for new ones.
+    let fake = Fake::default()
+        .rotates(Ok(issued(17, info(ID, 600, 620, true))))
+        .attests(Ok(issued(18, info(ID, 900, 1900, true))));
+    let (mut r, log, status) = holding(fake, true);
+    assert_eq!(r.step(600).await.unwrap(), REATTEST_INTERVAL);
+    assert_eq!(calls(&log), [Call::Rotate]);
+    assert_eq!(
+        status.observe().await.renewal,
+        Some(crate::status::RenewalPhase::Failed(AttestFailure::Other))
+    );
+    // An early wake does not retry; the next attempt waits the interval.
+    assert_eq!(r.step(700).await.unwrap(), Duration::from_secs(200));
+    // By then only the last quarter of the lifetime is left: re-attest.
+    r.step(900).await.unwrap();
+    assert_eq!(
+        calls(&log)[1..3],
+        [Call::FullAttest, Call::Install(18, RenewalPath::FullAttest)]
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_full_attestation_past_expiry_disables_minting() {
+    // A CMIS that stalls mid-stream must not keep the step from switching
+    // minting off at expiry (1 s left here).
+    let fake = Fake::default().stalls(Stall::FullAttest);
+    let (mut r, log, status) = holding(fake, false);
+    let wait = r.step(TTL - 1).await.unwrap();
+    assert_eq!(calls(&log), [Call::FullAttest, Call::Disable]);
+    assert!(wait >= Duration::from_secs(270), "{wait:?}");
+    assert_eq!(
+        status.observe().await.phase,
+        AttestPhase::Failed(AttestFailure::CmisUnreachable)
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_rotate_past_expiry_disables_minting() {
+    // SVID 0..4: renewal point 2, one second left at 3 (still a quarter).
+    let fake = Fake::default().stalls(Stall::Rotate);
+    let log = Arc::clone(&fake.calls);
+    let mut r = Renewal::new(fake, StatusHandle::new("default", 0))
+        .with_jitter(|| 0.5)
+        .with_current(info(ID, 0, 4, true), 0);
+    r.step(3).await.unwrap();
+    assert_eq!(calls(&log), [Call::Rotate, Call::Disable]);
+}
+
+#[tokio::test]
+async fn every_renewer_call_has_a_deadline() {
+    let short = Timeouts {
+        rotate: Duration::from_millis(50),
+        full_attest: Duration::from_millis(50),
+        after_install: Duration::from_millis(50),
+    };
+    // A stalled Rotate is a transient failure: retried after the back-off.
+    let fake = Fake::default().stalls(Stall::Rotate);
+    let (r, log, _) = holding(fake, true);
+    let mut r = r.with_timeouts(short);
     let wait = r.step(600).await.unwrap();
     assert!(wait <= Duration::from_secs(30), "{wait:?}");
     assert_eq!(calls(&log), [Call::Rotate]);
-    assert_eq!(status.observe().await.svid.unwrap().not_after, TTL);
+    // A stalled full attestation too, without disabling a valid SVID.
+    let fake = Fake::default().stalls(Stall::FullAttest);
+    let (r, log, status) = holding(fake, false);
+    let mut r = r.with_timeouts(short);
+    assert!(r.step(600).await.unwrap() <= Duration::from_secs(30));
+    assert_eq!(calls(&log), [Call::FullAttest]);
+    assert_eq!(status.observe().await.phase, AttestPhase::Attested);
+    // A stalled refresh after the swap leaves the new SVID in force.
+    let fake = Fake::default()
+        .rotates(Ok(issued(19, info(ID, 600, 1600, true))))
+        .stalls(Stall::AfterInstall);
+    let (r, log, status) = holding(fake, true);
+    let mut r = r.with_timeouts(short);
+    assert_eq!(r.step(600).await.unwrap(), Duration::from_secs(600));
+    assert_eq!(calls(&log)[1..3], installed(19, RenewalPath::Rotate));
+    assert_eq!(status.observe().await.svid.unwrap().not_after, 1600);
+}
+
+#[tokio::test]
+async fn status_reports_the_jittered_renewal_point() {
+    // A healthy host is not "renewal due" before its own jittered point.
+    let fake = Fake::default().rotates(Ok(issued(20, info(ID, 500, 1500, true))));
+    let log = Arc::clone(&fake.calls);
+    let status = StatusHandle::new("default", 0);
+    status.attest_succeeded(ID, 0, TTL);
+    let mut r = Renewal::new(fake, status.clone())
+        .with_jitter(|| 0.999)
+        .with_current(info(ID, 0, TTL, true), 0);
+    let due = ferro_svid::rotation_at(0, TTL, 0.999);
+    assert_eq!(status.observe().await.svid.unwrap().renew_at, due);
+    assert_eq!(due, 700);
+    r.step(due).await.unwrap();
+    assert_eq!(calls(&log)[0], Call::Rotate);
+    assert_eq!(
+        status.observe().await.svid.unwrap().renew_at,
+        ferro_svid::rotation_at(500, 1500, 0.999)
+    );
+}
+
+#[tokio::test]
+async fn repeated_transient_rotate_failures_fall_back_to_full_attestation() {
+    let fake = Fake::default()
+        .rotates(Err(Status::internal("x")))
+        .rotates(Err(Status::unknown("x")))
+        .rotates(Err(Status::aborted("x")))
+        .attests(Ok(issued(21, info(ID, 700, 1700, true))));
+    let (mut r, log, _) = holding(fake, true);
+    let mut now = 600;
+    for _ in 0..4 {
+        now += i64::try_from(r.step(now).await.unwrap().as_secs()).unwrap();
+    }
+    let mut want = vec![Call::Rotate, Call::Rotate, Call::Rotate, Call::FullAttest];
+    want.extend(installed(21, RenewalPath::FullAttest));
+    assert_eq!(calls(&log), want);
+}
+
+#[tokio::test]
+async fn rotate_is_skipped_in_the_last_quarter_of_the_lifetime() {
+    let fake = Fake::default()
+        .rotates(Err(Status::unavailable("x")))
+        .attests(Ok(issued(22, info(ID, 760, 1760, true))));
+    let (mut r, log, _) = holding(fake, true);
+    let wait = r.step(600).await.unwrap(); // Rotate fails transiently
+    let _ = wait;
+    r.step(760).await.unwrap(); // 240 s left of 1000: re-attest
+    assert_eq!(calls(&log)[..2], [Call::Rotate, Call::FullAttest]);
+}
+
+#[tokio::test]
+async fn identity_change_on_rotate_is_not_swapped() {
+    let fake = Fake::default().rotates(Ok(issued(23, info(OTHER_ID, 600, 1600, true))));
+    let (mut r, log, status) = holding(fake, true);
+    assert!(matches!(
+        r.step(600).await,
+        Err(Fatal::IdentityChanged { .. })
+    ));
+    assert_eq!(calls(&log), [Call::Rotate, Call::Disable]);
+    assert_eq!(
+        status.observe().await.phase,
+        AttestPhase::Failed(AttestFailure::IdentityChanged)
+    );
+}
+
+#[tokio::test]
+async fn accept_never_waits_past_the_new_expiry() {
+    for (iat, exp) in [
+        (600, 1600),
+        (0, 1100),
+        (-500, 700),
+        (600, 640),
+        (600, 100_000),
+    ] {
+        let fake = Fake::default().rotates(Ok(issued(24, info(ID, iat, exp, true))));
+        let (mut r, _, _) = holding(fake, true);
+        let wait = i64::try_from(r.step(600).await.unwrap().as_secs()).unwrap();
+        assert!(600 + wait <= exp.max(TTL), "{iat}..{exp}: {wait}");
+        assert!(wait >= 1);
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_renewal_task_disables_minting_and_is_fatal() {
+    // If the task dies, `serve` must not wait forever with minting on.
+    let fake = Fake {
+        panic_on_rotate: true,
+        ..Fake::default()
+    };
+    let (r, _, _) = holding(fake, true);
+    let creds = CredentialSlot::new();
+    let sink = Arc::new(CheckingSink {
+        slot: creds.clone(),
+        current: Mutex::new(None),
+        history: Mutex::new(Vec::new()),
+    });
+    let swap = Swap::new(
+        creds,
+        Arc::clone(&sink) as Arc<dyn MinterSink>,
+        SvidCell::new(),
+    );
+    let rx = spawn(r, swap, || 600, std::future::pending::<()>());
+    let fatal = tokio::time::timeout(Duration::from_secs(10), next_fatal(Some(rx)))
+        .await
+        .expect("the supervisor reports the dead task");
+    assert_eq!(fatal, Fatal::TaskEnded);
+    assert_eq!(*sink.history.lock().unwrap(), [None]);
+}
+
+#[tokio::test]
+async fn next_fatal_waits_only_for_a_fatal_exit() {
+    // No task, or one that shut down cleanly: never resolves.
+    let pending = tokio::time::timeout(Duration::from_millis(50), next_fatal(None)).await;
+    assert!(pending.is_err());
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    drop(tx);
+    let pending = tokio::time::timeout(Duration::from_millis(50), next_fatal(Some(rx))).await;
+    assert!(pending.is_err());
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    tx.send(Some(Fatal::TaskEnded)).unwrap();
+    assert_eq!(next_fatal(Some(rx)).await, Fatal::TaskEnded);
 }
 
 #[tokio::test]
@@ -482,8 +734,8 @@ async fn a_renewed_svid_is_not_renewed_again_at_once() {
     // already passed: wait at least RETRY_BASE instead of looping on CMIS.
     let fake = Fake::default().rotates(Ok(issued(15, info(ID, 0, 1100, true))));
     let (mut r, log, _) = holding(fake, true);
-    assert_eq!(r.step(800).await.unwrap(), schedule::RETRY_BASE);
-    assert_eq!(r.step(801).await.unwrap(), Duration::from_secs(29));
+    assert_eq!(r.step(700).await.unwrap(), schedule::RETRY_BASE);
+    assert_eq!(r.step(701).await.unwrap(), Duration::from_secs(29));
     assert_eq!(calls(&log).len(), 3, "one renewal only: {:?}", calls(&log));
 }
 
@@ -588,7 +840,7 @@ fn parent_of_minted(m: &ChildTokenMinter) -> String {
 }
 
 #[tokio::test]
-async fn swaps_credentials_and_minter_atomically() {
+async fn swap_installs_credentials_before_the_minter() {
     let (secret, _) = CompositeSecretKey::generate().unwrap();
     let secret = Arc::new(secret);
     let creds = CredentialSlot::new();
@@ -674,4 +926,205 @@ async fn propose_uses_renewed_svid() {
     // The cell's Debug output never shows the JWS.
     swap.install(&old).await;
     assert!(!format!("{cell:?}").contains("svid.jws"));
+}
+
+// --- the daemon's renewer (HostRenewer) ---------------------------------------
+
+/// A scripted [`HostAttestor`] that records the key policy of every call.
+#[derive(Default)]
+struct FakeAttestor {
+    results: Mutex<VecDeque<Result<Attested, AttestFailure>>>,
+    policies: Arc<Mutex<Vec<KeyPolicy>>>,
+}
+
+impl HostAttestor for FakeAttestor {
+    fn attest(&self, policy: KeyPolicy) -> BoxFuture<'_, Result<Attested, AttestFailure>> {
+        self.policies.lock().unwrap().push(policy);
+        let r = self
+            .results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("an unexpected attestation");
+        Box::pin(async move { r })
+    }
+}
+
+/// A dialer for tests that never Rotate.
+struct NoDial;
+
+impl CmisDial for NoDial {
+    fn dial(&self) -> BoxFuture<'_, Result<DialedCmis, Status>> {
+        Box::pin(async { Err(Status::unavailable("cmis_unreachable")) })
+    }
+}
+
+/// Records which SVIDs were sealed.
+#[derive(Default, Clone)]
+struct FakeSealer(Arc<Mutex<Vec<String>>>);
+
+impl X509Sealer for FakeSealer {
+    fn seal(&self, svid: &HostSvid) -> Option<&'static str> {
+        self.0.lock().unwrap().push(svid.jws.clone());
+        Some("machine-key")
+    }
+}
+
+/// Records the SVIDs `after_install` saw.
+#[derive(Default, Clone)]
+struct FakeHooks(Arc<Mutex<Vec<String>>>);
+
+impl RenewalHooks for FakeHooks {
+    fn after_install<'a>(&'a mut self, svid: &'a HostSvid) -> BoxFuture<'a, ()> {
+        self.0.lock().unwrap().push(svid.jws.clone());
+        Box::pin(async {})
+    }
+}
+
+/// A host SVID for `spiffe_id` under `kid`, `iat..exp`.
+fn svid_for(spiffe_id: &str, jws: &str, kid: &str, iat: i64, exp: i64) -> HostSvid {
+    let (secret, _) = CompositeSecretKey::generate().unwrap();
+    let key: Arc<dyn ferro_sep::MachineKey + Send + Sync> =
+        Arc::new(ferro_sep::SoftwareMachineKey::generate().unwrap());
+    HostSvid::new(
+        SvidBundle {
+            jws: jws.to_string(),
+            issued_at: iat,
+            expires_at: exp,
+            spiffe_id: spiffe_id.to_string(),
+            x509_svid: vec![1],
+            x509_bundle: vec![2],
+        },
+        Arc::new(secret),
+        kid.to_string(),
+        Some(key),
+    )
+}
+
+struct Rig {
+    renewal: Renewal<HostRenewer<FakeAttestor, NoDial, FakeSealer, FakeHooks>>,
+    policies: Arc<Mutex<Vec<KeyPolicy>>>,
+    sealed: FakeSealer,
+    hooks: FakeHooks,
+    creds: CredentialSlot,
+    status: StatusHandle,
+}
+
+/// A renewal over a [`HostRenewer`] answering `results`, holding `current`
+/// (a seeded start-up attestation) when given.
+fn rig(results: Vec<Result<Attested, AttestFailure>>, current: Option<Attested>) -> Rig {
+    let attestor = FakeAttestor {
+        results: Mutex::new(results.into()),
+        policies: Arc::default(),
+    };
+    let policies = Arc::clone(&attestor.policies);
+    let (sealed, hooks) = (FakeSealer::default(), FakeHooks::default());
+    let creds = CredentialSlot::new();
+    let sink = Arc::new(CheckingSink {
+        slot: creds.clone(),
+        current: Mutex::new(None),
+        history: Mutex::new(Vec::new()),
+    });
+    let swap = Swap::new(creds.clone(), sink as Arc<dyn MinterSink>, SvidCell::new());
+    let status = StatusHandle::new("default", 0);
+    let mut renewer = HostRenewer::new(
+        attestor,
+        NoDial,
+        sealed.clone(),
+        hooks.clone(),
+        swap,
+        status.clone(),
+        None,
+    );
+    let mut renewal_info = None;
+    if let Some(a) = current {
+        status.attest_succeeded(&a.svid.spiffe_id, a.svid.issued_at, a.svid.expires_at);
+        renewal_info = Some(a.svid.info());
+        renewer = renewer.with_current(&a);
+    }
+    let mut renewal = Renewal::new(renewer, status.clone()).with_jitter(|| 0.5);
+    if let Some(info) = renewal_info {
+        renewal = renewal.with_current(info, 0);
+    }
+    Rig {
+        renewal,
+        policies,
+        sealed,
+        hooks,
+        creds,
+        status,
+    }
+}
+
+fn seeded(svid: HostSvid) -> Attested {
+    Attested { svid, seeded: true }
+}
+
+#[tokio::test]
+async fn renewals_reopen_the_key_and_seed_they_started_with() {
+    // Before this run attested anything, the key and seed may be created;
+    // after, a renewal only reopens them (and needs the seed it used).
+    let first = svid_for(ID, "a.b.c", "kid-1", 0, TTL);
+    let second = svid_for(ID, "d.e.f", "kid-1", 600, 1600);
+    let mut rig = rig(vec![Ok(seeded(first)), Ok(seeded(second))], None);
+    rig.renewal.step(0).await.unwrap();
+    rig.renewal.step(600).await.unwrap();
+    assert_eq!(
+        *rig.policies.lock().unwrap(),
+        [
+            KeyPolicy::OpenOrCreate,
+            KeyPolicy::OpenOnly {
+                seed_required: true
+            }
+        ]
+    );
+    // The hooks ran with each new SVID, after the swap.
+    assert_eq!(*rig.hooks.0.lock().unwrap(), ["a.b.c", "d.e.f"]);
+    assert_eq!(rig.creds.get().unwrap().svid_jws, "d.e.f");
+}
+
+#[tokio::test]
+async fn a_seeded_host_refuses_a_renewal_under_another_kid() {
+    // A seed swapped behind the agent's back (or lost and re-created) would
+    // rotate the child-signing key and break tokens verifiers trust.
+    let start = seeded(svid_for(ID, "a.b.c", "kid-1", 0, TTL));
+    let other_kid = seeded(svid_for(ID, "d.e.f", "kid-2", 600, 1600));
+    let ephemeral = Attested {
+        svid: svid_for(ID, "g.h.i", "kid-1", 600, 1600),
+        seeded: false,
+    };
+    let mut rig = rig(vec![Ok(other_kid), Ok(ephemeral)], Some(start));
+    rig.renewal.step(600).await.unwrap();
+    assert_eq!(
+        rig.status.observe().await.renewal,
+        Some(crate::status::RenewalPhase::Failed(
+            AttestFailure::MachineKey
+        ))
+    );
+    let mut now = 600;
+    now += i64::try_from(rig.renewal.step(now).await.unwrap().as_secs()).unwrap();
+    let _ = now;
+    assert!(rig.sealed.0.lock().unwrap().is_empty(), "nothing sealed");
+    assert!(rig.hooks.0.lock().unwrap().is_empty(), "nothing installed");
+}
+
+#[tokio::test]
+async fn x509_is_sealed_only_after_acceptance() {
+    // Another identity, or an SVID with no life left, must not overwrite the
+    // sealed X.509 store.
+    let start = seeded(svid_for(ID, "a.b.c", "kid-1", 0, TTL));
+    let skewed = seeded(svid_for(ID, "d.e.f", "kid-1", 0, 610));
+    let good = seeded(svid_for(ID, "g.h.i", "kid-1", 900, 1900));
+    let mut r = rig(vec![Ok(skewed), Ok(good)], Some(start));
+    r.renewal.step(600).await.unwrap();
+    assert!(r.sealed.0.lock().unwrap().is_empty());
+    r.renewal.step(900).await.unwrap();
+    assert_eq!(*r.sealed.0.lock().unwrap(), ["g.h.i"]);
+
+    let start = seeded(svid_for(ID, "a.b.c", "kid-1", 0, TTL));
+    let foreign = seeded(svid_for(OTHER_ID, "x.y.z", "kid-1", 600, 1600));
+    let mut r = rig(vec![Ok(foreign)], Some(start));
+    assert!(r.renewal.step(600).await.is_err());
+    assert!(r.sealed.0.lock().unwrap().is_empty());
+    assert!(r.creds.get().is_none(), "minting and host calls off");
 }

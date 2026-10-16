@@ -104,7 +104,8 @@ Two seams are deliberately left for later milestones:
 - **Renewal in the running daemon (T294).** One task per environment
   (`mia::renewal`) renews at the jittered 60 % point, swaps credentials,
   minter, status and allowlist sync in a fixed order, retries with a bounded
-  back-off, switches minting off at expiry and stops the daemon if CMIS
-  issues another identity (see [../operations.md](../operations.md)
+  back-off and deadlines, switches minting off at expiry (the minter also
+  refuses an expired parent and clamps child tokens to it) and stops the
+  daemon if CMIS issues another identity (see [../operations.md](../operations.md)
   §"Host SVID renewal in the daemon"). Before 0.30.0 only a restart renewed
   an expired SVID.
