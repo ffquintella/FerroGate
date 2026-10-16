@@ -132,7 +132,7 @@ messages! {
     ExplainCrlStale => "The cached revocation list is older than 5 minutes, so token minting is refused. The self-test tells whether CMIS or this agent is at fault.", "A lista de revogação em cache tem mais de 5 minutos, então a emissão de tokens é recusada. O autoteste indica se a falha é do CMIS ou deste agente.";
     ExplainAllowlistMissing => "No signed allowlist is loaded, so every local caller is denied. Resync it from CMIS, or enable allowlist.fetch / allowlist.propose in the wizard.", "Nenhuma lista de permissões assinada está carregada, então todo chamador local é negado. Ressincronize-a a partir do CMIS ou ative allowlist.fetch / allowlist.propose no assistente.";
     ExplainAllowlistInvalid => "The allowlist failed verification or expired, so every local caller is denied. Resync it from CMIS.", "A lista de permissões falhou na verificação ou expirou, então todo chamador local é negado. Ressincronize-a a partir do CMIS.";
-    ExplainSvidExpiring => "The machine identity is past its renewal point and renewal is failing. Run the self-test; restarting the service retries attestation.", "A identidade da máquina passou do ponto de renovação e a renovação está falhando. Execute o autoteste; reiniciar o serviço tenta a atestação novamente.";
+    ExplainSvidExpiring => "The machine identity is past its renewal point and renewal is failing; the agent keeps retrying on its own. Run the self-test to see which step fails.", "A identidade da máquina passou do ponto de renovação e a renovação está falhando; o agente continua tentando sozinho. Execute o autoteste para ver qual etapa falha.";
     ExplainHealthy => "The machine identity is valid, the revocation list is fresh and the allowlist is loaded.", "A identidade da máquina é válida, a lista de revogação está atualizada e a lista de permissões está carregada.";
     ExplainUnknownError => "The agent reported a problem this version of the tray does not recognise. Run the self-test for details.", "O agente relatou um problema que esta versão do tray não reconhece. Execute o autoteste para detalhes.";
     ExplainAccessDenied => "Your account may not read the agent's status: it is not in the status group (ferrogate-status, or FerroGateStatus on Windows). Ask an administrator to add you, then log out and back in.", "Sua conta não pode ler o status do agente: ela não está no grupo de status (ferrogate-status, ou FerroGateStatus no Windows). Peça a um administrador para incluí-lo e depois saia e entre novamente.";
@@ -343,6 +343,21 @@ mod tests {
             };
             assert_eq!(holes(m.text(Lang::En)), holes(m.text(Lang::Pt)), "{m:?}");
         }
+    }
+
+    #[test]
+    fn a_failing_renewal_is_explained_as_retried_by_the_agent() {
+        // Since 0.30.0 the agent renews on its own (T294): no restart advice.
+        let en = Msg::ExplainSvidExpiring.text(Lang::En);
+        let pt = Msg::ExplainSvidExpiring.text(Lang::Pt);
+        assert!(
+            !en.contains("restart") && en.contains("keeps retrying"),
+            "{en}"
+        );
+        assert!(
+            !pt.contains("reiniciar") && pt.contains("continua tentando"),
+            "{pt}"
+        );
     }
 
     #[test]

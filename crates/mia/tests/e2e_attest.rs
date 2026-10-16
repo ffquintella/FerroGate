@@ -6,10 +6,11 @@
 //!
 //! - `Attest` issues a JWS that the independent reference verifier accepts
 //!   against the JWKS the server publishes;
-//! - `Rotate` takes the short path (no re-attestation) when PCRs and the policy
-//!   epoch are unchanged;
-//! - `Rotate` is refused (full re-attestation required) when the reported PCRs
-//!   drift.
+//! - a host-key host renews with a host-signed `Rotate` on the short path
+//!   (T293), and an epoch bump forces it back through `Attest`;
+//! - a TPM-tier host is always sent back to a full `Attest`;
+//! - the daemon's renewal loop renews before expiry and keeps minting and
+//!   forwarding under the renewed SVID (T294).
 
 #![allow(clippy::cast_possible_truncation)]
 // The handshake future holds a composite key (incl. a ~4 KB ML-DSA secret)
@@ -18,17 +19,21 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use cmis::credential::{CredentialError, CredentialMaker, WrappedCredential};
 use cmis::{CmisConfig, CmisState, MachineIdentitySvc};
 use ferro_attest::{PolicyId, RimStore, TpmQuoteVerifier, Vendor, VendorTrustStore};
 use ferro_audit::{AuditLog, AuditStore, InProcessSigner, LocalDiskWormStore};
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
-use ferro_proto::v1::{BumpEpochRequest, PcrValue, RotateRequest};
+use ferro_proto::v1::{BumpEpochRequest, RotateRequest};
+use ferro_sep::{MachineKey as _, SoftwareMachineKey};
 use ferro_svid::Issuer;
-use mia::client::run_attest;
-use mia::virtual_tpm::{expected_pcr_digest, pcr_values, software_credential_blob, VirtualTpm};
+use mia::audit_client::HostProofSigner;
+use mia::client::{run_attest, run_attest_host_key, AttestedSvid, RotateClientError};
+use mia::host_api::split_host_spiffe_id;
+use mia::virtual_tpm::{expected_pcr_digest, software_credential_blob, VirtualTpm};
 
-use sha2::{Digest, Sha384};
+use sha2::{Digest, Sha256, Sha384};
 
 // --- software credential channel --------------------------------------------
 
@@ -61,7 +66,8 @@ async fn build_state(evidence: &VirtualTpm) -> Arc<CmisState> {
         .unwrap();
     let pcr_digest = expected_pcr_digest();
     let rim = RimStore::new();
-    rim.approve(pcr_digest, PolicyId("test-fleet".into()));
+    rim.approve(pcr_digest, PolicyId("test-fleet".into()))
+        .unwrap();
     let verifier = TpmQuoteVerifier::new(trust, rim);
     state_with_verifier(verifier).await
 }
@@ -175,67 +181,131 @@ async fn attest_issues_svid_that_reference_verifier_accepts() {
     );
 }
 
-#[tokio::test]
-async fn rotate_short_path_when_pcrs_unchanged() {
-    let mut evidence = VirtualTpm::ephemeral().unwrap();
-    let state = build_state(&evidence).await;
-    let mut client = spawn_server(state).await;
+// --- T293: host-signed Rotate --------------------------------------------------
 
-    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+/// `base64url(SHA-256(SPKI))`: the `cnf.jkt` binding an SVID to `key`.
+fn jkt_of(key: &SoftwareMachineKey) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(key.public_spki_der()))
+}
+
+/// Synthetic hardware identifiers for the host-key tier.
+fn sample_facts() -> ferro_machineid::MachineFacts {
+    ferro_machineid::MachineFacts {
+        board_serial: "WT3QF2J3YL".to_string(),
+        platform_uuid: "38D33B14-6DDD-51DD-B8CD-9854CAF977D5".to_string(),
+        disk_serial: "0ba0206164386025".to_string(),
+    }
+}
+
+/// A CMIS for the host-key tier (its path never consults the TPM verifier).
+async fn host_key_state() -> Arc<CmisState> {
+    state_with_verifier(TpmQuoteVerifier::new(
+        VendorTrustStore::new(),
+        RimStore::new(),
+    ))
+    .await
+}
+
+/// Attest a host-key host whose SVID is bound to `key`.
+async fn attest_host_key(
+    client: &mut MachineIdentityClient<tonic::transport::Channel>,
+    facts: &ferro_machineid::MachineFacts,
+    key: &SoftwareMachineKey,
+) -> AttestedSvid {
+    run_attest_host_key(client, facts, key, jkt_of(key), None)
         .await
-        .unwrap();
+        .expect("host-key attestation succeeds")
+}
 
-    // Same PCRs, same epoch, inside the window: short path succeeds, no TPM.
-    let rotated = client
-        .rotate(RotateRequest {
-            current_svid: attested.bundle.jws.clone(),
-            pcr_values: pcr_values()
-                .into_iter()
-                .map(|(index, value)| PcrValue {
-                    index: u32::from(index),
-                    value,
-                })
-                .collect(),
-            known_epoch: 1,
-        })
-        .await
-        .expect("short-path rotate succeeds")
-        .into_inner();
+/// One host-signed `Rotate` of `svid`, made with `key`.
+async fn signed_rotate(
+    client: &mut MachineIdentityClient<tonic::transport::Channel>,
+    key: &SoftwareMachineKey,
+    svid: &ferro_proto::v1::SvidBundle,
+    state_digest: &[u8; 48],
+) -> Result<ferro_proto::v1::SvidBundle, RotateClientError> {
+    let (_, host_uuid) = split_host_spiffe_id(&svid.spiffe_id).expect("a host SVID");
+    let signer = HostProofSigner {
+        key,
+        svid_jws: &svid.jws,
+        host_uuid,
+    };
+    mia::client::rotate(client, &signer, state_digest).await
+}
 
-    assert_eq!(rotated.spiffe_id, attested.bundle.spiffe_id);
-    let jwks = ferro_svid_verify::JwkSet::from_json(&fetch_jwks(&mut client).await).unwrap();
-    ferro_svid_verify::verify(&rotated.jws, &jwks, rotated.issued_at + 10, 0).unwrap();
+fn refused_code(err: RotateClientError) -> tonic::Code {
+    match err {
+        RotateClientError::Transport(s) => s.code(),
+        other => panic!("expected an RPC refusal, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn rotate_refused_on_pcr_drift() {
+async fn rotate_short_path_for_host_key_tier() {
+    let mut client = spawn_server(host_key_state().await).await;
+    let facts = sample_facts();
+    let key = SoftwareMachineKey::generate().unwrap();
+    let attested = attest_host_key(&mut client, &facts, &key).await;
+    let fingerprint = facts.fingerprint();
+
+    // Same fingerprint, same epoch, inside the window: short path, no
+    // re-attestation, proven with the machine key.
+    let rotated = signed_rotate(&mut client, &key, &attested.bundle, fingerprint.as_bytes())
+        .await
+        .expect("short-path rotate succeeds");
+    assert_eq!(rotated.spiffe_id, attested.bundle.spiffe_id);
+    assert_ne!(rotated.jws, attested.bundle.jws);
+    let jwks = ferro_svid_verify::JwkSet::from_json(&fetch_jwks(&mut client).await).unwrap();
+    let verified =
+        ferro_svid_verify::verify(&rotated.jws, &jwks, rotated.issued_at + 10, 0).unwrap();
+    assert_eq!(
+        verified.claims.cnf.jkt,
+        jkt_of(&key),
+        "still bound to the key"
+    );
+    assert_eq!(verified.claims.attest.policy_id, "host-key");
+
+    // The renewed SVID renews again; the one it replaced no longer does.
+    signed_rotate(&mut client, &key, &rotated, fingerprint.as_bytes())
+        .await
+        .expect("the latest SVID renews");
+    let err = signed_rotate(&mut client, &key, &attested.bundle, fingerprint.as_bytes())
+        .await
+        .expect_err("a superseded SVID must not renew");
+    assert_eq!(refused_code(err), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn rotate_refused_for_tpm_tier() {
     let mut evidence = VirtualTpm::ephemeral().unwrap();
     let state = build_state(&evidence).await;
     let mut client = spawn_server(state).await;
-
-    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
+    // Bind the TPM-tier SVID to a machine key so the host can sign the proof.
+    let key = SoftwareMachineKey::generate().unwrap();
+    let attested = run_attest(&mut client, &mut evidence, jkt_of(&key))
         .await
         .unwrap();
 
-    // Tamper one PCR value -> drift -> server forces full re-attestation.
-    let mut drifted = pcr_values();
-    drifted[0].1[0] ^= 0xFF;
+    // The pre-T293 request (an SVID and the deprecated unsigned fields) is
+    // not even considered.
+    #[allow(deprecated)]
+    let legacy = RotateRequest {
+        current_svid: attested.bundle.jws.clone(),
+        known_epoch: 1,
+        ..Default::default()
+    };
     let status = client
-        .rotate(RotateRequest {
-            current_svid: attested.bundle.jws.clone(),
-            pcr_values: drifted
-                .into_iter()
-                .map(|(index, value)| PcrValue {
-                    index: u32::from(index),
-                    value,
-                })
-                .collect(),
-            known_epoch: 1,
-        })
+        .rotate(legacy)
         .await
-        .expect_err("rotate must be refused on drift");
+        .expect_err("an unauthenticated rotate must be refused");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    // A valid host proof still renews nothing on the TPM tier: its PCRs
+    // need a fresh quote, so it is sent back to a full Attest.
+    let err = signed_rotate(&mut client, &key, &attested.bundle, &expected_pcr_digest())
+        .await
+        .expect_err("the TPM tier must re-attest");
+    assert_eq!(refused_code(err), tonic::Code::FailedPrecondition);
 }
 
 // --- F10: RIM bundle / loader / status mapping ------------------------------
@@ -356,7 +426,8 @@ async fn audit_log_records_attest_events_and_proofs_verify_offline() {
             .unwrap();
         let pcr_digest = expected_pcr_digest();
         let rim = RimStore::new();
-        rim.approve(pcr_digest, PolicyId("test-fleet".into()));
+        rim.approve(pcr_digest, PolicyId("test-fleet".into()))
+            .unwrap();
         TpmQuoteVerifier::new(trust, rim)
     })
     .await;
@@ -591,28 +662,16 @@ impl Drop for RemoveOnDrop {
 
 #[tokio::test]
 async fn bump_epoch_forces_full_reattestation_on_next_rotate() {
-    let mut evidence = VirtualTpm::ephemeral().unwrap();
-    let state = build_state(&evidence).await;
+    let state = host_key_state().await;
     let mut client = spawn_server(Arc::clone(&state)).await;
+    let facts = sample_facts();
+    let fingerprint = facts.fingerprint();
+    let key = SoftwareMachineKey::generate().unwrap();
 
-    // Attest under epoch 1, then confirm a same-epoch rotate takes the short
-    // path (no re-attestation) — the control for the assertion below.
-    let attested = run_attest(&mut client, &mut evidence, "dpop-thumb".to_string())
-        .await
-        .unwrap();
-    let pcrs: Vec<PcrValue> = pcr_values()
-        .into_iter()
-        .map(|(index, value)| PcrValue {
-            index: u32::from(index),
-            value,
-        })
-        .collect();
-    client
-        .rotate(RotateRequest {
-            current_svid: attested.bundle.jws.clone(),
-            pcr_values: pcrs.clone(),
-            known_epoch: 1,
-        })
+    // Attest under epoch 1, then confirm a same-epoch, host-signed rotate
+    // takes the short path — the control for the assertion below.
+    let attested = attest_host_key(&mut client, &facts, &key).await;
+    let renewed = signed_rotate(&mut client, &key, &attested.bundle, fingerprint.as_bytes())
         .await
         .expect("short-path rotate succeeds before the bump");
 
@@ -632,17 +691,24 @@ async fn bump_epoch_forces_full_reattestation_on_next_rotate() {
     let (_old, new_epoch) = state.bump_epoch();
     assert_eq!(new_epoch, 2, "epoch advanced 1 -> 2");
 
-    // The SVID was attested under epoch 1; with the live epoch now 2, the next
-    // rotate must be refused so the host is driven back through full Attest.
-    let status = client
-        .rotate(RotateRequest {
-            current_svid: attested.bundle.jws.clone(),
-            pcr_values: pcrs,
-            known_epoch: 2,
-        })
+    // The host was attested under epoch 1; with the live epoch now 2, its
+    // next rotate (from its latest SVID) must be refused so it is driven back
+    // through a full Attest.
+    let err = signed_rotate(&mut client, &key, &renewed, fingerprint.as_bytes())
         .await
         .expect_err("rotate must be refused after an epoch bump");
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(refused_code(err), tonic::Code::FailedPrecondition);
+
+    // A full re-attestation under the new epoch makes renewal possible again.
+    let reattested = attest_host_key(&mut client, &facts, &key).await;
+    signed_rotate(
+        &mut client,
+        &key,
+        &reattested.bundle,
+        fingerprint.as_bytes(),
+    )
+    .await
+    .expect("renewal works again after re-attesting under epoch 2");
 }
 
 // --- F13: fleet enrolment pre-admission -------------------------------------
@@ -709,5 +775,332 @@ async fn unenrolled_host_is_rejected_before_quote_verification() {
         state.audit.len(),
         audit_before + 1,
         "only a HostRejected event should be recorded"
+    );
+}
+
+// --- T294: the daemon renews its host SVID while running -------------------
+
+/// The host-key backend against the in-process CMIS, as the daemon's
+/// attestor: records the key policy of every call; `facts` can be switched
+/// to make CMIS issue another identity.
+struct E2eAttestor {
+    client: MachineIdentityClient<tonic::transport::Channel>,
+    facts: std::sync::Mutex<ferro_machineid::MachineFacts>,
+    key: Arc<SoftwareMachineKey>,
+    seed: [u8; 32],
+    policies: Arc<std::sync::Mutex<Vec<mia::renewal::KeyPolicy>>>,
+}
+
+/// The [`mia::renewal::Attested`] a seeded host-key attestation yields.
+fn attested_of(attested: AttestedSvid, key: &Arc<SoftwareMachineKey>) -> mia::renewal::Attested {
+    let kid = ferro_svid::child_signing_kid(&attested.svid_public);
+    let key: Arc<dyn ferro_sep::MachineKey + Send + Sync> = key.clone();
+    mia::renewal::Attested {
+        svid: mia::renewal::HostSvid::new(
+            attested.bundle,
+            Arc::new(attested.svid_secret),
+            kid,
+            Some(key),
+        ),
+        seeded: true,
+    }
+}
+
+impl mia::renewal::HostAttestor for E2eAttestor {
+    fn attest(
+        &self,
+        policy: mia::renewal::KeyPolicy,
+    ) -> futures::future::BoxFuture<'_, Result<mia::renewal::Attested, mia::status::AttestFailure>>
+    {
+        self.policies.lock().unwrap().push(policy);
+        let facts = self.facts.lock().unwrap().clone();
+        let mut client = self.client.clone();
+        Box::pin(async move {
+            let attested = run_attest_host_key(
+                &mut client,
+                &facts,
+                &*self.key,
+                jkt_of(&self.key),
+                Some(&self.seed),
+            )
+            .await
+            .map_err(|e| mia::status::AttestFailure::from_attest_error(&e, false))?;
+            Ok(attested_of(attested, &self.key))
+        })
+    }
+}
+
+/// Records the SVIDs the refresh after a swap saw.
+#[derive(Clone, Default)]
+struct RecordingHooks(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl mia::renewal::RenewalHooks for RecordingHooks {
+    fn after_install<'a>(
+        &'a mut self,
+        svid: &'a mia::renewal::HostSvid,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        self.0.lock().unwrap().push(svid.jws.clone());
+        Box::pin(async {})
+    }
+}
+
+/// The helper API's minter, as the swap sees it.
+#[derive(Default)]
+struct LiveMinter(std::sync::Mutex<Option<mia::helper::ChildTokenMinter>>);
+
+impl mia::renewal::MinterSink for LiveMinter {
+    fn set(
+        &self,
+        minter: Option<mia::helper::ChildTokenMinter>,
+    ) -> futures::future::BoxFuture<'_, ()> {
+        *self.0.lock().unwrap() = minter;
+        Box::pin(async {})
+    }
+}
+
+/// Mint one child token with the live minter; its `(kid, parent_svid)`.
+fn mint_with(live: &LiveMinter, now: i64) -> (String, String) {
+    use mia::helper::token::{ChildClaims, ChildHeader};
+    let minter = live.0.lock().unwrap().clone().expect("minting is on");
+    let actor = mia::helper::CallerIdentity::new(4321, 1000, 1000, [0xAB; 48]);
+    let token = minter
+        .mint("https://api.test", "jkt", 60, &actor, now)
+        .unwrap();
+    let mut parts = token.jws.split('.');
+    let decode = |p: Option<&str>| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(p.unwrap())
+            .unwrap()
+    };
+    let header: ChildHeader = serde_json::from_slice(&decode(parts.next())).unwrap();
+    let claims: ChildClaims = serde_json::from_slice(&decode(parts.next())).unwrap();
+    (header.kid, claims.ferrogate.parent_svid)
+}
+
+/// The sealed X.509 leaf at `path`, opened with `fingerprint`.
+fn sealed_leaf(path: &std::path::Path, fingerprint: &[u8], now: i64) -> Vec<u8> {
+    mia::credstore::with_sealer(Some(fingerprint), |sealer| {
+        mia::credstore::load(path, sealer, now)
+    })
+    .expect("a sealer")
+    .expect("the store opens")
+    .expect("a credential is stored")
+    .credential
+    .leaf_der
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one renewal lifecycle, step by step.
+async fn daemon_renews_host_svid_before_expiry() {
+    use ferro_audit::{AuditEvent, Hash384};
+    use mia::renewal::{KeyPolicy, RenewalPath, X509Sealer as _};
+
+    let state = host_key_state().await;
+    let mut client = spawn_server(Arc::clone(&state)).await;
+    let facts = sample_facts();
+    let fingerprint = facts.fingerprint().as_bytes().to_vec();
+    let key = Arc::new(SoftwareMachineKey::generate().unwrap());
+    let seed = [7u8; 32];
+    let dir = std::env::temp_dir().join(format!("mia-e2e-renew-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    let store_path = dir.join("x509-svid.sealed");
+
+    // Start-up, as `serve` does it: attest, seal, swap in.
+    let attested = run_attest_host_key(&mut client, &facts, &*key, jkt_of(&key), Some(&seed))
+        .await
+        .unwrap();
+    let first = attested_of(attested, &key);
+    let store = mia::renewal::X509Store::new(store_path.clone(), Some(fingerprint.clone()));
+    store.seal(&first.svid).expect("sealed at start");
+    let creds = mia::host_api::CredentialSlot::new();
+    let live = Arc::new(LiveMinter::default());
+    let cell = mia::renewal::SvidCell::new();
+    let swap = mia::renewal::Swap::new(
+        creds.clone(),
+        Arc::clone(&live) as Arc<dyn mia::renewal::MinterSink>,
+        cell.clone(),
+    );
+    swap.install(&first.svid).await;
+    let (start_kid, _) = mint_with(&live, first.svid.issued_at);
+
+    // Audit forwarding signs with whatever the slot holds.
+    let spool_dir = dir.join("spool");
+    let (tx, rx) = tokio::sync::mpsc::channel(mia::audit_forward::CHANNEL_CAPACITY);
+    let forwarder = mia::audit_forward::spawn(
+        rx,
+        Some(mia::audit_forward::Forwarding {
+            api: Arc::new(mia::audit_forward::ChannelAuditApi::new(client.clone())),
+            creds: creds.clone(),
+        }),
+        &spool_dir.join("audit-spool.jsonl"),
+        mia::audit_forward::ForwarderConfig::default(),
+    );
+
+    // The daemon's renewer over the real Rotate, swap and X.509 store.
+    let policies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hooks = RecordingHooks::default();
+    let status = mia::status::StatusHandle::new("default", first.svid.issued_at);
+    let (iat, exp) = (first.svid.issued_at, first.svid.expires_at);
+    let attestor = E2eAttestor {
+        client: client.clone(),
+        facts: std::sync::Mutex::new(facts.clone()),
+        key: Arc::clone(&key),
+        seed,
+        policies: Arc::clone(&policies),
+    };
+    let host_renewer = mia::renewal::HostRenewer::new(
+        attestor,
+        client.clone(),
+        mia::renewal::X509Store::new(store_path.clone(), Some(fingerprint.clone())),
+        hooks.clone(),
+        swap.clone(),
+        status.clone(),
+        Some(*facts.fingerprint().as_bytes()),
+    )
+    .with_current(&first);
+    let mut renewal = mia::renewal::Renewal::new(host_renewer, status.clone())
+        .with_jitter(|| 0.5)
+        .with_current(first.svid.info(), iat);
+
+    // The daemon's clock reaches the renewal point (60 % of a 1 h test TTL)
+    // well before expiry: inside the 24 h window it renews with Rotate.
+    let due = iat + (exp - iat) * 6 / 10;
+    let wait = renewal.step(due).await.expect("renewal succeeds");
+    let renewed = creds.get().expect("credentials stay in force");
+    assert_ne!(renewed.svid_jws, first.svid.jws, "a new SVID is in force");
+    assert!(renewed.valid_at(due));
+    assert!(wait >= mia::renewal::schedule::RETRY_BASE, "{wait:?}");
+    assert!(policies.lock().unwrap().is_empty(), "no full attestation");
+    assert_eq!(
+        *hooks.0.lock().unwrap(),
+        std::slice::from_ref(&renewed.svid_jws)
+    );
+    let jwks = ferro_svid_verify::JwkSet::from_json(&fetch_jwks(&mut client).await).unwrap();
+    let verified = ferro_svid_verify::verify(&renewed.svid_jws, &jwks, iat + 10, 0).unwrap();
+    assert_eq!(verified.claims.sub, first.svid.spiffe_id);
+    assert_eq!(verified.claims.cnf.jkt, jkt_of(&key));
+
+    // Minting continues under the same key (kid), parented on the new SVID.
+    let (kid_after, parent_after) = mint_with(&live, due);
+    assert_eq!(kid_after, start_kid);
+    assert_eq!(
+        parent_after,
+        hex::encode(Sha384::digest(renewed.svid_jws.as_bytes()))
+    );
+    assert!(jwks.keys.iter().any(|k| k.kid == kid_after));
+    assert_eq!(
+        cell.jws_valid_at(due).as_deref(),
+        Some(renewed.svid_jws.as_str())
+    );
+    // The sealed X.509-SVID was replaced by the renewed leaf.
+    let leaf = sealed_leaf(&store_path, &fingerprint, iat + 10);
+    assert_ne!(leaf, first.svid.x509_svid, "re-sealed after Rotate");
+
+    // Forwarding signs with the renewed credentials and CMIS accepts them.
+    tx.send(AuditEvent::LocalDenied {
+        pid: 77,
+        uid: 1000,
+        bin_sha: Hash384([0xCC; 48]),
+        reason: "not_allowlisted".into(),
+    })
+    .await
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while forwarder.stats().forwarded == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the forwarder did not deliver with the renewed SVID: {:?}",
+            forwarder.stats()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    forwarder.abort();
+
+    // An operator epoch bump makes CMIS refuse the next Rotate: the same step
+    // falls back to a full attestation that only reopens the seeded key, and
+    // keeps the same identity and kid.
+    state.bump_epoch();
+    let next_due = due + i64::try_from(wait.as_secs()).unwrap();
+    renewal.step(next_due).await.expect("fallback succeeds");
+    assert_eq!(
+        *policies.lock().unwrap(),
+        [KeyPolicy::OpenOnly {
+            seed_required: true,
+            kid: Some(start_kid.clone())
+        }]
+    );
+    let reattested = creds.get().unwrap();
+    assert_ne!(reattested.svid_jws, renewed.svid_jws);
+    assert_eq!(mint_with(&live, next_due).0, start_kid);
+    assert_eq!(hooks.0.lock().unwrap().len(), 2);
+    assert_eq!(
+        status.observe().await.phase,
+        mia::status::AttestPhase::Attested
+    );
+    let _ = RenewalPath::FullAttest;
+}
+
+#[tokio::test]
+async fn an_identity_change_stops_the_daemon_and_minting() {
+    // A re-enrolled host: CMIS issues an SVID for another SPIFFE id. The
+    // renewal task stops with a fatal exit (`serve` then returns an error)
+    // and minting is off; nothing is sealed.
+    let state = host_key_state().await;
+    let mut client = spawn_server(Arc::clone(&state)).await;
+    let facts = sample_facts();
+    let key = Arc::new(SoftwareMachineKey::generate().unwrap());
+    let seed = [9u8; 32];
+    let attested = run_attest_host_key(&mut client, &facts, &*key, jkt_of(&key), Some(&seed))
+        .await
+        .unwrap();
+    let first = attested_of(attested, &key);
+    let creds = mia::host_api::CredentialSlot::new();
+    let live = Arc::new(LiveMinter::default());
+    let swap = mia::renewal::Swap::new(
+        creds.clone(),
+        Arc::clone(&live) as Arc<dyn mia::renewal::MinterSink>,
+        mia::renewal::SvidCell::new(),
+    );
+    swap.install(&first.svid).await;
+    let mut other = facts.clone();
+    other.board_serial = "ANOTHER-BOARD".into();
+    let attestor = E2eAttestor {
+        client: client.clone(),
+        facts: std::sync::Mutex::new(other),
+        key: Arc::new(SoftwareMachineKey::generate().unwrap()),
+        seed,
+        policies: Arc::default(),
+    };
+    let status = mia::status::StatusHandle::new("default", first.svid.issued_at);
+    // No fingerprint: no Rotate, straight to the full attestation.
+    let renewer = mia::renewal::HostRenewer::new(
+        attestor,
+        client.clone(),
+        (),
+        (),
+        swap.clone(),
+        status.clone(),
+        None,
+    )
+    .with_current(&first);
+    let due = first.svid.issued_at + 2160;
+    let renewal = mia::renewal::Renewal::new(renewer, status.clone())
+        .with_jitter(|| 0.5)
+        .with_current(first.svid.info(), first.svid.issued_at);
+    let rx = mia::renewal::spawn(renewal, swap, move || due, std::future::pending::<()>());
+    let fatal = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        mia::renewal::next_fatal(Some(rx)),
+    )
+    .await
+    .expect("the renewal stops the daemon");
+    assert!(matches!(fatal, mia::renewal::Fatal::IdentityChanged { .. }));
+    assert!(live.0.lock().unwrap().is_none(), "minting is off");
+    assert!(creds.get().is_none(), "host calls are off");
+    assert_eq!(
+        status.observe().await.phase,
+        mia::status::AttestPhase::Failed(mia::status::AttestFailure::IdentityChanged)
     );
 }

@@ -54,6 +54,9 @@ pub enum AttestFailure {
     /// pinned the key's public half — so an operator must repair or restore
     /// the file. See [`crate::machine_key`].
     MachineKey,
+    /// A full attestation returned an SVID for another SPIFFE id (the host
+    /// was re-enrolled, T294): not put in force; the environment stops.
+    IdentityChanged,
     /// Anything else (protocol error, an unexpected local problem).
     Other,
 }
@@ -112,6 +115,17 @@ pub enum AttestPhase {
     Attested,
 }
 
+/// Where the renewal of a still-valid SVID stands (T294). A renewal never
+/// changes the [`AttestPhase`]: the SVID in force keeps serving, so a failed
+/// renewal must not make a healthy host look broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewalPhase {
+    /// A renewal attempt is in flight.
+    InFlight,
+    /// The last renewal attempt failed for this reason; the daemon retries.
+    Failed(AttestFailure),
+}
+
 /// The inputs [`derive`] reads, gathered from a [`StatusHandle`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
@@ -126,6 +140,8 @@ pub struct Observed {
     pub crl_issued_at: Option<i64>,
     /// The allowlist's load outcome.
     pub allowlist: AllowlistLoad,
+    /// The renewal of the SVID held, if one has started since it was issued.
+    pub renewal: Option<RenewalPhase>,
 }
 
 /// Derive the state (and the error behind it) from `obs` at time `now`.
@@ -186,10 +202,13 @@ pub fn derive(obs: &Observed, now: i64) -> (AgentState, Option<ErrorSummary>) {
         AllowlistLoad::Loaded { .. } => {}
     }
     if now >= svid.renew_at {
-        return (
-            AgentState::SvidExpiring,
-            Some(summary(error_codes::SVID_RENEWAL_DUE)),
-        );
+        // A failed renewal names its cause (and that the agent retries);
+        // otherwise the renewal is due or in flight.
+        let error = match obs.renewal {
+            Some(RenewalPhase::Failed(f)) => failure_state(f).1,
+            Some(RenewalPhase::InFlight) | None => Some(summary(error_codes::SVID_RENEWAL_DUE)),
+        };
+        return (AgentState::SvidExpiring, error);
     }
     (AgentState::Healthy, None)
 }
@@ -210,6 +229,10 @@ fn failure_state(f: AttestFailure) -> (AgentState, Option<ErrorSummary>) {
         AttestFailure::MachineKey => (
             AgentState::CmisUnreachable,
             error_codes::MACHINE_KEY_REFUSED,
+        ),
+        AttestFailure::IdentityChanged => (
+            AgentState::CmisUnreachable,
+            error_codes::HOST_IDENTITY_CHANGED,
         ),
         AttestFailure::Other => (AgentState::CmisUnreachable, error_codes::ATTESTATION_FAILED),
     };
@@ -238,6 +261,10 @@ pub fn message_for(code: &str) -> &'static str {
         error_codes::MACHINE_KEY_REFUSED => {
             "the machine key or SVID seed exists but cannot be used; the agent will not \
              replace it (CMIS has pinned it) — repair or restore the file named in the agent log"
+        }
+        error_codes::HOST_IDENTITY_CHANGED => {
+            "CMIS issued this host a new identity; this environment stopped serving — restart \
+             the mia service to serve the new identity"
         }
         error_codes::IMA_DISABLED => {
             "IMA appraisal is required but not enforced; the agent refuses to start"
@@ -307,6 +334,7 @@ struct EnvStatus {
     default_address: bool,
     sync: Option<mia_status_proto::AllowlistSyncSummary>,
     registrations: Option<mia_status_proto::RegistrationCounts>,
+    renewal: Option<RenewalPhase>,
     last_state: Option<AgentState>,
     since: i64,
 }
@@ -346,6 +374,7 @@ impl StatusHandle {
                 default_address: false,
                 sync: None,
                 registrations: None,
+                renewal: None,
                 last_state: None,
                 since: now,
             })),
@@ -396,18 +425,43 @@ impl StatusHandle {
         self.with(|s| s.phase = AttestPhase::Failed(why));
     }
 
-    /// An attestation attempt succeeded with an SVID for `spiffe_id` valid
+    /// A renewal of the SVID in force started (T294). Unlike
+    /// [`Self::attest_started`] the phase stays as it is: the SVID still
+    /// serves while the renewal runs.
+    pub fn renewal_started(&self) {
+        self.with(|s| s.renewal = Some(RenewalPhase::InFlight));
+    }
+
+    /// A renewal of the SVID in force failed for `why` and will be retried.
+    /// The phase stays [`AttestPhase::Attested`]; the reason is reported
+    /// once the SVID is past its renewal point (stable codes only).
+    pub fn renewal_failed(&self, why: AttestFailure) {
+        self.with(|s| s.renewal = Some(RenewalPhase::Failed(why)));
+    }
+
+    /// An attestation or renewal succeeded with an SVID for `spiffe_id` valid
     /// `issued_at..expires_at` (Unix seconds). The renewal point is the
-    /// un-jittered 60% of the TTL.
+    /// un-jittered 60% of the TTL; any recorded renewal failure is cleared.
     pub fn attest_succeeded(&self, spiffe_id: &str, issued_at: i64, expires_at: i64) {
         let renew_at = ferro_svid::rotation_at(issued_at, expires_at, 0.5);
         self.with(|s| {
             s.phase = AttestPhase::Attested;
+            s.renewal = None;
             s.svid = Some(SvidSummary {
                 spiffe_id: spiffe_id.chars().take(MAX_NODE_LEN * 2).collect(),
                 not_after: expires_at,
                 renew_at,
             });
+        });
+    }
+
+    /// Report `at` (Unix seconds) as the SVID's renewal point: the jittered
+    /// time the renewal task actually renews at (T294). No-op without an SVID.
+    pub fn set_renew_at(&self, at: i64) {
+        self.with(|s| {
+            if let Some(svid) = s.svid.as_mut() {
+                svid.renew_at = at;
+            }
         });
     }
 
@@ -459,6 +513,7 @@ impl StatusHandle {
             svid: s.svid.clone(),
             crl_issued_at,
             allowlist: s.allowlist,
+            renewal: s.renewal,
         })
     }
 
@@ -579,6 +634,7 @@ mod tests {
                 entries: 2,
                 not_after: NOW + 86_400,
             },
+            renewal: None,
         }
     }
 
@@ -612,6 +668,7 @@ mod tests {
             (AttestFailure::PinMismatch, AgentState::PinMismatch),
             (AttestFailure::TpmUnavailable, AgentState::TpmUnavailable),
             (AttestFailure::MachineKey, AgentState::CmisUnreachable),
+            (AttestFailure::IdentityChanged, AgentState::CmisUnreachable),
             (AttestFailure::Other, AgentState::CmisUnreachable),
         ] {
             let mut o = h.clone();
@@ -680,6 +737,30 @@ mod tests {
         assert_eq!(err.code, error_codes::MACHINE_KEY_REFUSED);
         assert_ne!(err.message, message_for("no-such-code"));
         assert!(err.message.contains("will not"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_identity_change_has_its_own_code_and_fixed_message() {
+        // T294 review: an environment that stopped because CMIS issued
+        // another identity says so (the tray shows the message).
+        let (state, err) = failure_state(AttestFailure::IdentityChanged);
+        let err = err.unwrap();
+        assert_eq!(state, AgentState::CmisUnreachable);
+        assert_eq!(err.code, error_codes::HOST_IDENTITY_CHANGED);
+        assert!(err.message.contains("restart"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn the_renewal_point_follows_the_renewal_schedule() {
+        let h = attested_handle();
+        h.set_renew_at(NOW + 2300);
+        assert_eq!(h.observe().await.svid.unwrap().renew_at, NOW + 2300);
+        // Not "renewal due" before the scheduled (jittered) point.
+        assert_eq!(h.snapshot(NOW + 2200).await.state, AgentState::Healthy);
+        // Without an SVID there is nothing to move.
+        let empty = StatusHandle::new(DEFAULT_ENVIRONMENT_LABEL, NOW);
+        empty.set_renew_at(NOW);
+        assert!(empty.observe().await.svid.is_none());
     }
 
     #[test]
@@ -765,6 +846,76 @@ mod tests {
         assert_eq!(s.x509_store, Some(StoreBackend::MachineKey));
         assert_eq!(s.svid.as_ref().unwrap().renew_at, NOW + 10 + 2160);
         assert!(s.last_error.is_none());
+    }
+
+    /// A handle holding a fresh CRL, a loaded allowlist and an SVID valid
+    /// `NOW..NOW + 3600` (renewal point `NOW + 2160`).
+    fn attested_handle() -> StatusHandle {
+        let h = StatusHandle::new(DEFAULT_ENVIRONMENT_LABEL, NOW);
+        h.set_crl_cache(Arc::new(CrlCache::seeded(ferro_svid::CrlBody {
+            issued_at: NOW + 2200,
+            number: 1,
+            entries: vec![],
+        })));
+        h.set_allowlist(AllowlistLoad::Loaded {
+            entries: 1,
+            not_after: NOW + 86_400,
+        });
+        h.attest_succeeded("spiffe://ferrogate.test/host/abc", NOW, NOW + 3600);
+        h
+    }
+
+    #[tokio::test]
+    async fn renewal_failure_keeps_attested_phase() {
+        // T294: a renewal that fails while the SVID is still valid must not
+        // make a serving host look broken (attest_failed would).
+        let h = attested_handle();
+        h.renewal_started();
+        h.renewal_failed(AttestFailure::CmisUnreachable);
+        assert_eq!(h.observe().await.phase, AttestPhase::Attested);
+        // Before the renewal point the host is healthy: it keeps retrying.
+        let s = h.snapshot(NOW + 2200).await;
+        assert_eq!(s.state, AgentState::SvidExpiring, "60% point passed");
+        // Past the renewal point the problem names the renewal's failure,
+        // with its stable code and fixed message.
+        let e = s.last_error.unwrap();
+        assert_eq!(e.code, error_codes::CMIS_UNREACHABLE);
+        assert_eq!(e.message, message_for(error_codes::CMIS_UNREACHABLE));
+        let early = attested_handle();
+        early.renewal_failed(AttestFailure::CmisUnreachable);
+        early.set_crl_cache(Arc::new(CrlCache::seeded(ferro_svid::CrlBody {
+            issued_at: NOW + 1000,
+            number: 1,
+            entries: vec![],
+        })));
+        assert_eq!(early.snapshot(NOW + 1000).await.state, AgentState::Healthy);
+        // A new attempt in flight reports the plain renewal-due code.
+        h.renewal_started();
+        assert_eq!(
+            h.snapshot(NOW + 2200).await.last_error.unwrap().code,
+            error_codes::SVID_RENEWAL_DUE
+        );
+        // Once the SVID expires, a failed full attestation names the cause.
+        h.attest_started();
+        h.attest_failed(AttestFailure::PinMismatch);
+        assert_eq!(h.snapshot(NOW + 3600).await.state, AgentState::PinMismatch);
+    }
+
+    #[tokio::test]
+    async fn svid_renewal_due_clears_after_renewal() {
+        let h = attested_handle();
+        h.renewal_started();
+        h.renewal_failed(AttestFailure::Other);
+        let s = h.snapshot(NOW + 2200).await;
+        assert_eq!(s.state, AgentState::SvidExpiring);
+        // The renewed SVID (issued at NOW + 2200) moves the renewal point and
+        // clears the recorded failure.
+        h.attest_succeeded("spiffe://ferrogate.test/host/abc", NOW + 2200, NOW + 5800);
+        let s = h.snapshot(NOW + 2201).await;
+        assert_eq!(s.state, AgentState::Healthy);
+        assert!(s.last_error.is_none());
+        assert_eq!(s.svid.unwrap().renew_at, NOW + 2200 + 2160);
+        assert!(h.observe().await.renewal.is_none());
     }
 
     #[tokio::test]

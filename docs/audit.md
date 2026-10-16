@@ -67,12 +67,12 @@ appends the event to a spool and forwards the spool to CMIS:
   `host_mismatch`) and any `INVALID_ARGUMENT` other than the two below (such
   as `malformed_doc`, a proof document this CMIS cannot decode). It is retried
   on the same backoff, and at once when new credentials appear.
-- **SVID expiry.** Forwarding needs an unexpired host SVID, and the daemon
-  does not renew it while running: the background re-attestation only runs
-  when attestation failed at start, and stops at its first success. Once the
-  SVID expires, forwarding holds (one warning, `host SVID expired`) until
-  the daemon re-attests, which today means a restart; events keep
-  being spooled, and beyond the cap the oldest are dropped.
+- **SVID expiry.** Forwarding needs an unexpired host SVID. The daemon
+  renews it before expiry (T294) and each renewal is picked up by the next
+  call; if it expires anyway (CMIS unreachable for its whole remaining
+  lifetime), forwarding holds (one warning, `host SVID expired`) while the
+  daemon keeps re-attesting every 5 minutes; events keep being spooled, and
+  beyond the cap the oldest are dropped.
 - **What is dropped.** Only CMIS's answers about the event itself drop it,
   with a warning, so one bad event cannot block the queue:
   `INVALID_ARGUMENT field_too_long` or `malformed audit event`, and

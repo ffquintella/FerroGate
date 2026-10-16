@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "cmis"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2477,7 +2477,7 @@ checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 
 [[package]]
 name = "ferro-appid"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "hex",
  "plist",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-attest"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.23.1",
  "ferro-crypto",
@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-audit"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.23.1",
  "ciborium",
@@ -2526,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-ceremony"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.23.1",
  "ferro-crypto",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-child-verify"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-crypto"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-harden"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "caps",
  "libc",
@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-machineid"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "hex",
  "sha2 0.11.0",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-proto"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "prost",
  "tonic",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-raft"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "ciborium",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-sep"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "chacha20poly1305",
  "core-foundation 0.10.1",
@@ -2650,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.23.1",
  "ciborium",
@@ -2669,7 +2669,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-svid-verify"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.23.1",
  "der",
@@ -2683,7 +2683,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-tee"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "chacha20poly1305",
  "ciborium",
@@ -2706,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-transport"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "ferro-crypto",
@@ -2720,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "ferro-winauth"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "tokio",
@@ -2730,7 +2730,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogate-cli"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2756,7 +2756,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogate-sdk-rust"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "ferro-attest",
  "ferro-child-verify",
@@ -2774,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "ferrogate-tui"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-manifest"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "cmis",
@@ -4606,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "mia"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4664,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "mia-helper-proto"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "ciborium",
  "serde",
@@ -4673,7 +4673,7 @@ dependencies = [
 
 [[package]]
 name = "mia-status-proto"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "ciborium",
  "proptest",
@@ -4684,7 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "mia-tray"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arboard",
  "eframe",
@@ -5355,7 +5355,7 @@ dependencies = [
 
 [[package]]
 name = "offline-signer"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

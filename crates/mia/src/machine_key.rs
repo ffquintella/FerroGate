@@ -169,6 +169,14 @@ pub enum Unusable {
         /// The file whose presence shows a key existed.
         evidence: PathBuf,
     },
+    /// The file is gone although this agent attested with it earlier in this
+    /// run: an SVID renewal reopens only what is there (T294) and never
+    /// creates a replacement for the key CMIS pinned.
+    Vanished,
+    /// The seed is readable but no longer derives the child-signing key this
+    /// run uses: it was replaced. A renewal refuses it before contacting CMIS,
+    /// which would otherwise certify the planted key.
+    Replaced,
 }
 
 impl fmt::Display for Unusable {
@@ -194,6 +202,13 @@ impl fmt::Display for Unusable {
                 "it is missing although {} — created only after it — is still there, so a key \
                  existed and was lost",
                 evidence.display()
+            ),
+            Self::Vanished => f.write_str(
+                "it is missing, although this agent attested with it earlier in this run",
+            ),
+            Self::Replaced => f.write_str(
+                "it no longer derives the child-signing key this agent runs with, so it was \
+                 replaced",
             ),
         }
     }
@@ -263,6 +278,16 @@ impl Refusal {
                  (after the CMIS operator has cleared its key pin), delete {} as well so the \
                  agent may create a new key",
                 evidence.display()
+            ),
+            Unusable::Replaced => format!(
+                "restore the original {} at {path} from a backup and find out who replaced it; \
+                 the running agent renews only under the key it started with",
+                self.file.file_name()
+            ),
+            Unusable::Vanished => format!(
+                "restore {path} from a backup (owner-only, owned by the service account); the \
+                 running agent renews its SVID only with the {} it started with",
+                self.file.label()
             ),
         }
     }
@@ -766,6 +791,50 @@ pub fn open_or_create_machine_key(
     open_or_create_machine_key_with(path, &StateFile::MachineKey.legacy_paths(), seal_secret)
 }
 
+/// Reopen this host's existing machine signing key at `path` for an SVID
+/// renewal in the running daemon (T294). Unlike
+/// [`open_or_create_machine_key`] this never creates a key: the daemon already
+/// attested with one this run, so an absent file is refused
+/// ([`Unusable::Vanished`]) and the renewal fails closed instead of minting a
+/// new identity CMIS would refuse as a key rebind.
+///
+/// # Errors
+///
+/// [`KeyError::Refused`] when the key is absent, cannot be used (including one
+/// that does not unseal with `seal_secret`), or sits only at a legacy location.
+pub fn open_machine_key(
+    path: &Path,
+    seal_secret: Option<&[u8]>,
+) -> Result<ferro_sep::SoftwareMachineKey, KeyError> {
+    open_machine_key_with(path, &StateFile::MachineKey.legacy_paths(), seal_secret)
+}
+
+/// [`open_machine_key`] with explicit legacy locations.
+fn open_machine_key_with(
+    path: &Path,
+    legacy: &[PathBuf],
+    seal_secret: Option<&[u8]>,
+) -> Result<ferro_sep::SoftwareMachineKey, KeyError> {
+    let file = StateFile::MachineKey;
+    let refused = |reason: Unusable| {
+        KeyError::Refused(Refusal {
+            file,
+            path: path.to_path_buf(),
+            reason,
+        })
+    };
+    match plan_at(file, path, legacy) {
+        Plan::Open { .. } => match seal_secret {
+            Some(secret) => ferro_sep::SoftwareMachineKey::open_sealed(path, secret),
+            None => ferro_sep::SoftwareMachineKey::open_existing(path),
+        }
+        .map_err(|e| refused(unusable_from_sep(&e))),
+        Plan::Create => Err(refused(Unusable::Vanished)),
+        Plan::Migrate { from } => Err(refused(Unusable::NotMigrated { legacy: from })),
+        Plan::Refuse(r) => Err(KeyError::Refused(r)),
+    }
+}
+
 /// [`open_or_create_machine_key`] with explicit legacy locations.
 fn open_or_create_machine_key_with(
     path: &Path,
@@ -919,6 +988,72 @@ impl std::error::Error for SeedError {}
 /// none and persisting one failed.
 pub fn load_or_create_seed(path: &Path) -> Result<Seed, SeedError> {
     load_or_create_seed_with(path, &StateFile::SvidSeed.legacy_paths())
+}
+
+/// Read the existing SVID seed at `path` for an SVID renewal in the running
+/// daemon (T294); never create one. `None` when there is none and the run
+/// does not depend on one (it uses an ephemeral composite key).
+///
+/// # Errors
+///
+/// [`SeedError::Refused`] for a seed that exists but cannot be used, one
+/// stranded at a legacy location, or — with `required` — one that vanished.
+pub fn load_seed(path: &Path, required: bool) -> Result<Option<[u8; 32]>, SeedError> {
+    load_seed_with(path, &StateFile::SvidSeed.legacy_paths(), required)
+}
+
+/// [`load_seed`] with explicit legacy locations.
+fn load_seed_with(
+    path: &Path,
+    legacy: &[PathBuf],
+    required: bool,
+) -> Result<Option<[u8; 32]>, SeedError> {
+    let file = StateFile::SvidSeed;
+    let refused = |reason: Unusable| {
+        SeedError::Refused(Refusal {
+            file,
+            path: path.to_path_buf(),
+            reason,
+        })
+    };
+    match plan_at(file, path, legacy) {
+        Plan::Open { .. } => read_seed(path).map(Some).map_err(refused),
+        Plan::Create if required => Err(refused(Unusable::Vanished)),
+        Plan::Create => Ok(None),
+        Plan::Migrate { from } => Err(refused(Unusable::NotMigrated { legacy: from })),
+        Plan::Refuse(r) => Err(SeedError::Refused(r)),
+    }
+}
+
+/// The child-signing `kid` the composite key derived from `seed` is
+/// published under.
+#[must_use]
+pub fn seed_kid(seed: &[u8; 32]) -> String {
+    let (_secret, public) = ferro_crypto::composite::CompositeSecretKey::from_seed(seed);
+    ferro_svid::child_signing_kid(&public)
+}
+
+/// [`load_seed`] for a renewal that must keep the child-signing key
+/// `expected_kid` (the seed in force): a seed that derives another key is
+/// refused ([`Unusable::Replaced`]) and left untouched.
+///
+/// # Errors
+///
+/// As [`load_seed`], plus [`Unusable::Replaced`].
+pub fn reopen_seed(
+    path: &Path,
+    required: bool,
+    expected_kid: Option<&str>,
+) -> Result<Option<[u8; 32]>, SeedError> {
+    let seed = load_seed(path, required)?;
+    match (&seed, expected_kid) {
+        (Some(s), Some(kid)) if seed_kid(s) != kid => Err(SeedError::Refused(Refusal {
+            file: StateFile::SvidSeed,
+            path: path.to_path_buf(),
+            reason: Unusable::Replaced,
+        })),
+        _ => Ok(seed),
+    }
 }
 
 /// [`load_or_create_seed`] with explicit legacy locations.
@@ -1176,6 +1311,8 @@ mod tests {
         reasons.push(Unusable::Lost {
             evidence: "/state/svid-seed.bin".into(),
         });
+        reasons.push(Unusable::Vanished);
+        reasons.push(Unusable::Replaced);
         for reason in reasons {
             for file in StateFile::ALL {
                 let r = Refusal {
@@ -1378,6 +1515,92 @@ mod tests {
             }))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"short");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_renewal_reopens_the_pinned_key_and_never_creates_one() {
+        use ferro_sep::MachineKey as _;
+        // T294: the running daemon renews under the key CMIS pinned. A key
+        // that vanished mid-run is refused (fail closed), never re-minted.
+        let dir = scratch("open-only");
+        let path = dir.join("host-key.bin");
+        let Err(KeyError::Refused(r)) = open_machine_key_with(&path, &[], Some(b"fp")) else {
+            panic!("a missing key must not be created on renewal");
+        };
+        assert_eq!(r.reason, Unusable::Vanished);
+        assert!(!path.exists(), "nothing was created");
+        assert!(r.to_string().contains("will not be replaced"), "{r}");
+
+        let first = open_or_create_machine_key_with(&path, &[], Some(b"fp")).unwrap();
+        let again = open_machine_key_with(&path, &[], Some(b"fp")).unwrap();
+        assert_eq!(first.key.public_spki_der(), again.public_spki_der());
+        // Sealed to another fingerprint: refused, left intact.
+        assert!(matches!(
+            open_machine_key_with(&path, &[], Some(b"other")),
+            Err(KeyError::Refused(Refusal {
+                reason: Unusable::Malformed { .. },
+                ..
+            }))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_renewal_reads_the_seed_and_never_creates_one() {
+        let dir = scratch("seed-open-only");
+        let path = dir.join("svid-seed.bin");
+        // Absent (this run fell back to an ephemeral key): stays absent.
+        assert!(load_seed_with(&path, &[], false).unwrap().is_none());
+        assert!(!path.exists(), "nothing was created");
+        // Absent although the SVID in force came from it: refused.
+        assert!(matches!(
+            load_seed_with(&path, &[], true),
+            Err(SeedError::Refused(Refusal {
+                reason: Unusable::Vanished,
+                ..
+            }))
+        ));
+        assert!(!path.exists(), "nothing was created");
+        let Seed::Created(created) = load_or_create_seed_with(&path, &[]).unwrap() else {
+            panic!("first call creates");
+        };
+        assert_eq!(load_seed_with(&path, &[], true).unwrap(), Some(created));
+        std::fs::remove_file(&path).unwrap();
+        create_exclusive(&path, b"short").unwrap();
+        assert!(matches!(
+            load_seed_with(&path, &[], false),
+            Err(SeedError::Refused(Refusal {
+                reason: Unusable::Malformed { .. },
+                ..
+            }))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replaced_seed_is_refused_on_renewal() {
+        // T294 review: an owner-only 32-byte file planted as svid-seed.bin is
+        // a valid seed for another key; the renewal refuses it by kid.
+        let dir = scratch("seed-replaced");
+        let path = dir.join("svid-seed.bin");
+        create_exclusive(&path, &[1u8; 32]).unwrap();
+        let in_force = seed_kid(&[1u8; 32]);
+        assert_eq!(
+            reopen_seed(&path, true, Some(&in_force)).unwrap(),
+            Some([1u8; 32])
+        );
+        std::fs::remove_file(&path).unwrap();
+        create_exclusive(&path, &[2u8; 32]).unwrap();
+        let Err(SeedError::Refused(r)) = reopen_seed(&path, true, Some(&in_force)) else {
+            panic!("a replaced seed must be refused");
+        };
+        assert_eq!(r.reason, Unusable::Replaced);
+        assert!(r.to_string().contains("will not be replaced"), "{r}");
+        assert_eq!(std::fs::read(&path).unwrap(), [2u8; 32], "left intact");
+        // Without a kid to compare (an ephemeral run), it is just read.
+        assert_eq!(reopen_seed(&path, false, None).unwrap(), Some([2u8; 32]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

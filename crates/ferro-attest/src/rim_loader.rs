@@ -217,6 +217,30 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// A correctly signed bundle naming the reserved host-key policy id is
+    /// refused at load, fail closed: nothing is admitted.
+    #[test]
+    fn reload_refuses_a_signed_bundle_with_the_reserved_policy_id() {
+        let path = temp_path("reserved");
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let mut b = bundle(1, 0xAA);
+        b.policy_id = crate::rim::HOST_KEY_POLICY_ID.to_string();
+        write_signed(&path, b, "pub", &sk);
+        let mut trust = TrustedKeys::new();
+        trust.add("pub", pk);
+        let store = RimStore::new();
+        let loader = RimLoader::new(&path, trust, store.clone());
+        let err = loader.try_reload().unwrap_err();
+        assert!(matches!(
+            err,
+            ReloadError::Apply(ApplyError::ReservedPolicyId(_))
+        ));
+        assert!(err.to_string().contains("reserved policy id"));
+        assert_eq!(store.current_version(), 0);
+        assert!(store.lookup_at(&[0xAA; 48], 500).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn reload_with_unknown_publisher_is_refused() {
         let path = temp_path("badkid");

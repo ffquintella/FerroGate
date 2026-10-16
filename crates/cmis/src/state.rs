@@ -27,6 +27,7 @@ use ferro_svid::{
     LastAttestation, RevocationTarget, SignedCrl,
 };
 use parking_lot::RwLock;
+use sha2::{Digest as _, Sha384};
 
 use crate::cluster_store;
 use crate::credential::CredentialMaker;
@@ -115,6 +116,25 @@ impl Default for CmisConfig {
         }
     }
 }
+
+/// The outcome of [`CmisState::replace_bundle_if_current`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleSwap {
+    /// The new bundle is stored.
+    Replaced,
+    /// The stored record no longer holds the expected SVID (another renewal
+    /// or a re-attestation won), or is gone; nothing was written.
+    Superseded,
+    /// The replicated store failed; nothing was written (cause logged).
+    StoreFailed,
+}
+
+/// A stored issued-SVID record could not be read: the replicated store failed
+/// or the row did not decode. The cause is logged by the state layer, never
+/// returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("issued-SVID store unavailable")]
+pub struct RecordUnavailable;
 
 /// Everything needed to re-issue and gate renewals for one host.
 #[derive(Debug, Clone)]
@@ -623,20 +643,30 @@ impl CmisState {
 
     /// Look up the stored record for a subject. Reads are strongly-consistent
     /// so a follower never serves a stale record after a successful `record`
-    /// on the leader.
+    /// on the leader. A store or decode failure reads as `None` (logged); a
+    /// caller that must tell them apart uses [`Self::lookup_checked`].
     pub async fn lookup(&self, spiffe_id: &str) -> Option<IssuedRecord> {
+        self.lookup_checked(spiffe_id).await.ok().flatten()
+    }
+
+    /// [`Self::lookup`], telling a missing record (`Ok(None)`) from a store
+    /// that could not be read (`Err`, cause logged here).
+    pub async fn lookup_checked(
+        &self,
+        spiffe_id: &str,
+    ) -> Result<Option<IssuedRecord>, RecordUnavailable> {
         match self.cluster.fetch_svid_consistent(spiffe_id).await {
             Ok(Some(bytes)) => match cluster_store::decode(&bytes) {
-                Ok(rec) => Some(rec),
+                Ok(rec) => Ok(Some(rec)),
                 Err(e) => {
                     tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
-                    None
+                    Err(RecordUnavailable)
                 }
             },
-            Ok(None) => None,
+            Ok(None) => Ok(None),
             Err(e) => {
                 tracing::error!(error = %e, %spiffe_id, "cluster fetch failed");
-                None
+                Err(RecordUnavailable)
             }
         }
     }
@@ -666,18 +696,70 @@ impl CmisState {
         }
     }
 
-    /// Replace the stored bundle for a subject after a renewal (the
-    /// `last_attestation` window is intentionally left unchanged).
-    ///
-    /// Read-modify-write through the cluster. Two concurrent rotations for
-    /// the same subject would race; CMIS serialises them per-subject upstream
-    /// (`Rotate` decides off the looked-up record before issuance), so the
-    /// loss window is small and benign — the later writer wins and both
-    /// bundles are valid.
+    /// Replace the stored bundle for a subject, unconditionally (the
+    /// `last_attestation` window is left unchanged). Racy read-modify-write:
+    /// a concurrent renewal is silently overwritten.
+    #[deprecated(
+        since = "0.30.0",
+        note = "use `replace_bundle_if_current`, which re-checks the stored SVID inside the write"
+    )]
     pub async fn update_bundle(&self, spiffe_id: &str, bundle: IssuedSvid) {
         if let Some(mut rec) = self.lookup(spiffe_id).await {
             rec.bundle = bundle;
             self.record(rec).await;
+        }
+    }
+
+    /// Replace the stored bundle of `spiffe_id` with `bundle` only while the
+    /// stored record still holds the SVID whose compact-JWS SHA-384 is
+    /// `expected_jws_sha384` — checked by a compare-and-swap on the stored
+    /// payload, so of two renewals racing from one SVID at most one lands
+    /// (T293). `last_attestation` is left unchanged. Store failures are
+    /// logged here and answered as [`BundleSwap::StoreFailed`].
+    pub async fn replace_bundle_if_current(
+        &self,
+        spiffe_id: &str,
+        expected_jws_sha384: &[u8; 48],
+        bundle: IssuedSvid,
+    ) -> BundleSwap {
+        let current = match self.cluster.fetch_svid_consistent(spiffe_id).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return BundleSwap::Superseded,
+            Err(e) => {
+                tracing::error!(error = %e, %spiffe_id, "cluster fetch failed");
+                return BundleSwap::StoreFailed;
+            }
+        };
+        let mut rec = match cluster_store::decode(&current) {
+            Ok(rec) => rec,
+            Err(e) => {
+                tracing::error!(error = %e, %spiffe_id, "cluster decode failed");
+                return BundleSwap::StoreFailed;
+            }
+        };
+        if Sha384::digest(rec.bundle.jws.as_bytes()).as_slice() != expected_jws_sha384 {
+            return BundleSwap::Superseded;
+        }
+        let updated_at = bundle.iat;
+        rec.bundle = bundle;
+        let payload = match cluster_store::encode(&rec) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(error = %e, %spiffe_id, "cluster encode failed");
+                return BundleSwap::StoreFailed;
+            }
+        };
+        match self
+            .cluster
+            .replace_svid_if_unchanged(spiffe_id, &current, &payload, updated_at)
+            .await
+        {
+            Ok(true) => BundleSwap::Replaced,
+            Ok(false) => BundleSwap::Superseded,
+            Err(e) => {
+                tracing::error!(error = %e, %spiffe_id, "cluster svid swap failed");
+                BundleSwap::StoreFailed
+            }
         }
     }
 

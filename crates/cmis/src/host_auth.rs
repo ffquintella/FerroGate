@@ -2,9 +2,10 @@
 //! host-facing RPC that carries a signed document.
 //!
 //! Consumers: `AppendAuditEvent` (F20 Phase 0, context
-//! `ferrogate-audit-forward-v1`) and F19's `SubmitAppRequest`,
-//! `GetAppRequestStatus` and `SyncAllowlist`, each with its own context,
-//! document type, size bound and rate limiter.
+//! `ferrogate-audit-forward-v1`), F19's `SubmitAppRequest`,
+//! `GetAppRequestStatus` and `SyncAllowlist`, and `Rotate` (T293, context
+//! `ferrogate-rotate-v1`), each with its own context, document type, size
+//! bound and rate limiter.
 //!
 //! [`authenticate`] runs the checks in a fixed order and stops at the first
 //! failure:
@@ -70,12 +71,19 @@ pub const DEFAULT_APP_STATUS_PER_HOUR: u32 = 60;
 pub const DEFAULT_SYNC_MIN_INTERVAL_SECS: u32 = 30;
 /// Upper bound on the per-hour app budgets.
 pub const MAX_APP_PER_HOUR: u32 = 100_000;
+/// Default `Rotate` budget per host per hour (`CMIS_ROTATE_MAX_PER_HOUR`,
+/// T293). A healthy host renews about once per SVID lifetime; the budget
+/// only leaves room for retries.
+pub const DEFAULT_ROTATE_PER_HOUR: u32 = 6;
+/// Upper bound on `CMIS_ROTATE_MAX_PER_HOUR`.
+pub const MAX_ROTATE_PER_HOUR: u32 = 3600;
 /// Upper bound on `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`.
 pub const MAX_SYNC_MIN_INTERVAL_SECS: u32 = 3600;
 
-/// The SVID tier of a host with the software host-key profile (F15/F16);
-/// every other host attested with a TPM.
-pub const TIER_HOST_KEY: &str = "host-key";
+/// The SVID tier, and the `policy_id` CMIS stamps, of a host with the
+/// software host-key profile (F15/F16); every other host attested with a TPM.
+/// The one definition: reserved in the RIM, so no TPM policy can carry it.
+pub use ferro_attest::HOST_KEY_POLICY_ID as TIER_HOST_KEY;
 /// The SVID tier of a TPM-attested host.
 pub const TIER_TPM: &str = "tpm";
 
@@ -88,7 +96,7 @@ pub const MAX_SIG_BYTES: usize = 80;
 
 /// Host-call settings (`CMIS_AUDIT_FORWARD_MAX_PER_MIN`,
 /// `CMIS_APP_SUBMIT_MAX_PER_HOUR`, `CMIS_APP_STATUS_MAX_PER_HOUR`,
-/// `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`).
+/// `CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS`, `CMIS_ROTATE_MAX_PER_HOUR`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostCallConfig {
     /// `AppendAuditEvent` calls each host may make per minute (token bucket
@@ -101,6 +109,9 @@ pub struct HostCallConfig {
     pub app_status_per_hour: u32,
     /// Minimum seconds between two `SyncAllowlist` calls of one host.
     pub sync_min_interval_secs: u32,
+    /// `Rotate` calls each host may make per hour (T293). Every
+    /// authenticated call spends one, refused or not.
+    pub rotate_per_hour: u32,
     /// Replay-cache capacity.
     pub replay_capacity: usize,
 }
@@ -112,6 +123,7 @@ impl Default for HostCallConfig {
             app_submit_per_hour: DEFAULT_APP_SUBMIT_PER_HOUR,
             app_status_per_hour: DEFAULT_APP_STATUS_PER_HOUR,
             sync_min_interval_secs: DEFAULT_SYNC_MIN_INTERVAL_SECS,
+            rotate_per_hour: DEFAULT_ROTATE_PER_HOUR,
             replay_capacity: DEFAULT_REPLAY_CAPACITY,
         }
     }
@@ -172,6 +184,9 @@ impl HostCallConfig {
         )? {
             c.sync_min_interval_secs = n;
         }
+        if let Some(n) = positive(&get, "CMIS_ROTATE_MAX_PER_HOUR", MAX_ROTATE_PER_HOUR)? {
+            c.rotate_per_hour = n;
+        }
         Ok(c)
     }
 }
@@ -185,6 +200,7 @@ pub struct HostCallGuard {
     app_submit: HostRateLimiter,
     app_status: HostRateLimiter,
     allowlist_sync: HostRateLimiter,
+    rotate: HostRateLimiter,
 }
 
 impl HostCallGuard {
@@ -197,7 +213,14 @@ impl HostCallGuard {
             app_submit: HostRateLimiter::per_hour(cfg.app_submit_per_hour),
             app_status: HostRateLimiter::per_hour(cfg.app_status_per_hour),
             allowlist_sync: HostRateLimiter::new(1, cfg.sync_min_interval_secs),
+            rotate: HostRateLimiter::per_hour(cfg.rotate_per_hour),
         }
+    }
+
+    /// The `Rotate` rate limiter (T293).
+    #[must_use]
+    pub fn rotate_limiter(&self) -> &HostRateLimiter {
+        &self.rotate
     }
 
     /// The `AppendAuditEvent` rate limiter.
@@ -697,6 +720,24 @@ mod tests {
         );
         assert!(cfg(&[("CMIS_APP_SUBMIT_MAX_PER_HOUR", "0")]).is_err());
         assert!(cfg(&[("CMIS_ALLOWLIST_SYNC_MIN_INTERVAL_SECS", "x")]).is_err());
+    }
+
+    #[test]
+    fn from_lookup_reads_rotate_limit() {
+        assert_eq!(cfg(&[]).unwrap().rotate_per_hour, DEFAULT_ROTATE_PER_HOUR);
+        assert_eq!(DEFAULT_ROTATE_PER_HOUR, 6);
+        let c = cfg(&[("CMIS_ROTATE_MAX_PER_HOUR", "2")]).unwrap();
+        assert_eq!(c.rotate_per_hour, 2);
+        let c = cfg(&[("CMIS_ROTATE_MAX_PER_HOUR", "999999")]).unwrap();
+        assert_eq!(c.rotate_per_hour, MAX_ROTATE_PER_HOUR);
+        assert!(cfg(&[("CMIS_ROTATE_MAX_PER_HOUR", "0")]).is_err());
+        assert!(cfg(&[("CMIS_ROTATE_MAX_PER_HOUR", "-1")]).is_err());
+        assert!(cfg(&[("CMIS_ROTATE_MAX_PER_HOUR", "often")]).is_err());
+        // The guard enforces it per host and hour.
+        let guard = HostCallGuard::new(cfg(&[("CMIS_ROTATE_MAX_PER_HOUR", "1")]).unwrap());
+        assert!(guard.rotate_limiter().check("h", 0).is_ok());
+        assert_eq!(guard.rotate_limiter().check("h", 0), Err(3600));
+        assert!(guard.rotate_limiter().check("other", 0).is_ok());
     }
 
     #[test]

@@ -57,6 +57,47 @@ record them.
   imports they admit again, and needs confirmation (`--yes` when not on a
   terminal; `confirm_rollback` on the RPC). `GetAllowlistMode` lets any
   administrator session read the mode.
+- Renew the MIA daemon's host SVID while it runs, and fail closed if it expires anyway (S4, S7, S18, M33, T294)
+  Until now the daemon attested once at start (the background task only
+  retried a failed start) and, at expiry, kept minting child tokens under
+  the expired parent while audit forwarding, the allowlist sync and
+  registration stopped until a restart. One long-lived task per environment
+  (`mia::renewal`: the `Renewal` state machine over the daemon's
+  `HostRenewer`) now renews at 60 % of the TTL ±10 % jitter: with a
+  host-signed `Rotate` on the host-key tier while the last full attestation
+  is more than 10 minutes inside the 24 h window, `Rotate` has failed
+  transiently fewer than 3 times in a row and more than a quarter of the
+  lifetime is left; with a full attestation otherwise (the usual case with
+  the 96 h TTL floor, and always on the TPM tier). Refusals fall back to a
+  full attestation; transient errors retry after 30 s doubling, at most
+  15 min and a quarter of the time left, jittered, never later than 60 s
+  before expiry; `rate_limited` waits `retry-after`; without a valid SVID it
+  re-attests every 5 min ±10 %. Every call has a deadline (`Rotate` 60 s,
+  attestation 2 min, refresh 1 min) cut short at expiry, which abandons the
+  attempt and switches minting off. A new SVID with less than 30 s or 10 % of
+  its lifetime left (clock skew) is refused. An accepted SVID swaps the
+  host-call credentials, the minter (`ChildTokenMinter::with_parent`, same
+  key and `kid` after a `Rotate`), the status (with the jittered renewal
+  point) and the allowlist sync in that order, and only then seals its
+  X.509-SVID; the allowlist proposals read the current SVID every round.
+  The minter refuses to mint once its parent SVID has expired
+  (`MinterConfig::parent_expires_at`, `MintError::ParentExpired`, helper
+  answer `no_host_svid`) and clamps child tokens to it; the task also takes
+  the host-call credentials out at expiry. Renewals reopen the machine key
+  and seed the daemon started with and never create them
+  (`machine_key::{open_machine_key, load_seed, reopen_seed}`,
+  `Unusable::{Vanished, Replaced}`); a seed that no longer derives the
+  child-signing `kid` in force is refused before CMIS is contacted
+  (`renewal::HostKeyAttestor`), and a re-attestation under another `kid` is
+  never put in force. A full re-attestation under another SPIFFE id is never put in
+  force: minting stops, the status reports `host_identity_changed`, and the
+  environment's serve loop returns an error so the supervisor restarts the
+  daemon; a renewal task that dies does the same. The status endpoint keeps
+  a host whose renewal fails *attested* (`StatusHandle::renewal_started` /
+  `renewal_failed`) and, past the renewal point, reports `svid_expiring` with
+  the failure's stable code. `MinterConfig` gains a field and
+  `ChildTokenMinter::mint` returns `MintError`; `mia-tray` no longer advises
+  a restart for a failing renewal.
 - Write the 0.30.0 change document and the legacy-allowlist migration runbook (S56, M38, T274)
   `docs/change-v0.30.0.md` (FGV *documento de mudança*) and the runbook in
   `docs/operations.md`; `docs/cmis.md`, `docs/allowlist-provisioning.md`,
@@ -110,8 +151,32 @@ record them.
   ratatui lays them out, with middle-ellipsis truncation for paths. Unit
   table plus proptests over arbitrary bytes, strings and width-tricky
   sequences in `make test`.
+- Bound host-signed `Rotate` calls per host and node with `CMIS_ROTATE_MAX_PER_HOUR` (default 6) and add `mia::client::rotate` (S4, S51, M33, T293)
+  Parsed with the other host-call limits (`HostCallConfig::rotate_per_hour`,
+  1–3600; zero or garbage aborts startup, larger values are capped). Every
+  authenticated call spends one unit, refused or not. `mia::client::rotate`
+  and `rotate_request` build the host-signed request from the machine key,
+  the current SVID and the state digest; the MIA daemon calls them for its
+  background renewal (T294).
 
 ### Changed
+
+- Add the host proof to `RotateRequest` (`auth = 4`, `doc = 5`) and stop reading its unsigned fields (S4, S51, M33, T293)
+  `doc` is the canonical CBOR of `ferro_svid::host_call::RotateDoc`
+  `{v, host_uuid, issued_at, nonce, svid_sha384, state_digest}`, signed under
+  `ferrogate-rotate-v1`. `current_svid` is optional and must be empty or equal
+  `auth.svid_jws`; `pcr_values` and `known_epoch` are deprecated and ignored.
+  The fields are wire-compatible additions, but a client that does not send
+  the proof is now refused (see Security); no earlier MIA calls `Rotate`,
+  and this release's daemon sends the proof (T294).
+  `CmisState::update_bundle` is deprecated in favour of
+  `replace_bundle_if_current`, which re-checks the stored SVID inside the
+  write (`Cluster::replace_svid_if_unchanged`, a compare-and-swap).
+  `pcr_values` and `known_epoch` carry `[deprecated = true]`, so Rust code
+  naming them gets a deprecation warning. `CmisState::lookup_checked` tells
+  a missing record from an unreadable store (`RecordUnavailable`).
+  `ferro_attest::RimStore::approve` now returns `Result<(), ApplyError>`
+  (source-breaking for callers, which were tests only).
 
 - Retire the legacy allowlist writes in approvals mode and map the legacy commands and proposals onto the approval ledger (S50, M38, T273)
   In `approvals` mode `SetAllowlist` and `DeleteAllowlist` answer
@@ -165,9 +230,10 @@ record them.
   proofs (`malformed_doc` and `host_mismatch` included) keep the event until
   new credentials or the next retry; only CMIS's answers about the event
   itself (`field_too_long`, `malformed audit event`,
-  `event_not_forwardable`) drop it, with a warning. The daemon does not
-  renew its SVID: once it expires, forwarding holds (one warning) until a
-  restart re-attests, and the cap drops the oldest events meanwhile. A
+  `event_not_forwardable`) drop it, with a warning. The daemon renews its
+  SVID while running (T294); if it expires anyway, forwarding holds (one
+  warning) until a re-attestation succeeds, and the cap drops the oldest
+  events meanwhile. A
   restart replays the spool; a torn last line is skipped, and a spool that
   cannot be read to its end is renamed aside unchanged
   (`.unreadable-<unix time>`), never rewritten. Without CMIS, or with an
@@ -196,6 +262,35 @@ record them.
 
 ### Security
 
+- Require a host proof on `Rotate` and refuse the TPM tier and revoked, expired or superseded SVIDs, closing an SVID issuance oracle (S4, S51, S11, M33, T293)
+  `Rotate` was public, decoded the presented SVID without checking its
+  signature, expiry or revocation, trusted unsigned PCR values and
+  overwrote the stored record: anyone with a host's SPIFFE id and PCR values
+  could have CMIS mint a fresh SVID for that host. It is now a host method
+  (`Access::Host`) behind the shared F19 §7.1 verifier (SVID issued here,
+  valid, unrevoked; `cnf.jkt`; signature; ±300 s; single-use nonce; per-host
+  budget). Only the host-key tier renews; the TPM tier answers
+  `FAILED_PRECONDITION` and re-attests. Only the latest stored SVID renews,
+  re-checked inside the store write, so two racing renewals cannot both
+  land. The signed state digest replaces the PCR list, which also fixes
+  host-key hosts always being refused for PCR drift. Renewals are audited
+  as `SvidIssued`, refusals after authentication as `AttestFail`
+  (`rotate-tier-requires-attest`, `rotate-superseded`,
+  `rotate-reattest-<reason>`, `rotate-unknown-subject`, and
+  `rotate-store-failed` with `UNAVAILABLE store_unavailable` when the record
+  cannot be read); proof failures are logged, never audited. The 24 h window
+  is unchanged. Breaking for any client calling `Rotate` without the proof.
+- Reserve the `host-key` policy id so no RIM policy can put TPM hosts on the host-key tier (S10, S4, M33, T293)
+  The tier is derived from the SVID `policy_id`, and TPM SVIDs carry the RIM
+  policy id, so a RIM generation or manual approval named `host-key` would
+  have treated TPM hosts as host-key hosts (`Rotate`, `SubmitAppRequest`
+  auto-approval, admin tier display). `ferro_attest::HOST_KEY_POLICY_ID` is
+  now the single definition (`cmis::host_auth::TIER_HOST_KEY` re-exports it)
+  and `RimStore::apply` / `approve` refuse it, trimmed and in any case, with
+  `ApplyError::ReservedPolicyId`: a signed bundle using it aborts startup or
+  is refused on hot reload (`rim.reserved_policy_id` error log), keeping the
+  previous generations. Follow-up, out of scope here: derive the tier from a
+  dedicated issuance claim instead of `policy_id`.
 - Upgrade rustls to 0.23.46 to fix RUSTSEC-2026-0346, -0347, -0348 and -0349 (S1, T5)
   `cargo deny check advisories` failed on rustls 0.23.45. The worst of the four
   advisories, RUSTSEC-2026-0349, lets an unauthenticated ServerHello push later

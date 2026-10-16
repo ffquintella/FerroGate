@@ -17,9 +17,12 @@ service MachineIdentity {
   // Fetch the most recently issued SVID for a SPIFFE id (debug / cache miss).
   rpc FetchSVID (FetchRequest) returns (SVIDBundle);
 
-  // In-window renewal. No TPM interaction when PCRs and policy epoch are
-  // unchanged and the SVID is inside its re-attestation window; otherwise the
-  // server refuses and the client must run a full Attest.
+  // In-window renewal for the host-key tier (T293), a host method: needs the
+  // F19 §7.1 host proof over a `RotateDoc` (context `ferrogate-rotate-v1`)
+  // naming the host's latest SVID. Short path when the signed state digest
+  // and policy epoch are unchanged and the last full attestation is inside
+  // the 24 h window; otherwise, and always for the TPM tier,
+  // FAILED_PRECONDITION and the client must run a full Attest.
   rpc Rotate (RotateRequest) returns (SVIDBundle);
 
   // Composite verification key set used to validate SVID signatures. Also
@@ -298,9 +301,21 @@ message FetchRequest {
 }
 
 message RotateRequest {
-  string current_svid = 1;            // the JWS to renew
-  repeated PcrValue pcr_values = 2;   // current PCRs, for drift detection
-  uint64 known_epoch = 3;             // policy epoch the client believes is live
+  // The JWS to renew. Optional since T293: empty, or exactly
+  // `auth.svid_jws` (anything else is refused as a binding mismatch).
+  string current_svid = 1;
+  // Deprecated, ignored since T293: unsigned, so never trusted. The state
+  // digest CMIS compares is `RotateDoc.state_digest`, inside the signature.
+  repeated PcrValue pcr_values = 2 [deprecated = true];
+  // Deprecated, ignored: CMIS compares its own live epoch.
+  uint64 known_epoch = 3 [deprecated = true];
+  // Host proof over `doc` (context `ferrogate-rotate-v1`), made with the
+  // machine key the SVID in `auth.svid_jws` is bound to (`cnf.jkt`).
+  HostCallAuth auth = 4;
+  // Canonical CBOR of `ferro_svid::host_call::RotateDoc`
+  // `{v, host_uuid, issued_at, nonce, svid_sha384, state_digest}`, carried as
+  // opaque bytes so the exact bytes the host signed are what CMIS verifies.
+  bytes doc = 5;
 }
 
 message JWKSRequest {

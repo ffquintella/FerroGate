@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferro_attest::{ReloadOutcome, RimLoader};
+use ferro_attest::{ApplyError, ReloadError, ReloadOutcome, RimLoader};
 use tokio::task::JoinHandle;
 
 /// Spawn a background reload loop. Returns the join handle so the caller can
@@ -34,6 +34,15 @@ pub fn spawn(loader: Arc<RimLoader>, interval: Duration) -> JoinHandle<()> {
                 }
                 Ok(ReloadOutcome::UpToDate { version }) => {
                     tracing::debug!(version, "RIM unchanged");
+                }
+                Err(err @ ReloadError::Apply(ApplyError::ReservedPolicyId(_))) => {
+                    // A signed bundle that names the host-key tier: refused,
+                    // the previous generations stay in force (T293 review).
+                    tracing::error!(
+                        event = "rim.reserved_policy_id",
+                        error = %err,
+                        "RIM bundle refused: reserved policy id"
+                    );
                 }
                 Err(err) => {
                     // Keep going — a transient parse or signature error on a

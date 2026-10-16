@@ -23,6 +23,12 @@ use parking_lot::RwLock;
 /// pushes (see `docs/features/F10-rim-pcr-policy.md`).
 pub const MAX_GENERATIONS: usize = 6;
 
+/// The SVID `policy_id` of the software host-key tier (F15/F16). CMIS derives
+/// the attestation tier from it, so it is **reserved**: no RIM generation or
+/// manual approval may use it (compared trimmed, ASCII case-insensitively),
+/// or TPM hosts would be treated as host-key hosts (T293 review).
+pub const HOST_KEY_POLICY_ID: &str = "host-key";
+
 /// Identifies the policy generation an approved digest belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PolicyId(pub String);
@@ -32,6 +38,13 @@ impl PolicyId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this id is reserved ([`HOST_KEY_POLICY_ID`]) and so can never
+    /// name a RIM policy.
+    #[must_use]
+    pub fn is_reserved(&self) -> bool {
+        self.0.trim().eq_ignore_ascii_case(HOST_KEY_POLICY_ID)
     }
 }
 
@@ -120,6 +133,10 @@ pub enum ApplyError {
         /// Upper bound.
         not_after: i64,
     },
+    /// The policy id is reserved for the host-key tier
+    /// ([`HOST_KEY_POLICY_ID`]); nothing was applied or approved.
+    #[error("reserved policy id {0:?}: \"host-key\" names the host-key tier, not a RIM policy")]
+    ReservedPolicyId(String),
 }
 
 /// Process-shared allowlist. Cloning shares the underlying state.
@@ -135,12 +152,16 @@ impl RimStore {
         Self::default()
     }
 
-    /// Manually approve an aggregate PCR digest under `policy_id`. This is the
-    /// pre-F10 escape hatch for bring-up and tests — entries are always active
-    /// and survive every reload. Production deployments should publish a
-    /// signed [`crate::rim_bundle::SignedRimBundle`] via the loader instead.
-    pub fn approve(&self, digest: [u8; 48], policy_id: PolicyId) {
+    /// Manually approve an aggregate PCR digest under `policy_id`: the pre-F10
+    /// escape hatch for bring-up and tests (always active, survives reloads;
+    /// production publishes a signed [`crate::rim_bundle::SignedRimBundle`]).
+    /// Refuses [`HOST_KEY_POLICY_ID`] with [`ApplyError::ReservedPolicyId`].
+    pub fn approve(&self, digest: [u8; 48], policy_id: PolicyId) -> Result<(), ApplyError> {
+        if policy_id.is_reserved() {
+            return Err(ApplyError::ReservedPolicyId(policy_id.0));
+        }
         self.inner.write().manual.insert(digest, policy_id);
+        Ok(())
     }
 
     /// Look up an aggregate PCR digest in the active generations or the manual
@@ -184,6 +205,9 @@ impl RimStore {
     /// write lock, so an in-flight attestation either sees the old set in full
     /// or the new set in full — never a torn intermediate.
     pub fn apply(&self, generation: RimGeneration) -> Result<ApplyOutcome, ApplyError> {
+        if generation.policy_id.is_reserved() {
+            return Err(ApplyError::ReservedPolicyId(generation.policy_id.0));
+        }
         if generation.not_before >= generation.not_after {
             return Err(ApplyError::InvalidWindow {
                 not_before: generation.not_before,
@@ -275,7 +299,8 @@ mod tests {
     fn manual_approval_back_compat_works() {
         let rim = RimStore::new();
         let digest = [7u8; 48];
-        rim.approve(digest, PolicyId("2026-05-fleet-a".into()));
+        rim.approve(digest, PolicyId("2026-05-fleet-a".into()))
+            .unwrap();
         assert_eq!(
             rim.lookup(&digest).map(|p| p.0),
             Some("2026-05-fleet-a".to_string())
@@ -285,6 +310,39 @@ mod tests {
             rim.lookup_at(&digest, 0).map(|p| p.0),
             Some("2026-05-fleet-a".to_string())
         );
+    }
+
+    /// T293 review: the host-key tier is derived from the SVID `policy_id`,
+    /// so a RIM generation named "host-key" would put TPM hosts on the
+    /// host-key renewal path. Refused, in any case or padding.
+    #[test]
+    fn rim_policy_id_host_key_is_reserved() {
+        let rim = RimStore::new();
+        for name in ["host-key", "HOST-KEY", " Host-Key\t"] {
+            let err = rim.apply(gen(1, name, 0xAA, (0, 1_000))).unwrap_err();
+            assert_eq!(err, ApplyError::ReservedPolicyId(name.to_string()));
+            assert!(err.to_string().contains("reserved policy id"));
+        }
+        assert!(rim.is_empty(), "nothing applied");
+        assert_eq!(rim.current_version(), 0, "the version did not advance");
+        assert!(rim.lookup(&[0xAA; 48]).is_none());
+        // Look-alikes are ordinary policy ids.
+        rim.apply(gen(1, "host-key-fleet", 0xBB, (0, 1_000)))
+            .unwrap();
+        assert!(!PolicyId("host-keys".into()).is_reserved());
+        assert!(PolicyId(HOST_KEY_POLICY_ID.into()).is_reserved());
+    }
+
+    #[test]
+    fn manual_approval_of_the_host_key_policy_id_is_refused() {
+        let rim = RimStore::new();
+        let digest = [9u8; 48];
+        assert_eq!(
+            rim.approve(digest, PolicyId(HOST_KEY_POLICY_ID.into())),
+            Err(ApplyError::ReservedPolicyId("host-key".into()))
+        );
+        assert!(rim.lookup(&digest).is_none(), "fails closed: not approved");
+        assert!(rim.is_empty());
     }
 
     #[test]

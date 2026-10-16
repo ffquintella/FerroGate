@@ -93,6 +93,10 @@ pub mod machine_id;
 /// `mia x509-svid` — inspect the machine-bound X.509-SVID store.
 pub mod x509_svid;
 
+/// Host SVID renewal in the running daemon (T294): the schedule, the
+/// `Rotate`-or-attest decision and the credential swap.
+pub mod renewal;
+
 /// Application registration requests through the helper API (feature F19
 /// §7.6): identify, sign, submit, local ledger and outbox.
 #[cfg(any(unix, windows))]

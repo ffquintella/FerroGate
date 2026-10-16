@@ -36,7 +36,8 @@ surface. Configured via the `[server] listen` key (binary env var:
 All control-plane operations multiplex onto this one port:
 
 - **Issuance / lifecycle:** `Attest` (bidirectional stream), `FetchSVID`,
-  `Rotate`, `JWKS`.
+  `Rotate` (a host method since T293: host proof under `ferrogate-rotate-v1`,
+  `CMIS_ROTATE_MAX_PER_HOUR`), `JWKS`.
 - **Audit transparency:** `LatestSth`, `InclusionProof`, `ConsistencyProof`.
 - **Forwarding:** `AppendAuditEvent`, a host method authenticated by a host
   proof — the host's SVID plus a machine-key signature over a fresh,

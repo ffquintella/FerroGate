@@ -676,6 +676,52 @@ async fn issuer_seed_is_one_identity_across_the_cluster() {
     std::fs::remove_dir_all(root).ok();
 }
 
+/// `replace_svid_if_unchanged` writes only over the exact payload it was
+/// given: a stale expectation (another renewal won) or a missing row writes
+/// nothing (T293).
+#[tokio::test]
+async fn replace_svid_if_unchanged_is_a_compare_and_swap() {
+    let root = temp_root("svid-cas");
+    let node = Cluster::start_single_node(root.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let id = "spiffe://x/host/cas";
+    node.upsert_svid(id, b"v1", 1).await.unwrap();
+
+    assert!(node
+        .replace_svid_if_unchanged(id, b"v1", b"v2", 2)
+        .await
+        .unwrap());
+    assert_eq!(
+        node.fetch_svid(id).await.unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
+
+    // A second writer still expecting v1 loses and changes nothing.
+    assert!(!node
+        .replace_svid_if_unchanged(id, b"v1", b"v3", 3)
+        .await
+        .unwrap());
+    assert_eq!(
+        node.fetch_svid(id).await.unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
+
+    // No row, no write (it never inserts).
+    assert!(!node
+        .replace_svid_if_unchanged("spiffe://x/host/none", b"", b"v1", 4)
+        .await
+        .unwrap());
+    assert!(node
+        .fetch_svid("spiffe://x/host/none")
+        .await
+        .unwrap()
+        .is_none());
+
+    node.shutdown().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
 /// `try_store_issuer_seed` is idempotent on a single node too: the first call
 /// wins, later calls are no-ops, and the seed reads back unchanged.
 #[tokio::test]
