@@ -34,10 +34,7 @@ async fn state() -> CmisState {
     let issuer = Issuer::generate("root-2025", "ferrogate.test").unwrap();
     let verifier = TpmQuoteVerifier::new(VendorTrustStore::default(), RimStore::new());
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!(
-        "ferrogate-cmis-rot-{}-{seq}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("ferrogate-cmis-rot-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let store: Arc<dyn AuditStore> = Arc::new(LocalDiskWormStore::open(&tmp).unwrap());
     let (signer, _pk) = InProcessSigner::generate("audit-rot-1").unwrap();
