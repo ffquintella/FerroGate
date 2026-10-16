@@ -283,9 +283,11 @@ configured:
 - **Same key, same identity.** A renewal reopens the machine key and SVID
   seed the daemon started with and never creates either: a key file — or,
   when the SVID in force came from the seed, a seed file — that vanished is
-  refused (`machine_key_refused`; restore it from a backup), and a
-  re-attestation that comes back under another child-signing `kid` (a
-  replaced seed) is not put in force. If a full re-attestation comes back
+  refused (`machine_key_refused`; restore it from a backup). A seed that no
+  longer derives the child-signing `kid` in force (a replaced file) is refused
+  the same way *before* CMIS is contacted, so a planted seed never gets its
+  key certified; a re-attestation that still comes back under another `kid`
+  is not put in force. If a full re-attestation comes back
   under another SPIFFE id (the host was re-enrolled), the SVID is not put in
   force, minting stops, the status reports `host_identity_changed`, and the
   environment's serve loop exits with an error: the process exits non-zero

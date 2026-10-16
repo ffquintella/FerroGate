@@ -18,9 +18,9 @@ use super::schedule::{
     ROTATE_WINDOW_MARGIN_SECS,
 };
 use super::{
-    next_fatal, spawn, Attested, CmisDial, DialedCmis, Exit, Fatal, HostAttestor, HostRenewer,
-    HostSvid, Issued, KeyPolicy, MinterSink, Renewal, RenewalHooks, RenewalPath, Renewer, SvidCell,
-    SvidInfo, Swap, Timeouts, X509Sealer,
+    next_fatal, spawn, AttestDial, Attested, CmisDial, DialedCmis, Exit, Fatal, HostAttestor,
+    HostKeyAttestor, HostRenewer, HostSvid, Issued, KeyPolicy, MinterSink, Renewal, RenewalHooks,
+    RenewalPath, Renewer, SvidCell, SvidInfo, Swap, Timeouts, X509Sealer,
 };
 use crate::helper::auth::CallerIdentity;
 use crate::helper::token::{ChildClaims, ChildTokenMinter};
@@ -1074,7 +1074,8 @@ async fn renewals_reopen_the_key_and_seed_they_started_with() {
         [
             KeyPolicy::OpenOrCreate,
             KeyPolicy::OpenOnly {
-                seed_required: true
+                seed_required: true,
+                kid: Some("kid-1".into())
             }
         ]
     );
@@ -1127,4 +1128,69 @@ async fn x509_is_sealed_only_after_acceptance() {
     assert!(r.renewal.step(600).await.is_err());
     assert!(r.sealed.0.lock().unwrap().is_empty());
     assert!(r.creds.get().is_none(), "minting and host calls off");
+}
+
+// --- the host-key attestor ------------------------------------------------------
+
+/// Counts dials; never connects.
+#[derive(Default)]
+struct CountingDial(std::sync::atomic::AtomicUsize);
+
+impl AttestDial for CountingDial {
+    fn connect(&self) -> BoxFuture<'_, anyhow::Result<DialedCmis>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Err(anyhow::anyhow!("connection refused")) })
+    }
+}
+
+fn sample_facts() -> ferro_machineid::MachineFacts {
+    ferro_machineid::MachineFacts {
+        board_serial: "WT3QF2J3YL".to_string(),
+        platform_uuid: "38D33B14-6DDD-51DD-B8CD-9854CAF977D5".to_string(),
+        disk_serial: "0ba0206164386025".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn a_replaced_seed_is_refused_before_any_cmis_call() {
+    // T294 review: checking the kid only after CMIS certified the planted key
+    // would hand the planter a CMIS-certified host signing key.
+    let dir = std::env::temp_dir().join(format!("mia-renewal-seed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (key_path, seed_path) = (dir.join("host-key.bin"), dir.join("svid-seed.bin"));
+    let facts = sample_facts();
+    crate::machine_key::open_or_create_machine_key(&key_path, Some(facts.fingerprint().as_bytes()))
+        .unwrap();
+    crate::machine_key::create_exclusive(&seed_path, &[1u8; 32]).unwrap();
+    let in_force = crate::machine_key::seed_kid(&[1u8; 32]);
+    let attestor = HostKeyAttestor::new(
+        CountingDial::default(),
+        facts,
+        key_path,
+        seed_path.clone(),
+        StatusHandle::new("default", 0),
+    );
+    let policy = KeyPolicy::OpenOnly {
+        seed_required: true,
+        kid: Some(in_force),
+    };
+    // The seed in force: the attestation goes on to dial CMIS.
+    assert!(attestor.attest(policy.clone()).await.is_err());
+    assert_eq!(
+        attestor.dial().0.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    // A planted seed: refused, and CMIS is never contacted.
+    std::fs::remove_file(&seed_path).unwrap();
+    crate::machine_key::create_exclusive(&seed_path, &[2u8; 32]).unwrap();
+    assert!(matches!(
+        attestor.attest(policy).await,
+        Err(AttestFailure::MachineKey)
+    ));
+    assert_eq!(
+        attestor.dial().0.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

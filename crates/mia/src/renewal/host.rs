@@ -15,16 +15,19 @@ use crate::host_api::CALL_TIMEOUT;
 use crate::status::{AttestFailure, StatusHandle};
 
 /// What an attestation may do with the host's machine key and SVID seed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyPolicy {
     /// Before this run attested: open what exists, create only what exists
     /// nowhere ([`crate::machine_key`]).
     OpenOrCreate,
     /// A renewal: reopen the key CMIS pinned and never create a key or seed;
-    /// with `seed_required` a missing seed fails closed as well.
+    /// with `seed_required` a missing seed fails closed as well, and a seed
+    /// that no longer derives `kid` is refused before CMIS is contacted.
     OpenOnly {
         /// The SVID in force was derived from the persistent seed.
         seed_required: bool,
+        /// The child-signing `kid` in force, when it came from the seed.
+        kid: Option<String>,
     },
 }
 
@@ -242,11 +245,20 @@ where
     fn key_policy(&self) -> KeyPolicy {
         match self.seeded {
             None => KeyPolicy::OpenOrCreate,
-            Some(seed_required) => KeyPolicy::OpenOnly { seed_required },
+            Some(seed_required) => KeyPolicy::OpenOnly {
+                seed_required,
+                kid: if seed_required {
+                    self.kid.clone()
+                } else {
+                    None
+                },
+            },
         }
     }
 
     /// Refuse a seeded host's renewal under another key: the seed changed.
+    /// Defence in depth: the attestor already refuses such a seed before
+    /// contacting CMIS.
     fn check_key(&self, attested: &Attested) -> Result<(), AttestFailure> {
         if self.seeded != Some(true) {
             return Ok(());

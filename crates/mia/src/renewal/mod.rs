@@ -16,6 +16,7 @@ use tonic::Status;
 use crate::status::{AttestFailure, StatusHandle};
 
 mod host;
+mod host_key;
 pub mod schedule;
 mod swap;
 
@@ -23,6 +24,7 @@ pub use host::{
     Attested, CmisDial, DialedCmis, HostAttestor, HostRenewer, KeyPolicy, RenewalHooks, X509Sealer,
     X509Store,
 };
+pub use host_key::{AttestDial, HostKeyAttestor};
 pub use swap::{rotate_host_svid, HostSvid, MinterSink, SvidCell, Swap};
 
 use schedule::{secs, Next, RETRY_BASE};
@@ -484,19 +486,22 @@ impl<R: Renewer> Renewal<R> {
         self.status.set_renew_at(due);
         let t0 = Instant::now();
         let left = Some(secs(expires_at - now));
-        if !matches!(
-            bounded(
-                self.renewer.after_install(path),
-                self.timeouts.after_install,
-                left
-            )
-            .await,
-            Bounded::Done(())
-        ) {
-            tracing::warn!(
+        match bounded(
+            self.renewer.after_install(path),
+            self.timeouts.after_install,
+            left,
+        )
+        .await
+        {
+            Bounded::Done(()) => {}
+            Bounded::TimedOut => tracing::warn!(
                 "the refresh after the host SVID renewal (allowlist, proposals) timed out; the \
                  new SVID is in force"
-            );
+            ),
+            Bounded::Expired => tracing::warn!(
+                "the new host SVID expired while the refresh after its renewal (allowlist, \
+                 proposals) was still running; the next step switches minting off"
+            ),
         }
         let now = later(now, t0);
 

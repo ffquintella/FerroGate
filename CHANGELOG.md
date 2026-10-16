@@ -85,9 +85,11 @@ record them.
   answer `no_host_svid`) and clamps child tokens to it; the task also takes
   the host-call credentials out at expiry. Renewals reopen the machine key
   and seed the daemon started with and never create them
-  (`machine_key::{open_machine_key, load_seed}`, `Unusable::Vanished`), and
-  refuse a re-attestation under another child-signing `kid` while the seed is
-  in use. A full re-attestation under another SPIFFE id is never put in
+  (`machine_key::{open_machine_key, load_seed, reopen_seed}`,
+  `Unusable::{Vanished, Replaced}`); a seed that no longer derives the
+  child-signing `kid` in force is refused before CMIS is contacted
+  (`renewal::HostKeyAttestor`), and a re-attestation under another `kid` is
+  never put in force. A full re-attestation under another SPIFFE id is never put in
   force: minting stops, the status reports `host_identity_changed`, and the
   environment's serve loop returns an error so the supervisor restarts the
   daemon; a renewal task that dies does the same. The status endpoint keeps

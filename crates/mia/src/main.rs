@@ -957,13 +957,6 @@ fn svid_seed_path() -> std::path::PathBuf {
     mia::machine_key::StateFile::SvidSeed.path_in(&state_dir())
 }
 
-/// Set once this process has created a machine key because none existed
-/// anywhere: if CMIS then refuses the host, the likeliest cause is that it
-/// pinned an earlier key for this fingerprint (a key rebind), and the log says
-/// so instead of leaving the operator to guess.
-static MACHINE_KEY_CREATED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// The machine fingerprint, collected once *before* the privilege drop (the DMI
 /// serials it hashes are root-only) and reused by attestation afterwards.
 static PREFETCHED_FACTS: std::sync::OnceLock<Option<ferro_machineid::MachineFacts>> =
@@ -1121,151 +1114,24 @@ async fn bootstrap_host_svid_host_key(
     status: &mia::status::StatusHandle,
     policy: mia::renewal::KeyPolicy,
 ) -> Result<mia::renewal::Attested, mia::status::AttestFailure> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine as _;
-    use ferro_sep::MachineKey as _;
-    use mia::renewal::KeyPolicy;
-    use mia::status::AttestFailure;
-    use sha2::{Digest, Sha256};
+    use mia::renewal::HostAttestor as _;
 
     let Some(facts) = prefetched_facts() else {
         tracing::warn!("no hardware fingerprint available; host-key attestation skipped");
-        return Err(AttestFailure::Other);
+        return Err(mia::status::AttestFailure::Other);
     };
-    let key_path = host_key_path();
-    // Seal the software key at rest to the hardware fingerprint: a key file
-    // copied to another host won't decrypt there (clone resistance bound to
-    // machine identity, not a hardware root of trust — docs/features/F16).
-    // CMIS pins the key's public half on first contact, so an existing key is
-    // only ever opened; one that cannot be used fails closed with the fix in
-    // the log, and a key is created only when none exists anywhere.
-    let opened = match policy {
-        KeyPolicy::OpenOrCreate => mia::machine_key::open_or_create_machine_key(
-            &key_path,
-            Some(facts.fingerprint().as_bytes()),
-        ),
-        KeyPolicy::OpenOnly { .. } => {
-            mia::machine_key::open_machine_key(&key_path, Some(facts.fingerprint().as_bytes())).map(
-                |key| mia::machine_key::MachineKey {
-                    key,
-                    created: false,
-                },
-            )
-        }
-    };
-    let key = match opened {
-        Ok(opened) => {
-            if opened.created {
-                MACHINE_KEY_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    path = %key_path.display(),
-                    fingerprint = %facts.fingerprint().to_hex(),
-                    "no machine signing key existed; created a new one. This is a new host \
-                     identity: if CMIS enrolled this machine before, it will refuse this key as a \
-                     key rebind — restore the original host-key.bin instead"
-                );
-            }
-            opened.key
-        }
-        Err(mia::machine_key::KeyError::Refused(refusal)) => {
-            tracing::error!(path = %key_path.display(), "{refusal}");
-            return Err(AttestFailure::MachineKey);
-        }
-        Err(e @ mia::machine_key::KeyError::CreateFailed(_)) => {
-            tracing::error!(error = %e, path = %key_path.display(), "cannot create the machine signing key");
-            return Err(AttestFailure::Other);
-        }
-    };
-
-    // Host DPoP confirmation key thumbprint. A host-bound stand-in derived from
-    // the machine key until the host DPoP key (F09) is wired; CMIS records it as
-    // the SVID's `cnf.jkt`.
-    let dpop_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(key.public_spki_der()));
-
-    // Resolve + dial CMIS with fail-over (static endpoint or SRV-discovered HA
-    // cluster); a successful pinned handshake selects a live node.
-    let (endpoint, mut client) = match resolver.connect().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, cmis = %resolver.describe(), "could not connect to CMIS for attestation");
-            return Err(AttestFailure::from_connect_error(&e));
-        }
-    };
-    status.set_cmis_node(&endpoint);
-    // Recover (or first-boot create) the persistent SVID seed so the composite
-    // key — and therefore the child-signing kid and its JWKS entry — is stable
-    // across restarts. An existing seed that cannot be used is refused, never
-    // overwritten (fail closed). Without one (none could be persisted, or a
-    // renewal finds none) the key is ephemeral: the kid rotates.
-    let seed_path = svid_seed_path();
-    let seed = match policy {
-        KeyPolicy::OpenOrCreate => mia::machine_key::load_or_create_seed(&seed_path).map(|s| {
-            if matches!(s, mia::machine_key::Seed::Created(_)) {
-                tracing::info!(path = %seed_path.display(), "created the persistent SVID seed");
-            }
-            Some(*s.bytes())
-        }),
-        KeyPolicy::OpenOnly { seed_required } => {
-            mia::machine_key::load_seed(&seed_path, seed_required)
-        }
-    };
-    let seed = match seed {
-        Ok(s) => s,
-        Err(mia::machine_key::SeedError::Refused(refusal)) => {
-            tracing::error!(path = %seed_path.display(), "{refusal}");
-            return Err(AttestFailure::MachineKey);
-        }
-        Err(e @ mia::machine_key::SeedError::CreateFailed(_)) => {
-            tracing::warn!(
-                error = %e,
-                path = %seed_path.display(),
-                "cannot persist the SVID seed; using an ephemeral key (the child-signing kid will rotate on restart)"
-            );
-            None
-        }
-    };
-    let attested = match mia::client::run_attest_host_key(
-        &mut client,
-        facts,
-        &key,
-        dpop_jkt,
-        seed.as_ref(),
+    // The key is sealed at rest to the hardware fingerprint (clone resistance
+    // bound to machine identity, docs/features/F16); CMIS pins its public
+    // half, so it is only ever opened, and created only when none exists.
+    mia::renewal::HostKeyAttestor::new(
+        resolver.clone(),
+        facts.clone(),
+        host_key_path(),
+        svid_seed_path(),
+        status.clone(),
     )
+    .attest(policy)
     .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "host-key attestation failed");
-            let failure = AttestFailure::from_attest_error(&e, false);
-            if failure == AttestFailure::NotEnrolled
-                && MACHINE_KEY_CREATED.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                tracing::error!(
-                    path = %key_path.display(),
-                    fingerprint = %facts.fingerprint().to_hex(),
-                    "CMIS refused this host, and this agent created its machine key at this \
-                     start. If the machine was enrolled before, CMIS has pinned the earlier key \
-                     for this fingerprint and refuses the new one as a key rebind: restore the \
-                     original host-key.bin (and svid-seed.bin) from a backup, or have the CMIS \
-                     operator clear this host's key pin"
-                );
-            }
-            return Err(failure);
-        }
-    };
-
-    tracing::info!(
-        spiffe_id = %attested.bundle.spiffe_id,
-        fingerprint = %facts.fingerprint().to_hex(),
-        cmis = %endpoint,
-        "host SVID obtained via host-key attestation; token minting enabled"
-    );
-    // The SVID's `cnf.jkt` binds this key, so it signs host calls.
-    Ok(attested_from(
-        attested,
-        Some(std::sync::Arc::new(key)),
-        seed.is_some(),
-    ))
 }
 
 /// The owned attestation inputs the bootstrap and re-attestation paths need:
@@ -1503,6 +1369,12 @@ async fn bootstrap_host_svid_tpm(
 /// persistent seed. Nothing is written: the X.509-SVID is sealed once the
 /// SVID is accepted (start-up, or the renewal's install).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+// Only the TPM-class backends build one here (the host-key tier's comes from
+// `mia::renewal::HostKeyAttestor`).
+#[cfg_attr(
+    not(any(target_os = "linux", feature = "virtual-tpm")),
+    allow(dead_code)
+)]
 fn attested_from(
     attested: mia::client::AttestedSvid,
     host_call_key: Option<std::sync::Arc<dyn ferro_sep::MachineKey + Send + Sync>>,

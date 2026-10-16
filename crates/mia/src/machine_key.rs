@@ -173,6 +173,10 @@ pub enum Unusable {
     /// run: an SVID renewal reopens only what is there (T294) and never
     /// creates a replacement for the key CMIS pinned.
     Vanished,
+    /// The seed is readable but no longer derives the child-signing key this
+    /// run uses: it was replaced. A renewal refuses it before contacting CMIS,
+    /// which would otherwise certify the planted key.
+    Replaced,
 }
 
 impl fmt::Display for Unusable {
@@ -201,6 +205,10 @@ impl fmt::Display for Unusable {
             ),
             Self::Vanished => f.write_str(
                 "it is missing, although this agent attested with it earlier in this run",
+            ),
+            Self::Replaced => f.write_str(
+                "it no longer derives the child-signing key this agent runs with, so it was \
+                 replaced",
             ),
         }
     }
@@ -270,6 +278,11 @@ impl Refusal {
                  (after the CMIS operator has cleared its key pin), delete {} as well so the \
                  agent may create a new key",
                 evidence.display()
+            ),
+            Unusable::Replaced => format!(
+                "restore the original {} at {path} from a backup and find out who replaced it; \
+                 the running agent renews only under the key it started with",
+                self.file.file_name()
             ),
             Unusable::Vanished => format!(
                 "restore {path} from a backup (owner-only, owned by the service account); the \
@@ -1012,6 +1025,37 @@ fn load_seed_with(
     }
 }
 
+/// The child-signing `kid` the composite key derived from `seed` is
+/// published under.
+#[must_use]
+pub fn seed_kid(seed: &[u8; 32]) -> String {
+    let (_secret, public) = ferro_crypto::composite::CompositeSecretKey::from_seed(seed);
+    ferro_svid::child_signing_kid(&public)
+}
+
+/// [`load_seed`] for a renewal that must keep the child-signing key
+/// `expected_kid` (the seed in force): a seed that derives another key is
+/// refused ([`Unusable::Replaced`]) and left untouched.
+///
+/// # Errors
+///
+/// As [`load_seed`], plus [`Unusable::Replaced`].
+pub fn reopen_seed(
+    path: &Path,
+    required: bool,
+    expected_kid: Option<&str>,
+) -> Result<Option<[u8; 32]>, SeedError> {
+    let seed = load_seed(path, required)?;
+    match (&seed, expected_kid) {
+        (Some(s), Some(kid)) if seed_kid(s) != kid => Err(SeedError::Refused(Refusal {
+            file: StateFile::SvidSeed,
+            path: path.to_path_buf(),
+            reason: Unusable::Replaced,
+        })),
+        _ => Ok(seed),
+    }
+}
+
 /// [`load_or_create_seed`] with explicit legacy locations.
 fn load_or_create_seed_with(path: &Path, legacy: &[PathBuf]) -> Result<Seed, SeedError> {
     let file = StateFile::SvidSeed;
@@ -1268,6 +1312,7 @@ mod tests {
             evidence: "/state/svid-seed.bin".into(),
         });
         reasons.push(Unusable::Vanished);
+        reasons.push(Unusable::Replaced);
         for reason in reasons {
             for file in StateFile::ALL {
                 let r = Refusal {
@@ -1531,6 +1576,31 @@ mod tests {
             }))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"short");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replaced_seed_is_refused_on_renewal() {
+        // T294 review: an owner-only 32-byte file planted as svid-seed.bin is
+        // a valid seed for another key; the renewal refuses it by kid.
+        let dir = scratch("seed-replaced");
+        let path = dir.join("svid-seed.bin");
+        create_exclusive(&path, &[1u8; 32]).unwrap();
+        let in_force = seed_kid(&[1u8; 32]);
+        assert_eq!(
+            reopen_seed(&path, true, Some(&in_force)).unwrap(),
+            Some([1u8; 32])
+        );
+        std::fs::remove_file(&path).unwrap();
+        create_exclusive(&path, &[2u8; 32]).unwrap();
+        let Err(SeedError::Refused(r)) = reopen_seed(&path, true, Some(&in_force)) else {
+            panic!("a replaced seed must be refused");
+        };
+        assert_eq!(r.reason, Unusable::Replaced);
+        assert!(r.to_string().contains("will not be replaced"), "{r}");
+        assert_eq!(std::fs::read(&path).unwrap(), [2u8; 32], "left intact");
+        // Without a kid to compare (an ephemeral run), it is just read.
+        assert_eq!(reopen_seed(&path, false, None).unwrap(), Some([2u8; 32]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

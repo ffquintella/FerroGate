@@ -1027,7 +1027,8 @@ async fn daemon_renews_host_svid_before_expiry() {
     assert_eq!(
         *policies.lock().unwrap(),
         [KeyPolicy::OpenOnly {
-            seed_required: true
+            seed_required: true,
+            kid: Some(start_kid.clone())
         }]
     );
     let reattested = creds.get().unwrap();
