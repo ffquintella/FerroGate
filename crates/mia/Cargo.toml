@@ -131,7 +131,7 @@ libc = "0.2"
 # conversion), reads its flags, path, file system and ACL attribute; `nix`
 # resolves uids to user names (`getpwuid_r`) for the request's user fields.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "net"] }
-nix    = { version = "0.30", default-features = false, features = ["user"] }
+nix    = { version = "0.31", default-features = false, features = ["user"] }
 
 # The Windows named-pipe helper transport delegates all FFI (client PID, image
 # attestation, ACL) to `ferro-winauth`, keeping `mia` itself `forbid(unsafe)`.
