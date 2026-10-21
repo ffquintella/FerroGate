@@ -850,31 +850,102 @@ pub(crate) fn restart_hint() -> &'static str {
     "restart the mia service"
 }
 
-/// The argv that signals the running agent to reload its allowlist (SIGHUP)
-/// without restarting it, so the helper socket never goes down. `None` on
-/// platforms with no signal-reload path (Windows: no SIGHUP). The daemon must
-/// be a build that handles SIGHUP — older builds treat it as terminate and the
-/// supervisor simply restarts them (a degraded but safe fallback).
+/// Signal the running agent to reload its allowlist (SIGHUP) without
+/// restarting it, so the helper socket never goes down. `None` on platforms
+/// with no signal-reload path (Windows: no SIGHUP). `Some(Ok(tool))` reports
+/// the service-manager tool used (`launchctl`, `systemctl`), so the caller
+/// can quote it in operator messages; `Some(Err(_))` carries a diagnostic
+/// with the platform restart hint. The daemon must be a build that handles
+/// SIGHUP — older builds treat it as terminate and the supervisor simply
+/// restarts them (a degraded but safe fallback).
 #[cfg(target_os = "linux")]
-pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
-    Some(&["systemctl", "kill", "-s", "HUP", "mia"])
+pub(crate) fn perform_reload() -> Option<anyhow::Result<&'static str>> {
+    let status = match std::process::Command::new("systemctl")
+        .args(["kill", "-s", "HUP", "mia"])
+        .status()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(Err(anyhow::anyhow!(
+                "running `systemctl kill -s HUP mia`: {e}"
+            )))
+        }
+    };
+    if !status.success() {
+        return Some(Err(anyhow::anyhow!(
+            "`systemctl kill -s HUP mia` exited with {status}; is mia running as a managed \
+             service? Otherwise restart it to load changes:  {}",
+            restart_hint()
+        )));
+    }
+    Some(Ok("systemctl"))
 }
 
-/// The reload command (macOS launchd).
+/// The reload command (macOS launchd). On a host where the daemon has not been
+/// bootstrapped yet (first-time setup, or `launchctl bootout` ran earlier) a
+/// bare `launchctl kill HUP system/com.ferrogate.mia` fails with exit 113
+/// ("Could not find specified service"), so we check `launchctl print` first
+/// and bootstrap from the installed plist before signalling.
 #[cfg(target_os = "macos")]
-pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
-    Some(&["launchctl", "kill", "HUP", "system/com.ferrogate.mia"])
+pub(crate) fn perform_reload() -> Option<anyhow::Result<&'static str>> {
+    use std::process::{Command, Stdio};
+    const SERVICE: &str = "system/com.ferrogate.mia";
+    const PLIST: &str = "/Library/LaunchDaemons/com.ferrogate.mia.plist";
+    let loaded = Command::new("launchctl")
+        .args(["print", SERVICE])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !loaded {
+        let status = match Command::new("launchctl")
+            .args(["bootstrap", "system", PLIST])
+            .status()
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return Some(Err(anyhow::anyhow!(
+                    "running `launchctl bootstrap system {PLIST}`: {e}"
+                )));
+            }
+        };
+        if !status.success() {
+            return Some(Err(anyhow::anyhow!(
+                "`launchctl bootstrap system {PLIST}` exited with {status}; is the mia plist \
+                 installed? Otherwise restart the agent:  {}",
+                restart_hint()
+            )));
+        }
+    }
+    let status = match Command::new("launchctl")
+        .args(["kill", "HUP", SERVICE])
+        .status()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(Err(anyhow::anyhow!(
+                "running `launchctl kill HUP {SERVICE}`: {e}"
+            )));
+        }
+    };
+    if !status.success() {
+        return Some(Err(anyhow::anyhow!(
+            "`launchctl kill HUP {SERVICE}` exited with {status}; restart the agent:  {}",
+            restart_hint()
+        )));
+    }
+    Some(Ok("launchctl"))
 }
 
 /// The reload command (Windows — no SIGHUP, so none).
 #[cfg(windows)]
-pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
+pub(crate) fn perform_reload() -> Option<anyhow::Result<&'static str>> {
     None
 }
 
 /// The reload command (other platforms).
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(crate) fn reload_command() -> Option<&'static [&'static str]> {
+pub(crate) fn perform_reload() -> Option<anyhow::Result<&'static str>> {
     None
 }
 

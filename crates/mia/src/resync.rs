@@ -50,36 +50,19 @@ pub fn run_reload(args: &[String]) -> anyhow::Result<()> {
             other => anyhow::bail!("unknown argument: {other}\n\n{USAGE_RELOAD}"),
         }
     }
-    let Some(cmd) = crate::setup::reload_command() else {
+    let Some(outcome) = crate::setup::perform_reload() else {
         anyhow::bail!(
             "--reload is not supported on this platform (no SIGHUP); restart the agent instead:  {}",
             crate::setup::restart_hint()
         );
     };
+    println!("Signaling the running agent to reload its configuration and allowlist (SIGHUP) …");
+    let tool = outcome?;
     println!(
-        "Signaling the running agent to reload its configuration and allowlist (SIGHUP via {}) …",
-        cmd[0]
+        "✓ done via {tool} — the agent re-read its configuration and signed allowlist live; the \
+         helper socket stayed up."
     );
-    let status = std::process::Command::new(cmd[0])
-        .args(&cmd[1..])
-        .status()
-        .with_context(|| format!("running `{}`", cmd[0]))?;
-    if status.success() {
-        println!(
-            "✓ done — the agent re-read its configuration and signed allowlist live; the helper \
-             socket stayed up."
-        );
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "reload command exited with {}; is mia running as a managed service? Otherwise restart \
-             it to load changes:  {}",
-            status
-                .code()
-                .map_or_else(|| "a signal".to_string(), |c| c.to_string()),
-            crate::setup::restart_hint()
-        )
-    }
+    Ok(())
 }
 
 /// Run the `mia resync-allowlist` subcommand. `args` is everything after
@@ -261,40 +244,22 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
 /// can't be sent (no signal-reload path on this platform, or the service
 /// manager command fails — e.g. the agent isn't running as a managed service).
 pub(crate) fn signal_reload() {
-    let Some(cmd) = crate::setup::reload_command() else {
+    let Some(outcome) = crate::setup::perform_reload() else {
         println!(
             "\n--reload is not supported on this platform; restart the agent to load it:  {}",
             crate::setup::restart_hint()
         );
         return;
     };
-    print!(
-        "\nSignaling the running agent to reload (SIGHUP via {}) … ",
-        cmd[0]
-    );
-    match std::process::Command::new(cmd[0]).args(&cmd[1..]).status() {
-        Ok(status) if status.success() => {
-            println!("done.");
+    print!("\nSignaling the running agent to reload (SIGHUP) … ");
+    match outcome {
+        Ok(tool) => {
+            println!("done via {tool}.");
             println!("  The new allowlist is now live — no restart, the helper socket stayed up.");
         }
-        Ok(status) => {
-            println!(
-                "failed (exit {}).",
-                status
-                    .code()
-                    .map_or_else(|| "signal".to_string(), |c| c.to_string())
-            );
-            println!(
-                "  Load it with a restart instead:  {}",
-                crate::setup::restart_hint()
-            );
-        }
         Err(e) => {
-            println!("could not run `{}` ({e}).", cmd[0]);
-            println!(
-                "  Load it with a restart instead:  {}",
-                crate::setup::restart_hint()
-            );
+            println!("failed.");
+            println!("  {e:#}");
         }
     }
 }
@@ -304,24 +269,13 @@ pub(crate) fn signal_reload() {
 /// must stay one JSON document. Errors when the platform has no live reload
 /// or the service manager command fails.
 pub(crate) fn send_reload() -> anyhow::Result<()> {
-    let cmd = crate::setup::reload_command().with_context(|| {
+    let outcome = crate::setup::perform_reload().with_context(|| {
         format!(
             "live reload is not supported on this platform; restart the agent:  {}",
             crate::setup::restart_hint()
         )
     })?;
-    let status = std::process::Command::new(cmd[0])
-        .args(&cmd[1..])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .with_context(|| format!("running `{}`", cmd[0]))?;
-    anyhow::ensure!(
-        status.success(),
-        "the reload command exited with {status}; restart the agent:  {}",
-        crate::setup::restart_hint()
-    );
-    Ok(())
+    outcome.map(|_| ())
 }
 
 /// Verify the freshly fetched allowlist against the locally pinned enrollment

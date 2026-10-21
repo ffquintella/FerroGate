@@ -25,6 +25,17 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-10-21
+
+### Fixed
+
+- Bootstrap the launchd daemon from the plist before `launchctl kill HUP` on
+  macOS so `mia setup --apply --reload` (and the MIA tray's "Aplicar" button)
+  no longer fails with exit 113 when the service is not loaded yet. The new
+  `setup::perform_reload()` checks `launchctl print system/com.ferrogate.mia`
+  and, if the service is absent, runs `launchctl bootstrap system
+  /Library/LaunchDaemons/com.ferrogate.mia.plist` before signalling.
+
 ### Added
 
 - Import every legacy allowlist entry as a `legacy_import` approval with `ferrogate admin migrate-allowlists [--dry-run]` (S50, S54, M38, T272)
