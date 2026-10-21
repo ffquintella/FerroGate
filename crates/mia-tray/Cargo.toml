@@ -70,7 +70,7 @@ sys-locale = "0.3"
 # ── GUI (feature `gui`) ──────────────────────────────────────────────────────
 # Native rendering only — no embedded web view, so log text and config values
 # have no HTML/JS injection surface.
-eframe      = { version = "0.36", optional = true }
+eframe      = { version = "0.37", optional = true }
 tray-icon   = { version = "0.24", optional = true }
 notify-rust = { version = "4.17", optional = true }
 arboard     = { version = "3.6", optional = true }
