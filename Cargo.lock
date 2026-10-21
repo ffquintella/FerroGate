@@ -1380,7 +1380,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.21",
  "tokio",
@@ -2136,7 +2136,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519",
  "rand_core 0.10.1",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "signature",
  "subtle",
  "zeroize",
@@ -2483,7 +2483,7 @@ dependencies = [
  "hex",
  "plist",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
 ]
 
@@ -2501,7 +2501,7 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "sha3 0.12.0",
  "subtle",
  "thiserror 2.0.21",
@@ -2549,7 +2549,7 @@ dependencies = [
  "ferro-crypto",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
 ]
 
@@ -2573,7 +2573,7 @@ dependencies = [
  "rustls-post-quantum",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "sha3 0.12.0",
  "subtle",
  "thiserror 2.0.21",
@@ -2599,7 +2599,7 @@ name = "ferro-machineid"
 version = "0.30.0"
 dependencies = [
  "hex",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
 ]
 
@@ -2644,7 +2644,7 @@ dependencies = [
  "hkdf",
  "p256",
  "security-framework",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "zeroize",
 ]
@@ -2662,7 +2662,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "uuid",
  "x509-parser",
@@ -2678,7 +2678,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
 ]
 
@@ -2747,7 +2747,7 @@ dependencies = [
  "inquire",
  "rcgen",
  "rustls-pki-types",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -2799,7 +2799,7 @@ dependencies = [
  "rustix 1.1.5",
  "rustls-pki-types",
  "serde",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "static_assertions",
  "tokio",
  "tokio-stream",
@@ -3715,7 +3715,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_rusqlite",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "socket2",
  "thiserror 2.0.21",
  "thread-priority",
@@ -4649,7 +4649,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -5500,7 +5500,7 @@ dependencies = [
  "elliptic-curve",
  "primefield",
  "primeorder",
- "sha2 0.11.0",
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -6687,7 +6687,7 @@ version = "8.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ffa149f6aa81b58a5b3011d01a857c4ed12c7a732d2c51947a4c7c692185f0"
 dependencies = [
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "walkdir",
 ]
 
@@ -6896,7 +6896,7 @@ dependencies = [
  "reqwest",
  "rustls-webpki",
  "serde",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -7177,9 +7177,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
