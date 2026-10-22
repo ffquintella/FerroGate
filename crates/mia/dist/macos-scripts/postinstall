@@ -109,11 +109,28 @@ if [ -d "$RUN_DIR" ] && [ ! -L "$RUN_DIR" ] && [ -n "$STATUS_GID" ]; then
   done
 fi
 
+# Candidates for "the user installing this": the console user (set when the
+# install is run through Installer.app) and SUDO_USER (set when it is run from
+# a terminal with `sudo installer`). Add every distinct real user, so the
+# installer works in both flows. The membership applies from their next login.
 CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
 case "$CONSOLE_USER" in
-  ""|root|loginwindow) CONSOLE_USER="" ;;
-  *) dseditgroup -o edit -a "$CONSOLE_USER" -t user "$STATUS_GROUP" 2>/dev/null || true ;;
+  ""|root|loginwindow|_*) CONSOLE_USER="" ;;
 esac
+SUDO_INSTALLER_USER="${SUDO_USER:-}"
+case "$SUDO_INSTALLER_USER" in
+  ""|root|_*) SUDO_INSTALLER_USER="" ;;
+esac
+ADDED_USERS=""
+for candidate in "$CONSOLE_USER" "$SUDO_INSTALLER_USER"; do
+  [ -n "$candidate" ] || continue
+  case " $ADDED_USERS " in *" $candidate "*) continue ;; esac
+  id -u "$candidate" >/dev/null 2>&1 || continue
+  if dseditgroup -o edit -a "$candidate" -t user "$STATUS_GROUP" 2>/dev/null; then
+    ADDED_USERS="$ADDED_USERS $candidate"
+  fi
+done
+ADDED_USERS="${ADDED_USERS# }"
 if [ -f "$DAEMON_PLIST" ] && [ -n "$STATUS_GID" ]; then
   /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:FERROGATE_STATUS_SOCKET_GID string $STATUS_GID" "$DAEMON_PLIST" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:FERROGATE_STATUS_SOCKET_GID $STATUS_GID" "$DAEMON_PLIST"
@@ -138,7 +155,7 @@ fi
 
 echo "FerroGate MIA installed."
 echo "  Uninstall: sudo mia-uninstall (keeps the configuration and this host's machine key; --purge deletes them)."
-echo "  Status readers (mia-tray, mia status): group $STATUS_GROUP (gid $STATUS_GID)${CONSOLE_USER:+, including $CONSOLE_USER from their next login}."
+echo "  Status readers (mia-tray, mia status): group $STATUS_GROUP (gid $STATUS_GID)${ADDED_USERS:+, including $ADDED_USERS from their next login}."
 case "$DAEMON_STATE" in
   restarted)
     echo "  Daemon: reloaded with the new binary and launchd plist."
