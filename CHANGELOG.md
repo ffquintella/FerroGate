@@ -25,6 +25,16 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.3] - 2026-10-27
+
+### Added
+
+- Drive every daemon-reportable `AgentState` over the status endpoint in the new `agent_states` test (S18, M31, T213)
+
+### Removed
+
+- Drop the self-signed split-brain test from `ferro-raft`, since hiqlite no longer has the check
+
 ## [0.30.1] - 2026-10-21
 
 ### Fixed
