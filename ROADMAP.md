@@ -790,7 +790,8 @@ changes on workstations.
 - [x] T211 Ship `mia-tray` in the macOS, Windows and Linux packages (S18)
   - note: Builds run 2026-10-16 at 0.29.0. `pkg-macos`: `FerroGate MIA.app` (signature verified), LaunchAgent, postinstall status group. `pkg-win`: `mia-tray.exe` (now GUI-subsystem, build-gated) plus the HKLM `Run` entry in the MSI. `pkg-deb`: tray inside `ferrogate-mia`, checked by `check-deb-package.sh` in the v0.29.0 release run. `pkg-rpm-tray`: built and `dnf install`ed next to the agent RPM on Fedora 41 (deps resolve, `%post` adds the installer to `ferrogate-status`, `rpm -V` clean). Not run on real desktops: that is T213–T215.
 - [x] T212 Ship the macOS tray as the `FerroGate MIA.app` bundle (S18, S30)
-- [ ] T213 Drive every `AgentState` from the daemon's e2e harness (S18)
+- [x] T213 Drive every `AgentState` from the daemon's e2e harness (S18)
+  - note: `crates/mia/tests/agent_states.rs` serves one environment per state over the real status socket, built with the `StatusHandle` calls the daemon makes, and reads them back with a protocol client; `NotRunning` is driven against an absent socket. `NotInstalled` and `ImaDisabled` are client-side only and asserted as such. The states come from handle inputs, not from a live attestation failing against CMIS.
 - [ ] T214 Test per platform that a peer outside the status group cannot connect (S18)
   - note: Needs root and real groups; answering `StatusReq`/`LogTailReq` and refusing anything else is already tested over a real socket.
 - [ ] T215 Run the setup wizard and consent prompts end to end against real prompts (S18)
