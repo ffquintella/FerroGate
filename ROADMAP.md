@@ -794,7 +794,7 @@ changes on workstations.
   - note: `crates/mia/tests/agent_states.rs` serves one environment per state over the real status socket, built with the `StatusHandle` calls the daemon makes, and reads them back with a protocol client; `NotRunning` is driven against an absent socket. `NotInstalled` and `ImaDisabled` are client-side only and asserted as such. The states come from handle inputs, not from a live attestation failing against CMIS.
 - [ ] T214 Test per platform that a peer outside the status group cannot connect (S18)
   - note: Needs root and real groups; answering `StatusReq`/`LogTailReq` and refusing anything else is already tested over a real socket.
-  - note: Unix half added in `crates/mia/tests/status_group_peer.rs` (skips without root; probes as in-group and outside-group peers). Not yet confirmed passing as root, and the Windows pipe case is not written, so this stays open.
+  - note: Unix half added in `crates/mia/tests/status_group_peer.rs` (skips without root; probes as in-group and outside-group peers). Passes as root on macOS (2026-10-29); not yet run on Linux, and the Windows pipe case is not written, so this stays open.
 - [ ] T215 Run the setup wizard and consent prompts end to end against real prompts (S18)
 - [ ] T216 Test as root that `mia setup --apply` preserves a different file owner (S18)
   - note: The rest of the `--apply` criterion (rejections, atomic write, `0640`, `ConfigChanged`, byte-identity with the TTY wizard) is tested.
@@ -978,7 +978,8 @@ Supersedes the host-request flow of M35 once ADR-0004 is accepted.
 > phase: P10
 > spec: S53, S51, S50, S18
 
-- [ ] T280 Ship the `mia-tray-admin` binary with in-memory, zeroized credentials (S53)
+- [x] T280 Ship the `mia-tray-admin` binary with in-memory, zeroized credentials (S53)
+  - note: `crates/mia-tray`: feature `admin-core` (headless; `zeroize`, `static_assertions` only) and `admin` (= `gui` + `admin-core`) with `[[bin]] mia-tray-admin` (`src/admin_main.rs`, `required-features = ["admin"]`); `src/admin/` `secret` (`Secret`, `SessionToken`: fixed capacity, wiped on drop and on `pop`, no `Debug`/`Display`/`Clone`), `login` (`LoginModel`: borrowed `type_text`/`backspace`, wipe on submit, `Esc`, close, lock; `LoginView` serialises lengths only), `cli` (`--environment <EnvName>`, closed set). `src/gui/admin/`: the window draws its fields by hand and reads keystrokes from the input events, so no `egui` text widget (undo history, galley cache) ever holds a secret; `persist_window` and `persist_egui_memory` off. The submit wipes the credentials unsent until the CMIS link (T281). `make tray-admin`, `make check-tray-isolation` (the `mia-tray` graph has no `tonic`/`ferro-transport`/`zeroize`, and `eframe` persistence is off), `lint-tray`/`test-tray` cover the admin build; `docs/mia-tray.md` "Admin client". Not done here: the tray menu item that spawns the binary and packaging (T285), the shared `ferrogate-admin-client` crate (T281). Tests: `admin::secret::tests`, `admin::login::tests`, `admin::cli::tests`, `gui::admin::tests::{typing_and_submitting_leave_no_copy_in_the_toolkit, escape_and_close_wipe_the_secrets, nothing_is_persisted}`.
 - [ ] T281 Log in and step up with TOTP or FIDO2 from the tray admin client (S53, S51)
 - [ ] T282 Enroll and manage TOTP and FIDO2 factors from the tray admin client (S53, S51)
 - [ ] T283 Add request and approval administration screens to the tray admin client (S53)

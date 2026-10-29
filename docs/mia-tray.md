@@ -256,6 +256,38 @@ Linux, macOS and Windows.
 | `MIA_TRAY_LOG` | the tray's own tracing directive on stderr (default `info`) |
 | `LC_ALL` / `LC_MESSAGES` / `LANG` / `LANGUAGE`, then the OS locale | English or Portuguese |
 
+## Admin client (`mia-tray-admin`)
+
+An optional, **separate binary** for FerroGate administrators (feature F22). It
+is not part of the tray: `mia-tray` holds no credentials and links none of the
+admin code, and nothing flows between the two. Build it with
+`make tray-admin` (cargo feature `admin`, which implies `gui`); `make
+check-tray-isolation` asserts that the `mia-tray` dependency graph contains no
+`tonic`, `ferro-transport` or admin crate and that `eframe` persistence stays
+off.
+
+Current state (T280): the window, the login model and the credential handling.
+Signing in to CMIS, factor enrollment, the approval views and "Add application"
+follow in T281 to T285, so today a submitted form is wiped unsent.
+
+Credential handling:
+
+- the password and the TOTP code live in fixed-capacity `Zeroizing` buffers
+  (`admin::secret::Secret`) with no `Debug`, `Display` or `Clone`, checked at
+  compile time; the session token has the same type of guarantee;
+- the window never gives a secret to an `egui` text widget: it reads the
+  keystrokes straight from the input events and hands them to the model by
+  reference, and draws the mask from a length, so `egui`'s undo history and
+  galley cache never hold a copy (tests type a password through real frames and
+  scan the painted text and `egui` memory);
+- the buffers are wiped on submit, on `Esc`, when the window closes and on lock;
+- nothing is persisted: `persist_window` and `persist_egui_memory` are off, there
+  is no "remember me", and the window title never carries a user name.
+
+Residual risk: the toolkit keeps a typed character in its per-frame input queue
+until the frame ends, and input-method (IME) composition is not supported in the
+secret fields.
+
 ## Limitations
 
 - On Linux without a StatusNotifierItem host the icon is not visible; the tray

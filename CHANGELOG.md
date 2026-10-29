@@ -25,6 +25,12 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.5] - 2026-10-29
+
+### Added
+
+- Ship the `mia-tray-admin` administrator client binary behind the `admin` feature, with in-memory zeroized credentials that are wiped on submit, `Esc`, close and lock (S53, M40, T280)
+
 ## [0.30.4] - 2026-10-29
 
 ### Added

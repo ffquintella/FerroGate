@@ -36,11 +36,24 @@ name = "mia-tray"
 path = "src/main.rs"
 required-features = ["gui"]
 
+[[bin]]
+name = "mia-tray-admin"
+path = "src/admin_main.rs"
+required-features = ["admin"]
+
 [lints]
 workspace = true
 
 [features]
 default = []
+# The administrator client's headless core (F22): secret buffers, the login
+# model and its argument parser. It pulls in no GUI, gRPC or transport crate,
+# so it is built and tested on every host.
+admin-core = ["dep:zeroize", "dep:static_assertions"]
+# The administrator client `mia-tray-admin` (F22): a separate binary with its
+# own link graph. `cargo tree -p mia-tray --bin mia-tray -e normal` must stay
+# free of everything this feature adds (`make check-tray-isolation`).
+admin = ["gui", "admin-core"]
 # The desktop front end. See the note above.
 gui = [
     "dep:eframe",
@@ -66,6 +79,10 @@ tracing-subscriber = { workspace = true }
 tempfile   = "3"
 # The OS UI language (English / Portuguese string table).
 sys-locale = "0.3"
+
+# Administrator client (features `admin-core` / `admin`): wiped secret buffers.
+zeroize           = { workspace = true, optional = true }
+static_assertions = { workspace = true, optional = true }
 
 # ── GUI (feature `gui`) ──────────────────────────────────────────────────────
 # Native rendering only — no embedded web view, so log text and config values

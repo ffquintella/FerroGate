@@ -34,6 +34,10 @@
 //! - [`text`] — escaping untrusted text for display;
 //! - [`cli`] — the binary's own (tiny) argument parser.
 //!
+//! The `admin-core` feature adds [`admin`], the headless core of the separate
+//! `mia-tray-admin` administrator client (F22): secret buffers, the login model
+//! and the binary's argument parser. The tray itself links none of it.
+//!
 //! The `gui` feature adds the `gui` module (tray icon, menus, windows); see the crate
 //! manifest for why it is off by default.
 //!
@@ -42,6 +46,8 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+#[cfg(feature = "admin-core")]
+pub mod admin;
 pub mod alerts;
 pub mod bundle;
 pub mod cli;

@@ -217,6 +217,15 @@ messages! {
     TabRecovery => "Recovery", "Recuperação";
     TabSetup => "Setup", "Configuração";
     TabLogs => "Logs", "Logs";
+    AdminAppName => "FerroGate administrator", "Administrador FerroGate";
+    AdminSignInTitle => "Sign in", "Entrar";
+    AdminUsername => "User name", "Usuário";
+    AdminPassword => "Password", "Senha";
+    AdminCode => "Authenticator code (leave empty to use a security key)", "Código do autenticador (deixe vazio para usar uma chave de segurança)";
+    AdminSignIn => "Sign in", "Entrar";
+    AdminMissingFields => "Sign-in failed. Check the fields and try again.", "Falha ao entrar. Verifique os campos e tente novamente.";
+    AdminNotConnected => "This build cannot reach the server yet. Nothing was sent and the typed credentials were wiped.", "Esta versão ainda não se conecta ao servidor. Nada foi enviado e as credenciais digitadas foram apagadas.";
+    AdminMemoryOnly => "Credentials are kept in memory only and wiped on sign-out, lock and exit.", "As credenciais ficam apenas na memória e são apagadas ao sair, ao bloquear e ao fechar.";
     ButtonRefresh => "Refresh", "Atualizar";
     ButtonRun => "Run", "Executar";
     LabelEnvironment => "Environment", "Ambiente";

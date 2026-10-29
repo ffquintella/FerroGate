@@ -13,6 +13,8 @@
 //! misbehaving window from taking the icon down. Every decision is made by
 //! the headless modules; this layer only draws and dispatches.
 
+#[cfg(feature = "admin")]
+pub mod admin;
 mod job;
 mod logs_view;
 mod notify;

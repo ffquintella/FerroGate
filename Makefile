@@ -2,7 +2,7 @@
         formal formal-tamarin formal-cryptoverif docs container-image container-image-push \
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
         pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk \
-        tray icons lint-tray test-tray deny-tray pkg-deb-tray pkg-rpm-tray pkg-tray \
+        tray tray-admin check-tray-isolation icons lint-tray test-tray deny-tray pkg-deb-tray pkg-rpm-tray pkg-tray \
         publish-sdk publish-sdk-dry-run release deploy-release
 
 # Default target: list available targets with their descriptions.
@@ -55,18 +55,35 @@ lint: ## Run clippy with warnings denied
 # targets cover the GUI build. On Linux they need GTK 3 headers:
 #   sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
 TRAY := -p mia-tray --features mia-tray/gui
+# The administrator client (F22) is a separate binary behind the `admin`
+# feature, which the unprivileged tray never enables.
+TRAY_ADMIN := -p mia-tray --features mia-tray/admin
 
 tray: ## Build the mia-tray desktop companion with its GUI (release)
 	cargo build --release $(TRAY) --bin mia-tray
 
+tray-admin: ## Build the mia-tray-admin administrator client (release)
+	cargo build --release $(TRAY_ADMIN) --bin mia-tray-admin
+
+check-tray-isolation: ## Assert the mia-tray binary links no admin or network crate (F22)
+	@deps="$$(cargo tree -p mia-tray --features mia-tray/gui -e normal --prefix none)" || exit 1; \
+	if echo "$$deps" | grep -E '^(tonic|ferro-transport|ferrogate-admin-client|zeroize) v'; then \
+	  echo "ERROR: the mia-tray binary links admin or network code (see above)"; exit 1; fi; \
+	feats="$$(cargo tree -p mia-tray --features mia-tray/admin -e features --prefix none)" || exit 1; \
+	if echo "$$feats" | grep -E 'eframe feature "persistence"'; then \
+	  echo "ERROR: eframe persistence is enabled; the admin client must persist nothing"; exit 1; fi; \
+	echo "mia-tray isolation OK"
+
 icons: ## Regenerate the MIA app icons (PNG/ICNS/ICO) from crates/mia-tray/dist/icons/ferrogate-mia.svg
 	scripts/gen-mia-icons.sh
 
-lint-tray: ## Clippy the mia-tray GUI build (and mia-status-proto) with warnings denied
+lint-tray: ## Clippy the mia-tray GUI and admin builds (and mia-status-proto) with warnings denied
 	cargo clippy $(TRAY) -p mia-status-proto --all-targets -- -D warnings
+	cargo clippy $(TRAY_ADMIN) --all-targets -- -D warnings
 
-test-tray: ## Test mia-tray with the GUI compiled in, plus mia-status-proto
+test-tray: ## Test mia-tray with the GUI and admin client compiled in, plus mia-status-proto
 	cargo test $(TRAY) -p mia-status-proto
+	cargo test $(TRAY_ADMIN)
 
 deny-tray: ## cargo-deny over the GUI dependency graph (deny.toml's graph is default features only)
 	cargo deny --features mia-tray/gui check
