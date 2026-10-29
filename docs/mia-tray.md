@@ -222,8 +222,15 @@ the committed PNG, `.icns` (app bundle) and `.ico` (MSI). The packages install
 it as `ferrogate-mia` in the hicolor icon theme on Linux. The menu-bar icon
 itself is the state disc drawn in `src/icon.rs`.
 
+The optional administrator client (`mia-tray-admin`, see [Admin client](#admin-client-mia-tray-admin))
+is **not** part of the workstation `ferrogate-mia` `.deb`, and it is off by
+default in the MSI; it has its own packages (`make pkg-tray-admin`) and shows
+up in the tray menu only once installed. It is meant for approvers on managed
+devices: install it from [Installing the admin client](#installing-the-admin-client).
+
 `MIA_TRAY=0 make pkg-macos` / `MIA_TRAY=0 make pkg-win` build the agent
-packages without the tray. On Windows `mia-tray.exe` is a GUI-subsystem
+packages without the tray (and so without the admin client);
+`MIA_TRAY_ADMIN=0` leaves out only the admin client. On Windows `mia-tray.exe` is a GUI-subsystem
 program (no console window at logon), so `mia-tray --help` / `--version` print
 only when stdout is redirected (`mia-tray --version | more`). On Linux the tray needs a StatusNotifierItem host:
 KDE, Xfce, Cinnamon and most others have one; GNOME needs the
@@ -268,9 +275,48 @@ check-tray-isolation` asserts that the `mia-tray` dependency graph contains no
 admin build does link `ferrogate-admin-client` (so the check is not blind), and
 that `eframe` persistence stays off.
 
-Current state (T282): sign-in and step-up against CMIS, token enrollment and
-second-factor management. The approval views, "Add application" and packaging
-follow in T283 to T285.
+Current state (T280 to T285): sign-in and step-up against CMIS, token
+enrollment and second-factor management, the request and approval views, adding
+an application in one step, packaged on every desktop platform and offered from
+the tray menu.
+
+### Installing the admin client
+
+**Who.** Approvers on managed devices only (FIDO2 is recommended and can be
+required by the server policy). Regular workstations do not need it: the Debian
+workstation package and the RPM tray package leave it out, and it is off by
+default in the MSI (the macOS `.pkg` carries it in the bundle unless built with
+`MIA_TRAY_ADMIN=0`). It runs as the signed-in
+user and **needs no privileges** at install time or run time: no group
+membership (not `ferrogate-status`, not `ferrogate-clients`), no setuid or setgid,
+no polkit action, no service, no autostart or login item, and no Windows
+elevation manifest (`asInvoker`, like `mia-tray.exe`). Get the CMIS admin
+endpoint and its pin from operations first (see [Configuration](#configuration)).
+
+| Platform | How to install | Where it lands |
+|---|---|---|
+| Linux (Debian/Ubuntu) | `sudo apt install ./ferrogate-mia-tray-admin_<version>-1_amd64.deb` (`make pkg-deb-tray-admin`); depends on the tray (`ferrogate-mia` provides it) | `/usr/bin/mia-tray-admin` |
+| Linux (RPM) | `sudo dnf install ./ferrogate-mia-tray-admin-<version>-1.x86_64.rpm` (`make pkg-rpm-tray-admin`); requires `ferrogate-mia-tray` | `/usr/bin/mia-tray-admin` |
+| macOS | inside the `.pkg` of `make pkg-macos`, in the same signed bundle as the tray (`MIA_TRAY_ADMIN=0` to leave it out) | `/Applications/FerroGate MIA.app/Contents/MacOS/mia-tray-admin` |
+| Windows | the MSI feature **Admin client**, off by default: `msiexec /i ferrogate-mia-<version>-x64.msi ADDLOCAL=Main,AdminClient`, or with Chocolatey `choco install ferrogate-mia --params "'/AdminClient'"` (repeat the parameter on `choco upgrade`) | `%ProgramFiles%\FerroGate\MIA\mia-tray-admin.exe` |
+
+On macOS the binary is signed with the same identity as the bundle
+(`CODESIGN_ID`, ad hoc otherwise), hardened runtime, no entitlements. On every
+platform it is installed beside `mia-tray`, owned by root and not writable by
+anyone else.
+
+**Menu entry.** Within a few seconds of installing (the tray looks again on every
+status refresh, no restart needed) **Admin client…** appears in the tray menu,
+only when `mia-tray-admin` is found in the same directory as the running `mia-tray` *and* passes the same
+trust rule `mia` must pass to run elevated (Unix: a regular file, not a link,
+owned by root and not group- or world-writable, in a root-owned directory that is
+not group- or world-writable; Windows: under the machine's Program Files). The
+rule is checked again right before each launch. The tray starts it as you, with
+no arguments, no elevation and stdin closed, and nothing flows between the two
+processes; a second click while the window is open does nothing. A copy in a
+user-writable place (a development build, a Homebrew-owned `/usr/local/bin`) is
+never offered: run such a build directly. The client also works without the tray
+(run it from a terminal by the path above).
 
 ### Configuration
 
@@ -419,6 +465,38 @@ The rules, the filters and the calls are the TUI's, from
 with controls, bidi and zero-width characters made visible, failures are shown
 by kind only (the reason goes to the log), and an idle lock, sign-out or close
 drops every record shown.
+
+### Adding an application
+
+**Add application…** (shown with `app.direct_register`) registers a binary whose
+SHA-384 and path you already know, the tray's version of the TUI's `A` dialog
+(F22 §5): host UUID, platform, canonical path, SHA-384 (exactly 96 hex
+characters, typed or pasted; sent lowercased), a Unix uid or a Windows SID or
+RID, user name, optional declared version and reason, and the "path writable
+only by administrators" box, followed by the same approval terms, safe
+defaults and wide-scope confirmation as **Approve…**. The fields are checked
+before anything is sent, by the rules the TUI uses
+(`ferrogate-admin-client::approvals::register`).
+
+The review page says what will happen: the add **registers AND approves** the
+application in one step and is recorded as approved by the same person
+(`AppApprovedBySameActor`), or, without `app_request.approve` or under the
+server's strict separation of duties (`CMIS_ADMIN_STRICT_SOD`), only queues a
+request for a different approver. It also says that the hash, the path and the
+protected-path box are **your assertion**: nothing checks them against the
+host, the approval pins the exact hash, and MIA re-hashes the binary at every
+mint, so a wrong hash grants nothing.
+
+**Confirm with a fresh second factor…** always opens the second-factor prompt,
+even right after a step-up: every add carries its own proof (a TOTP code, or a
+key touch where the session offers one), sent with `AdminRegisterApplication`.
+A wrong code changes nothing and the prompt asks again for the same request, so
+the retry reuses its idempotency key (so does a retry after no answer); closing
+the prompt sends nothing. The outcome names the request and approval
+("Registered and approved", "Queued for another approver" or "Already
+approved") and the list reloads. Picking a local file, identifying it with
+`ferro-appid`, taking this machine's host UUID and "Sync this machine now" are
+not in the tray yet.
 
 Credential handling:
 

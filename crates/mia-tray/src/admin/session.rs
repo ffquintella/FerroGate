@@ -11,7 +11,8 @@
 //! Enrollment and factor management (F22 §3a) ride the same queue; the
 //! worker keeps no state between commands (nonces and creation requests go
 //! back and forth with the window). So do the request and approval reads
-//! and decisions (F22 §4), which carry no secret.
+//! and decisions (F22 §4), which carry no secret, and the single-step add
+//! (F22 §5), which carries its fresh second factor.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,9 @@ use std::time::Duration;
 use ferrogate_admin_client::approvals::proto::{
     GetAppRequestResponse, GetApprovalResponse, ListAppRequestsRequest, ListAppRequestsResponse,
     ListApprovalsRequest, ListApprovalsResponse,
+};
+use ferrogate_admin_client::approvals::register::{
+    AdminRegisterApplicationRequest, AdminRegisterApplicationResponse,
 };
 use ferrogate_admin_client::approvals::{Mutated, Mutation};
 use ferrogate_admin_client::client::{
@@ -139,6 +143,14 @@ pub enum Cmd {
     GetApproval(String),
     /// A decision or edit (kept by the window for the one step-up retry).
     Mutate(Box<Mutation>),
+    /// `AdminRegisterApplication` with a fresh second factor (the window
+    /// keeps the request, not the factor, for a retry with the same key).
+    Register {
+        /// The request, without its proof.
+        req: Box<AdminRegisterApplicationRequest>,
+        /// The fresh second factor.
+        proof: FactorChoice,
+    },
 }
 
 static_assertions::assert_not_impl_any!(Cmd: std::fmt::Debug, std::fmt::Display, Clone);
@@ -196,6 +208,8 @@ pub enum Reply {
     Approval(Result<Box<GetApprovalResponse>, ClientError>),
     /// Answer to [`Cmd::Mutate`].
     Mutated(Result<Box<Mutated>, ClientError>),
+    /// Answer to [`Cmd::Register`].
+    Registered(Result<Box<AdminRegisterApplicationResponse>, ClientError>),
 }
 
 static_assertions::assert_not_impl_any!(Reply: std::fmt::Debug, std::fmt::Display, Clone);
@@ -408,6 +422,14 @@ async fn run_factors(
             log_failure("remove_factor", result.as_ref().err());
             Reply::FactorRemoved(result)
         }
+        Cmd::Register { req, proof } => {
+            let result = match factor(proof) {
+                Ok(p) => conn.register_application(*req, p).await.map(Box::new),
+                Err(e) => Err(e),
+            };
+            log_failure("register_application", result.as_ref().err());
+            Reply::Registered(result)
+        }
         other => run_views(conn, other).await,
     }
 }
@@ -486,6 +508,7 @@ fn refused(cmd: Cmd, e: &ClientError) -> (&'static str, Reply) {
         Cmd::ListApprovals(_) => ("list_approvals", Reply::Approvals(failed(err()))),
         Cmd::GetApproval(_) => ("get_approval", Reply::Approval(failed(err()))),
         Cmd::Mutate(_) => ("mutate", Reply::Mutated(failed(err()))),
+        Cmd::Register { .. } => ("register_application", Reply::Registered(failed(err()))),
     }
 }
 
@@ -687,6 +710,10 @@ mod tests {
             Cmd::Mutate(Box::new(Mutation::Freeze(
                 ferrogate_admin_client::approvals::rules::freeze_request("lin", true, "k".into()),
             ))),
+            Cmd::Register {
+                req: Box::default(),
+                proof: FactorChoice::Code(secret("123456")),
+            },
         ];
         for cmd in stale {
             let ended = match rt.block_on(run(&mut conn, queued_at, cmd, None)) {
@@ -698,6 +725,7 @@ mod tests {
                 Reply::Permissions(r) => r.err(),
                 Reply::Request(r) => r.err(),
                 Reply::Mutated(r) => r.err(),
+                Reply::Registered(r) => r.err(),
                 _ => panic!("a reply of another kind"),
             };
             assert_eq!(ended, Some(ClientError::SessionEnded));
@@ -775,6 +803,30 @@ mod tests {
         assert!(matches!(
             next(&mut w),
             Reply::Mutated(Err(ClientError::SessionEnded))
+        ));
+        w.stop(SHUTDOWN_WAIT);
+    }
+
+    #[test]
+    fn an_add_without_a_session_or_a_key_backend_sends_nothing() {
+        let mut w = spawn(refused_config(), None, Arc::new(|| {})).unwrap();
+        assert!(w.send(Cmd::Register {
+            req: Box::default(),
+            proof: FactorChoice::Code(secret("123456")),
+        }));
+        assert!(matches!(
+            next(&mut w),
+            Reply::Registered(Err(ClientError::SessionEnded))
+        ));
+        assert!(w.send(Cmd::Register {
+            req: Box::default(),
+            proof: FactorChoice::SecurityKey,
+        }));
+        assert!(matches!(
+            next(&mut w),
+            Reply::Registered(Err(ClientError::Authenticator(
+                AuthenticatorError::Unavailable
+            )))
         ));
         w.stop(SHUTDOWN_WAIT);
     }

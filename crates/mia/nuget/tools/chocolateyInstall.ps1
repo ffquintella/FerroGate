@@ -71,12 +71,23 @@ Install-ChocolateyPath -PathToInstall $installDir -PathType 'Machine'
 #    own logs: the MSI declares the service non-vital (a bare-MSI install must
 #    not hard-fail on service quirks), so this log is the only record of a
 #    failed InstallServices/StartServices action.
+#    The administrator client (feature F22) is the MSI feature "Admin client",
+#    OFF by default: `choco install ferrogate-mia --params "'/AdminClient'"`
+#    turns it on (ADDLOCAL=Main,AdminClient). It is for approvers on managed
+#    devices; pass the parameter again on `choco upgrade` (or remember
+#    arguments) or the upgrade installs the default features only.
+$pp = Get-PackageParameters
+$msiFeatures = ''
+if ($pp.ContainsKey('AdminClient')) {
+    $msiFeatures = ' ADDLOCAL=Main,AdminClient'
+    Write-Host 'Installing the optional Admin client feature.'
+}
 $msiLog = Join-Path $env:ProgramData 'chocolatey\logs\ferrogate-mia.msi.install.log'
 $packageArgs = @{
     packageName    = 'ferrogate-mia'
     fileType       = 'msi'
     file           = Join-Path $toolsDir 'ferrogate-mia.msi'
-    silentArgs     = "/qn /norestart /l*v `"$msiLog`""
+    silentArgs     = "/qn /norestart /l*v `"$msiLog`"$msiFeatures"
     validExitCodes = @(0, 3010, 1641)
 }
 Install-ChocolateyInstallPackage @packageArgs

@@ -239,6 +239,37 @@ pub fn locate_mia() -> Option<MiaBinary> {
     on_path(exe_name()).map(untrusted)
 }
 
+/// The executable file name of the administrator client (`mia-tray-admin`,
+/// F22) on this OS.
+#[must_use]
+pub fn admin_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "mia-tray-admin.exe"
+    } else {
+        "mia-tray-admin"
+    }
+}
+
+/// The administrator client the tray menu may offer: [`admin_exe_name`] in
+/// the same directory as the running tray executable `tray_exe`, a regular
+/// file (not a link) passing [`trusted_for_elevation`], so nothing
+/// unprivileged can have planted it where an administrator types a password.
+/// No override variable, no `PATH` search; `None` shows no menu entry.
+#[must_use]
+pub fn locate_admin_client(tray_exe: &Path) -> Option<PathBuf> {
+    locate_admin_client_with(tray_exe, trusted_for_elevation)
+}
+
+/// [`locate_admin_client`] with the trust rule injected (only so tests can
+/// use files that are not root-owned).
+#[must_use]
+pub fn locate_admin_client_with(tray_exe: &Path, trusted: fn(&Path) -> bool) -> Option<PathBuf> {
+    let dir = resolved(tray_exe.to_path_buf()).parent()?.to_path_buf();
+    let candidate = dir.join(admin_exe_name());
+    let regular = std::fs::symlink_metadata(&candidate).is_ok_and(|m| m.is_file());
+    (regular && trusted(&candidate)).then_some(candidate)
+}
+
 /// The first of `candidates` that exists as a file (fixed system tools such
 /// as `pkexec`, `systemctl`, `xdg-open`).
 #[must_use]
@@ -342,6 +373,59 @@ mod tests {
         for p in packaged_locations() {
             assert!(p.is_absolute(), "{}", p.display());
             assert!(p.ends_with(exe_name()));
+        }
+    }
+
+    #[test]
+    fn the_admin_client_is_found_only_beside_the_tray_and_only_when_trusted() {
+        let trusted: fn(&Path) -> bool = |_| true;
+        let untrusted: fn(&Path) -> bool = |_| false;
+        let dir = tempfile::tempdir().unwrap();
+        let tray = dir.path().join("mia-tray");
+        std::fs::write(&tray, b"").unwrap();
+
+        // Not installed: no entry, whatever the trust rule says.
+        assert_eq!(locate_admin_client_with(&tray, trusted), None);
+
+        let admin = dir.path().join(admin_exe_name());
+        std::fs::write(&admin, b"").unwrap();
+        let found = locate_admin_client_with(&tray, trusted).unwrap();
+        assert_eq!(found.file_name().unwrap(), admin_exe_name());
+        assert_eq!(found.parent(), resolved(tray.clone()).parent());
+        // Present but failing the trust rule: no entry.
+        assert_eq!(locate_admin_client_with(&tray, untrusted), None);
+
+        // Another directory's copy is never picked up.
+        let other = tempfile::tempdir().unwrap();
+        let lone_tray = other.path().join("mia-tray");
+        std::fs::write(&lone_tray, b"").unwrap();
+        assert_eq!(locate_admin_client_with(&lone_tray, trusted), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_admin_client_is_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let tray = dir.path().join("mia-tray");
+        std::fs::write(&tray, b"").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = elsewhere.path().join("evil");
+        std::fs::write(&real, b"").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(admin_exe_name())).unwrap();
+        assert_eq!(locate_admin_client_with(&tray, |_| true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_owned_admin_client_fails_the_real_trust_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let tray = dir.path().join("mia-tray");
+        std::fs::write(&tray, b"").unwrap();
+        std::fs::write(dir.path().join(admin_exe_name()), b"").unwrap();
+        // The real rule, not an injected one: a temp dir is user-owned
+        // (unless the tests run as root).
+        if facts(dir.path(), true).is_some_and(|f| f.uid != 0) {
+            assert_eq!(locate_admin_client(&tray), None);
         }
     }
 

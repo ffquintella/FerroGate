@@ -319,7 +319,9 @@ impl AdminApp {
                 Busy::SignIn { key: true }
                 | Busy::StepUp { key: true }
                 | Busy::Enroll { key: true }
-                | Busy::Factors { key: true } => Msg::AdminTouchKey,
+                | Busy::Factors { key: true }
+                | Busy::Register { key: true } => Msg::AdminTouchKey,
+                Busy::Register { key: false } => Msg::AdminRegistering,
                 Busy::SignIn { key: false } => Msg::AdminSigningIn,
                 Busy::StepUp { key: false } => Msg::AdminConfirming,
                 Busy::Enroll { key: false } | Busy::Factors { key: false } | Busy::Views => {
@@ -594,7 +596,12 @@ fn signed_in(ui: &mut egui::Ui, lang: Lang, view: &FlowView, actions: &mut Vec<A
     ui.add_space(8.0);
     if let Some(su) = &view.step_up {
         ui.group(|ui| {
-            ui.label(Msg::AdminStepUpTitle.text(lang));
+            // The fresh factor of an add is not a step-up (F20 §7 "M").
+            ui.label(if su.for_add {
+                Msg::AdminAddProofTitle.text(lang)
+            } else {
+                Msg::AdminStepUpTitle.text(lang)
+            });
             if s.methods.totp {
                 ui.label(Msg::AdminCode.text(lang));
                 field_box(ui, &"•".repeat(su.code_len), true);
@@ -630,12 +637,38 @@ fn signed_in(ui: &mut egui::Ui, lang: Lang, view: &FlowView, actions: &mut Vec<A
             if s.methods.security_key && !view.key_available {
                 ui.weak(Msg::AdminKeyUnavailable.text(lang));
             }
-            if su.error.is_some() {
-                ui.colored_label(ui.visuals().error_fg_color, Msg::AdminRejected.text(lang));
+            match (su.error, su.for_add) {
+                (None, _) => {}
+                (Some(p), true) => {
+                    ui.colored_label(ui.visuals().error_fg_color, add_problem(lang, view, p));
+                }
+                (Some(_), false) => {
+                    ui.colored_label(ui.visuals().error_fg_color, Msg::AdminRejected.text(lang));
+                }
             }
         });
     } else {
         ui.horizontal(|ui| session_buttons(ui, lang, view, idle, actions));
+    }
+}
+
+/// Why an add's fresh factor did not go through (nothing was registered).
+fn add_problem(lang: Lang, view: &FlowView, p: Problem) -> String {
+    match p {
+        Problem::Rejected => Msg::AdminAddRejected.text(lang).to_string(),
+        Problem::Throttled => fill(
+            Msg::AdminThrottled.text(lang),
+            &[(
+                "time",
+                &human_duration(i64::try_from(view.throttle_secs_left.unwrap_or(0)).unwrap_or(0)),
+            )],
+        ),
+        Problem::Unreachable => Msg::AdminUnreachable.text(lang).to_string(),
+        Problem::NotOffered => Msg::AdminNotOffered.text(lang).to_string(),
+        Problem::KeyUnavailable => Msg::AdminKeyUnavailable.text(lang).to_string(),
+        Problem::KeyCancelled => Msg::AdminKeyCancelled.text(lang).to_string(),
+        Problem::KeyFailed => Msg::AdminKeyFailed.text(lang).to_string(),
+        _ => Msg::AdminServerError.text(lang).to_string(),
     }
 }
 
@@ -793,6 +826,12 @@ mod tests {
                 Cmd::Mutate(m) => {
                     seen.cmds.push("mutate");
                     seen.keys.push(m.idempotency_key().to_string());
+                }
+                Cmd::Register { req, proof } => {
+                    seen.cmds.push("register");
+                    seen.keys.push(req.idempotency_key.clone());
+                    seen.secrets_ok = req.proof.is_none()
+                        && matches!(proof, FactorChoice::Code(c) if c.expose() == "123456");
                 }
             }
             true
@@ -1352,6 +1391,116 @@ mod tests {
         let painted = frame_at(&ctx, &mut app, Vec::new(), later).join("\n");
         assert!(!painted.contains("R-0000A1B2"), "{painted}");
         assert!(app.flow.view(later).views.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one frame per step of the add.
+    fn an_add_shows_its_outcome_and_assertion_and_always_asks_a_fresh_masked_code() {
+        use crate::admin::decide::tests::HOST;
+        use crate::admin::decide::{DecisionField, DecisionKind};
+        use ferrogate_admin_client::approvals::proto::{AppRequestInfo, ApprovalInfo};
+        use ferrogate_admin_client::approvals::register::AdminRegisterApplicationResponse;
+        use ferrogate_admin_client::error::ClientError;
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        let painted = on_the_requests(
+            &ctx,
+            &mut app,
+            &seen,
+            &["app.direct_register", "app_request.approve"],
+        );
+        assert!(painted.contains("Add application…"), "{painted}");
+        app.act(vec![Action::View(ViewAction::Decide(
+            DecisionKind::Register,
+        ))]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(
+            painted.contains("Add an application by known hash and path"),
+            "{painted}"
+        );
+        assert!(painted.contains("(your assertion)"), "{painted}");
+        for (field, text) in [
+            (DecisionField::Host, HOST.to_string()),
+            (
+                DecisionField::Path,
+                "/opt/tool/bin/tool\u{202e}gpj".to_string(),
+            ),
+            (DecisionField::Sha, "ab".repeat(48)),
+            (DecisionField::Uid, "1000".to_string()),
+            (DecisionField::User, "alice".to_string()),
+        ] {
+            app.act(vec![Action::View(ViewAction::FocusDecision(field))]);
+            frame(&ctx, &mut app, vec![egui::Event::Paste(text)]);
+        }
+        app.act(vec![Action::View(ViewAction::DecisionNext)]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        for want in [
+            "Review what will be sent",
+            "registers AND approves",
+            "recorded as approved by the same person",
+            "YOUR ASSERTION",
+            "fresh second factor",
+            "Confirm with a fresh second factor…",
+        ] {
+            assert!(painted.contains(want), "{want}: {painted}");
+        }
+        assert!(!painted.contains('\u{202e}'), "typed text is drawn inert");
+
+        // Just stepped up at sign-in? Irrelevant: the add asks a code.
+        app.act(vec![Action::View(ViewAction::DecisionConfirm)]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(
+            painted.contains("Confirm this addition with a fresh second factor"),
+            "{painted}"
+        );
+        assert!(
+            !seen.borrow().cmds.contains(&"register"),
+            "nothing sent yet"
+        );
+        let mut typed = frame(&ctx, &mut app, vec![egui::Event::Text("123456".into())]);
+        typed.extend(frame(&ctx, &mut app, Vec::new()));
+        assert!(typed.iter().all(|t| !t.contains("123456")), "masked");
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert_eq!(seen.borrow().cmds.last(), Some(&"register"));
+        assert!(seen.borrow().secrets_ok, "the code went with the request");
+        push(&seen, Reply::Registered(Err(ClientError::Rejected)));
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(
+            painted.contains("The code was not accepted; nothing was registered."),
+            "{painted}"
+        );
+        frame(&ctx, &mut app, vec![egui::Event::Text("123456".into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        {
+            let s = seen.borrow();
+            assert_eq!(s.keys.len(), 2);
+            assert_eq!(s.keys[0], s.keys[1], "the retry reuses the key");
+        }
+        let done = AdminRegisterApplicationResponse {
+            request: Some(AppRequestInfo {
+                request_id: "0192a9f1-0000-7000-8000-00000000a1b2".into(),
+                ..AppRequestInfo::default()
+            }),
+            approval: Some(ApprovalInfo {
+                approval_id: "0190f0aa-0000-7000-8000-00000000beef".into(),
+                ..ApprovalInfo::default()
+            }),
+            allowlist_generation: 7,
+            ..AdminRegisterApplicationResponse::default()
+        };
+        push(&seen, Reply::Registered(Ok(Box::new(done))));
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert_eq!(
+            seen.borrow().cmds.last(),
+            Some(&"list_requests"),
+            "reloaded"
+        );
+        assert!(
+            painted.contains("Registered and approved: request R-0000A1B2, approval A-0000BEEF"),
+            "{painted}"
+        );
+        let memory = ctx.memory(|m| format!("{m:?}"));
+        assert!(!memory.contains("123456"));
     }
 
     #[test]

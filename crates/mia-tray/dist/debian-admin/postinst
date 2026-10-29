@@ -1,0 +1,12 @@
+#!/bin/sh
+# postinst for the ferrogate-mia-tray-admin package (feature F22); also used as
+# the RPM %post script (crates/mia-tray/Cargo.toml).
+#
+# Prints a pointer and nothing else: the administrator client needs no group,
+# no service and no privilege, so this script changes nothing on the system.
+set -e
+
+echo "ferrogate-mia-tray-admin: installed /usr/bin/mia-tray-admin. Open it from the tray menu (\"Admin client...\","
+echo "ferrogate-mia-tray-admin: shown within seconds) or run it directly. It needs the CMIS admin endpoint and its pin in"
+echo "ferrogate-mia-tray-admin: ~/.config/ferrogate/admin.toml; see /usr/share/doc/ferrogate-mia-tray-admin/mia-tray.md"
+exit 0

@@ -13,6 +13,7 @@ on:
     paths:
       - "crates/mia-tray/**"
       - "crates/mia-status-proto/**"
+      - "crates/ferrogate-admin-client/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
@@ -21,6 +22,7 @@ on:
     paths:
       - "crates/mia-tray/**"
       - "crates/mia-status-proto/**"
+      - "crates/ferrogate-admin-client/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
@@ -64,6 +66,23 @@ jobs:
 
       - name: Build the release binary
         run: cargo build --release -p mia-tray --features mia-tray/gui --bin mia-tray
+
+      # The administrator client (F22) is a separate binary behind the `admin`
+      # feature, packaged apart from the tray (optional deb/rpm, MSI feature,
+      # macOS bundle binary). It is built, linted and tested on its own so its
+      # dependencies never unify into the tray.
+      - name: Lint (admin client build, warnings denied)
+        run: cargo clippy -p mia-tray --features mia-tray/admin --all-targets -- -D warnings
+
+      - name: Test (admin client build)
+        run: cargo test -p mia-tray --features mia-tray/admin
+
+      - name: Build the admin client release binary
+        run: cargo build --release -p mia-tray --features mia-tray/admin --bin mia-tray-admin
+
+      - name: The tray links no admin or network code
+        if: runner.os == 'Linux'
+        run: make check-tray-isolation
 
   deny:
     name: cargo-deny (GUI dependency graph)

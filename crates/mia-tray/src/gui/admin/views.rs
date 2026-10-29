@@ -1,6 +1,7 @@
 //! Requests and Approvals (F22 §4), drawn from the inert [`ViewsView`]:
 //! the lists with search and filters, the details, and the decision dialog
-//! with its wide-scope confirmation and review page.
+//! with its wide-scope confirmation and review page, which also adds an
+//! application by known hash and path (F22 §5, T284).
 
 //! Server text is plain `egui` text (no markup, links or web view), already
 //! made inert by the headless model. Typed fields are painted boxes, never
@@ -8,6 +9,7 @@
 
 use eframe::egui;
 use ferrogate_admin_client::approvals::filters::{POLICIES, PRESETS, REQUEST_KINDS};
+use ferrogate_admin_client::approvals::register::{RegisterError, Registered, PLATFORMS};
 use ferrogate_admin_client::approvals::rules::{
     ApprovalChange, DENY_REASONS, EDIT_EXPIRY_DAYS, EXPIRY_DAYS, REVOKE_REASONS,
 };
@@ -15,7 +17,8 @@ use ferrogate_admin_client::timefmt;
 
 use super::{field_box, Action};
 use crate::admin::decide::{
-    Choice, DecisionError, DecisionField, DecisionKind, DecisionStage, DecisionView, ReviewLine,
+    Choice, DecisionError, DecisionField, DecisionKind, DecisionStage, DecisionView, RegisterView,
+    ReviewLine,
 };
 use crate::admin::views::{
     origin_names, policy_names, ApprovalDetail, ApprovalRow, FilterChoice, FilterField,
@@ -114,6 +117,25 @@ fn outcome_lines(lang: Lang, o: &Outcome) -> Vec<String> {
         Outcome::StepUpAgain => vec![Msg::AdminOutStepUpAgain.text(lang).to_string()],
         Outcome::NotSent => vec![Msg::AdminOutNotSent.text(lang).to_string()],
         Outcome::RevokedMeanwhile => vec![Msg::AdminOutRevokedMeanwhile.text(lang).to_string()],
+        Outcome::Added(Registered::Approved {
+            request,
+            approval,
+            generation,
+        }) => vec![fill(
+            Msg::AdminOutRegistered.text(lang),
+            &[
+                ("req", request),
+                ("id", approval),
+                ("gen", &generation.to_string()),
+            ],
+        )],
+        Outcome::Added(Registered::Queued { request }) => {
+            vec![fill(Msg::AdminOutQueued.text(lang), &[("req", request)])]
+        }
+        Outcome::Added(Registered::AlreadyApproved { approval }) => vec![fill(
+            Msg::AdminOutAlreadyApproved.text(lang),
+            &[("id", approval)],
+        )],
     }
 }
 
@@ -151,6 +173,14 @@ pub(super) fn panel(
                 .clicked()
         {
             actions.push(view(ViewAction::OpenFilters));
+        }
+        if v.can_register
+            && v.decision.is_none()
+            && ui
+                .add_enabled(free, egui::Button::new(Msg::AdminAddOpen.text(lang)))
+                .clicked()
+        {
+            actions.push(view(ViewAction::Decide(DecisionKind::Register)));
         }
         if ui
             .add_enabled(free, egui::Button::new(Msg::AdminClose.text(lang)))
@@ -730,10 +760,119 @@ fn change_name(lang: Lang, c: ApprovalChange) -> &'static str {
     .text(lang)
 }
 
+fn register_error(lang: Lang, e: RegisterError) -> &'static str {
+    match e {
+        RegisterError::HostUuid => Msg::AdminRegErrHost,
+        RegisterError::Required => Msg::AdminRegErrRequired,
+        RegisterError::Sha384 => Msg::AdminRegErrSha,
+        RegisterError::UidNumber => Msg::AdminRegErrUid,
+        RegisterError::SidPrintable => Msg::AdminRegErrSid,
+        RegisterError::UnixNeedsUid => Msg::AdminRegErrUnixUid,
+        RegisterError::WindowsNeedsSid => Msg::AdminRegErrWindowsSid,
+        RegisterError::TooLong => Msg::AdminRegErrTooLong,
+    }
+    .text(lang)
+}
+
+/// One typed field of the add dialog: its label (and why it is refused)
+/// over a painted box.
+fn register_field(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    (label, field): (Msg, DecisionField),
+    (d, r): (&DecisionView, &RegisterView),
+    value: &str,
+    actions: &mut Vec<Action>,
+) {
+    match r.invalid.iter().find(|(f, _)| *f == field) {
+        Some((_, e)) => ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("{} ⚠ {}", label.text(lang), register_error(lang, *e)),
+        ),
+        None => ui.label(label.text(lang)),
+    };
+    text_field(ui, value, d, field, actions);
+}
+
+/// The add dialog's facts: host, platform, path, hash, user, version,
+/// reason and the protected-path assertion.
+fn register_form(ui: &mut egui::Ui, lang: Lang, d: &DecisionView, actions: &mut Vec<Action>) {
+    let Some(r) = &d.register else {
+        return;
+    };
+    let field = |ui: &mut egui::Ui, at: (Msg, DecisionField), value: &str, a: &mut Vec<Action>| {
+        register_field(ui, lang, at, (d, r), value, a);
+    };
+    field(
+        ui,
+        (Msg::AdminRegHost, DecisionField::Host),
+        &r.host,
+        actions,
+    );
+    ui.label(Msg::AdminRegPlatform.text(lang));
+    ui.horizontal(|ui| {
+        for (i, name) in PLATFORMS.iter().enumerate() {
+            if ui.radio(r.platform == i, *name).clicked() {
+                choose(actions, Choice::Platform(i));
+            }
+        }
+    });
+    field(
+        ui,
+        (Msg::AdminRegPath, DecisionField::Path),
+        &r.path,
+        actions,
+    );
+    field(ui, (Msg::AdminRegSha, DecisionField::Sha), &r.sha, actions);
+    two_way(
+        ui,
+        lang,
+        Msg::AdminRegUser,
+        r.windows_user,
+        (Msg::AdminRegUnix, Msg::AdminRegWindows),
+        Choice::WindowsUser,
+        actions,
+    );
+    field(ui, (Msg::AdminRegUid, DecisionField::Uid), &r.uid, actions);
+    if r.windows_user {
+        field(ui, (Msg::AdminRegSid, DecisionField::Sid), &r.sid, actions);
+    }
+    field(
+        ui,
+        (Msg::AdminRegUser, DecisionField::User),
+        &r.user,
+        actions,
+    );
+    field(
+        ui,
+        (Msg::AdminRegVersion, DecisionField::Version),
+        &r.version,
+        actions,
+    );
+    field(
+        ui,
+        (Msg::AdminRegReason, DecisionField::Reason),
+        &r.reason,
+        actions,
+    );
+    let mut on = r.path_protected;
+    if ui
+        .checkbox(&mut on, Msg::AdminRegProtected.text(lang))
+        .changed()
+    {
+        choose(actions, Choice::PathProtected(on));
+    }
+    ui.weak(Msg::AdminRegAssertionNote.text(lang));
+    ui.add_space(4.0);
+}
+
 #[allow(clippy::too_many_lines)] // one section per decision kind.
 fn decision_form(ui: &mut egui::Ui, lang: Lang, d: &DecisionView, actions: &mut Vec<Action>) {
+    if d.kind == DecisionKind::Register {
+        register_form(ui, lang, d, actions);
+    }
     match d.kind {
-        DecisionKind::Approve | DecisionKind::Edit => {
+        DecisionKind::Approve | DecisionKind::Edit | DecisionKind::Register => {
             two_way(
                 ui,
                 lang,
@@ -756,7 +895,7 @@ fn decision_form(ui: &mut egui::Ui, lang: Lang, d: &DecisionView, actions: &mut 
         _ => {}
     }
     match d.kind {
-        DecisionKind::Approve => {
+        DecisionKind::Approve | DecisionKind::Register => {
             two_way(
                 ui,
                 lang,
@@ -895,7 +1034,10 @@ fn decision_form(ui: &mut egui::Ui, lang: Lang, d: &DecisionView, actions: &mut 
             });
         }
     }
-    if matches!(d.kind, DecisionKind::Approve | DecisionKind::Edit) {
+    if matches!(
+        d.kind,
+        DecisionKind::Approve | DecisionKind::Edit | DecisionKind::Register
+    ) {
         ui.label(Msg::AdminNoteLabel.text(lang));
         text_field(ui, &d.note, d, DecisionField::Note, actions);
     }
@@ -939,6 +1081,7 @@ fn decision_title(lang: Lang, d: &DecisionView) -> String {
         DecisionKind::Edit => Msg::AdminDecideEdit,
         DecisionKind::Revoke => Msg::AdminDecideRevoke,
         DecisionKind::Freeze => Msg::AdminDecideFreeze,
+        DecisionKind::Register => Msg::AdminDecideRegister,
     };
     fill(msg.text(lang), &[("id", &d.short_id)])
 }
@@ -1023,6 +1166,15 @@ fn review_line(lang: Lang, line: &ReviewLine) -> String {
         ReviewLine::Lineage(l) => kv(Msg::AdminFieldLineage, l),
         ReviewLine::Freeze(true) => Msg::AdminReviewFreeze.text(lang).to_string(),
         ReviewLine::Freeze(false) => Msg::AdminReviewUnfreeze.text(lang).to_string(),
+        ReviewLine::Host(h) => kv(Msg::AdminFieldHost, h),
+        ReviewLine::Platform(p) => kv(Msg::AdminRegPlatform, p),
+        ReviewLine::Version(v) => kv(Msg::AdminFieldVersion, v),
+        ReviewLine::Reason(r) => kv(Msg::AdminFieldReason, r),
+        ReviewLine::PathProtectedAsserted => Msg::AdminReviewProtected.text(lang).to_string(),
+        ReviewLine::RegisterOutcome(true) => Msg::AdminReviewRegisterApprove.text(lang).to_string(),
+        ReviewLine::RegisterOutcome(false) => Msg::AdminReviewRegisterQueue.text(lang).to_string(),
+        ReviewLine::Assertion => Msg::AdminReviewAssertion.text(lang).to_string(),
+        ReviewLine::FreshFactor => Msg::AdminReviewFreshFactor.text(lang).to_string(),
     }
 }
 
@@ -1070,6 +1222,7 @@ fn decision(
                         DecisionError::AnyUserNeedsProtectedPath => Msg::AdminErrAnyUser,
                         DecisionError::NothingToChange => Msg::AdminErrNothing,
                         DecisionError::ShortIdMismatch => Msg::AdminErrShortId,
+                        DecisionError::FieldsInvalid => Msg::AdminErrFields,
                     };
                     ui.colored_label(ui.visuals().error_fg_color, msg.text(lang));
                 }
@@ -1089,7 +1242,7 @@ fn decision(
                 });
             }
             DecisionStage::WideConfirm => {
-                if d.any_user && d.kind == DecisionKind::Approve {
+                if d.any_user && matches!(d.kind, DecisionKind::Approve | DecisionKind::Register) {
                     ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminWideAnyUser.text(lang));
                 }
                 if d.path_user_continuity {
@@ -1113,15 +1266,25 @@ fn decision(
             DecisionStage::Review => {
                 ui.strong(Msg::AdminReviewTitle.text(lang));
                 for line in &d.review {
-                    ui.label(review_line(lang, line));
+                    match line {
+                        // What the add does and what it rests on stand out.
+                        ReviewLine::RegisterOutcome(_) | ReviewLine::Assertion => {
+                            ui.colored_label(ui.visuals().warn_fg_color, review_line(lang, line));
+                        }
+                        _ => {
+                            ui.label(review_line(lang, line));
+                        }
+                    }
                 }
                 ui.weak(Msg::AdminReviewSync.text(lang));
+                let confirm = if d.kind == DecisionKind::Register {
+                    Msg::AdminRegConfirm
+                } else {
+                    Msg::AdminDecisionConfirm
+                };
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(
-                            free,
-                            egui::Button::new(Msg::AdminDecisionConfirm.text(lang)),
-                        )
+                        .add_enabled(free, egui::Button::new(confirm.text(lang)))
                         .clicked()
                     {
                         actions.push(view(ViewAction::DecisionConfirm));

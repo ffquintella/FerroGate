@@ -13,7 +13,9 @@
 #      ships wixl; Fedora's does) and assemble the Chocolatey/NuGet package.
 #
 # The MSI installs mia.exe and registers + starts the mia service, plus the
-# mia-tray.exe desktop companion with a Startup entry (MIA_TRAY=0 to omit). The nupkg
+# mia-tray.exe desktop companion with a Startup entry (MIA_TRAY=0 to omit), and
+# the administrator client mia-tray-admin.exe (feature F22) as the optional MSI
+# feature "Admin client", OFF by default (MIA_TRAY_ADMIN=0 to omit it). The nupkg
 # additionally creates the FerroGateClients group and adds the install dir to
 # PATH before invoking the MSI (see crates/mia/nuget/ and crates/mia/wix/).
 #
@@ -54,6 +56,7 @@ docker run --rm --platform linux/amd64 \
   -v "$PWD":/work -w /work \
   -e CARGO_TERM_COLOR=always \
   -e MIA_TRAY="${MIA_TRAY:-1}" \
+  -e MIA_TRAY_ADMIN="${MIA_TRAY_ADMIN:-1}" \
   rust:bookworm bash -euo pipefail -c '
     echo "==> installing cross toolchain (clang/lld/nasm/cmake)…"
     apt-get update -qq
@@ -63,23 +66,35 @@ docker run --rm --platform linux/amd64 \
     cargo xwin build --release -p mia --bin mia --target x86_64-pc-windows-msvc
     # The mia-tray desktop companion (feature F18). Optional: MIA_TRAY=0
     # skips it, and a failed cross-compile only drops it from the MSI.
-    rm -f target/x86_64-pc-windows-msvc/release/mia-tray.exe
+    rm -f target/x86_64-pc-windows-msvc/release/mia-tray.exe target/x86_64-pc-windows-msvc/release/mia-tray-admin.exe
     if [ "$MIA_TRAY" != 0 ]; then
       cargo xwin build --release -p mia-tray --features gui --bin mia-tray --target x86_64-pc-windows-msvc \
         || echo "WARNING: mia-tray.exe did not build; the MSI will ship without the tray"
+      # The administrator client (feature F22): a separate build, so its
+      # dependencies never unify into the tray binary. It sits beside the tray.
+      if [ "$MIA_TRAY_ADMIN" != 0 ] && [ -f target/x86_64-pc-windows-msvc/release/mia-tray.exe ]; then
+        cargo xwin build --release -p mia-tray --features admin --bin mia-tray-admin --target x86_64-pc-windows-msvc \
+          || echo "WARNING: mia-tray-admin.exe did not build; the MSI will ship without the admin client"
+      fi
     fi
   '
 BINDIR=target/x86_64-pc-windows-msvc/release
 [ -f "$BINDIR/mia.exe" ] || { echo "ERROR: $BINDIR/mia.exe was not produced" >&2; exit 1; }
 
 # The tray starts from the Run key at logon: a console-subsystem build would
-# open a console window next to it. PE Subsystem (u16 at e_lfanew + 0x5C):
-# 2 = Windows GUI, 3 = console.
-if [ -f "$BINDIR/mia-tray.exe" ]; then
-  pe_off=$(od -An -tu4 -j60 -N4 "$BINDIR/mia-tray.exe" | tr -d ' ')
-  subsystem=$(od -An -tu2 -j$((pe_off + 92)) -N2 "$BINDIR/mia-tray.exe" | tr -d ' ')
-  [ "$subsystem" = 2 ] || { echo "ERROR: $BINDIR/mia-tray.exe has PE subsystem $subsystem, expected 2 (Windows GUI)" >&2; exit 1; }
-fi
+# open a console window next to it (the admin client has no console either).
+# PE Subsystem (u16 at e_lfanew + 0x5C): 2 = Windows GUI, 3 = console. Neither
+# program may carry an elevation manifest: both run as the signed-in user.
+for exe in mia-tray.exe mia-tray-admin.exe; do
+  [ -f "$BINDIR/$exe" ] || continue
+  pe_off=$(od -An -tu4 -j60 -N4 "$BINDIR/$exe" | tr -d ' ')
+  subsystem=$(od -An -tu2 -j$((pe_off + 92)) -N2 "$BINDIR/$exe" | tr -d ' ')
+  [ "$subsystem" = 2 ] || { echo "ERROR: $BINDIR/$exe has PE subsystem $subsystem, expected 2 (Windows GUI)" >&2; exit 1; }
+  if grep -aqE 'requireAdministrator|highestAvailable' "$BINDIR/$exe"; then
+    echo "ERROR: $BINDIR/$exe asks Windows for elevation (requireAdministrator/highestAvailable); it must run asInvoker" >&2
+    exit 1
+  fi
+done
 
 # ── Stage 2: build the MSI (wixl) and the Chocolatey/NuGet package ────────────
 echo "==> [2/2] building MSI + NuGet package in fedora…"
@@ -108,13 +123,25 @@ docker run --rm --platform linux/amd64 \
     [ -z "${WIN_SIGN:-}" ] || sign_file "$BINDIR/mia.exe"
 
     # The tray (if it was built) is signed the same way, and shipped with a
-    # per-machine Startup entry; without it the TRAY block is stripped.
+    # per-machine Startup entry; without it the TRAY block is stripped. The
+    # admin client (optional MSI feature, off by default) is signed the same
+    # way; without it the ADMIN block and feature are stripped, and they go
+    # with the tray, since the client is only offered from beside it.
     WXS=crates/mia/wix/mia.wxs
+    STRIP_TRAY=(-e "/<!-- TRAY-BEGIN/,/<!-- TRAY-END -->/d" -e "/<!-- TRAY-REF -->/d")
+    STRIP_ADMIN=(-e "/<!-- ADMIN-BEGIN/,/<!-- ADMIN-END -->/d" -e "/<!-- ADMIN-FEATURE-BEGIN/,/<!-- ADMIN-FEATURE-END -->/d")
     if [ -f "$BINDIR/mia-tray.exe" ]; then
       [ -z "${WIN_SIGN:-}" ] || sign_file "$BINDIR/mia-tray.exe"
+      if [ -f "$BINDIR/mia-tray-admin.exe" ]; then
+        [ -z "${WIN_SIGN:-}" ] || sign_file "$BINDIR/mia-tray-admin.exe"
+      else
+        WXS="$(mktemp --suffix=.wxs)"
+        sed "${STRIP_ADMIN[@]}" crates/mia/wix/mia.wxs > "$WXS"
+        echo "NOTE: building the MSI without the admin client (mia-tray-admin.exe not built)"
+      fi
     else
       WXS="$(mktemp --suffix=.wxs)"
-      sed -e "/<!-- TRAY-BEGIN/,/<!-- TRAY-END -->/d" -e "/<!-- TRAY-REF -->/d" crates/mia/wix/mia.wxs > "$WXS"
+      sed "${STRIP_TRAY[@]}" "${STRIP_ADMIN[@]}" crates/mia/wix/mia.wxs > "$WXS"
       echo "NOTE: building the MSI without mia-tray (mia-tray.exe not built)"
     fi
 

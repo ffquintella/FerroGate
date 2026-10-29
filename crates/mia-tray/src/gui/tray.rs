@@ -18,6 +18,7 @@ use crate::actions::{self, invocation, Action, ActionError, ActionResult, EnvNam
 use crate::alerts::{AlertKind, Alerter, Policy};
 use crate::client::{Observation, Source};
 use crate::i18n::{fill, Lang, Msg};
+use crate::locate::locate_admin_client;
 use crate::model::{
     menu_model, snapshot_title, title, tray_view, MenuCommand, MenuNode, Presentation, Recovery,
     TrayView, WindowKind,
@@ -105,6 +106,7 @@ pub(crate) struct TrayController {
     running: Vec<Action>,
     last_action: Option<String>,
     windows: HashMap<WindowKind, Child>,
+    admin_client: Option<Child>,
     clipboard: Option<arboard::Clipboard>,
     logged_state: Option<mia_status_proto::AgentState>,
 }
@@ -121,7 +123,7 @@ impl TrayController {
         };
         let view = tray_view(&empty, crate::unix_now(), lang);
         let look = view.presentation;
-        let model = menu_model(&view, lang, None);
+        let model = menu_model(&view, lang, None, admin_client_path().is_some());
         let mut commands = HashMap::new();
         let mut next_id = 0;
         let handles: Vec<Handle> = model
@@ -157,6 +159,7 @@ impl TrayController {
             running: Vec::new(),
             last_action: None,
             windows: HashMap::new(),
+            admin_client: None,
             clipboard: None,
             logged_state: None,
         })
@@ -189,6 +192,13 @@ impl TrayController {
         }
         self.windows
             .retain(|_, child| matches!(child.try_wait(), Ok(None)));
+        if self
+            .admin_client
+            .as_mut()
+            .is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
+        {
+            self.admin_client = None;
+        }
         Flow::Continue
     }
 
@@ -242,7 +252,14 @@ impl TrayController {
         if let Err(e) = self.tray.set_tooltip(Some(menu_text(&self.view.headline))) {
             tracing::debug!(error = %e, "tooltip not supported here");
         }
-        let model = menu_model(&self.view, self.shared.lang, self.last_action.as_deref());
+        // Looked up on every refresh, so installing or removing the optional
+        // package shows or hides the entry without restarting the tray.
+        let model = menu_model(
+            &self.view,
+            self.shared.lang,
+            self.last_action.as_deref(),
+            admin_client_path().is_some(),
+        );
         if model == self.model {
             return;
         }
@@ -280,6 +297,7 @@ impl TrayController {
         match cmd {
             MenuCommand::Quit => return Flow::Quit,
             MenuCommand::Open(kind) => self.open_window(kind),
+            MenuCommand::OpenAdminClient => self.open_admin_client(),
             MenuCommand::Recover(Recovery::Run(action), env) => self.run_action(action, env, false),
             MenuCommand::Recover(Recovery::CopyMachineIds, _) => {
                 self.run_action(Action::ShowMachineId, None, true);
@@ -322,6 +340,32 @@ impl TrayController {
                 self.windows.insert(kind, child);
             }
             Err(e) => tracing::error!(error = %e, ?kind, "could not open the window"),
+        }
+    }
+
+    /// Start the separate administrator client (F22), at most one at a time.
+    /// The trust rule runs again right before the launch (the file may have
+    /// been replaced since the menu was built); the child gets a fixed
+    /// command line, no elevation and no stdin.
+    fn open_admin_client(&mut self) {
+        if let Some(child) = self.admin_client.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                tracing::debug!("admin client already open");
+                return;
+            }
+        }
+        let Some(program) = admin_client_path() else {
+            tracing::warn!("the admin client is gone or no longer trusted");
+            self.refresh();
+            return;
+        };
+        match actions::admin_client_spec(&program)
+            .command()
+            .stdin(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => self.admin_client = Some(child),
+            Err(e) => tracing::error!(error = %e, "could not open the admin client"),
         }
     }
 
@@ -410,6 +454,14 @@ impl TrayController {
                 .is_ok()
         })
     }
+}
+
+/// The administrator client beside this tray executable, when it passes the
+/// trust rule ([`locate_admin_client`]).
+fn admin_client_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| locate_admin_client(&exe))
 }
 
 fn icon(look: Presentation, frame: u32) -> Result<Icon, String> {

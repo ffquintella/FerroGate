@@ -103,9 +103,30 @@
     </DirectoryRef>
     <!-- TRAY-END -->
 
+    <!-- ADMIN-BEGIN: the administrator client mia-tray-admin.exe (feature
+         F22), beside mia-tray.exe so the tray can offer it. No Startup entry,
+         no service, no elevation manifest. scripts/build-msi-amd64.sh strips
+         this block and the AdminClient feature when it was not built. -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="MiaTrayAdminExe" Guid="19C014FD-3AD1-4194-AA7C-C387CC044D59">
+        <File Id="miaTrayAdminExe" Name="mia-tray-admin.exe" Source="$(var.BinDir)/mia-tray-admin.exe" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <!-- ADMIN-END -->
+
     <Feature Id="Main" Title="FerroGate MIA" Level="1">
       <ComponentRef Id="MiaExe" />
       <ComponentRef Id="MiaTrayExe" /><!-- TRAY-REF -->
     </Feature>
+
+    <!-- ADMIN-FEATURE-BEGIN: "Admin client" is OFF by default (Level 2 is above
+         the default INSTALLLEVEL 1). Turn it on with
+         msiexec /i ... ADDLOCAL=Main,AdminClient, or with the Chocolatey
+         package parameter /AdminClient. -->
+    <Feature Id="AdminClient" Title="Admin client" Level="2"
+             Description="FerroGate administrator client, for approvers on managed devices. Opened from the tray menu; runs as the signed-in user.">
+      <ComponentRef Id="MiaTrayAdminExe" />
+    </Feature>
+    <!-- ADMIN-FEATURE-END -->
   </Product>
 </Wix>

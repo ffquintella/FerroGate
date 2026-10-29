@@ -6,7 +6,9 @@
 //! A decision waits in [`AdminViews`] for its outcome: a `step_up_required`
 //! answer asks the flow for a step-up, after which the same request (same
 //! idempotency key) is sent once more; an `ABORTED` edit reloads the
-//! approval, shows what changed and asks again.
+//! approval, shows what changed and asks again. "Add application" (T284)
+//! hands its confirmed request to the flow, which always asks a fresh
+//! second factor for it.
 
 //! Every server string in [`ViewsView`] is made inert; failures are shown
 //! by kind only (the reason goes to the log). The views hold no secret.
@@ -18,6 +20,9 @@ use ferrogate_admin_client::approvals::filters::{
 use ferrogate_admin_client::approvals::proto::{
     AppRequestInfo, ApprovalInfo, GetAppRequestResponse, GetApprovalResponse,
     ListAppRequestsResponse, ListApprovalsResponse,
+};
+use ferrogate_admin_client::approvals::register::{
+    self, AdminRegisterApplicationRequest, AdminRegisterApplicationResponse, Registered,
 };
 use ferrogate_admin_client::approvals::rules::{short_host, short_id, user_label};
 use ferrogate_admin_client::approvals::{Mutated, Mutation};
@@ -277,6 +282,9 @@ pub enum Outcome {
     NotSent,
     /// The approval was revoked by someone else meanwhile.
     RevokedMeanwhile,
+    /// An application was added (registered and approved, queued, or
+    /// already covered).
+    Added(Registered),
 }
 
 /// A request row (inert).
@@ -464,6 +472,8 @@ pub struct ViewsView {
     pub can_update: bool,
     /// May revoke.
     pub can_revoke: bool,
+    /// May add an application directly (`app.direct_register`).
+    pub can_register: bool,
 }
 
 /// What the flow must do after a reply.
@@ -542,6 +552,8 @@ pub struct AdminViews {
     /// the approval it was based on.
     reask: Option<Box<ApprovalInfo>>,
     pending: Option<Pending>,
+    /// A confirmed add waits for its fresh second factor or its outcome.
+    registering: bool,
 }
 
 fn shown(text: &str) -> String {
@@ -638,6 +650,7 @@ impl AdminViews {
             error: None,
             reask: None,
             pending: None,
+            registering: false,
         }
     }
 
@@ -657,10 +670,11 @@ impl AdminViews {
             .is_none_or(|p| p.iter().any(|x| x == permission))
     }
 
-    /// Whether a decision waits for its outcome or its step-up.
+    /// Whether a decision waits for its outcome or its step-up, or an add
+    /// for its second factor or its outcome.
     #[must_use]
     pub fn has_pending(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.registering
     }
 
     /// Whether typing goes to a field of the panel now.
@@ -742,8 +756,13 @@ impl AdminViews {
         }
     }
 
-    /// `Tab` / `Shift-Tab` between the typed filter fields.
+    /// `Tab` / `Shift-Tab` between the typed fields of the dialog or the
+    /// filter panel.
     pub fn tab_key(&mut self, back: bool) {
+        if let Some(d) = &mut self.decision {
+            d.tab(back);
+            return;
+        }
         let tab = self.tab;
         if let Some(draft) = &mut self.draft {
             let fields = FilterField::of(tab);
@@ -1017,7 +1036,7 @@ impl AdminViews {
     }
 
     fn open_decision(&mut self, kind: DecisionKind) {
-        if self.pending.is_some() {
+        if self.has_pending() {
             return;
         }
         self.outcome = None;
@@ -1028,12 +1047,15 @@ impl AdminViews {
             DecisionKind::Deny => self.can(perm::DENY),
             DecisionKind::Edit | DecisionKind::Freeze => self.can(perm::UPDATE),
             DecisionKind::Revoke => self.can(perm::REVOKE),
+            DecisionKind::Register => self.can(perm::DIRECT_REGISTER),
         };
         if !allowed {
             self.outcome = Some(Outcome::Refused(Refusal::NotAllowed));
             return;
         }
         self.decision = match (self.screen, kind) {
+            // From any screen: the add is about no record shown.
+            (_, DecisionKind::Register) => Some(Decision::register(self.can(perm::APPROVE))),
             (Screen::Request, DecisionKind::Approve) => request.and_then(Decision::approve),
             (Screen::Request, DecisionKind::Deny) => request
                 .and_then(|d| d.request.as_ref())
@@ -1060,7 +1082,7 @@ impl AdminViews {
     }
 
     fn confirm(&mut self, now: i64) -> Option<Cmd> {
-        if self.pending.is_some() {
+        if self.has_pending() {
             return None;
         }
         let d = self.decision.as_ref()?;
@@ -1089,6 +1111,53 @@ impl AdminViews {
     pub fn drop_pending(&mut self) {
         if self.pending.take().is_some() {
             self.outcome = Some(Outcome::NotSent);
+        }
+    }
+
+    /// "Confirm" on an add's review page: the request (no proof, no secret)
+    /// the flow sends once a fresh second factor is given, whatever the
+    /// step-up window. The dialog stays on its review meanwhile. `None`
+    /// unless an add is confirmable now.
+    #[must_use]
+    pub fn confirm_register(&mut self, now: i64) -> Option<Box<AdminRegisterApplicationRequest>> {
+        if self.has_pending() {
+            return None;
+        }
+        let req = self.decision.as_ref()?.confirm_register(now)?;
+        self.registering = true;
+        self.outcome = None;
+        Some(Box::new(req))
+    }
+
+    /// The add's second-factor prompt was closed: nothing was sent.
+    pub fn register_cancelled(&mut self) {
+        if std::mem::take(&mut self.registering) {
+            self.outcome = Some(Outcome::NotSent);
+        }
+    }
+
+    /// An add's outcome. A refusal leaves the dialog on its review
+    /// (nothing was registered); success closes it and reloads the list.
+    pub fn on_registered(
+        &mut self,
+        result: Result<Box<AdminRegisterApplicationResponse>, ClientError>,
+        now: i64,
+    ) -> ViewsEvent {
+        if !std::mem::take(&mut self.registering) {
+            return ViewsEvent::None;
+        }
+        match result {
+            Ok(r) => {
+                self.decision = None;
+                self.outcome = Some(Outcome::Added(register::outcome(&r)));
+                // Refresh after every decision (stale-data mitigation).
+                ViewsEvent::Send(self.reload(now))
+            }
+            Err(ClientError::SessionEnded) => ViewsEvent::SessionEnded,
+            Err(e) => {
+                self.outcome = Some(Outcome::Refused(refusal(&e)));
+                ViewsEvent::None
+            }
         }
     }
 
@@ -1384,11 +1453,12 @@ impl AdminViews {
             decision: self.decision.as_ref().map(|d| d.view(now)),
             outcome: self.outcome.clone(),
             error: self.error,
-            pending: self.pending.is_some(),
+            pending: self.has_pending(),
             can_approve: self.can(perm::APPROVE),
             can_deny: self.can(perm::DENY),
             can_update: self.can(perm::UPDATE),
             can_revoke: self.can(perm::REVOKE),
+            can_register: self.can(perm::DIRECT_REGISTER),
         }
     }
 }
@@ -1421,7 +1491,7 @@ pub fn policy_names() -> &'static [&'static str] {
 mod tests {
     use super::*;
     use crate::admin::decide::tests::{approval, detail, request, APPROVAL_ID, NOW};
-    use crate::admin::decide::DecisionStage;
+    use crate::admin::decide::{DecisionStage, ReviewLine};
     use ferrogate_admin_client::approvals::proto::{
         ApproveAppRequestResponse, UpdateApprovalResponse,
     };
@@ -1658,6 +1728,96 @@ mod tests {
             ViewsEvent::Send(Cmd::GetApproval(_))
         ));
         assert_eq!(v.view(NOW).outcome, Some(Outcome::Updated(3)));
+    }
+
+    /// The add dialog on its review page, typed through the panel.
+    fn add_reviewed(v: &mut AdminViews) {
+        use crate::admin::decide::tests::HOST;
+        assert!(v
+            .act(ViewAction::Decide(DecisionKind::Register), NOW)
+            .is_none());
+        for (field, text) in [
+            (DecisionField::Host, HOST.to_string()),
+            (DecisionField::Path, "/opt/tool/bin/tool".to_string()),
+            (DecisionField::Sha, "ab".repeat(48)),
+            (DecisionField::Uid, "1000".to_string()),
+            (DecisionField::User, "alice".to_string()),
+        ] {
+            let _ = v.act(ViewAction::FocusDecision(field), NOW);
+            v.type_text(&text);
+        }
+        let _ = v.act(ViewAction::DecisionNext, NOW);
+        assert_eq!(v.view(NOW).decision.unwrap().stage, DecisionStage::Review);
+    }
+
+    #[test]
+    fn an_add_is_gated_handed_to_the_flow_and_its_outcome_reloads_the_list() {
+        let mut v = AdminViews::new(Tab::Requests);
+        let _ = v.on_permissions(Ok(vec![perm::REQUEST_LIST.to_string()]), NOW);
+        assert!(!v.view(NOW).can_register);
+        let _ = v.act(ViewAction::Decide(DecisionKind::Register), NOW);
+        assert_eq!(
+            v.view(NOW).outcome,
+            Some(Outcome::Refused(Refusal::NotAllowed))
+        );
+        assert!(v.view(NOW).decision.is_none());
+
+        // `app.direct_register` without `app_request.approve`: queue only.
+        let mut v = AdminViews::new(Tab::Requests);
+        let perms = vec![perm::DIRECT_REGISTER.to_string()];
+        let _ = v.on_permissions(Ok(perms), NOW);
+        assert!(v.view(NOW).can_register);
+        add_reviewed(&mut v);
+        let d = v.view(NOW).decision.unwrap();
+        assert!(!d.register.unwrap().can_approve);
+        assert!(d.review.contains(&ReviewLine::RegisterOutcome(false)));
+        // "Confirm" sends nothing itself: the flow asks the fresh factor.
+        assert!(v.act(ViewAction::DecisionConfirm, NOW).is_none());
+        let first = v.confirm_register(NOW).expect("the request to prove");
+        assert!(first.proof.is_none());
+        assert!(v.has_pending() && v.view(NOW).pending);
+        assert!(v.confirm_register(NOW).is_none(), "one at a time");
+        // A refusal leaves the review open; nothing was registered.
+        assert!(matches!(
+            v.on_registered(Err(server(Code::InvalidArgument, "bad_value")), NOW),
+            ViewsEvent::None
+        ));
+        let view = v.view(NOW);
+        assert_eq!(view.outcome, Some(Outcome::Refused(Refusal::Invalid)));
+        assert_eq!(view.decision.unwrap().stage, DecisionStage::Review);
+        assert!(!v.has_pending());
+        // A closed prompt sends nothing.
+        let second = v.confirm_register(NOW).unwrap();
+        assert_ne!(second.idempotency_key, first.idempotency_key);
+        v.register_cancelled();
+        assert_eq!(v.view(NOW).outcome, Some(Outcome::NotSent));
+        // Queued under strict separation of duties: shown, list reloaded.
+        let _ = v.confirm_register(NOW).unwrap();
+        let queued = AdminRegisterApplicationResponse {
+            request: Some(AppRequestInfo {
+                request_id: "0192a9f1-0000-7000-8000-00000000a1b2".into(),
+                ..AppRequestInfo::default()
+            }),
+            queued: true,
+            ..AdminRegisterApplicationResponse::default()
+        };
+        assert!(matches!(
+            v.on_registered(Ok(Box::new(queued)), NOW),
+            ViewsEvent::Send(Cmd::ListRequests(_))
+        ));
+        let view = v.view(NOW);
+        assert!(view.decision.is_none());
+        assert_eq!(
+            view.outcome,
+            Some(Outcome::Added(Registered::Queued {
+                request: "R-0000A1B2".into()
+            }))
+        );
+        // A late answer with nothing waiting changes nothing.
+        assert!(matches!(
+            v.on_registered(Err(ClientError::SessionEnded), NOW),
+            ViewsEvent::None
+        ));
     }
 
     #[test]

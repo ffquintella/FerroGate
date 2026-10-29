@@ -2,7 +2,8 @@
 //! then password with a TOTP code or a security key), token enrollment, the
 //! signed-in summary, second-factor management, the request and approval
 //! views (a decision that asks for a step-up is sent once more after it),
-//! the step-up prompt, sign-out and the idle lock. Input goes in as calls,
+//! the step-up prompt (which also takes the fresh second factor every
+//! "add application" needs, T284), sign-out and the idle lock. Input goes in as calls,
 //! [`Reply`]s from the worker through [`Flow::on_reply`], and out come
 //! [`Effect`]s.
 
@@ -12,8 +13,11 @@
 
 use std::time::{Duration, Instant};
 
+use ferrogate_admin_client::approvals::register::{
+    AdminRegisterApplicationRequest, AdminRegisterApplicationResponse,
+};
 use ferrogate_admin_client::client::{LoginInfo, Methods};
-use ferrogate_admin_client::error::ClientError;
+use ferrogate_admin_client::error::{ClientError, Code};
 use ferrogate_admin_client::factors::{AddNonce, AddOffer, FactorInfo, FactorMethod};
 use ferrogate_admin_client::webauthn::AuthenticatorError;
 use serde::Serialize;
@@ -76,6 +80,11 @@ pub enum Busy {
     },
     /// Loading requests or approvals, or sending a decision.
     Views,
+    /// Adding an application (`key`: waiting for a key touch first).
+    Register {
+        /// A security key was chosen.
+        key: bool,
+    },
 }
 
 /// Why something did not work, as the window words it (generic, F20 §6).
@@ -174,6 +183,8 @@ pub struct StepUpView {
     pub can_submit_code: bool,
     /// Whether a key can be used.
     pub can_submit_key: bool,
+    /// The fresh second factor of an "add application", not a step-up.
+    pub for_add: bool,
 }
 
 /// Everything the window draws. Holds no secret and no token.
@@ -213,6 +224,8 @@ struct Session {
 struct StepUpForm {
     code: Secret,
     error: Option<Problem>,
+    /// The add this factor proves (sent with it, never a step-up).
+    register: Option<Box<AdminRegisterApplicationRequest>>,
 }
 
 /// What goes on after a successful step-up.
@@ -430,7 +443,6 @@ impl Flow {
             return;
         }
         if self.step_up.is_some() {
-            self.step_up = None;
             self.step_up_abandoned();
         } else if self.session.is_some() {
             if let Some(p) = &mut self.factors {
@@ -546,9 +558,21 @@ impl Flow {
             self.step_up = Some(StepUpForm {
                 code: Secret::new(),
                 error: None,
+                register: None,
             });
             self.notice = None;
         }
+    }
+
+    /// The prompt for the fresh second factor of an add: opened for every
+    /// add, even inside the step-up window (F20 §7 "M").
+    fn open_add_proof(&mut self, req: Box<AdminRegisterApplicationRequest>) {
+        self.step_up = Some(StepUpForm {
+            code: Secret::new(),
+            error: None,
+            register: Some(req),
+        });
+        self.notice = None;
     }
 
     /// Step up with the code or a key.
@@ -581,29 +605,38 @@ impl Flow {
             form.error = Some(Problem::NotOffered);
             return Vec::new();
         };
-        self.send(
-            Cmd::StepUp { factor },
-            Busy::StepUp {
-                key: how == Submission::SecurityKey,
-            },
-        )
+        let key = how == Submission::SecurityKey;
+        if let Some(req) = &form.register {
+            // The same request each time: a retry reuses its key.
+            let req = req.clone();
+            return self.send(Cmd::Register { req, proof: factor }, Busy::Register { key });
+        }
+        self.send(Cmd::StepUp { factor }, Busy::StepUp { key })
     }
 
     /// Close the step-up prompt (its code is wiped).
     pub fn cancel_step_up(&mut self) {
         if self.busy.is_none() {
-            self.step_up = None;
             self.step_up_abandoned();
         }
     }
 
-    /// The step-up prompt closed unconfirmed: what waited for it is
-    /// dropped, unsent.
+    /// The step-up prompt closes unconfirmed (its code is wiped): what
+    /// waited for it is dropped, unsent.
     fn step_up_abandoned(&mut self) {
-        if self.after_step_up.take() == Some(AfterStepUp::Resend) {
-            if let Some(v) = &mut self.views {
+        let add = self
+            .step_up
+            .take()
+            .is_some_and(|form| form.register.is_some());
+        if let Some(v) = &mut self.views {
+            if add {
+                v.register_cancelled();
+            }
+            if self.after_step_up.take() == Some(AfterStepUp::Resend) {
                 v.drop_pending();
             }
+        } else {
+            self.after_step_up = None;
         }
     }
 
@@ -724,6 +757,14 @@ impl Flow {
     pub fn views_action(&mut self, action: ViewAction) -> Vec<Effect> {
         if self.busy.is_some() || self.session.is_none() || self.step_up.is_some() {
             return Vec::new();
+        }
+        if action == ViewAction::DecisionConfirm {
+            let now = crate::unix_now();
+            if let Some(req) = self.views.as_mut().and_then(|v| v.confirm_register(now)) {
+                // Always a fresh second factor, whatever the step-up window.
+                self.open_add_proof(req);
+                return Vec::new();
+            }
         }
         let cmd = self
             .views
@@ -923,8 +964,54 @@ impl Flow {
             Reply::AddFactorBegun(result) => self.add_begun_reply(result, now),
             Reply::FactorAdded(result) => self.factor_changed_reply(result.map(|_| ()), true, now),
             Reply::FactorRemoved(result) => self.factor_changed_reply(result, false, now),
+            Reply::Registered(result) => self.registered_reply(result, now),
             other => self.views_reply(other),
         }
+    }
+
+    /// An add's answer. A wrong or missing factor, or no answer at all,
+    /// keeps the prompt with the same request (a retry reuses its key);
+    /// the code is wiped either way.
+    fn registered_reply(
+        &mut self,
+        result: Result<Box<AdminRegisterApplicationResponse>, ClientError>,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let retry = match &result {
+            Err(ClientError::SessionEnded) => return self.end(Some(Notice::SessionEnded)),
+            Err(
+                ClientError::Rejected
+                | ClientError::Throttled(_)
+                | ClientError::FactorNotOffered
+                | ClientError::Authenticator(_)
+                | ClientError::Connect(_),
+            ) => true,
+            Err(ClientError::Other(e)) => {
+                matches!(e.code, Code::DeadlineExceeded | Code::Unavailable)
+            }
+            Ok(_) => false,
+        };
+        if retry {
+            if let Err(e) = &result {
+                if let ClientError::Throttled(_) = e {
+                    self.fail(e, now);
+                }
+                if let Some(form) = &mut self.step_up {
+                    form.code.clear();
+                    form.error = Some(match e {
+                        ClientError::Other(_) => Problem::Unreachable,
+                        other => problem(other),
+                    });
+                }
+            }
+            return Vec::new();
+        }
+        self.step_up = None;
+        let event = match &mut self.views {
+            Some(v) => v.on_registered(result, crate::unix_now()),
+            None => ViewsEvent::None,
+        };
+        self.views_event(event)
     }
 
     /// A reply for the request and approval views.
@@ -942,6 +1029,11 @@ impl Flow {
             Reply::Mutated(r) => v.on_mutated(r, unix),
             _ => ViewsEvent::None,
         };
+        self.views_event(event)
+    }
+
+    /// Carry out what the views asked for after a reply.
+    fn views_event(&mut self, event: ViewsEvent) -> Vec<Effect> {
         match event {
             ViewsEvent::None => Vec::new(),
             ViewsEvent::Send(cmd) => self.send(cmd, Busy::Views),
@@ -1169,6 +1261,7 @@ impl Flow {
                 error: form.error,
                 can_submit_code: s.info.methods.totp && form.code.is_totp_code(),
                 can_submit_key: s.info.methods.security_key && self.key_available,
+                for_add: form.register.is_some(),
             }),
             _ => None,
         };
@@ -1999,5 +2092,162 @@ mod tests {
         assert!(ends(&effects));
         assert_eq!(f.view(now).notice, Some(Notice::SessionEnded));
         assert!(!f.signed_in());
+    }
+
+    // ---- add application (T284) ------------------------------------------
+
+    use crate::admin::decide::tests::HOST;
+    use crate::admin::decide::DecisionField;
+    use ferrogate_admin_client::approvals::register::{
+        AdminRegisterApplicationResponse, Registered,
+    };
+
+    /// Signed in and stepped up (the window is open), the Requests view
+    /// loaded with `permissions`, the add dialog typed and on its review.
+    fn add_reviewed(now: Instant, permissions: &[&str]) -> Flow {
+        let mut f = signed_in(now, BOTH, 900);
+        f.open_step_up();
+        f.type_text(CODE);
+        let Cmd::StepUp { .. } = cmd(f.enter()) else {
+            panic!("the step-up");
+        };
+        f.on_reply(Reply::SteppedUp(Ok(crate::unix_now() + 300)), now);
+        assert!(f.view(now).session.unwrap().step_up_until.is_some());
+        let _ = cmd(f.open_views(Tab::Requests));
+        let perms = permissions.iter().map(|p| (*p).to_string()).collect();
+        let _ = cmd(f.on_reply(Reply::Permissions(Ok(perms)), now));
+        f.on_reply(Reply::Requests(Ok(ListAppRequestsResponse::default())), now);
+        assert!(f
+            .views_action(ViewAction::Decide(DecisionKind::Register))
+            .is_empty());
+        for (field, text) in [
+            (DecisionField::Host, HOST.to_string()),
+            (DecisionField::Path, "/opt/tool/bin/tool".to_string()),
+            (DecisionField::Sha, "ab".repeat(48)),
+            (DecisionField::Uid, "1000".to_string()),
+            (DecisionField::User, "alice".to_string()),
+        ] {
+            assert!(f.views_action(ViewAction::FocusDecision(field)).is_empty());
+            f.type_text(&text);
+        }
+        f.tab(false);
+        assert!(
+            f.enter().is_empty(),
+            "Enter moves the form on, never confirms"
+        );
+        let d = f.view(now).views.unwrap().decision.unwrap();
+        assert_eq!(d.stage, crate::admin::decide::DecisionStage::Review);
+        f
+    }
+
+    #[test]
+    fn an_add_always_asks_a_fresh_factor_and_a_wrong_code_reuses_the_key() {
+        let now = Instant::now();
+        let mut f = add_reviewed(now, &["app.direct_register", "app_request.approve"]);
+        // Inside the step-up window, yet nothing goes before a fresh factor.
+        assert!(f.views_action(ViewAction::DecisionConfirm).is_empty());
+        let v = f.view(now);
+        let prompt = v.step_up.expect("the fresh-factor prompt");
+        assert!(prompt.for_add && prompt.code_len == 0);
+        assert!(v.views.unwrap().pending);
+        assert!(f.views_action(ViewAction::Refresh).is_empty(), "held");
+        assert!(f.open_factors().is_empty(), "held");
+        f.type_text("654321");
+        clean(&f, now);
+        let Cmd::Register {
+            req,
+            proof: FactorChoice::Code(code),
+        } = cmd(f.enter())
+        else {
+            panic!("the add with its code");
+        };
+        assert_eq!(code.expose(), "654321");
+        assert!(req.proof.is_none(), "the worker adds the proof");
+        assert_eq!(f.view(now).busy, Some(Busy::Register { key: false }));
+        let key = req.idempotency_key.clone();
+        // A wrong code: nothing changed, the prompt asks again.
+        assert!(f
+            .on_reply(Reply::Registered(Err(ClientError::Rejected)), now)
+            .is_empty());
+        let prompt = f.view(now).step_up.expect("asked again");
+        assert_eq!(
+            (prompt.error, prompt.code_len),
+            (Some(Problem::Rejected), 0)
+        );
+        assert!(f.view(now).views.unwrap().outcome.is_none());
+        f.type_text(CODE);
+        let Cmd::Register { req: again, .. } = cmd(f.enter()) else {
+            panic!("the retry");
+        };
+        assert_eq!(again.idempotency_key, key, "the retry reuses the key");
+        // No answer either: the same request may go once more.
+        f.on_reply(
+            Reply::Registered(Err(ClientError::Other(RpcError::local(
+                Code::DeadlineExceeded,
+                "deadline",
+            )))),
+            now,
+        );
+        assert_eq!(
+            f.view(now).step_up.unwrap().error,
+            Some(Problem::Unreachable)
+        );
+        f.type_text(CODE);
+        let Cmd::Register { req: third, .. } = cmd(f.enter()) else {
+            panic!("the retry");
+        };
+        assert_eq!(third.idempotency_key, key);
+        let done = AdminRegisterApplicationResponse {
+            allowlist_generation: 5,
+            ..AdminRegisterApplicationResponse::default()
+        };
+        let Cmd::ListRequests(_) = cmd(f.on_reply(Reply::Registered(Ok(Box::new(done))), now))
+        else {
+            panic!("the list is reloaded");
+        };
+        let v = f.view(now);
+        assert!(v.step_up.is_none());
+        let views = v.views.unwrap();
+        assert!(views.decision.is_none() && !views.pending);
+        assert!(matches!(
+            views.outcome,
+            Some(Outcome::Added(Registered::Approved { generation: 5, .. }))
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_or_refused_add_sends_nothing_more_and_a_lock_drops_it() {
+        let now = Instant::now();
+        let mut f = add_reviewed(now, &["app.direct_register"]);
+        assert!(f.views_action(ViewAction::DecisionConfirm).is_empty());
+        f.type_text("12");
+        f.escape();
+        let v = f.view(now);
+        assert!(v.step_up.is_none());
+        let views = v.views.unwrap();
+        assert_eq!(views.outcome, Some(Outcome::NotSent));
+        assert!(!views.pending && views.decision.is_some());
+        // Refused by the server: the review stays, nothing registered.
+        assert!(f.views_action(ViewAction::DecisionConfirm).is_empty());
+        f.type_text(CODE);
+        let _ = cmd(f.enter());
+        let refused = ClientError::Other(RpcError::local(Code::PermissionDenied, "denied"));
+        assert!(f.on_reply(Reply::Registered(Err(refused)), now).is_empty());
+        let v = f.view(now);
+        assert!(v.step_up.is_none());
+        assert_eq!(
+            v.views.unwrap().outcome,
+            Some(Outcome::Refused(crate::admin::views::Refusal::NotAllowed))
+        );
+        // A lock with the prompt open wipes it with the session.
+        assert!(f.views_action(ViewAction::DecisionConfirm).is_empty());
+        f.type_text("1234");
+        let later = now + Duration::from_secs(2000);
+        assert!(ends(&f.tick(later)));
+        let v = f.view(later);
+        assert!(v.step_up.is_none() && v.views.is_none() && v.session.is_none());
+        // Its late answer shows nothing.
+        let late = f.on_reply(Reply::Registered(Ok(Box::default())), later);
+        assert!(late.is_empty() && f.view(later).views.is_none());
     }
 }

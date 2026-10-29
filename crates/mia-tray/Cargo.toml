@@ -156,6 +156,26 @@ assets = [
     ["../../docs/mia-tray.md", "usr/share/doc/ferrogate-mia-tray/mia-tray.md", "644"],
 ]
 
+# The optional administrator client (F22), a separate package so `ferrogate-mia`
+# never carries it: `make pkg-deb-tray-admin` (`cargo deb --variant tray-admin`).
+# Only `/usr/bin/mia-tray-admin`, root-owned 0755 (the tray's trust check relies
+# on it): no autostart, systemd unit, polkit action or setuid. `ferrogate-mia`
+# provides `ferrogate-mia-tray`, so either package meets the dependency.
+[package.metadata.deb.variants.tray-admin]
+name = "ferrogate-mia-tray-admin"
+extended-description = """\
+Administrator client for FerroGate (feature F22): a separate desktop program, \
+opened from the tray menu, to sign in to CMIS with a second factor and approve \
+application requests. Install it only on managed approver devices. Runs as the \
+logged-in user, needs no group membership or privilege, keeps credentials in \
+memory only."""
+depends = "ferrogate-mia-tray, libgtk-3-0, libxdo3, libayatana-appindicator3-1"
+maintainer-scripts = "dist/debian-admin"
+assets = [
+    ["../../target/release/mia-tray-admin", "usr/bin/", "755"],
+    ["../../docs/mia-tray.md", "usr/share/doc/ferrogate-mia-tray-admin/mia-tray.md", "644"],
+]
+
 [package.metadata.generate-rpm]
 name = "ferrogate-mia-tray"
 summary = "FerroGate MIA tray companion (desktop)"
@@ -171,6 +191,25 @@ assets = [
 ]
 auto-req = "no"
 post_install_script = "crates/mia-tray/dist/debian/postinst"
+
+# The optional administrator client (F22): `make pkg-rpm-tray-admin`
+# (`cargo generate-rpm --variant tray-admin`). Same contract as the deb variant:
+# one root-owned 0755 binary beside `mia-tray`, nothing else; the variant
+# replaces the base's assets, requires and %post.
+[package.metadata.generate-rpm.variants.tray-admin]
+name = "ferrogate-mia-tray-admin"
+summary = "FerroGate administrator client (desktop, optional)"
+assets = [
+    { source = "target/release/mia-tray-admin", dest = "/usr/bin/mia-tray-admin", mode = "755" },
+    { source = "docs/mia-tray.md", dest = "/usr/share/doc/ferrogate-mia-tray-admin/mia-tray.md", mode = "644", doc = true },
+]
+post_install_script = "crates/mia-tray/dist/debian-admin/postinst"
+
+[package.metadata.generate-rpm.variants.tray-admin.requires]
+ferrogate-mia-tray = "*"
+gtk3 = "*"
+libxdo = "*"
+libayatana-appindicator-gtk3 = "*"
 
 [package.metadata.generate-rpm.requires]
 ferrogate-mia = "*"

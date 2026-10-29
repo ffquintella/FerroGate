@@ -11,12 +11,16 @@
 
 //! The rules themselves (defaults, wide scope, narrowing-only edits, the
 //! typed short id, the requests built) are shared with the tray admin
-//! client (`ferrogate_admin_client::approvals::rules`, T283).
+//! client (`ferrogate_admin_client::approvals::rules`, T283), and so are the
+//! checks and the request of the direct add (`approvals::register`, T284).
 
 use ferro_appid::flags::RiskFlags;
 use ferro_proto::admin_v1::{
-    AdminRegisterApplicationRequest, AppBinaryDesc, AppRequestInfo, AppUser, ApprovalInfo,
-    ApprovalTerms, GetAppRequestResponse, UpdateApprovalRequest,
+    AdminRegisterApplicationRequest, AppRequestInfo, ApprovalInfo, ApprovalTerms,
+    GetAppRequestResponse, UpdateApprovalRequest,
+};
+use ferrogate_admin_client::approvals::register::{
+    RegisterError, RegisterField, Registration, PLATFORMS,
 };
 use ferrogate_admin_client::approvals::rules::{self, EditExpiry, Terms, EXPIRY_DAYS};
 pub use ferrogate_admin_client::approvals::rules::{
@@ -32,6 +36,8 @@ use crate::timefmt;
 use crate::timefmt::DAY;
 #[cfg(test)]
 use ferro_proto::admin_v1::approve_app_request_request::Choice;
+#[cfg(test)]
+use ferro_proto::admin_v1::AppUser;
 
 /// Index of `replaced` in [`REVOKE_REASONS`] (default for "also revoke").
 const REPLACED: usize = rules::REVOKE_REPLACED;
@@ -64,7 +70,6 @@ const EDIT_EXPIRY_OPTIONS: [&str; 6] = [
     "365 days from now",
     "No expiry (if the server allows it)",
 ];
-const PLATFORMS: [&str; 3] = ["Linux", "macOS", "Windows"];
 const USER_KINDS: [&str; 2] = ["Unix", "Windows"];
 
 fn policy_name(code: u32) -> &'static str {
@@ -504,37 +509,46 @@ impl Dialog {
         true
     }
 
+    /// What the add dialog's fields hold.
+    fn registration(&self) -> Registration {
+        Registration {
+            host_uuid: self.form.text("host").to_string(),
+            platform: self.form.choice("platform"),
+            canonical_path: self.form.text("path").to_string(),
+            sha384: self.form.text("sha").to_string(),
+            windows_user: self.form.choice("user_kind") == 1,
+            uid: self.form.text("uid").to_string(),
+            sid: self.form.text("sid").to_string(),
+            user_name: self.form.text("user").to_string(),
+            version: self.form.text("version").to_string(),
+            reason: self.form.text("reason").to_string(),
+            path_protected: self.form.toggled("protected"),
+        }
+    }
+
     fn validate_register(&mut self) {
-        let host = self.form.text("host").trim().to_string();
-        if uuid::Uuid::parse_str(&host).is_err() {
-            self.form.set_error("host", "a host UUID (8-4-4-4-12 hex)");
-        }
-        if self.form.text("path").trim().is_empty() {
-            self.form.set_error("path", "required");
-        }
-        let sha = self.form.text("sha").trim().to_string();
-        if sha.len() != 96 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-            self.form
-                .set_error("sha", "exactly 96 hex characters (SHA-384)");
-        }
-        let uid = self.form.text("uid").trim().to_string();
-        if !uid.is_empty() && uid.parse::<u32>().is_err() {
-            self.form.set_error("uid", "a number (0–4294967295)");
-        }
-        let sid = self.form.text("sid").trim().to_string();
-        if !sid.bytes().all(|b| b.is_ascii_graphic()) {
-            self.form.set_error("sid", "printable ASCII only");
-        }
-        let windows = self.form.choice("user_kind") == 1;
-        if !windows && uid.is_empty() {
-            self.form.set_error("uid", "required for a Unix user");
-        }
-        if windows && uid.is_empty() && sid.is_empty() {
-            self.form
-                .set_error("sid", "a Windows user needs a SID (or the RID)");
-        }
-        if self.form.text("user").trim().is_empty() {
-            self.form.set_error("user", "required");
+        for (field, error) in self.registration().problems() {
+            let key = match field {
+                RegisterField::Host => "host",
+                RegisterField::Path => "path",
+                RegisterField::Sha => "sha",
+                RegisterField::Uid => "uid",
+                RegisterField::Sid => "sid",
+                RegisterField::User => "user",
+                RegisterField::Version => "version",
+                RegisterField::Reason => "reason",
+            };
+            let why = match error {
+                RegisterError::HostUuid => "a host UUID (8-4-4-4-12 hex)",
+                RegisterError::Required => "required",
+                RegisterError::Sha384 => "exactly 96 hex characters (SHA-384)",
+                RegisterError::UidNumber => "a number (0–4294967295)",
+                RegisterError::SidPrintable => "printable ASCII only",
+                RegisterError::UnixNeedsUid => "required for a Unix user",
+                RegisterError::WindowsNeedsSid => "a Windows user needs a SID (or the RID)",
+                RegisterError::TooLong => "too long",
+            };
+            self.form.set_error(key, why);
         }
     }
 
@@ -646,41 +660,7 @@ impl Dialog {
     }
 
     fn register_request(&self, now: i64, key: String) -> AdminRegisterApplicationRequest {
-        let platform = u32::try_from(self.form.choice("platform") + 1).unwrap_or(1);
-        let windows_user = self.form.choice("user_kind") == 1;
-        let uid = self.form.text("uid").trim().parse::<i64>().ok();
-        AdminRegisterApplicationRequest {
-            idempotency_key: key,
-            proof: None,
-            host_uuid: self.form.text("host").trim().to_ascii_lowercase(),
-            binary: Some(AppBinaryDesc {
-                canonical_path: self.form.text("path").trim().to_string(),
-                platform,
-                sha384: self.form.text("sha").trim().to_ascii_lowercase(),
-                size: 0,
-                // elf, macho, pe by platform.
-                format: platform,
-                declared_version: self.form.text("version").trim().to_string(),
-                flags: if self.form.toggled("protected") {
-                    RiskFlags::PATH_PROTECTED
-                } else {
-                    0
-                },
-                ..AppBinaryDesc::default()
-            }),
-            target_user: Some(AppUser {
-                kind: if windows_user { 2 } else { 1 },
-                uid,
-                sid: if windows_user {
-                    self.form.text("sid").trim().to_string()
-                } else {
-                    String::new()
-                },
-                name: self.form.text("user").trim().to_string(),
-            }),
-            reason: self.form.text("reason").trim().to_string(),
-            terms: Some(self.terms(now)),
-        }
+        self.registration().request(self.terms(now), key)
     }
 
     fn build(&self, now: i64) -> Outcome {

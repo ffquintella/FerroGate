@@ -552,6 +552,11 @@ pub enum MenuCommand {
     Open(WindowKind),
     /// Run a recovery for an environment.
     Recover(Recovery, Option<EnvName>),
+    /// Start the separate administrator client (`mia-tray-admin`, F22). A
+    /// unit variant on purpose: the command line is fixed
+    /// ([`crate::actions::admin_client_spec`]) and nothing the menu shows
+    /// can reach it.
+    OpenAdminClient,
     /// Quit the tray.
     Quit,
 }
@@ -584,9 +589,17 @@ pub fn recovery_command(r: Recovery, env: Option<EnvName>) -> MenuCommand {
 }
 
 /// The tray menu for `view`. `last_action` is a status line for the most
-/// recent action (already localised).
+/// recent action (already localised). `admin_client` is whether the
+/// administrator client was found beside the tray and passed the trust rule
+/// ([`crate::locate::locate_admin_client`]); only then is "Admin client…"
+/// offered.
 #[must_use]
-pub fn menu_model(view: &TrayView, lang: Lang, last_action: Option<&str>) -> Vec<MenuNode> {
+pub fn menu_model(
+    view: &TrayView,
+    lang: Lang,
+    last_action: Option<&str>,
+    admin_client: bool,
+) -> Vec<MenuNode> {
     let t = |m: Msg| m.text(lang).to_string();
     let mut menu = vec![MenuNode::Label(view.headline.clone()), MenuNode::Separator];
     for env in &view.envs {
@@ -647,6 +660,13 @@ pub fn menu_model(view: &TrayView, lang: Lang, last_action: Option<&str>) -> Vec
         t(Msg::MenuRunSelfTest),
         MenuCommand::Open(WindowKind::SelfTest),
     ));
+    if admin_client {
+        menu.push(MenuNode::Separator);
+        menu.push(MenuNode::Item(
+            t(Msg::MenuAdminClient),
+            MenuCommand::OpenAdminClient,
+        ));
+    }
     if let Some(line) = last_action {
         menu.push(MenuNode::Separator);
         menu.push(MenuNode::Label(line.to_string()));
@@ -804,7 +824,7 @@ mod tests {
         assert_eq!(v.worst, AgentState::CrlStale);
         assert_eq!(v.presentation.color, IconColor::Yellow);
         assert!(v.headline.contains("(prod)"));
-        let menu = menu_model(&v, Lang::En, Some("Last action: x — done"));
+        let menu = menu_model(&v, Lang::En, Some("Last action: x — done"), false);
         // One submenu per environment, and the worst one's recoveries on top
         // with the environment passed along.
         assert_eq!(
@@ -925,7 +945,7 @@ mod tests {
 
         // In the menu: inside each environment's submenu, with the name passed
         // along; never among the top-level (worst-state) recoveries.
-        let menu = menu_model(&v, Lang::En, None);
+        let menu = menu_model(&v, Lang::En, None, false);
         let submenu = |label: &str| {
             menu.iter()
                 .find_map(|n| match n {
@@ -979,5 +999,40 @@ mod tests {
             assert_eq!(WindowKind::from_arg(k.as_arg()), Some(k));
         }
         assert_eq!(WindowKind::from_arg("--evil"), None);
+    }
+
+    /// "Admin client…" is offered only when the caller found the binary in a
+    /// trusted place, in both languages, and never in any other menu.
+    #[test]
+    fn the_admin_client_item_appears_only_when_it_was_located_and_trusted() {
+        let obs = Observation {
+            snapshots: vec![snap(AgentState::Healthy, None, None)],
+            source: Source::Endpoint,
+        };
+        for lang in [Lang::En, Lang::Pt] {
+            let v = tray_view(&obs, 100, lang);
+            let item = MenuNode::Item(
+                Msg::MenuAdminClient.text(lang).to_string(),
+                MenuCommand::OpenAdminClient,
+            );
+            let without = menu_model(&v, lang, None, false);
+            let with = menu_model(&v, lang, None, true);
+            assert!(!without.contains(&item));
+            assert!(!without
+                .iter()
+                .any(|n| matches!(n, MenuNode::Item(_, MenuCommand::OpenAdminClient))));
+            assert!(with.contains(&item));
+            // The item and its separator are the only difference, and Quit
+            // stays last.
+            assert_eq!(with.len(), without.len() + 2);
+            assert!(matches!(
+                with.last(),
+                Some(MenuNode::Item(_, MenuCommand::Quit))
+            ));
+        }
+        assert_ne!(
+            Msg::MenuAdminClient.text(Lang::En),
+            Msg::MenuAdminClient.text(Lang::Pt)
+        );
     }
 }

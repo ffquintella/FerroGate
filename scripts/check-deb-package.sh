@@ -40,6 +40,13 @@ for path in \
     require_file "$path"
 done
 
+# The administrator client (F22) is the separate, optional
+# ferrogate-mia-tray-admin package; every workstation gets this one.
+if grep -Fx "./usr/bin/mia-tray-admin" "$work_dir/files" >/dev/null; then
+    echo "ERROR: $deb must not contain /usr/bin/mia-tray-admin (ferrogate-mia-tray-admin ships it)" >&2
+    exit 1
+fi
+
 depends=$(dpkg-deb --field "$deb" Depends)
 for dependency in libgtk-3-0 libayatana-appindicator3-1 policykit-1 systemd passwd; do
     printf '%s\n' "$depends" | grep -F "$dependency" >/dev/null || {

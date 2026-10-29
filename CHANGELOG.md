@@ -48,6 +48,32 @@ record them.
   node until T223: run it on every replica. Superseded SVIDs that have not
   expired are not tracked and become acceptable again; `docs/operations.md`
   §"Revocation" says when to wait instead.
+- Add an application in one step from `mia-tray-admin`, with a fresh second factor on every add (S53, S50, M40, T284)
+  **Add application…** (`app.direct_register`) takes the host UUID,
+  platform, canonical path, SHA-384 (exactly 96 hex, sent lowercased), a
+  Unix uid or Windows SID/RID, user name, optional version and reason, the
+  "path writable only by administrators" assertion and the approve terms,
+  with the same safe defaults and wide-scope confirmation as an approval.
+  The review says it registers AND approves in one step, recorded as
+  approved by the same person (or, under strict separation of duties, only
+  queues it), and that the hash and path are the administrator's
+  assertion. Confirming always asks for a fresh TOTP code (or a key touch
+  where offered), even inside the step-up window, and sends it as the
+  `MfaProof` of `AdminRegisterApplication`; a wrong code changes nothing
+  and the retry reuses the idempotency key. The checks, request and outcome
+  moved into `ferrogate-admin-client::approvals::register`
+  (`AdminSession::register_application`); the TUI's add dialog uses them
+  with no behaviour change.
+- Package `mia-tray-admin` beside the tray and offer it from the tray menu (S53, S30, M40, T285; Linux and Windows packages not yet built on their hosts)
+  The tray shows **Admin client…** only when `mia-tray-admin` sits in its
+  own install directory and passes the install-location trust check, and
+  starts it unprivileged with no arguments. Packages: optional
+  `ferrogate-mia-tray-admin` deb and rpm (`make pkg-tray-admin`), inside
+  `FerroGate MIA.app` on macOS signed with the tray's identity
+  (`MIA_TRAY_ADMIN=0` leaves it out), and an MSI feature "Admin client",
+  off by default (`ADDLOCAL=Main,AdminClient` or Chocolatey
+  `/AdminClient`). No package gives it privileges, a group, a service or
+  autostart.
 - Administer requests and approvals from `mia-tray-admin`: lists with search and filters, details, and approve, deny, edit or renew, revoke and freeze with review, step-up and typed confirmation (S53, M40, T283)
   **Requests** and **Approvals** page through `ListAppRequests` /
   `ListApprovals` with checked filters, open a record, and decide on it

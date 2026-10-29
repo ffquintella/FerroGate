@@ -112,7 +112,12 @@ pub struct Server {
 /// Start a server whose FIDO2 tray policy binds `fido2_groups`.
 pub async fn server(tag: &str, fido2_groups: &[&str]) -> Server {
     let groups: Vec<String> = fido2_groups.iter().map(|g| (*g).to_string()).collect();
-    let h = support::harness_with(tag, |c| c.tray_fido2_groups = groups).await;
+    server_with(tag, |c| c.tray_fido2_groups = groups).await
+}
+
+/// Start a server with its admin configuration changed by `tweak`.
+pub async fn server_with(tag: &str, tweak: impl FnOnce(&mut cmis::admin::AdminConfig)) -> Server {
+    let h = support::harness_with(tag, tweak).await;
     let ck = rcgen::generate_simple_self_signed(vec!["cmis.test.ferrogate.invalid".to_string()])
         .unwrap();
     let pin = SpkiPin::from_certificate_der(ck.cert.der().as_ref()).unwrap();

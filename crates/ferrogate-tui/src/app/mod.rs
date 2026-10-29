@@ -26,6 +26,8 @@ use ferro_proto::admin_v1::{
     AppRequestInfo, ApprovalInfo, GetAppRequestResponse, GetApprovalResponse, SessionInfo,
 };
 
+use ferrogate_admin_client::approvals::register::{self, Registered};
+
 use crate::client::{
     Cmd, DashboardCounts, LoginError, LoginInfo, Mutated, Mutation, Op, Query, Reply, RpcError,
 };
@@ -1652,41 +1654,35 @@ impl App {
 
     fn registered(&mut self, r: &AdminRegisterApplicationResponse, cmds: &mut Vec<Cmd>) {
         self.pending_register = None;
-        let req = r
-            .request
-            .as_ref()
-            .map_or_else(|| "—".into(), |q| short_id("R", &q.request_id));
-        let apr = r
-            .approval
-            .as_ref()
-            .map_or_else(|| "—".into(), |a| short_id("A", &a.approval_id));
-        let (title, lines) = if r.queued {
-            (
+        // The outcome's classification is shared with the tray (T284).
+        let (title, lines) = match register::outcome(r) {
+            Registered::Queued { request } => (
                 "Queued for another approver",
                 vec![
-                    format!("Request {req} is PENDING: strict separation of duties is on."),
+                    format!("Request {request} is PENDING: strict separation of duties is on."),
                     "A different approver must decide it.".to_string(),
                 ],
-            )
-        } else if r.deduplicated && r.request.is_none() {
-            (
+            ),
+            Registered::AlreadyApproved { approval } => (
                 "Already approved",
                 vec![format!(
-                    "An active approval ({apr}) already covers this binary; nothing was added."
+                    "An active approval ({approval}) already covers this binary; nothing was added."
                 )],
-            )
-        } else {
-            (
+            ),
+            Registered::Approved {
+                request,
+                approval,
+                generation,
+            } => (
                 "Registered and approved",
                 vec![
                     format!(
-                        "Request {req}, approval {apr}; host generation {}.",
-                        r.allowlist_generation
+                        "Request {request}, approval {approval}; host generation {generation}."
                     ),
                     "The host picks it up within 5 minutes.".to_string(),
                     "Audited as AppApprovedBySameActor.".to_string(),
                 ],
-            )
+            ),
         };
         self.info(format!("{title}."));
         self.modal = Some(Modal::Message {

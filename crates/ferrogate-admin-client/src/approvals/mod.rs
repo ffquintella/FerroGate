@@ -1,12 +1,14 @@
 //! Request and approval administration (F19 §7, F21 §3–§6, F22 §4), shared
 //! by the TUI and the tray admin client: the reads (`ListAppRequests`,
 //! `GetAppRequest`, `ListApprovals`, `GetApproval`), the decisions and edits
-//! ([`Mutation`]), the decision [`rules`] and the list [`filters`].
+//! ([`Mutation`]), the decision [`rules`], the list [`filters`] and the
+//! single-step add ([`register`]).
 
 //! A mutation carries no secret, so a front end keeps it for the single
 //! retry after a step-up (F20 §7 "S"), with the same idempotency key.
 
 pub mod filters;
+pub mod register;
 pub mod rules;
 
 /// The protocol messages these calls take and return, so front ends need no

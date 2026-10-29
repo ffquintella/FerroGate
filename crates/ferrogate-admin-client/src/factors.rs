@@ -142,7 +142,8 @@ pub async fn register_key(
 }
 
 impl AdminSession {
-    fn require_session(&self) -> Result<u64, ClientError> {
+    /// The session's epoch now, or [`ClientError::SessionEnded`].
+    pub(crate) fn require_session(&self) -> Result<u64, ClientError> {
         if self.has_session() {
             Ok(self.slot().epoch())
         } else {
@@ -151,7 +152,7 @@ impl AdminSession {
     }
 
     /// The session ended since `epoch` (a lock while a key was touched).
-    fn still(&self, epoch: u64) -> Result<(), ClientError> {
+    pub(crate) fn still(&self, epoch: u64) -> Result<(), ClientError> {
         if self.slot().epoch() == epoch {
             Ok(())
         } else {

@@ -955,6 +955,20 @@ pub fn spawn_detached(spec: &Spec) -> Result<(), ActionError> {
     Ok(())
 }
 
+/// The process that opens the administrator client (`mia-tray-admin`, F22):
+/// the binary [`crate::locate::locate_admin_client`] found, with **no
+/// arguments and no environment** — nothing the tray displays or reads can
+/// reach its command line, and the client takes its credentials only from its
+/// own window. The caller starts it unprivileged with stdin closed.
+#[must_use]
+pub fn admin_client_spec(program: &Path) -> Spec {
+    Spec {
+        program: program.to_path_buf(),
+        args: Vec::new(),
+        env: Vec::new(),
+    }
+}
+
 /// The machine id printed by `mia machine-id`: its first line, accepted only
 /// when it is UUID-shaped (hex digits and dashes, at most 64 characters), so
 /// nothing else ever reaches the clipboard.
@@ -1626,6 +1640,19 @@ mod tests {
                 assert_eq!(s.args, vec![OsString::from(url.clone())]);
             }
         }
+    }
+
+    #[test]
+    fn the_admin_client_is_started_with_no_arguments_at_all() {
+        let s = admin_client_spec(Path::new("/usr/bin/mia-tray-admin"));
+        assert_eq!(
+            s,
+            Spec {
+                program: PathBuf::from("/usr/bin/mia-tray-admin"),
+                args: vec![],
+                env: vec![],
+            }
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
         pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk \
         tray tray-admin check-tray-isolation icons lint-tray test-tray deny-tray pkg-deb-tray pkg-rpm-tray pkg-tray \
+        pkg-deb-tray-admin pkg-rpm-tray-admin pkg-tray-admin \
         publish-sdk publish-sdk-dry-run release deploy-release
 
 # Default target: list available targets with their descriptions.
@@ -417,6 +418,11 @@ CARGO_FEATURE_FLAG := $(if $(strip $(MIA_FEATURES)),--features $(MIA_FEATURES),)
 # MIA_TRAY=0 builds the macOS and Windows packages without it.
 MIA_TRAY  ?= 1
 TRAY_DIST := crates/mia-tray/dist
+# The administrator client (F22, `mia-tray-admin`) is optional: separate Linux
+# packages (`pkg-deb-tray-admin`, `pkg-rpm-tray-admin`), a macOS app-bundle
+# binary and an MSI feature that is off by default. MIA_TRAY_ADMIN=0 builds
+# the macOS and Windows packages without it (it also needs MIA_TRAY != 0).
+MIA_TRAY_ADMIN ?= 1
 
 pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
 	cargo install --locked cargo-deb cargo-generate-rpm
@@ -455,6 +461,32 @@ pkg-tray: ## Build Linux packages containing the tray (combined deb + opt-in rpm
 	  *)     echo "Host is $(UNAME_S): the tray ships inside 'make pkg-macos' / 'make pkg-win' (MIA_TRAY=0 to omit)." ;; \
 	esac
 
+pkg-deb-tray-admin: ## Build the optional ferrogate-mia-tray-admin .deb (Linux; needs cargo-deb + GTK 3 headers)
+	@command -v cargo-deb >/dev/null 2>&1 || { echo "ERROR: cargo-deb not found — run 'make pkg-tools'"; exit 1; }
+	cargo build --release $(TRAY_ADMIN) --bin mia-tray-admin
+	strip target/release/mia-tray-admin
+	cargo deb -p mia-tray --variant tray-admin --no-build --no-strip
+	./scripts/check-tray-admin-package.sh target/debian/ferrogate-mia-tray-admin_$(CARGO_VERSION)-1_amd64.deb
+	@echo "==> ferrogate-mia-tray-admin .deb written under target/debian/"
+
+pkg-rpm-tray-admin: ## Build the optional ferrogate-mia-tray-admin .rpm (Linux/x86_64; cargo-generate-rpm + GTK 3 headers)
+ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
+	@command -v cargo-generate-rpm >/dev/null 2>&1 || { echo "ERROR: cargo-generate-rpm not found — run 'make pkg-tools'"; exit 1; }
+	cargo build --release $(TRAY_ADMIN) --bin mia-tray-admin
+	strip target/release/mia-tray-admin
+	cargo generate-rpm -p crates/mia-tray -a $(RPM_ARCH) --variant tray-admin
+	@echo "==> ferrogate-mia-tray-admin $(RPM_ARCH) .rpm written under target/generate-rpm/"
+else
+	@echo "ERROR: pkg-rpm-tray-admin needs a Linux/x86_64 host (host is $(UNAME_S)/$(HOST_ARCH))."
+	@exit 1
+endif
+
+pkg-tray-admin: ## Build the optional administrator-client Linux packages (.deb + .rpm); not part of 'make pkg'
+	@case "$(UNAME_S)" in \
+	  Linux) $(MAKE) --no-print-directory pkg-deb-tray-admin pkg-rpm-tray-admin ;; \
+	  *)     echo "Host is $(UNAME_S): the admin client ships inside 'make pkg-macos' / 'make pkg-win' (MIA_TRAY_ADMIN=0 to omit)." ;; \
+	esac
+
 pkg-rpm: ## Build the mia .rpm package for x86_64/amd64 (Fedora/RHEL/SUSE)
 ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
 	@command -v cargo-generate-rpm >/dev/null 2>&1 || { echo "ERROR: cargo-generate-rpm not found — run 'make pkg-tools'"; exit 1; }
@@ -482,7 +514,7 @@ WIN_MSI   := target/wix/ferrogate-$(PKG_CRATE)-$(CARGO_VERSION)-x64.msi
 WIN_NUPKG := target/nuget/ferrogate-$(PKG_CRATE).$(CARGO_VERSION).nupkg
 pkg-win: ## Build the mia Windows MSI + Chocolatey/NuGet package in a linux/amd64 container (needs Docker)
 	@command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found — the Windows MSI/nupkg build runs in a linux/amd64 container"; exit 1; }
-	MIA_TRAY=$(MIA_TRAY) ./scripts/build-msi-amd64.sh $(CARGO_VERSION)
+	MIA_TRAY=$(MIA_TRAY) MIA_TRAY_ADMIN=$(MIA_TRAY_ADMIN) ./scripts/build-msi-amd64.sh $(CARGO_VERSION)
 
 # macOS component+product package built with the platform's own tools (no extra
 # cargo plugin). Stages a payload root, then pkgbuild → productbuild. Set
@@ -521,6 +553,13 @@ ifneq ($(MIA_TRAY),0)
 	# Signed below, once it sits inside its .app bundle.
 	cargo build --release $(TRAY) --bin mia-tray
 	strip target/release/mia-tray
+ifneq ($(MIA_TRAY_ADMIN),0)
+	# The administrator client (F22): a separate unprivileged program with its
+	# own link graph, built apart from the tray so features never unify. It
+	# goes beside mia-tray in the bundle and is signed like it (below).
+	cargo build --release $(TRAY_ADMIN) --bin mia-tray-admin
+	strip target/release/mia-tray-admin
+endif
 endif
 	rm -rf $(MACOS_PKG_ROOT)
 	install -d -m 0755 $(MACOS_PKG_ROOT)/usr/local/bin
@@ -550,6 +589,14 @@ ifneq ($(MIA_TRAY),0)
 	install -d -m 0755 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Resources"
 	install -m 0644 $(TRAY_DIST)/icons/ferrogate-mia.icns "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Resources/ferrogate-mia.icns"
 	install -m 0755 target/release/mia-tray "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray"
+ifneq ($(MIA_TRAY_ADMIN),0)
+	install -m 0755 target/release/mia-tray-admin "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray-admin"
+	# A second executable in the bundle is not covered by the bundle signature
+	# alone: sign it with the same identity and options, before the bundle.
+	codesign --force --options runtime \
+		$(if $(CODESIGN_ID),--timestamp --sign "$(CODESIGN_ID)",--sign -) \
+		"$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray-admin"
+endif
 	sed 's/@VERSION@/$(CARGO_VERSION)/g' $(TRAY_DIST)/macos/Info.plist > "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Info.plist"
 	chmod 0644 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Info.plist"
 	plutil -lint "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Info.plist"
@@ -560,6 +607,9 @@ ifneq ($(MIA_TRAY),0)
 		$(if $(CODESIGN_ID),--timestamp --sign "$(CODESIGN_ID)",--sign -) \
 		"$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)"
 	codesign --verify --strict --verbose=1 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)"
+ifneq ($(MIA_TRAY_ADMIN),0)
+	codesign --verify --strict --verbose=1 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray-admin"
+endif
 	ln -s "/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray" $(MACOS_PKG_ROOT)/usr/local/bin/mia-tray
 	install -d -m 0755 $(MACOS_PKG_ROOT)/Library/LaunchAgents
 	install -m 0644 $(TRAY_DIST)/com.ferrogate.mia-tray.plist $(MACOS_PKG_ROOT)/Library/LaunchAgents/com.ferrogate.mia-tray.plist
