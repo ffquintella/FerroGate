@@ -416,7 +416,7 @@ MFA.
 | `RevokeSession` (other account) (S) | `session.revoke_any` | | | ✓ | |
 | legacy `ListAllowlists`, `ListProposals`, `ListSvids` | `legacy.allowlist.read`, `svid.list` | | | | ✓ |
 | legacy `SetAllowlist` (S), `DeleteAllowlist` (S), `DeleteProposal` (S) | `legacy.allowlist.write` | | | | ✓ |
-| legacy `RevokeSvid` (S), `RevokeHost` (S) | `svid.revoke` | | | | ✓ |
+| legacy `RevokeSvid` (S), `RevokeHost` (S), `UnrevokeHost` (S, T296) | `svid.revoke` | | | | ✓ |
 | legacy `BumpEpoch` (S) | `policy.epoch_bump` | | | | ✓ |
 | `SetAllowlistMode` (S), `ImportLegacyAllowlists` (S) (F19 §11) | `settings.allowlist_mode`, `allowlist.import` | | | | ✓ |
 | `GetAllowlistMode` (F19 §11; read-only, lets every client pick the legacy or approvals flow) | any authenticated session | ✓ | ✓ | ✓ | ✓ |

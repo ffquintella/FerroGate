@@ -222,6 +222,8 @@ pub mod paths {
     pub const REVOKE_SVID: &str = "/ferrogate.v1.MachineIdentity/RevokeSvid";
     /// Legacy `RevokeHost`.
     pub const REVOKE_HOST: &str = "/ferrogate.v1.MachineIdentity/RevokeHost";
+    /// `UnrevokeHost` (T296), the inverse of [`REVOKE_HOST`].
+    pub const UNREVOKE_HOST: &str = "/ferrogate.v1.MachineIdentity/UnrevokeHost";
     /// Legacy `BumpEpoch`.
     pub const BUMP_EPOCH: &str = "/ferrogate.v1.MachineIdentity/BumpEpoch";
     /// Legacy `ListSvids`.
@@ -372,6 +374,11 @@ pub const METHOD_ACCESS: &[(&str, Access)] = &[
     ),
     (
         paths::REVOKE_HOST,
+        session(Some(P::SvidRevoke), true, false, false),
+    ),
+    // T296: lifting a host revocation needs exactly what imposing it does.
+    (
+        paths::UNREVOKE_HOST,
         session(Some(P::SvidRevoke), true, false, false),
     ),
     (
@@ -934,6 +941,7 @@ mod tests {
             ("DeleteProposal", P::LegacyAllowlistWrite, true),
             ("RevokeSvid", P::SvidRevoke, true),
             ("RevokeHost", P::SvidRevoke, true),
+            ("UnrevokeHost", P::SvidRevoke, true),
             ("BumpEpoch", P::PolicyEpochBump, true),
         ];
         for (m, perm, step_up) in want {

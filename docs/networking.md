@@ -47,7 +47,7 @@ All control-plane operations multiplex onto this one port:
   [operations.md](operations.md#audit-forwarding-from-hosts).
 - **Legacy admin RPCs:** `SetAllowlist`, `DeleteAllowlist`, `ListAllowlists`,
   `ListProposals`, `DeleteProposal`, `RevokeSvid`, `RevokeHost`, `BumpEpoch`,
-  `ListSvids`. They are **not** gated at the TLS layer: this listener does not
+  `ListSvids`, and `UnrevokeHost` (T296). They are **not** gated at the TLS layer: this listener does not
   request client certificates, so every MIA host that can reach `:8443` can
   also reach these methods. What gates them is the authorization layer in
   front of every listener: each call needs an administrator session token

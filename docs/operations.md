@@ -380,9 +380,14 @@ configured:
     `AttestFail { reason: "attest-host-revoked" }` (T295), so the host
     cannot undo the revocation by re-attesting or through the MIA renewal
     loop.
+  - `UnrevokeHost(spiffe_id, reason)` (T296; CLI `ferrogate unrevoke-host
+    <spiffe_id> [reason]`) — lift a host revocation so the host can attest
+    again. See "Bringing back a revoked host" below.
   Each revocation is recorded in the audit log (`SvidRevoked` / `HostRevoked`,
   with the reason opcode) and republishes the CRL immediately, so the change
   reaches consumers within one publish cycle rather than after the next tick.
+  An un-revoke is recorded as `HostUnrevoked` before it takes effect, and is
+  refused (`UNAVAILABLE`) if the audit log cannot record it.
 - The MIA refuses to mint helper tokens if the cached CRL is missing or more
   than 5 minutes old (fail closed), and refuses if the CRL revokes its own
   host. The independent reference verifier (`ferro-svid-verify`) likewise
@@ -394,19 +399,37 @@ configured:
   entry this also ends the `Attest` refusal: the host can attest again after
   30 days unless `RevokeHost` is issued again, which refreshes `revoked_at`.
 - The revocation working set is in memory on each CMIS node (replication is
-  T223). Issue `RevokeHost` / `RevokeSvid` on every replica, and again on a
-  replica after it restarts, or a replica without the entry keeps issuing to
-  the host.
-- **Bringing back a revoked host.** No RPC lifts a revocation (follow-up
-  T296). The host's SPIFFE id comes from its EK certificate digest (TPM) or
-  machine fingerprint (host-key), so re-imaging or re-enrolling the same
-  hardware keeps the revoked id. Until T296, the host attests again only once
-  the entry expires (30 days after the last `RevokeHost`), or under a new
-  identity (replacement TPM or hardware, which also means updating the fleet
-  manifest and, on the host-key tier, the pre-registered key). Restarting
-  CMIS nodes to clear the in-memory set also drops every other revocation, so
-  it is not a recovery procedure. Record the decision and the evidence that
-  the host is clean before it attests again.
+  T223). Issue `RevokeHost` / `RevokeSvid` / `UnrevokeHost` on every replica,
+  and again on a replica after it restarts, or a replica without the entry
+  keeps issuing to the host (and, for an un-revoke, a replica that still holds
+  the entry keeps refusing it).
+- **Bringing back a revoked host.** The host's SPIFFE id comes from its EK
+  certificate digest (TPM) or machine fingerprint (host-key), so re-imaging or
+  re-enrolling the same hardware keeps the revoked id. Once the host is clean
+  (re-imaged or re-enrolled), record the decision and the evidence, then run
+  `ferrogate unrevoke-host <spiffe_id> <reason>` against every replica (the
+  same `svid.revoke` permission and step-up as `revoke-host`). It prints
+  `unrevoked host …` on a node that held the entry and `was not revoked on
+  this node` (no change) on one that did not. The un-revoke:
+  - removes only the host entry: `RevokeSvid` entries stay;
+  - revokes the host's stored SVID and its X.509-SVID pair by `cert_sha` in
+    the same step, so the host attests afresh (the MIA does this on its own:
+    `Rotate` is refused with the old SVID and it falls back to `Attest`);
+  - is audited `HostUnrevoked { spiffe_id, reason, by_admin_id,
+    svid_cert_sha }` before it takes effect, and republishes the CRL.
+
+  It does not change the host-key tier's machine-key binding: a re-imaged
+  host-key host has a new machine key, which must match its pre-registered key
+  in the fleet manifest (update it) or the key pinned on first use by each
+  node. SVIDs the host held before its stored one (superseded by a renewal
+  but not yet expired) are not tracked and become acceptable to relying
+  parties again until they expire. If the host's credentials may have been
+  copied off it, wait until every SVID issued before the revocation has
+  expired (`revoked_at` plus the SVID TTL: `CMIS_SVID_TTL_SECS`, or
+  `CMIS_HOST_KEY_SVID_TTL_SECS` on the host-key tier) before un-revoking, or
+  bring it back under a new identity.
+  Restarting CMIS nodes to clear the in-memory set also drops every other
+  revocation, so it is not a recovery procedure.
 - For mass revocation (compromised RIM generation, vulnerable kernel image),
   the operator bumps the policy epoch via `BumpEpoch` — see "RIM policy and
   epoch bump" above. Every host attested under the old epoch re-attests at its

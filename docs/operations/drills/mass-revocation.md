@@ -102,10 +102,25 @@ done
 Confirm: the host's `Attest` ends with `PERMISSION_DENIED host_revoked` on
 every replica, an `AttestFail { reason: "attest-host-revoked" }` leaf is
 appended for each attempt, and no `SvidIssued` leaf for that SPIFFE id follows
-the `HostRevoked` leaf. **Use a host you can retire or re-key**: there is no
-un-revoke RPC (T296), and the same hardware stays refused until the entry
-expires 30 days after the last `RevokeHost` (see `docs/operations.md`
-§"Revocation", "Bringing back a revoked host").
+the `HostRevoked` leaf.
+
+Then bring the drill host back (T296):
+
+```sh
+for n in cmis-a cmis-b cmis-c; do   # per node until T223
+  ferrogate --admin-endpoint "https://$n:8444" \
+    --session-file "$XDG_RUNTIME_DIR/drill.session" \
+    unrevoke-host spiffe://<td>/host/<uuid> DRILL-restore
+done
+```
+
+Confirm: each replica prints `unrevoked host …` (a replica that never held
+the entry prints `was not revoked on this node`), a `HostUnrevoked` leaf names
+the host, the administrator and the `svid_cert_sha` of the host's stored SVID,
+the fresh CRL no longer names the host but does name that SVID (and its
+X.509-SVID pair), and the host's next renewal falls back to `Attest` and
+succeeds (a new `SvidIssued` leaf). See `docs/operations.md` §"Revocation",
+"Bringing back a revoked host".
 
 ## Pass criteria
 
@@ -119,6 +134,9 @@ expires 30 days after the last `RevokeHost` (see `docs/operations.md`
 - (Secondary) a revoked host's re-attestation is refused with
   `PERMISSION_DENIED host_revoked` on every replica and audited
   `attest-host-revoked`; no new SVID is issued to it.
+- (Secondary) after `unrevoke-host` on every replica, one `HostUnrevoked`
+  leaf per replica that held the entry, the host's pre-drill SVID stays in
+  the CRL, and the host re-attests.
 
 ## Abort / rollback
 
@@ -127,9 +145,11 @@ error, the only remedy is to let the fleet re-attest (it will, under the new
 epoch) and to publish a corrected RIM bundle if the bump was triggered by a
 false alarm. This is why the authorize step is mandatory.
 
-A `RevokeHost` is not reversible either (T296 tracks an un-revoke RPC): the
-host stays refused at `Attest` until the entry expires. Revoke only hosts
-named in the authorize step.
+A `RevokeHost` is reversed with `UnrevokeHost` (`ferrogate unrevoke-host`,
+T296) on every replica that holds the entry; the host's stored SVID stays
+revoked and it re-attests. Un-revoke only a host whose credentials cannot
+have been copied off it (see `docs/operations.md` §"Revocation"), and revoke
+only hosts named in the authorize step.
 
 ---
 

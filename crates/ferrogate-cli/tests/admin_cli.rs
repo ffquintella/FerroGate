@@ -1050,3 +1050,60 @@ async fn migrate_allowlists_switch_modes_and_map_the_allowlist_commands() {
         "{stdout}"
     );
 }
+
+/// T296: `revoke-host` then `unrevoke-host` through the admin listener. The
+/// un-revoke needs a fresh step-up like the revoke (without a second factor
+/// it changes nothing), lifts the host entry, and a repeat is a no-op.
+#[tokio::test]
+async fn unrevoke_host_needs_a_step_up_and_lifts_the_host_entry() {
+    let cmis = spawn_cmis("unrevoke").await;
+    let secret = cmis.bootstrap().await;
+    let session = cmis.dir.join("session");
+    cmis.login(&secret, &session).await;
+    let s = session.to_str().unwrap();
+    let host = "spiffe://ferrogate.test/host/0f0e0d0c";
+    let state = cmis.state.cmis();
+
+    let (ok, stdout, stderr) = cmis
+        .run(&["--session-file", s, "revoke-host", host, "drill"], &[])
+        .await;
+    assert!(ok && stdout.contains("revoked host"), "{stdout} {stderr}");
+    assert!(state.is_host_revoked(host));
+
+    // Past the step-up window, with no second factor to give, nothing changes.
+    cmis.clock.advance(301);
+    let (ok, _, stderr) = cmis
+        .run(
+            &["--session-file", s, "unrevoke-host", host, "re-enrolled"],
+            &[],
+        )
+        .await;
+    assert!(!ok, "un-revoke without a step-up: {stderr}");
+    assert!(state.is_host_revoked(host), "still revoked");
+
+    let code = cmis.code(&secret);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &["--session-file", s, "unrevoke-host", host, "re-enrolled"],
+            &[&code],
+        )
+        .await;
+    assert!(ok, "unrevoke-host: {stderr}");
+    assert!(
+        stdout.contains(&format!("unrevoked host {host}")) && stdout.contains("CRL #"),
+        "{stdout}"
+    );
+    assert!(!state.is_host_revoked(host), "the host entry is lifted");
+
+    let (ok, stdout, stderr) = cmis
+        .run(&["--session-file", s, "unrevoke-host", host], &[])
+        .await;
+    assert!(ok, "repeat: {stderr}");
+    assert!(stdout.contains("was not revoked on this node"), "{stdout}");
+
+    let (ok, _, stderr) = cmis.run(&["--session-file", s, "unrevoke-host"], &[]).await;
+    assert!(
+        !ok && stderr.contains("unrevoke-host needs a spiffe_id"),
+        "{stderr}"
+    );
+}

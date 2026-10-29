@@ -25,6 +25,26 @@ record them.
 
 ## [Unreleased]
 
+### Added
+
+- Add the audited `UnrevokeHost` admin RPC and `ferrogate unrevoke-host`, so a cleaned or re-enrolled host can attest again before its revocation expires (S11, M33, T296)
+  Since T295 a revoked host is refused at `Attest`, and re-imaging the same
+  hardware keeps its SPIFFE id, so the only ways back were the 30-day entry
+  expiry or new hardware. `UnrevokeHost(spiffe_id, reason)` needs what
+  `RevokeHost` needs (`svid.revoke` and a step-up in the last 5 minutes). It
+  removes only the host entry (`RevokeSvid` entries and other hosts stay)
+  and, under the same lock, revokes the host's stored SVID and its X.509-SVID
+  pair by `cert_sha`, so the credential minted before the un-revoke stays
+  revoked and the host attests afresh. `HostUnrevoked { spiffe_id, reason,
+  by_admin_id, svid_cert_sha }` is appended before anything changes; if the
+  audit log or the record store cannot be read or written the call is
+  refused with `UNAVAILABLE` and the host stays revoked. The CRL is
+  republished at once. A host with no entry on the node is a no-op
+  (`existed = false`). Like the revocation working set, the un-revoke is per
+  node until T223: run it on every replica. Superseded SVIDs that have not
+  expired are not tracked and become acceptable again; `docs/operations.md`
+  §"Revocation" says when to wait instead.
+
 ## [0.30.5] - 2026-10-29
 
 ### Added

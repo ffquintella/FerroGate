@@ -11,7 +11,7 @@ use ferro_proto::v1::machine_identity_server::MachineIdentity;
 use ferro_proto::v1::{
     BumpEpochRequest, DeleteAllowlistRequest, DeleteProposalRequest, ListAllowlistsRequest,
     ListProposalsRequest, ListSvidsRequest, RevokeHostRequest, RevokeSvidRequest,
-    SetAllowlistRequest,
+    SetAllowlistRequest, UnrevokeHostRequest,
 };
 use tonic::{Code, Request};
 
@@ -116,6 +116,21 @@ async fn call_all(
                 .map(|_| ()),
             ),
         ),
+        // After RevokeHost, so an authorized caller lifts a real entry.
+        (
+            "UnrevokeHost",
+            code(
+                mi.unrevoke_host(req(
+                    UnrevokeHostRequest {
+                        spiffe_id: "spiffe://t/h".into(),
+                        reason: String::new(),
+                    },
+                    ctx.as_ref(),
+                ))
+                .await
+                .map(|_| ()),
+            ),
+        ),
         (
             "BumpEpoch",
             code(
@@ -178,9 +193,47 @@ async fn an_operator_context_reaches_every_handler() {
         assert_eq!(code, Code::Ok, "{m}");
     }
     assert_eq!(h.cmis.current_epoch(), 2);
+    assert!(
+        !h.cmis.is_host_revoked("spiffe://t/h"),
+        "revoked, then lifted"
+    );
     // Mutations are attributed to the administrator.
     let attributed = h.audit_events().into_iter().any(|e| {
         matches!(e, ferro_audit::AuditEvent::PolicyEpochBumped { by_admin_id: Some(ref id), .. } if id == "operator")
     });
     assert!(attributed, "PolicyEpochBumped carries by_admin_id");
+    let unrevoked = h.audit_events().into_iter().any(|e| {
+        matches!(e, ferro_audit::AuditEvent::HostUnrevoked { by_admin_id: Some(ref id), .. } if id == "operator")
+    });
+    assert!(unrevoked, "HostUnrevoked carries by_admin_id");
+}
+
+/// T296: a refused un-revoke leaves the host entry in place.
+#[tokio::test]
+async fn a_refused_unrevoke_leaves_the_host_revoked() {
+    let h = support::harness("guard-unrevoke").await;
+    let host = "spiffe://t/kept";
+    h.cmis.revoke(
+        ferro_svid::RevocationTarget::Host {
+            spiffe_id: host.into(),
+        },
+        "compromised",
+        1,
+    );
+    let viewer = AdminContext::synthetic("viewer", [Permission::HostList]);
+    for ctx in [None, Some(viewer)] {
+        let mut r = Request::new(UnrevokeHostRequest {
+            spiffe_id: host.into(),
+            reason: String::new(),
+        });
+        if let Some(c) = ctx {
+            r.extensions_mut().insert(c);
+        }
+        assert!(h.mi.unrevoke_host(r).await.is_err());
+        assert!(h.cmis.is_host_revoked(host));
+    }
+    assert!(!h
+        .audit_events()
+        .into_iter()
+        .any(|e| matches!(e, ferro_audit::AuditEvent::HostUnrevoked { .. })));
 }

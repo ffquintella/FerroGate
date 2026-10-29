@@ -9,6 +9,7 @@
 //! - `list-svids`          → `ListSvids`  (issued-SVID inventory)
 //! - `revoke-svid <sha>`   → `RevokeSvid` (revoke one SVID by cert SHA-384)
 //! - `revoke-host <id>`    → `RevokeHost` (revoke every SVID/child token for a host)
+//! - `unrevoke-host <id>`  → `UnrevokeHost` (lift a host revocation so it can attest again)
 //! - `bump-epoch`          → `BumpEpoch`  (force fleet-wide re-attestation)
 //! - `enrollment-key`      → `GetEnrollmentKey` (print the fingerprint of the
 //!   key that signs caller allowlists, for `mia allowlist-key fetch
@@ -18,7 +19,7 @@
 //! bring-up endpoint), overridable with `--endpoint` or `FERROGATE_CMIS_ENDPOINT`.
 //!
 //! **Administrator sign-in (feature F20).** The admin RPCs (`list-svids`,
-//! `revoke-*`, `bump-epoch`, and every `allowlist` subcommand except `get` and
+//! `revoke-*`, `unrevoke-host`, `bump-epoch`, and every `allowlist` subcommand except `get` and
 //! `show`) require an authenticated admin session and go to the CMIS admin
 //! listener (`--admin-endpoint`, default `https://127.0.0.1:8444`, or
 //! `$FERROGATE_ADMIN_ENDPOINT`), pinned like the main endpoint. The session
@@ -49,7 +50,7 @@ use ferro_crypto::pin::SpkiPin;
 use ferro_proto::v1::machine_identity_client::MachineIdentityClient;
 use ferro_proto::v1::{
     BumpEpochRequest, GetEnrollmentKeyRequest, HealthRequest, ListSvidsRequest, NodeRole,
-    RevokeHostRequest, RevokeSvidRequest,
+    RevokeHostRequest, RevokeSvidRequest, UnrevokeHostRequest,
 };
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
@@ -76,6 +77,9 @@ fn usage() -> &'static str {
      \x20 list-svids                       list issued SVIDs (spiffe id, cert sha, ttl)\n\
      \x20 revoke-svid <cert_sha> [reason]  revoke one SVID by lowercase-hex SHA-384\n\
      \x20 revoke-host <spiffe_id> [reason] revoke every SVID + child token for a host\n\
+     \x20 unrevoke-host <spiffe_id> [reason]\n\
+     \x20                                  lift a host revocation so the host can attest\n\
+     \x20                                  again; its stored SVID stays revoked\n\
      \x20 bump-epoch [reason]              advance the RIM policy epoch (mass re-attest)\n\
      \x20 allowlist <subcommand> ...       manage per-host signed caller allowlists\n\
      \x20                                  (run `ferrogate allowlist help` for details)\n\
@@ -89,9 +93,9 @@ fn usage() -> &'static str {
      \x20 admin <subcommand> ...           administrator sign-in and accounts (F20)\n\
      \x20                                  (run `ferrogate admin help` for details)\n\
      \n\
-     Admin commands (list-svids, revoke-*, bump-epoch, allowlist other than\n\
-     get/show, admin ...) need a signed-in administrator and use the admin\n\
-     listener; the others use --endpoint.\n\
+     Admin commands (list-svids, revoke-*, unrevoke-host, bump-epoch, allowlist\n\
+     other than get/show, admin ...) need a signed-in administrator and use the\n\
+     admin listener; the others use --endpoint.\n\
      \n\
      options:\n\
      \x20 --endpoint <url>   CMIS gRPC endpoint (default http://127.0.0.1:8443,\n\
@@ -183,6 +187,7 @@ async fn run() -> anyhow::Result<()> {
             | "list-svids"
             | "revoke-svid"
             | "revoke-host"
+            | "unrevoke-host"
             | "bump-epoch"
             | "allowlist"
             | "admin"
@@ -258,6 +263,7 @@ async fn dispatch(
         "list-svids" => list_svids(client).await,
         "revoke-svid" => revoke_svid(client, rest).await,
         "revoke-host" => revoke_host(client, rest).await,
+        "unrevoke-host" => unrevoke_host(client, rest).await,
         "bump-epoch" => bump_epoch(client, rest).await,
         "allowlist" => {
             let (sub, sub_args) = rest
@@ -689,6 +695,37 @@ async fn revoke_host(client: &mut CmisClient, args: &[String]) -> anyhow::Result
         resp.crl_number
     );
     Ok(())
+}
+
+async fn unrevoke_host(client: &mut CmisClient, args: &[String]) -> anyhow::Result<()> {
+    let Some(spiffe_id) = args.first() else {
+        anyhow::bail!("unrevoke-host needs a spiffe_id");
+    };
+    let reason = args.get(1).cloned().unwrap_or_default();
+    let resp = client
+        .unrevoke_host(UnrevokeHostRequest {
+            spiffe_id: spiffe_id.clone(),
+            reason,
+        })
+        .await
+        .map_err(rpc_err)?
+        .into_inner();
+    println!(
+        "{}",
+        unrevoke_outcome(spiffe_id, resp.existed, resp.crl_number)
+    );
+    Ok(())
+}
+
+/// The line `unrevoke-host` prints: whether this node lifted a host entry.
+fn unrevoke_outcome(spiffe_id: &str, existed: bool, crl_number: u64) -> String {
+    if existed {
+        format!(
+            "unrevoked host {spiffe_id}; its stored SVID stays revoked; published CRL #{crl_number}"
+        )
+    } else {
+        format!("host {spiffe_id} was not revoked on this node; nothing changed")
+    }
 }
 
 async fn bump_epoch(client: &mut CmisClient, args: &[String]) -> anyhow::Result<()> {

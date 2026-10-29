@@ -7,9 +7,10 @@
 //!
 //! The legacy admin RPCs (`SetAllowlist`, `DeleteAllowlist`, `ListAllowlists`,
 //! `ListProposals`, `DeleteProposal`, `RevokeSvid`, `RevokeHost`, `BumpEpoch`,
-//! `ListSvids`) are authenticated and authorized by the admin layer (F20
-//! Phase 0) and each handler re-checks the [`crate::admin::AdminContext`] the
-//! layer inserted, so they fail closed even if the layer is missing.
+//! `ListSvids`) and `UnrevokeHost` (T296) are authenticated and authorized by
+//! the admin layer (F20 Phase 0) and each handler re-checks the
+//! [`crate::admin::AdminContext`] the layer inserted, so they fail closed even
+//! if the layer is missing.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,7 +43,8 @@ use ferro_proto::v1::{
     NotModified, PendingProposal, ProposeAllowlistRequest, ProposeAllowlistResponse,
     RevokeHostRequest, RevokeResponse, RevokeSvidRequest, RotateRequest, SetAllowlistRequest,
     SetAllowlistResponse, SignedTreeHead, SubmitAppRequestRequest, SubmitAppRequestResponse,
-    SvidBundle, SvidSummary, SyncAllowlistRequest, SyncAllowlistResponse,
+    SvidBundle, SvidSummary, SyncAllowlistRequest, SyncAllowlistResponse, UnrevokeHostRequest,
+    UnrevokeHostResponse,
 };
 use ferro_raft::NodeRole;
 use ferro_svid::host_call::{decode_rotate, RotateDoc, ROTATE_CONTEXT};
@@ -201,6 +203,26 @@ pub(crate) fn audit_record(state: &CmisState, event: AuditEvent, now: i64) {
         tracing::error!(error = %e, "audit STH produce failed");
     }
 }
+
+/// Append `event` and seal a fresh STH, refusing with `UNAVAILABLE` when the
+/// append fails. For actions that loosen a control (`UnrevokeHost`), which
+/// must not happen unrecorded; unlike [`audit_record`], the caller acts only
+/// after this succeeds. An STH failure is logged: the leaf is already durable.
+#[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
+fn audit_record_strict(state: &CmisState, event: &AuditEvent, now: i64) -> Result<(), Status> {
+    state.audit.append(event).map_err(|e| {
+        tracing::error!(error = %e, "audit append failed; action refused");
+        Status::unavailable("audit log unavailable")
+    })?;
+    if let Err(e) = state.audit.produce_sth(now) {
+        tracing::error!(error = %e, "audit STH produce failed");
+    }
+    Ok(())
+}
+
+/// Upper bound on a SPIFFE id accepted by `UnrevokeHost` (the SPIFFE spec's
+/// 2048-byte URI limit).
+const MAX_SPIFFE_ID_LEN: usize = 2048;
 
 /// Record an `AttestFail` event with a stable opcode. Never user input.
 fn audit_fail(state: &CmisState, opcode: &'static str, now: i64) {
@@ -1534,6 +1556,78 @@ impl MachineIdentity for MachineIdentitySvc {
         Ok(Response::new(RevokeResponse { crl_number: number }))
     }
 
+    async fn unrevoke_host(
+        &self,
+        request: Request<UnrevokeHostRequest>,
+    ) -> Result<Response<UnrevokeHostResponse>, Status> {
+        let admin = require(&request, paths::UNREVOKE_HOST)?;
+        let req = request.into_inner();
+        let now = unix_now();
+
+        if req.spiffe_id.is_empty() {
+            return Err(Status::invalid_argument("empty spiffe_id"));
+        }
+        if req.spiffe_id.len() > MAX_SPIFFE_ID_LEN {
+            return Err(Status::invalid_argument("spiffe_id too long"));
+        }
+        // No host entry on this node: nothing to lift. The authorization
+        // layer already recorded the call (`AdminCallAuthorized`).
+        if !self.state.is_host_revoked(&req.spiffe_id) {
+            tracing::info!(spiffe_id = %req.spiffe_id, "unrevoke: host not revoked here");
+            return Ok(Response::new(UnrevokeHostResponse {
+                existed: false,
+                crl_number: 0,
+            }));
+        }
+        let reason = revocation_reason(&req.reason);
+
+        // The SVID stored for the host, and its X.509 pair, stay revoked by
+        // digest: the host entry was what kept them out, and a credential
+        // that may have left a compromised host must not come back with it.
+        // An unreadable store refuses the call with nothing changed.
+        let record = self
+            .state
+            .lookup_checked(&req.spiffe_id)
+            .await
+            .map_err(|_| {
+                tracing::error!(spiffe_id = %req.spiffe_id, "unrevoke refused: store unavailable");
+                store_unavailable()
+            })?;
+        let svid_cert = record.as_ref().map(|rec| sha384(rec.bundle.jws.as_bytes()));
+        let mut keep_revoked: Vec<String> = svid_cert.iter().map(hex::encode).collect();
+        if let Some(x509) = record.as_ref().and_then(|rec| rec.bundle.x509.as_ref()) {
+            keep_revoked.push(hex::encode(sha384(&x509.leaf_der)));
+        }
+
+        // Recorded before anything changes; no audit, no un-revoke.
+        audit_record_strict(
+            &self.state,
+            &AuditEvent::HostUnrevoked {
+                spiffe_id: req.spiffe_id.clone(),
+                reason: reason.clone(),
+                by_admin_id: Some(admin.admin_id.clone()),
+                svid_cert_sha: svid_cert.map(Hash384),
+            },
+            now,
+        )?;
+        let existed = self.state.unrevoke_host(&req.spiffe_id, &keep_revoked, now);
+        if !existed {
+            // Lifted concurrently (another call, or pruned at expiry).
+            tracing::warn!(spiffe_id = %req.spiffe_id, "unrevoke: entry already gone");
+        }
+        let number = self.publish_crl_now(now)?;
+        tracing::info!(
+            spiffe_id = %req.spiffe_id,
+            crl_number = number,
+            svids_kept_revoked = keep_revoked.len(),
+            "host unrevoked"
+        );
+        Ok(Response::new(UnrevokeHostResponse {
+            existed,
+            crl_number: number,
+        }))
+    }
+
     async fn bump_epoch(
         &self,
         request: Request<BumpEpochRequest>,
@@ -1846,6 +1940,7 @@ fn host_forwardable(event: &AuditEvent) -> bool {
         | AuditEvent::SvidIssued { .. }
         | AuditEvent::SvidRevoked { .. }
         | AuditEvent::HostRevoked { .. }
+        | AuditEvent::HostUnrevoked { .. }
         | AuditEvent::HostEnrolled { .. }
         | AuditEvent::HostRejected { .. }
         | AuditEvent::PolicyEpochBumped { .. }

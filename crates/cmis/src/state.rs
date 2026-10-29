@@ -545,6 +545,41 @@ impl CmisState {
         }
     }
 
+    /// Lift the host entry for `spiffe_id` (T296) and, under the same lock,
+    /// revoke by `cert_sha` each digest in `keep_revoked` (the stored SVID and
+    /// its X.509 pair) with the host entry's reason, so pre-un-revoke
+    /// credentials stay revoked. Existing [`RevocationTarget::Svid`] entries
+    /// are left as they are. Returns `false` and changes nothing without a
+    /// host entry. Process-local like [`CmisState::revoke`].
+    pub fn unrevoke_host(&self, spiffe_id: &str, keep_revoked: &[String], now: i64) -> bool {
+        let is_host = |t: &RevocationTarget| {
+            let RevocationTarget::Host { spiffe_id: s } = t else {
+                return false;
+            };
+            s == spiffe_id
+        };
+        let mut revs = self.revocations.lock();
+        let Some(reason) = revs
+            .entries
+            .iter()
+            .find(|e| is_host(&e.target))
+            .map(|e| e.reason.clone())
+        else {
+            return false;
+        };
+        for cert_sha in keep_revoked {
+            let target = RevocationTarget::Svid {
+                cert_sha: cert_sha.clone(),
+            };
+            if !revs.entries.iter().any(|e| e.target == target) {
+                revs.entries
+                    .push(CrlEntry::new(target, reason.clone(), now));
+            }
+        }
+        revs.entries.retain(|e| !is_host(&e.target));
+        true
+    }
+
     /// Whether the revocation working set names the host `spiffe_id` itself
     /// (a [`RevocationTarget::Host`] entry; an SVID-only revocation does not
     /// count). Consulted by `Attest` before issuing, so a revoked host cannot

@@ -65,6 +65,24 @@ pub enum AuditEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by_admin_id: Option<String>,
     },
+    /// A host revocation was lifted by the `UnrevokeHost` admin RPC (T296),
+    /// so the host may attest again. Written before the entry is removed.
+    HostUnrevoked {
+        /// The host SPIFFE ID whose host revocation entry was lifted.
+        spiffe_id: String,
+        /// Stable opcode for the un-revocation reason.
+        reason: String,
+        /// Pseudonymous id (UUIDv7) of the administrator whose authenticated
+        /// session made the call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_admin_id: Option<String>,
+        /// SHA-384 of the host's stored JWS-SVID, revoked by `cert_sha` in
+        /// the same step (with its X.509-SVID pair) so the credential minted
+        /// before the un-revoke stays revoked. Absent when CMIS held no
+        /// record for the host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        svid_cert_sha: Option<Hash384>,
+    },
     /// A host passed the F13 fleet-manifest pre-admission check at the start
     /// of `Attest` — its EK certificate hash is enrolled — and was allowed to
     /// proceed to TPM quote verification.
@@ -791,5 +809,32 @@ mod tests {
         for e in events {
             assert_eq!(decode(&encode(&e).unwrap()).unwrap(), e);
         }
+    }
+
+    /// T296: the un-revoke event round-trips with and without the stored
+    /// SVID digest, and is told apart from the revocation it lifts.
+    #[test]
+    fn host_unrevoked_round_trips_and_differs_from_host_revoked() {
+        let with_svid = AuditEvent::HostUnrevoked {
+            spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
+            reason: "re-enrolled".into(),
+            by_admin_id: Some("0190".into()),
+            svid_cert_sha: Some(Hash384([7; 48])),
+        };
+        let without = AuditEvent::HostUnrevoked {
+            spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
+            reason: "re-enrolled".into(),
+            by_admin_id: Some("0190".into()),
+            svid_cert_sha: None,
+        };
+        for e in [&with_svid, &without] {
+            assert_eq!(&decode(&encode(e).unwrap()).unwrap(), e);
+        }
+        let revoked = AuditEvent::HostRevoked {
+            spiffe_id: "spiffe://ferrogate.test/host/abc".into(),
+            reason: "re-enrolled".into(),
+            by_admin_id: Some("0190".into()),
+        };
+        assert_ne!(encode(&without).unwrap(), encode(&revoked).unwrap());
     }
 }

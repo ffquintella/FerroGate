@@ -126,7 +126,8 @@ already authenticated and the CRL that names it is public. A `RevokeSvid`
 entry does not block re-attestation: that is how a host recovers from one
 leaked SVID. The SPIFFE id comes from the EK certificate digest (TPM tier) or
 the machine fingerprint (host-key tier), so re-imaging or re-enrolling the same
-hardware keeps the same id, and the host stays refused.
+hardware keeps the same id, and the host stays refused until the entry
+expires or an administrator lifts it with `UnrevokeHost` (T296).
 
 Known limits:
 
@@ -139,8 +140,40 @@ Known limits:
   SVID lifetime) after its `revoked_at` and is pruned at the next CRL publish.
   The host can attest again after that. Issuing `RevokeHost` again refreshes
   `revoked_at`.
-- **No un-revoke.** No RPC lifts a host revocation (follow-up T296). See
-  `docs/operations.md` §"Revocation" for the operator procedure.
+- **Un-revoke (T296).** `UnrevokeHost(spiffe_id, reason)` lifts the entry
+  before it expires (see below). It is per node like the working set: issue
+  it on every replica that holds the entry.
+
+### Un-revoking a host (T296)
+
+`UnrevokeHost` is an admin RPC with the same requirements as `RevokeHost`: an
+administrator session with `svid.revoke` and a step-up in the last 5 minutes
+(F20). On the node that receives it:
+
+1. An empty or oversized (> 2048 bytes) `spiffe_id` is `INVALID_ARGUMENT`.
+2. No host entry for the id on this node: a no-op, `existed = false`,
+   `crl_number = 0`. Nothing is changed or published; the call itself is in the
+   audit log as `AdminCallAuthorized`.
+3. CMIS reads the host's stored record. A store that cannot be read refuses
+   the call (`UNAVAILABLE store_unavailable`) with nothing changed.
+4. `HostUnrevoked { spiffe_id, reason, by_admin_id, svid_cert_sha }` is
+   appended to the audit log **before** anything changes. If the append fails
+   the call is refused (`UNAVAILABLE audit log unavailable`) and the host stays
+   revoked: lifting a control never happens unrecorded.
+5. Under one lock, the host entry is removed and the stored JWS-SVID and its
+   X.509-SVID pair are revoked by `cert_sha` (`svid_cert_sha` in the event)
+   with the host entry's reason. `RevokeSvid` entries (including one already
+   naming that SVID) and other hosts' entries are not touched.
+6. The CRL is republished at once; the response carries `existed = true` and
+   its number.
+
+The host then attests afresh: its old SVID no longer authenticates host
+calls, so the MIA's `Rotate` is refused and it falls back to `Attest`, which
+now succeeds. Keeping the stored SVID revoked means the credential that may
+have left a compromised host does not come back with the un-revoke. SVIDs the
+host held before that one (superseded by a renewal but not yet expired) are
+not tracked by CMIS and are accepted again by relying parties until they
+expire; `docs/operations.md` §"Revocation" says when to wait instead.
 - **Client retries.** The MIA treats `PERMISSION_DENIED` from `Attest` as
   "not enrolled" and keeps trying; each attempt is refused and audited.
   While its revoked SVID is still valid, the renewal loop backs off from 30 s,

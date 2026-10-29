@@ -68,7 +68,11 @@ async fn plaintext_listener_refuses_admin_methods_with_tls_required() {
     let h = support::harness("layer-plain").await;
     let layer = AdminAuthLayer::new(Some(Arc::clone(&h.authz)), ListenerKind::Main, false, true);
     let legacy = legacy_admin_paths();
-    assert_eq!(legacy.len(), 9, "the nine legacy admin RPCs: {legacy:?}");
+    assert_eq!(
+        legacy.len(),
+        10,
+        "the nine legacy admin RPCs plus UnrevokeHost (T296): {legacy:?}"
+    );
     for path in legacy {
         assert_eq!(
             through(&layer, path, None, lo()).await,
@@ -223,7 +227,7 @@ async fn a_viewer_session_is_refused_every_legacy_admin_rpc() {
         .into_iter()
         .filter(|e| matches!(e, ferro_audit::AuditEvent::AdminAccessDenied { .. }))
         .count();
-    assert_eq!(denied, 9);
+    assert_eq!(denied, 10);
 }
 
 #[tokio::test]
