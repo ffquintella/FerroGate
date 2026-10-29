@@ -25,6 +25,10 @@ record them.
 
 ## [Unreleased]
 
+### Abandoned
+
+- Abandon the host-side `mia request-allowlist` / `mia allowlist-status` commands and the unauthenticated `GetProposalStatus` RPC: ADR-0004 (accepted 2026-10-29) supersedes ADR-0003 and rebuilds them on the approval ledger (S22, S54, M35, T231, T232, T233, T234, T235, T248)
+
 ### Added
 
 - Add the audited `UnrevokeHost` admin RPC and `ferrogate unrevoke-host`, so a cleaned or re-enrolled host can attest again before its revocation expires (S11, M33, T296)

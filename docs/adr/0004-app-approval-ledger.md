@@ -1,6 +1,6 @@
 # ADR-0004 — Application approval ledger and the non-replacement invariant
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-10-29, product owner; the ESI acknowledgement of the §6 risk is still outstanding)
 - **Date:** 2026-10-14
 - **Deciders:** FerroGate core team and the product owner (single-step direct add,
   decision D4 in the [Decisions log](../app-approval-and-admin.md#decisions-log)).
@@ -14,9 +14,8 @@
 - **Relation to earlier ADRs:**
   - **Supersedes, on acceptance, [ADR-0003](0003-host-allowlist-request-status.md)**
     (host-side `request-allowlist` / unauthenticated `GetProposalStatus`). ADR-0003
-    is still *Proposed* and its commands are not implemented. Its status line is
-    left unchanged in this change and should be updated to "Superseded by
-    ADR-0004" when this ADR is accepted.
+    was still *Proposed* and its commands were never implemented. Accepted on
+    2026-10-29, so ADR-0003 is now "Superseded by ADR-0004".
   - **Amends [ADR-0002](0002-allowlist-optional-uid.md)** without changing it: the
     v1 entry model `(uid?, bin_sha)` and its signing context stay byte-identical.
     The new constraints exist only in a new **v2** document format.

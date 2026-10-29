@@ -867,20 +867,25 @@ that repository Actions were disabled at the time.
   - from: M5
   - why: lands with the TEE work; CMIS ships only `UnconfiguredCredentialMaker`, which refuses so no half-configured node can appear to attest TPM hosts.
 
-## [M35] Host-side allowlist request and status (ADR-0003)
+## [M35] Host-side allowlist request and status (ADR-0003, superseded)
 > outcome: An on-host operator can request explicit apps with `mia request-allowlist` and confirm approval with `mia allowlist-status`, while signing stays with the CMIS issuer and approval with the operator.
 > phase: P9
 > spec: S22, S32
 
-ADR-0003 is **Proposed**, not Accepted; these tasks follow its rollout plan and
-start only once it is accepted. ADR-0004 (S54) supersedes it on acceptance; the
-replacement work is M37.
+ADR-0004 (S54) was accepted on 2026-10-29 and supersedes ADR-0003 (S22), so these
+tasks are abandoned. The replacement work is M37 (app requests, status and the
+5-minute sync).
 
-- [ ] T231 Add the `GetProposalStatus` request, response and RPC to `ferro-proto` (S22)
-- [ ] T232 Implement read-only `GetProposalStatus` in CMIS (S22)
-- [ ] T233 Add `mia request-allowlist` to request explicit apps for this host (S22)
-- [ ] T234 Add `mia allowlist-status` to report live, pending or absent apps (S22)
-- [ ] T235 Document operator-gated approval with `CMIS_ALLOWLIST_PROPOSALS=off` (S22, S32)
+- [-] T231 Add the `GetProposalStatus` request, response and RPC to `ferro-proto` (S22)
+  - why: superseded by ADR-0004 (accepted 2026-10-29); the host request and status flow is rebuilt on the approval ledger in M37.
+- [-] T232 Implement read-only `GetProposalStatus` in CMIS (S22)
+  - why: superseded by ADR-0004 (accepted 2026-10-29); the host request and status flow is rebuilt on the approval ledger in M37.
+- [-] T233 Add `mia request-allowlist` to request explicit apps for this host (S22)
+  - why: superseded by ADR-0004 (accepted 2026-10-29); the host request and status flow is rebuilt on the approval ledger in M37.
+- [-] T234 Add `mia allowlist-status` to report live, pending or absent apps (S22)
+  - why: superseded by ADR-0004 (accepted 2026-10-29); the host request and status flow is rebuilt on the approval ledger in M37.
+- [-] T235 Document operator-gated approval with `CMIS_ALLOWLIST_PROPOSALS=off` (S22, S32)
+  - why: superseded by ADR-0004 (accepted 2026-10-29); the host request and status flow is rebuilt on the approval ledger in M37.
 
 ## [M36] Authenticated administration surface (F20 Phase 0)
 > outcome: No CMIS admin RPC answers without an authenticated, authorized administrator session over TLS; local admin accounts sign in with a password plus TOTP or FIDO2, and `AppendAuditEvent` accepts only host-signed events.
@@ -921,7 +926,7 @@ must ship before M37-M40. Breaking change for old `ferrogate` binaries (0.29.0).
 > phase: P10
 > spec: S50, S54, S56, S8
 
-Supersedes the host-request flow of M35 once ADR-0004 is accepted.
+Supersedes the host-request flow of M35: ADR-0004 was accepted on 2026-10-29.
 
 - [x] T263 Add the hiqlite app-request, approval and lineage tables with the non-replacement invariant (S50, S54)
   - note: Ordered `schema_migrations` runner (`crates/ferro-raft/src/migrations.rs`); migration 1 is the F19 §2 ledger (`crates/ferro-raft/src/apps/schema.rs`): lineages, binaries, requests, approvals, approval revisions, `host_allowlist_state`. INV-1 to INV-3 are enforced twice: the store API (`apps::{intake, decisions, approvals}`: intake only inserts; every approval change names one id, checks `row_version` and appends a PII-free revision in the same Raft transaction; guarded transactions abort on a failed precondition) and SQLite triggers (no deletes, immutable binaries/revisions/identity columns, one decision per request, terminal states final, scope only narrows, `REVOKED` final, versioned changes need their revision row, auto-update copies an active unfrozen parent incl. expiry and never re-approves revoked/denied hashes, one open request per dedup key, dense never-reused revisions, monotonic generation). Store API also covers dedup, auto-approve conditions #2–#7, approve/deny/direct-register/revoke/edit/renew/expire, §7.5 search with keyset paging, host-scoped status, compile input and generation/digest CAS. Tests: `crates/ferro-raft/tests/app_ledger.rs` (`a_request_never_overwrites_an_approval`, `revisions_are_sequential_stable_and_never_reused`, `host_operations_never_change_existing_approvals`, auto-update, decisions, versioning, generation, search).
@@ -1025,7 +1030,8 @@ Supersedes the host-request flow of M35 once ADR-0004 is accepted.
 - [ ] T245 Emit the incoming root's X.509 anchor from the offline ceremony (S17, S14)
 - [ ] T246 Reuse the stored SVID credential to skip attestation within the F04 window (S4, S17)
 - [ ] T247 Suppress allowlist proposal noise from `DynamicUser` hosts (S21)
-- [ ] T248 Keep a short-lived rejection record for allowlist proposals (S22)
+- [-] T248 Keep a short-lived rejection record for allowlist proposals (S22)
+  - why: superseded by ADR-0004; denied requests stay visible in the append-only request ledger.
 - [ ] T249 Refresh stale status notes in the READMEs, doc indexes and transport-tls.md (S19)
   - note: Inferred during migration: README.md / docs/README.md say crates are not split out of `src/`; docs/features/README.md shows stale F05/F06/F07/F10 statuses and omits F15/F16; docs/adr/README.md lists only ADR-0001; docs/transport-tls.md says the daemon does not yet dial CMIS; docs/testing.md says `formal/` is "to be created".
 
@@ -1053,7 +1059,7 @@ Supersedes the host-request flow of M35 once ADR-0004 is accepted.
 | S19 | Feature index and status table | docs/features/README.md |
 | S20 | ADR-0001 — gRPC over HTTP/REST for the control plane (Accepted) | docs/adr/0001-grpc-over-http-transport.md |
 | S21 | ADR-0002 — Optional uid in caller allowlist entries (Accepted) | docs/adr/0002-allowlist-optional-uid.md |
-| S22 | ADR-0003 — Host-side allowlist request and status commands (Proposed) | docs/adr/0003-host-allowlist-request-status.md |
+| S22 | ADR-0003 — Host-side allowlist request and status commands (Superseded by ADR-0004) | docs/adr/0003-host-allowlist-request-status.md |
 | S23 | Architecture | docs/architecture.md |
 | S24 | Threat model | docs/threat-model.md |
 | S25 | Attestation protocol | docs/protocol.md |
@@ -1085,7 +1091,7 @@ Supersedes the host-request flow of M35 once ADR-0004 is accepted.
 | S51 | F20 — Administrator authentication and authorization | docs/features/F20-admin-authentication.md |
 | S52 | F21 — Server administration TUI | docs/features/F21-admin-tui.md |
 | S53 | F22 — Tray admin client | docs/features/F22-tray-admin-client.md |
-| S54 | ADR-0004 — App approval ledger and non-replacement invariant (Proposed) | docs/adr/0004-app-approval-ledger.md |
+| S54 | ADR-0004 — App approval ledger and non-replacement invariant (Accepted) | docs/adr/0004-app-approval-ledger.md |
 | S55 | ADR-0005 — Administrator authentication (Proposed) | docs/adr/0005-admin-authentication.md |
 | S56 | App approval and administration overview | docs/app-approval-and-admin.md |
 

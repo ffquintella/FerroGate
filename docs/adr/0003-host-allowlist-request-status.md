@@ -1,6 +1,6 @@
 # ADR-0003 — Host-side allowlist *request* and *status* commands
 
-- **Status:** Proposed
+- **Status:** Superseded by [ADR-0004](0004-app-approval-ledger.md) (2026-10-29); never implemented
 - **Date:** 2026-06-10
 - **Deciders:** FerroGate core team
 - **Scope:** New MIA agent commands `mia request-allowlist` and
