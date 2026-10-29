@@ -25,6 +25,12 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.4] - 2026-10-29
+
+### Added
+
+- Test that a peer outside the status group cannot connect to the status socket, on Linux and macOS as root (S18, M31, T214)
+
 ## [0.30.3] - 2026-10-27
 
 ### Added

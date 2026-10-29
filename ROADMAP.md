@@ -794,6 +794,7 @@ changes on workstations.
   - note: `crates/mia/tests/agent_states.rs` serves one environment per state over the real status socket, built with the `StatusHandle` calls the daemon makes, and reads them back with a protocol client; `NotRunning` is driven against an absent socket. `NotInstalled` and `ImaDisabled` are client-side only and asserted as such. The states come from handle inputs, not from a live attestation failing against CMIS.
 - [ ] T214 Test per platform that a peer outside the status group cannot connect (S18)
   - note: Needs root and real groups; answering `StatusReq`/`LogTailReq` and refusing anything else is already tested over a real socket.
+  - note: Unix half added in `crates/mia/tests/status_group_peer.rs` (skips without root; probes as in-group and outside-group peers). Not yet confirmed passing as root, and the Windows pipe case is not written, so this stays open.
 - [ ] T215 Run the setup wizard and consent prompts end to end against real prompts (S18)
 - [ ] T216 Test as root that `mia setup --apply` preserves a different file owner (S18)
   - note: The rest of the `--apply` criterion (rejections, atomic write, `0640`, `ConfigChanged`, byte-identity with the TTY wizard) is tested.
