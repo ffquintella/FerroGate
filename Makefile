@@ -421,8 +421,11 @@ TRAY_DIST := crates/mia-tray/dist
 # The administrator client (F22, `mia-tray-admin`) is optional: separate Linux
 # packages (`pkg-deb-tray-admin`, `pkg-rpm-tray-admin`), a macOS app-bundle
 # binary and an MSI feature that is off by default. MIA_TRAY_ADMIN=0 builds
-# the macOS and Windows packages without it (it also needs MIA_TRAY != 0).
+# the Windows packages without it (it also needs MIA_TRAY != 0).
 MIA_TRAY_ADMIN ?= 1
+# The macOS .pkg leaves the admin client out unless MIA_TRAY_ADMIN_MACOS=1
+# (opt-in, F22 "Migration and rollout"); the MSI feature is off by default.
+MIA_TRAY_ADMIN_MACOS ?= 0
 
 pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
 	cargo install --locked cargo-deb cargo-generate-rpm
@@ -484,7 +487,7 @@ endif
 pkg-tray-admin: ## Build the optional administrator-client Linux packages (.deb + .rpm); not part of 'make pkg'
 	@case "$(UNAME_S)" in \
 	  Linux) $(MAKE) --no-print-directory pkg-deb-tray-admin pkg-rpm-tray-admin ;; \
-	  *)     echo "Host is $(UNAME_S): the admin client ships inside 'make pkg-macos' / 'make pkg-win' (MIA_TRAY_ADMIN=0 to omit)." ;; \
+	  *)     echo "Host is $(UNAME_S): the admin client ships inside 'make pkg-win' (MIA_TRAY_ADMIN=0 to omit) and, opt-in, 'make pkg-macos' (MIA_TRAY_ADMIN_MACOS=1)." ;; \
 	esac
 
 pkg-rpm: ## Build the mia .rpm package for x86_64/amd64 (Fedora/RHEL/SUSE)
@@ -553,7 +556,7 @@ ifneq ($(MIA_TRAY),0)
 	# Signed below, once it sits inside its .app bundle.
 	cargo build --release $(TRAY) --bin mia-tray
 	strip target/release/mia-tray
-ifneq ($(MIA_TRAY_ADMIN),0)
+ifneq ($(MIA_TRAY_ADMIN_MACOS),0)
 	# The administrator client (F22): a separate unprivileged program with its
 	# own link graph, built apart from the tray so features never unify. It
 	# goes beside mia-tray in the bundle and is signed like it (below).
@@ -589,7 +592,7 @@ ifneq ($(MIA_TRAY),0)
 	install -d -m 0755 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Resources"
 	install -m 0644 $(TRAY_DIST)/icons/ferrogate-mia.icns "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/Resources/ferrogate-mia.icns"
 	install -m 0755 target/release/mia-tray "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray"
-ifneq ($(MIA_TRAY_ADMIN),0)
+ifneq ($(MIA_TRAY_ADMIN_MACOS),0)
 	install -m 0755 target/release/mia-tray-admin "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray-admin"
 	# A second executable in the bundle is not covered by the bundle signature
 	# alone: sign it with the same identity and options, before the bundle.
@@ -607,7 +610,7 @@ endif
 		$(if $(CODESIGN_ID),--timestamp --sign "$(CODESIGN_ID)",--sign -) \
 		"$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)"
 	codesign --verify --strict --verbose=1 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)"
-ifneq ($(MIA_TRAY_ADMIN),0)
+ifneq ($(MIA_TRAY_ADMIN_MACOS),0)
 	codesign --verify --strict --verbose=1 "$(MACOS_PKG_ROOT)/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray-admin"
 endif
 	ln -s "/$(MACOS_TRAY_APP)/Contents/MacOS/mia-tray" $(MACOS_PKG_ROOT)/usr/local/bin/mia-tray

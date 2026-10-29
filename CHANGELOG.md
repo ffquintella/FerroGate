@@ -70,7 +70,7 @@ record them.
   starts it unprivileged with no arguments. Packages: optional
   `ferrogate-mia-tray-admin` deb and rpm (`make pkg-tray-admin`), inside
   `FerroGate MIA.app` on macOS signed with the tray's identity
-  (`MIA_TRAY_ADMIN=0` leaves it out), and an MSI feature "Admin client",
+  (opt-in with `MIA_TRAY_ADMIN_MACOS=1`, left out by default), and an MSI feature "Admin client",
   off by default (`ADDLOCAL=Main,AdminClient` or Chocolatey
   `/AdminClient`). No package gives it privileges, a group, a service or
   autostart.

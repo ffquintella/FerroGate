@@ -230,7 +230,7 @@ devices: install it from [Installing the admin client](#installing-the-admin-cli
 
 `MIA_TRAY=0 make pkg-macos` / `MIA_TRAY=0 make pkg-win` build the agent
 packages without the tray (and so without the admin client);
-`MIA_TRAY_ADMIN=0` leaves out only the admin client. On Windows `mia-tray.exe` is a GUI-subsystem
+`MIA_TRAY_ADMIN=0` leaves out only the Windows admin client; the macOS `.pkg` leaves it out unless built with `MIA_TRAY_ADMIN_MACOS=1`. On Windows `mia-tray.exe` is a GUI-subsystem
 program (no console window at logon), so `mia-tray --help` / `--version` print
 only when stdout is redirected (`mia-tray --version | more`). On Linux the tray needs a StatusNotifierItem host:
 KDE, Xfce, Cinnamon and most others have one; GNOME needs the
@@ -285,8 +285,8 @@ the tray menu.
 **Who.** Approvers on managed devices only (FIDO2 is recommended and can be
 required by the server policy). Regular workstations do not need it: the Debian
 workstation package and the RPM tray package leave it out, and it is off by
-default in the MSI (the macOS `.pkg` carries it in the bundle unless built with
-`MIA_TRAY_ADMIN=0`). It runs as the signed-in
+default in the MSI (the macOS `.pkg` carries it in the bundle only when built with
+`MIA_TRAY_ADMIN_MACOS=1`). It runs as the signed-in
 user and **needs no privileges** at install time or run time: no group
 membership (not `ferrogate-status`, not `ferrogate-clients`), no setuid or setgid,
 no polkit action, no service, no autostart or login item, and no Windows
@@ -297,7 +297,7 @@ endpoint and its pin from operations first (see [Configuration](#configuration))
 |---|---|---|
 | Linux (Debian/Ubuntu) | `sudo apt install ./ferrogate-mia-tray-admin_<version>-1_amd64.deb` (`make pkg-deb-tray-admin`); depends on the tray (`ferrogate-mia` provides it) | `/usr/bin/mia-tray-admin` |
 | Linux (RPM) | `sudo dnf install ./ferrogate-mia-tray-admin-<version>-1.x86_64.rpm` (`make pkg-rpm-tray-admin`); requires `ferrogate-mia-tray` | `/usr/bin/mia-tray-admin` |
-| macOS | inside the `.pkg` of `make pkg-macos`, in the same signed bundle as the tray (`MIA_TRAY_ADMIN=0` to leave it out) | `/Applications/FerroGate MIA.app/Contents/MacOS/mia-tray-admin` |
+| macOS | opt-in: `MIA_TRAY_ADMIN_MACOS=1 make pkg-macos` puts it in the same signed bundle as the tray (left out by default) | `/Applications/FerroGate MIA.app/Contents/MacOS/mia-tray-admin` |
 | Windows | the MSI feature **Admin client**, off by default: `msiexec /i ferrogate-mia-<version>-x64.msi ADDLOCAL=Main,AdminClient`, or with Chocolatey `choco install ferrogate-mia --params "'/AdminClient'"` (repeat the parameter on `choco upgrade`) | `%ProgramFiles%\FerroGate\MIA\mia-tray-admin.exe` |
 
 On macOS the binary is signed with the same identity as the bundle
