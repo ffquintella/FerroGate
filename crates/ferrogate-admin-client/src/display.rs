@@ -40,6 +40,13 @@ fn is_invisible(c: char) -> bool {
     )
 }
 
+/// Whether `c` is a control or an invisible format character (what [`inert`]
+/// rewrites): text the client passes on to an authenticator must hold none.
+#[must_use]
+pub fn is_hidden_or_control(c: char) -> bool {
+    is_control(c) || is_invisible(c)
+}
+
 /// `text` with every control and invisible format character made visible,
 /// cut to at most `max_chars` characters (the last one an [`ELLIPSIS`] when
 /// cut).

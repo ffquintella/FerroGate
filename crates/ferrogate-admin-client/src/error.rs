@@ -5,6 +5,10 @@
 use crate::display::inert;
 use crate::webauthn::AuthenticatorError;
 
+/// gRPC status codes, so front ends can read [`RpcError::code`] without
+/// depending on `tonic` themselves.
+pub use tonic::Code;
+
 /// A gRPC failure: status code, the server's stable reason (inert, at most
 /// 64 characters), the offending field and the `retry-after` hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +98,12 @@ impl ClientError {
             tonic::Code::ResourceExhausted => Self::Throttled(e.retry_after.unwrap_or(60)),
             _ => Self::Other(e),
         }
+    }
+
+    /// Whether the server asked for a fresh step-up first (F20 §7).
+    #[must_use]
+    pub fn needs_step_up(&self) -> bool {
+        matches!(self, Self::Other(e) if e.is_step_up_required())
     }
 
     /// Whether the call reported a deadline (the channel is then redialled).

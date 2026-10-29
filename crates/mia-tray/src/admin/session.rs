@@ -8,15 +8,23 @@
 //! [`Link::end_session`]: the token leaves the slot at once and a separate
 //! task sends the `Logout`, so a stuck RPC can neither delay nor drop it.
 
+//! Enrollment and factor management (F22 §3a) ride the same queue; the
+//! worker keeps no state between commands (nonces and creation requests go
+//! back and forth with the window).
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use ferrogate_admin_client::client::{
     logout_task, AdminSession, ClientConfig, Factor, LoginInfo, Methods,
 };
+use ferrogate_admin_client::enroll::EnrollmentOffer;
 use ferrogate_admin_client::error::ClientError;
+use ferrogate_admin_client::factors::{register_key, AddNonce, AddOffer, FactorInfo, FactorMethod};
 use ferrogate_admin_client::session::SessionHandle;
-use ferrogate_admin_client::webauthn::{Authenticator, AuthenticatorError};
+use ferrogate_admin_client::webauthn::{
+    Authenticator, AuthenticatorError, CreationRequest, WebAuthnAttestation,
+};
 use tokio::sync::mpsc;
 
 use super::secret::Secret;
@@ -56,6 +64,63 @@ pub enum Cmd {
         /// The second factor.
         factor: FactorChoice,
     },
+    /// `BeginEnrollment` (a copy of the token; the wizard keeps its own).
+    BeginEnrollment {
+        /// The enrollment or reset token.
+        token: Secret,
+    },
+    /// Register the platform's key for an enrollment (no server call).
+    EnrollKey {
+        /// The server's creation request.
+        request: Box<CreationRequest>,
+        /// The key's label.
+        label: String,
+    },
+    /// `CompleteEnrollment`.
+    CompleteEnrollment {
+        /// The token (a copy).
+        token: Secret,
+        /// The new password.
+        password: Secret,
+        /// A code from the new (or, for a reset, the current) authenticator.
+        code: Option<Secret>,
+        /// The registered key.
+        key: Option<WebAuthnAttestation>,
+    },
+    /// `ListMyFactors`.
+    ListFactors,
+    /// `BeginAddFactor`.
+    BeginAddFactor {
+        /// What to add.
+        method: FactorMethod,
+    },
+    /// `CompleteAddFactor` for a TOTP seed.
+    CompleteAddTotp {
+        /// The ceremony's nonce.
+        nonce: AddNonce,
+        /// A code from the new authenticator.
+        code: Secret,
+        /// Proof of a factor already held.
+        proof: FactorChoice,
+    },
+    /// `CompleteAddFactor` for a new key of this platform.
+    CompleteAddKey {
+        /// The ceremony's nonce.
+        nonce: AddNonce,
+        /// The server's creation request.
+        request: Box<CreationRequest>,
+        /// The key's label.
+        label: String,
+        /// Proof of a factor already held.
+        proof: FactorChoice,
+    },
+    /// `RemoveFactor`.
+    RemoveFactor {
+        /// The factor (as the server listed it).
+        factor_id: String,
+        /// Proof of a factor the account keeps.
+        proof: FactorChoice,
+    },
 }
 
 static_assertions::assert_not_impl_any!(Cmd: std::fmt::Debug, std::fmt::Display, Clone);
@@ -67,8 +132,8 @@ struct Queued {
     cmd: Cmd,
 }
 
-/// The worker's answer to one [`Cmd`]. Never carries a secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The worker's answer to one [`Cmd`]. Never carries a credential; a
+/// TOTP seed offered by the server travels only inside its wiped buffer.
 pub enum Reply {
     /// Answer to [`Cmd::Offer`].
     Offered {
@@ -86,7 +151,24 @@ pub enum Reply {
     },
     /// Answer to [`Cmd::StepUp`]: the end of the step-up window.
     SteppedUp(Result<i64, ClientError>),
+    /// Answer to [`Cmd::BeginEnrollment`].
+    EnrollmentBegun(Result<Box<EnrollmentOffer>, ClientError>),
+    /// Answer to [`Cmd::EnrollKey`].
+    EnrollKeyMade(Result<WebAuthnAttestation, ClientError>),
+    /// Answer to [`Cmd::CompleteEnrollment`]: the admin id.
+    Enrolled(Result<String, ClientError>),
+    /// Answer to [`Cmd::ListFactors`].
+    Factors(Result<Vec<FactorInfo>, ClientError>),
+    /// Answer to [`Cmd::BeginAddFactor`].
+    AddFactorBegun(Result<(AddNonce, AddOffer), ClientError>),
+    /// Answer to [`Cmd::CompleteAddTotp`] or [`Cmd::CompleteAddKey`]: the
+    /// new factor's id.
+    FactorAdded(Result<String, ClientError>),
+    /// Answer to [`Cmd::RemoveFactor`].
+    FactorRemoved(Result<(), ClientError>),
 }
+
+static_assertions::assert_not_impl_any!(Reply: std::fmt::Debug, std::fmt::Display, Clone);
 
 /// What the window needs from the worker (a test double stands in for it).
 pub trait Link {
@@ -173,23 +255,7 @@ async fn run(
 ) -> Reply {
     if conn.slot().epoch() != epoch {
         let ended = ClientError::SessionEnded;
-        let (step, reply) = match cmd {
-            Cmd::Offer { username } => (
-                "offer",
-                Reply::Offered {
-                    username,
-                    result: Err(ended.clone()),
-                },
-            ),
-            Cmd::SignIn { username, .. } => (
-                "sign_in",
-                Reply::SignedIn {
-                    username,
-                    result: Err(ended.clone()),
-                },
-            ),
-            Cmd::StepUp { .. } => ("step_up", Reply::SteppedUp(Err(ended.clone()))),
-        };
+        let (step, reply) = refused(cmd, &ended);
         log_failure(step, Some(&ended));
         return reply;
     }
@@ -225,6 +291,130 @@ async fn run(
             log_failure("step_up", result.as_ref().err());
             Reply::SteppedUp(result)
         }
+        other => run_factors(conn, other, key).await,
+    }
+}
+
+/// [`run`] for enrollment and factor management.
+async fn run_factors(
+    conn: &mut AdminSession,
+    cmd: Cmd,
+    key: Option<&Arc<dyn Authenticator>>,
+) -> Reply {
+    let factor = |choice: FactorChoice| match choice {
+        FactorChoice::Code(code) => Ok(Factor::Totp(code)),
+        FactorChoice::SecurityKey => key
+            .map(|k| Factor::SecurityKey(Arc::clone(k)))
+            .ok_or(ClientError::Authenticator(AuthenticatorError::Unavailable)),
+    };
+    let platform_key = || {
+        key.cloned()
+            .ok_or(ClientError::Authenticator(AuthenticatorError::Unavailable))
+    };
+    match cmd {
+        Cmd::BeginEnrollment { token } => {
+            let result = conn.begin_enrollment(&token).await.map(Box::new);
+            drop(token);
+            log_failure("begin_enrollment", result.as_ref().err());
+            Reply::EnrollmentBegun(result)
+        }
+        Cmd::EnrollKey { request, label } => {
+            let result = match platform_key() {
+                Ok(k) => register_key(k, &request, &label).await,
+                Err(e) => Err(e),
+            };
+            log_failure("enroll_key", result.as_ref().err());
+            Reply::EnrollKeyMade(result)
+        }
+        Cmd::CompleteEnrollment {
+            token,
+            password,
+            code,
+            key: attestation,
+        } => {
+            let result = conn
+                .complete_enrollment(&token, password, code, attestation)
+                .await;
+            drop(token);
+            log_failure("complete_enrollment", result.as_ref().err());
+            Reply::Enrolled(result)
+        }
+        Cmd::ListFactors => {
+            let result = conn.list_factors().await;
+            log_failure("list_factors", result.as_ref().err());
+            Reply::Factors(result)
+        }
+        Cmd::BeginAddFactor { method } => {
+            let result = conn.begin_add_factor(method).await;
+            log_failure("begin_add_factor", result.as_ref().err());
+            Reply::AddFactorBegun(result)
+        }
+        Cmd::CompleteAddTotp { nonce, code, proof } => {
+            let result = match factor(proof) {
+                Ok(p) => conn.complete_add_totp(nonce, code, p).await,
+                Err(e) => Err(e),
+            };
+            log_failure("complete_add_factor", result.as_ref().err());
+            Reply::FactorAdded(result)
+        }
+        Cmd::CompleteAddKey {
+            nonce,
+            request,
+            label,
+            proof,
+        } => {
+            let result = match (platform_key(), factor(proof)) {
+                (Ok(k), Ok(p)) => conn.complete_add_key(nonce, &request, k, &label, p).await,
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            };
+            log_failure("complete_add_factor", result.as_ref().err());
+            Reply::FactorAdded(result)
+        }
+        Cmd::RemoveFactor { factor_id, proof } => {
+            let result = match factor(proof) {
+                Ok(p) => conn.remove_factor(&factor_id, p).await,
+                Err(e) => Err(e),
+            };
+            log_failure("remove_factor", result.as_ref().err());
+            Reply::FactorRemoved(result)
+        }
+        Cmd::Offer { .. } | Cmd::SignIn { .. } | Cmd::StepUp { .. } => {
+            refused(cmd, &ClientError::FactorNotOffered).1
+        }
+    }
+}
+
+/// The reply to `cmd` when it is not sent (its secrets are wiped here).
+fn refused(cmd: Cmd, e: &ClientError) -> (&'static str, Reply) {
+    fn failed<T>(e: &ClientError) -> Result<T, ClientError> {
+        Err(e.clone())
+    }
+    let err = || e;
+    match cmd {
+        Cmd::Offer { username } => (
+            "offer",
+            Reply::Offered {
+                username,
+                result: failed(err()),
+            },
+        ),
+        Cmd::SignIn { username, .. } => (
+            "sign_in",
+            Reply::SignedIn {
+                username,
+                result: failed(err()),
+            },
+        ),
+        Cmd::StepUp { .. } => ("step_up", Reply::SteppedUp(failed(err()))),
+        Cmd::BeginEnrollment { .. } => ("begin_enrollment", Reply::EnrollmentBegun(failed(err()))),
+        Cmd::EnrollKey { .. } => ("enroll_key", Reply::EnrollKeyMade(failed(err()))),
+        Cmd::CompleteEnrollment { .. } => ("complete_enrollment", Reply::Enrolled(failed(err()))),
+        Cmd::ListFactors => ("list_factors", Reply::Factors(failed(err()))),
+        Cmd::BeginAddFactor { .. } => ("begin_add_factor", Reply::AddFactorBegun(failed(err()))),
+        Cmd::CompleteAddTotp { .. } | Cmd::CompleteAddKey { .. } => {
+            ("complete_add_factor", Reply::FactorAdded(failed(err())))
+        }
+        Cmd::RemoveFactor { .. } => ("remove_factor", Reply::FactorRemoved(failed(err()))),
     }
 }
 
@@ -309,7 +499,7 @@ mod tests {
     use ferrogate_admin_client::transport::{CONNECT_TIMEOUT, RPC_TIMEOUT};
 
     /// A configuration that is refused before any dialling.
-    fn refused() -> ClientConfig {
+    fn refused_config() -> ClientConfig {
         ClientConfig {
             endpoint: "http://127.0.0.1:1".into(),
             pins: Vec::new(),
@@ -343,19 +533,19 @@ mod tests {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             w2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
-        let mut w = spawn(refused(), None, wake).unwrap();
+        let mut w = spawn(refused_config(), None, wake).unwrap();
         assert!(w.send(Cmd::SignIn {
             username: "alice".into(),
             password: secret("pw"),
             factor: FactorChoice::SecurityKey,
         }));
-        assert_eq!(
+        assert!(matches!(
             next(&mut w),
             Reply::SignedIn {
-                username: "alice".into(),
+                username,
                 result: Err(ClientError::Authenticator(AuthenticatorError::Unavailable)),
-            }
-        );
+            } if username == "alice"
+        ));
         assert!(w.send(Cmd::Offer {
             username: "alice".into()
         }));
@@ -378,7 +568,7 @@ mod tests {
             .build()
             .unwrap();
         let (logout_tx, _logout_rx) = mpsc::unbounded_channel();
-        let mut conn = AdminSession::new(refused());
+        let mut conn = AdminSession::new(refused_config());
         let handle = conn.session_handle(logout_tx);
         let queued_at = handle.epoch();
         handle.end();
@@ -388,47 +578,115 @@ mod tests {
             factor: FactorChoice::Code(secret("123456")),
         };
         // Stale: refused here (a sent one would fail to dial instead).
-        assert_eq!(
+        assert!(matches!(
             rt.block_on(run(&mut conn, queued_at, sign_in, None)),
             Reply::SignedIn {
-                username: "alice".into(),
+                username,
                 result: Err(ClientError::SessionEnded),
-            }
-        );
+            } if username == "alice"
+        ));
         let step_up = Cmd::StepUp {
             factor: FactorChoice::Code(secret("123456")),
         };
-        assert_eq!(
+        assert!(matches!(
             rt.block_on(run(&mut conn, queued_at, step_up, None)),
             Reply::SteppedUp(Err(ClientError::SessionEnded))
-        );
+        ));
+        // Enrollment and factor commands obey the same rule.
+        let stale = [
+            Cmd::BeginEnrollment {
+                token: secret("fgae_token"),
+            },
+            Cmd::CompleteEnrollment {
+                token: secret("fgae_token"),
+                password: secret("pw"),
+                code: Some(secret("123456")),
+                key: None,
+            },
+            Cmd::ListFactors,
+            Cmd::BeginAddFactor {
+                method: FactorMethod::SecurityKey,
+            },
+            Cmd::RemoveFactor {
+                factor_id: "totp".into(),
+                proof: FactorChoice::Code(secret("123456")),
+            },
+        ];
+        for cmd in stale {
+            let ended = match rt.block_on(run(&mut conn, queued_at, cmd, None)) {
+                Reply::EnrollmentBegun(r) => r.err(),
+                Reply::Enrolled(r) => r.err(),
+                Reply::Factors(r) => r.err(),
+                Reply::AddFactorBegun(r) => r.err(),
+                Reply::FactorRemoved(r) => r.err(),
+                _ => panic!("a reply of another kind"),
+            };
+            assert_eq!(ended, Some(ClientError::SessionEnded));
+        }
         // Queued after the lock: it goes out.
         let offer = Cmd::Offer {
             username: "alice".into(),
         };
         let reply = rt.block_on(run(&mut conn, handle.epoch(), offer, None));
-        assert!(
-            matches!(
-                reply,
-                Reply::Offered {
-                    result: Err(ClientError::Connect(_)),
-                    ..
-                }
-            ),
-            "{reply:?}"
-        );
+        assert!(matches!(
+            reply,
+            Reply::Offered {
+                result: Err(ClientError::Connect(_)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn without_a_key_backend_no_key_is_registered_and_nothing_is_sent() {
+        let mut w = spawn(refused_config(), None, Arc::new(|| {})).unwrap();
+        let options =
+            ferrogate_admin_client::webauthn::creation_request(&ferro_like_options()).unwrap();
+        assert!(w.send(Cmd::EnrollKey {
+            request: Box::new(options),
+            label: "Desk key".into(),
+        }));
+        assert!(matches!(
+            next(&mut w),
+            Reply::EnrollKeyMade(Err(ClientError::Authenticator(
+                AuthenticatorError::Unavailable
+            )))
+        ));
+        // A factor command without a session never dials.
+        assert!(w.send(Cmd::ListFactors));
+        assert!(matches!(
+            next(&mut w),
+            Reply::Factors(Err(ClientError::SessionEnded))
+        ));
+        w.stop(SHUTDOWN_WAIT);
+    }
+
+    /// Creation options as CMIS sends them.
+    fn ferro_like_options() -> ferrogate_admin_client::webauthn::CreationOptions {
+        ferrogate_admin_client::webauthn::CreationOptions {
+            challenge: vec![3; 32],
+            rp_id: "ferrogate-admin.ferrogate.test".into(),
+            rp_name: "FerroGate".into(),
+            user_id: vec![4; 32],
+            user_name: "alice".into(),
+            display_name: "Alice".into(),
+            pub_key_cred_params: vec![-7, -8],
+            exclude_credential_ids: Vec::new(),
+            user_verification: 1,
+            attestation: 1,
+        }
     }
 
     #[test]
     fn a_step_up_without_a_session_is_refused_locally() {
-        let mut w = spawn(refused(), None, Arc::new(|| {})).unwrap();
+        let mut w = spawn(refused_config(), None, Arc::new(|| {})).unwrap();
         assert!(w.send(Cmd::StepUp {
             factor: FactorChoice::Code(secret("123456")),
         }));
-        assert_eq!(
+        assert!(matches!(
             next(&mut w),
             Reply::SteppedUp(Err(ClientError::SessionEnded))
-        );
+        ));
         w.end_session();
         w.stop(SHUTDOWN_WAIT);
     }

@@ -1,8 +1,8 @@
 //! The admin window's state machine (F22 §3), headless: sign-in (user name,
-//! then password with a TOTP code or a security key), the signed-in summary,
-//! the step-up prompt, sign-out and the idle lock. Input goes in as calls,
-//! [`Reply`]s from the worker go in through [`Flow::on_reply`], and out come
-//! [`Effect`]s for the window to carry out.
+//! then password with a TOTP code or a security key), token enrollment, the
+//! signed-in summary, second-factor management, the step-up prompt,
+//! sign-out and the idle lock. Input goes in as calls, [`Reply`]s from the
+//! worker through [`Flow::on_reply`], and out come [`Effect`]s.
 
 //! The models hold the typed secrets; [`FlowView`] holds none (masks are
 //! lengths) and never the session token, which only the worker has. Every
@@ -12,11 +12,15 @@ use std::time::{Duration, Instant};
 
 use ferrogate_admin_client::client::{LoginInfo, Methods};
 use ferrogate_admin_client::error::ClientError;
+use ferrogate_admin_client::factors::{AddNonce, AddOffer, FactorInfo, FactorMethod};
 use ferrogate_admin_client::webauthn::AuthenticatorError;
 use serde::Serialize;
 
+use super::enroll::{EnrollField, EnrollStage, EnrollView, EnrollWizard};
+use super::factors::{FactorField, FactorsPanel, FactorsView};
 use super::login::{Field, LoginModel, LoginView, Stage, Submission};
 use super::secret::Secret;
+use super::seed::SeedDisplay;
 use super::session::{Cmd, FactorChoice, Reply};
 use crate::text::display_safe;
 
@@ -57,6 +61,16 @@ pub enum Busy {
         /// A security key was chosen.
         key: bool,
     },
+    /// Enrolling with a token (`key`: waiting for a key touch).
+    Enroll {
+        /// The platform's key is prompting.
+        key: bool,
+    },
+    /// Managing second factors (`key`: waiting for a key touch).
+    Factors {
+        /// The platform's key is prompting.
+        key: bool,
+    },
 }
 
 /// Why something did not work, as the window words it (generic, F20 §6).
@@ -83,6 +97,16 @@ pub enum Problem {
     Incomplete,
     /// The worker is busy or gone.
     NotSent,
+    /// Enrollment refused: an unknown, spent or expired token, or a wrong
+    /// code or key (one generic message).
+    EnrollmentRejected,
+    /// The new password breaks the server's policy.
+    PasswordPolicy,
+    /// A factor change was refused: a wrong code or proof, or the offer
+    /// expired; nothing changed (start again).
+    FactorRejected,
+    /// The account's last factor is never removed.
+    LastFactor,
 }
 
 /// A message above the form or the summary.
@@ -103,6 +127,16 @@ pub enum Notice {
     KeyRegistrationRequired,
     /// The step-up succeeded.
     SteppedUp,
+    /// The step-up is needed first (then the action goes on).
+    StepUpFirst,
+    /// Enrollment completed: sign in with the new password and factor.
+    Enrolled,
+    /// A factor was added.
+    FactorAdded,
+    /// A factor was removed (the account's other sessions ended).
+    FactorRemoved,
+    /// The required key was registered: sign in again with it.
+    KeyRegistered,
 }
 
 /// The signed-in summary (server strings escaped).
@@ -120,6 +154,8 @@ pub struct SessionView {
     pub step_up_until: Option<i64>,
     /// The factors the account may use (for the step-up prompt).
     pub methods: Methods,
+    /// The FIDO2 policy holds this session to registering a key.
+    pub restricted: bool,
 }
 
 /// The step-up prompt.
@@ -152,11 +188,19 @@ pub struct FlowView {
     pub session: Option<SessionView>,
     /// The step-up prompt, when open.
     pub step_up: Option<StepUpView>,
+    /// The enrollment wizard, when open (signed out).
+    pub enroll: Option<EnrollView>,
+    /// The second-factor panel, when open (signed in).
+    pub factors: Option<FactorsView>,
 }
 
 struct Session {
     info: LoginInfo,
     step_up_until: Option<i64>,
+    /// Held to registering a key (FIDO2 policy).
+    restricted: bool,
+    /// Whether sign-in offered a code (the policy may forbid one).
+    signin_totp: bool,
 }
 
 struct StepUpForm {
@@ -173,6 +217,11 @@ pub struct Flow {
     throttled_until: Option<Instant>,
     session: Option<Session>,
     step_up: Option<StepUpForm>,
+    enroll: Option<EnrollWizard>,
+    factors: Option<FactorsPanel>,
+    /// The factor being added (resent after a required step-up).
+    adding: Option<FactorMethod>,
+    after_step_up: Option<FactorMethod>,
     /// The methods last offered for the form's user name.
     offered: Methods,
     last_activity: Instant,
@@ -205,6 +254,24 @@ fn problem(e: &ClientError) -> Problem {
     }
 }
 
+/// [`problem`] for enrollment: a refusal names the enrollment.
+fn enroll_problem(e: &ClientError) -> Problem {
+    match e {
+        ClientError::Rejected => Problem::EnrollmentRejected,
+        ClientError::Other(r) if r.reason == "password_policy" => Problem::PasswordPolicy,
+        _ => problem(e),
+    }
+}
+
+/// [`problem`] for factor changes.
+fn factor_problem(e: &ClientError) -> Problem {
+    match e {
+        ClientError::Rejected => Problem::FactorRejected,
+        ClientError::Other(r) if r.reason == "last_factor" => Problem::LastFactor,
+        _ => problem(e),
+    }
+}
+
 impl Flow {
     /// The empty sign-in form; `key_available` when this build has a
     /// security-key backend on this platform.
@@ -218,6 +285,10 @@ impl Flow {
             throttled_until: None,
             session: None,
             step_up: None,
+            enroll: None,
+            factors: None,
+            adding: None,
+            after_step_up: None,
             offered: Methods::default(),
             last_activity: now,
             idle_limit: DEFAULT_IDLE.saturating_sub(IDLE_MARGIN),
@@ -261,7 +332,13 @@ impl Flow {
         if let Some(form) = &mut self.step_up {
             form.error = None;
             form.code.push_str(text);
-        } else if self.session.is_none() {
+        } else if self.session.is_some() {
+            if let Some(p) = &mut self.factors {
+                p.type_text(text);
+            }
+        } else if let Some(w) = &mut self.enroll {
+            w.type_text(text);
+        } else {
             self.login.type_text(text);
         }
     }
@@ -274,33 +351,71 @@ impl Flow {
         if let Some(form) = &mut self.step_up {
             form.error = None;
             form.code.pop();
-        } else if self.session.is_none() {
+        } else if self.session.is_some() {
+            if let Some(p) = &mut self.factors {
+                p.backspace();
+            }
+        } else if let Some(w) = &mut self.enroll {
+            w.backspace();
+        } else {
             self.login.backspace();
         }
     }
 
     /// `Tab` / `Shift-Tab`.
     pub fn tab(&mut self, back: bool) {
-        if self.session.is_none() {
+        if self.step_up.is_some() {
+            return;
+        }
+        if self.session.is_some() {
+            if let Some(p) = &mut self.factors {
+                p.tab(back);
+            }
+        } else if let Some(w) = &mut self.enroll {
+            w.tab(back);
+        } else {
             self.login.tab(back);
         }
     }
 
     /// A click on a field.
     pub fn focus(&mut self, field: Field) {
-        if self.session.is_none() {
+        if self.session.is_none() && self.enroll.is_none() {
             self.login.focus(field);
         }
     }
 
-    /// `Esc`: close the step-up prompt, or wipe the typed secrets.
+    /// A click on a wizard field.
+    pub fn focus_enroll(&mut self, field: EnrollField) {
+        if let (None, Some(w)) = (&self.session, &mut self.enroll) {
+            w.focus(field);
+        }
+    }
+
+    /// A click on a factor-form field.
+    pub fn focus_factor(&mut self, field: FactorField) {
+        if let (Some(_), Some(p)) = (&self.session, &mut self.factors) {
+            p.focus(field);
+        }
+    }
+
+    /// `Esc`: close the step-up prompt or a factor form, or wipe the typed
+    /// secrets.
     pub fn escape(&mut self) {
         if self.busy.is_some() {
             return;
         }
         if self.step_up.is_some() {
             self.step_up = None;
-        } else if self.session.is_none() {
+            self.after_step_up = None;
+        } else if self.session.is_some() {
+            if let Some(p) = &mut self.factors {
+                p.cancel();
+            }
+        } else if let Some(w) = &mut self.enroll {
+            w.escape();
+            self.notice = None;
+        } else {
             self.login.escape();
             self.notice = None;
         }
@@ -317,7 +432,17 @@ impl Flow {
                 };
                 return self.submit_step_up(how);
             }
+            if let Some(p) = self.factors.as_ref().filter(|p| p.editing()) {
+                let how = p.default_submission();
+                return self.submit_factor(how);
+            }
             return Vec::new();
+        }
+        if let Some(w) = &self.enroll {
+            return match w.view().stage {
+                EnrollStage::Token => self.enroll_continue(),
+                EnrollStage::Details => self.enroll_finish(),
+            };
         }
         match self.login.view().stage {
             Stage::Username => self.continue_with(),
@@ -382,9 +507,10 @@ impl Flow {
         )
     }
 
-    /// Open the step-up prompt.
+    /// Open the step-up prompt (not in a restricted session, where the
+    /// server allows no step-up).
     pub fn open_step_up(&mut self) {
-        if self.session.is_some() && self.busy.is_none() {
+        if self.session.as_ref().is_some_and(|s| !s.restricted) && self.busy.is_none() {
             self.step_up = Some(StepUpForm {
                 code: Secret::new(),
                 error: None,
@@ -435,6 +561,158 @@ impl Flow {
     pub fn cancel_step_up(&mut self) {
         if self.busy.is_none() {
             self.step_up = None;
+            self.after_step_up = None;
+        }
+    }
+
+    /// "Enroll with a token…" (signed out): the wizard replaces the form,
+    /// whose typed secrets are wiped.
+    pub fn open_enrollment(&mut self) {
+        if self.session.is_none() && self.busy.is_none() && self.enroll.is_none() {
+            self.login.wipe();
+            self.enroll = Some(EnrollWizard::new(self.key_available));
+            self.notice = None;
+        }
+    }
+
+    /// Close the wizard (everything it holds is wiped).
+    pub fn close_enrollment(&mut self) {
+        if self.busy.is_none() && self.enroll.take().is_some() {
+            self.notice = None;
+        }
+    }
+
+    /// "Continue" with the token: `BeginEnrollment`.
+    pub fn enroll_continue(&mut self) -> Vec<Effect> {
+        if self.busy.is_some() || self.session.is_some() || self.throttled() {
+            return Vec::new();
+        }
+        let Some(token) = self.enroll.as_mut().and_then(|w| w.continue_with().ok()) else {
+            return Vec::new();
+        };
+        self.notice = None;
+        self.send(Cmd::BeginEnrollment { token }, Busy::Enroll { key: false })
+    }
+
+    /// "Register security key" in the wizard.
+    pub fn enroll_register_key(&mut self) -> Vec<Effect> {
+        if self.busy.is_some() || self.session.is_some() {
+            return Vec::new();
+        }
+        let Some(Ok((request, label))) = self.enroll.as_mut().map(EnrollWizard::register_key)
+        else {
+            return Vec::new();
+        };
+        self.notice = None;
+        self.send(
+            Cmd::EnrollKey { request, label },
+            Busy::Enroll { key: true },
+        )
+    }
+
+    /// "Finish": `CompleteEnrollment`.
+    pub fn enroll_finish(&mut self) -> Vec<Effect> {
+        if self.busy.is_some() || self.session.is_some() || self.throttled() {
+            return Vec::new();
+        }
+        let Some(Ok(done)) = self.enroll.as_mut().map(EnrollWizard::finish) else {
+            return Vec::new();
+        };
+        self.notice = None;
+        self.send(
+            Cmd::CompleteEnrollment {
+                token: done.token,
+                password: done.password,
+                code: done.code,
+                key: done.key,
+            },
+            Busy::Enroll { key: false },
+        )
+    }
+
+    /// "Second factors" (signed in): open the panel and list the factors.
+    pub fn open_factors(&mut self) -> Vec<Effect> {
+        let Some(s) = &self.session else {
+            return Vec::new();
+        };
+        if self.busy.is_some() || self.step_up.is_some() || s.restricted {
+            return Vec::new();
+        }
+        self.factors = Some(FactorsPanel::new(false, s.info.methods, self.key_available));
+        self.notice = None;
+        self.send(Cmd::ListFactors, Busy::Factors { key: false })
+    }
+
+    /// Close the panel (not in a restricted session, which is only it).
+    pub fn close_factors(&mut self) {
+        if self.busy.is_none() && self.factors.as_ref().is_some_and(|p| !p.restricted()) {
+            self.factors = None;
+        }
+    }
+
+    /// "Add an authenticator app" / "Add a security key": `BeginAddFactor`.
+    pub fn add_factor(&mut self, method: FactorMethod) -> Vec<Effect> {
+        if self.busy.is_some() || self.session.is_none() || self.step_up.is_some() {
+            return Vec::new();
+        }
+        if !self.factors.as_ref().is_some_and(|p| p.can_add(method)) {
+            return Vec::new();
+        }
+        self.adding = Some(method);
+        self.notice = None;
+        self.send(Cmd::BeginAddFactor { method }, Busy::Factors { key: false })
+    }
+
+    /// "Remove" on a factor: its confirmation form.
+    pub fn remove_factor(&mut self, factor_id: &str) {
+        if self.busy.is_none() {
+            if let Some(p) = &mut self.factors {
+                let _ = p.start_remove(factor_id);
+            }
+        }
+    }
+
+    /// "Cancel" on a factor form (wiped).
+    pub fn cancel_factor_form(&mut self) {
+        if self.busy.is_none() {
+            if let Some(p) = &mut self.factors {
+                p.cancel();
+            }
+        }
+    }
+
+    /// Submit the factor form shown, proving the account with `how`.
+    pub fn submit_factor(&mut self, how: Submission) -> Vec<Effect> {
+        if self.busy.is_some() || self.session.is_none() {
+            return Vec::new();
+        }
+        let Some(Ok(cmd)) = self.factors.as_mut().map(|p| p.submit(how)) else {
+            return Vec::new();
+        };
+        let key = how == Submission::SecurityKey || matches!(cmd, Cmd::CompleteAddKey { .. });
+        self.notice = None;
+        self.send(cmd, Busy::Factors { key })
+    }
+
+    /// Show or hide the seed shown (wizard or panel) as text.
+    pub fn toggle_seed_text(&mut self) {
+        if self.session.is_some() {
+            if let Some(p) = &mut self.factors {
+                p.toggle_seed_text();
+            }
+        } else if let Some(w) = &mut self.enroll {
+            w.toggle_seed_text();
+        }
+    }
+
+    /// The TOTP seed to paint, while one is shown. It never enters
+    /// [`FlowView`].
+    #[must_use]
+    pub fn seed_display(&self) -> Option<SeedDisplay<'_>> {
+        if self.session.is_some() {
+            self.factors.as_ref().and_then(FactorsPanel::seed_display)
+        } else {
+            self.enroll.as_ref().and_then(EnrollWizard::seed_display)
         }
     }
 
@@ -443,6 +721,10 @@ impl Flow {
         self.login.wipe();
         self.session = None;
         self.step_up = None;
+        self.enroll = None;
+        self.factors = None;
+        self.adding = None;
+        self.after_step_up = None;
         self.busy = None;
         self.awaiting = None;
         self.notice = notice;
@@ -467,7 +749,13 @@ impl Flow {
         }
         self.last_activity = now;
         let view = self.login.view();
-        let typed = !view.username.is_empty() || view.password_len > 0 || view.code_len > 0;
+        let typed = !view.username.is_empty()
+            || view.password_len > 0
+            || view.code_len > 0
+            || self
+                .enroll
+                .as_ref()
+                .is_some_and(EnrollWizard::holds_anything);
         if self.session.is_some() || self.busy.is_some() || typed {
             return self.end(Some(Notice::Locked));
         }
@@ -480,6 +768,7 @@ impl Flow {
         if self.awaiting != Some(self.received) {
             // Answers a command the window gave up on (a lock, a sign-out):
             // a session it reports must not survive.
+            // Anything else it carried (a seed included) is dropped, wiped.
             return match reply {
                 Reply::SignedIn { result: Ok(_), .. } | Reply::SteppedUp(Ok(_)) => {
                     vec![Effect::EndSession]
@@ -502,14 +791,138 @@ impl Flow {
             }
             Reply::SignedIn { username, result } => self.signed_in_reply(&username, result, now),
             Reply::SteppedUp(result) => self.stepped_up_reply(result, now),
+            Reply::EnrollmentBegun(result) => {
+                match result {
+                    Ok(offer) => {
+                        if let Some(w) = &mut self.enroll {
+                            w.offered(*offer);
+                        }
+                    }
+                    Err(e) => self.fail_as(&e, enroll_problem(&e), now),
+                }
+                Vec::new()
+            }
+            Reply::EnrollKeyMade(result) => {
+                match result {
+                    Ok(attestation) => {
+                        if let Some(w) = &mut self.enroll {
+                            w.key_registered(attestation);
+                        }
+                    }
+                    Err(e) => self.fail(&e, now),
+                }
+                Vec::new()
+            }
+            Reply::Enrolled(result) => {
+                match result {
+                    Ok(_) => {
+                        self.enroll = None;
+                        self.notice = Some(Notice::Enrolled);
+                    }
+                    Err(e) => self.fail_as(&e, enroll_problem(&e), now),
+                }
+                Vec::new()
+            }
+            Reply::Factors(result) => self.factors_reply(result, now),
+            Reply::AddFactorBegun(result) => self.add_begun_reply(result, now),
+            Reply::FactorAdded(result) => self.factor_changed_reply(result.map(|_| ()), true, now),
+            Reply::FactorRemoved(result) => self.factor_changed_reply(result, false, now),
         }
     }
 
     fn fail(&mut self, e: &ClientError, now: Instant) {
+        self.fail_as(e, problem(e), now);
+    }
+
+    fn fail_as(&mut self, e: &ClientError, p: Problem, now: Instant) {
         if let ClientError::Throttled(secs) = e {
             self.throttled_until = Some(now + Duration::from_secs((*secs).min(24 * 3600)));
         }
-        self.notice = Some(Notice::Problem(problem(e)));
+        self.notice = Some(Notice::Problem(p));
+    }
+
+    fn factors_reply(
+        &mut self,
+        result: Result<Vec<FactorInfo>, ClientError>,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let list = match result {
+            Ok(list) => list,
+            Err(ClientError::SessionEnded) => return self.end(Some(Notice::SessionEnded)),
+            Err(e) => {
+                self.fail_as(&e, factor_problem(&e), now);
+                return Vec::new();
+            }
+        };
+        // The proofs the session may use now: a key once one is held, a
+        // code only if sign-in offered one (the FIDO2 policy may not).
+        let has = |m: FactorMethod| list.iter().any(|f| f.method == m);
+        let (totp, key) = (has(FactorMethod::Totp), has(FactorMethod::SecurityKey));
+        if let Some(s) = &mut self.session {
+            s.info.methods = Methods {
+                totp: s.signin_totp && totp,
+                security_key: key,
+            };
+            if let Some(p) = &mut self.factors {
+                p.set_methods(s.info.methods);
+                p.loaded(list);
+            }
+        }
+        Vec::new()
+    }
+
+    fn add_begun_reply(
+        &mut self,
+        result: Result<(AddNonce, AddOffer), ClientError>,
+        now: Instant,
+    ) -> Vec<Effect> {
+        match result {
+            Ok((nonce, offer)) => {
+                if let Some(p) = &mut self.factors {
+                    p.offered(nonce, offer);
+                }
+                Vec::new()
+            }
+            Err(e) if e.needs_step_up() && self.session.as_ref().is_some_and(|s| !s.restricted) => {
+                // Confirm first, then the add goes on by itself.
+                self.after_step_up = self.adding;
+                self.open_step_up();
+                self.notice = Some(Notice::StepUpFirst);
+                Vec::new()
+            }
+            Err(ClientError::SessionEnded) => self.end(Some(Notice::SessionEnded)),
+            Err(e) => {
+                self.fail_as(&e, factor_problem(&e), now);
+                Vec::new()
+            }
+        }
+    }
+
+    fn factor_changed_reply(
+        &mut self,
+        result: Result<(), ClientError>,
+        added: bool,
+        now: Instant,
+    ) -> Vec<Effect> {
+        match result {
+            Ok(()) if self.session.as_ref().is_some_and(|s| s.restricted) => {
+                // The key the policy requires is in: sign in again with it.
+                self.end(Some(Notice::KeyRegistered))
+            }
+            Ok(()) => {
+                self.notice = Some(if added {
+                    Notice::FactorAdded
+                } else {
+                    Notice::FactorRemoved
+                });
+                self.send(Cmd::ListFactors, Busy::Factors { key: false })
+            }
+            Err(ClientError::SessionEnded) => self.end(Some(Notice::SessionEnded)),
+            Err(e) => {
+                self.fail_as(&e, factor_problem(&e), now);
+                Vec::new()
+            }
+        }
     }
 
     fn signed_in_reply(
@@ -534,7 +947,10 @@ impl Flow {
         if info.password_change_required {
             return self.end(Some(Notice::PasswordExpired));
         }
-        if info.factor_enrollment_required {
+        // The FIDO2 policy holds a key-less session to registering a key:
+        // possible only with a key backend here.
+        let restricted = info.factor_enrollment_required;
+        if restricted && !self.key_available {
             return self.end(Some(Notice::KeyRegistrationRequired));
         }
         self.login.wipe();
@@ -542,9 +958,13 @@ impl Flow {
         self.throttled_until = None;
         self.idle_limit = idle_limit(info.idle_timeout_secs);
         self.last_activity = now;
+        self.factors =
+            restricted.then(|| FactorsPanel::new(true, info.methods, self.key_available));
         self.session = Some(Session {
+            signin_totp: info.methods.totp,
             info,
             step_up_until: None,
+            restricted,
         });
         Vec::new()
     }
@@ -557,7 +977,11 @@ impl Flow {
                 }
                 self.step_up = None;
                 self.notice = Some(Notice::SteppedUp);
-                Vec::new()
+                match self.after_step_up.take() {
+                    // The add that asked for it goes on.
+                    Some(method) => self.add_factor(method),
+                    None => Vec::new(),
+                }
             }
             Err(ClientError::SessionEnded) => self.end(Some(Notice::SessionEnded)),
             Err(e) => {
@@ -600,6 +1024,7 @@ impl Flow {
             idle_lock_secs: self.idle_limit.as_secs(),
             step_up_until: s.step_up_until,
             methods: s.info.methods,
+            restricted: s.restricted,
         });
         let step_up = match (&self.step_up, &self.session) {
             (Some(form), Some(s)) => Some(StepUpView {
@@ -610,6 +1035,7 @@ impl Flow {
             }),
             _ => None,
         };
+        let signed_in = self.session.is_some();
         FlowView {
             login,
             busy: self.busy,
@@ -618,6 +1044,16 @@ impl Flow {
             throttle_secs_left,
             session,
             step_up,
+            enroll: self
+                .enroll
+                .as_ref()
+                .filter(|_| !signed_in)
+                .map(EnrollWizard::view),
+            factors: self
+                .factors
+                .as_ref()
+                .filter(|_| signed_in)
+                .map(FactorsPanel::view),
         }
     }
 }
@@ -844,11 +1280,13 @@ mod tests {
     #[test]
     fn an_expired_password_or_a_missing_key_ends_the_session_at_once() {
         let now = Instant::now();
+        // A key-less session under the FIDO2 policy ends at once only when
+        // this build cannot register a key here.
         for (expired, enroll, notice) in [
             (true, false, Notice::PasswordExpired),
             (false, true, Notice::KeyRegistrationRequired),
         ] {
-            let mut f = Flow::new(true, now);
+            let mut f = Flow::new(false, now);
             offered(&mut f, now, BOTH);
             f.type_text(PASSWORD);
             f.tab(false);
@@ -984,6 +1422,288 @@ mod tests {
             now,
         );
         assert_eq!(f.view(now).login.stage, Stage::Secrets(BOTH));
+    }
+
+    fn key_request() -> Box<ferrogate_admin_client::webauthn::CreationRequest> {
+        use ferrogate_admin_client::webauthn::{creation_request, CreationOptions};
+        Box::new(
+            creation_request(&CreationOptions {
+                challenge: vec![3; 32],
+                rp_id: "ferrogate-admin.ferrogate.test".into(),
+                rp_name: "FerroGate".into(),
+                user_id: vec![4; 32],
+                user_name: "alice".into(),
+                display_name: "Alice".into(),
+                pub_key_cred_params: vec![-7],
+                exclude_credential_ids: Vec::new(),
+                user_verification: 1,
+                attestation: 1,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn nonce() -> AddNonce {
+        AddNonce::from_bytes(vec![7; 32])
+    }
+
+    fn totp_row() -> FactorInfo {
+        FactorInfo {
+            factor_id: "totp".into(),
+            method: FactorMethod::Totp,
+            label: "TOTP authenticator".into(),
+            created_at: 0,
+            last_used_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_restricted_session_registers_a_key_and_then_ends() {
+        let now = Instant::now();
+        let code_only = Methods {
+            totp: true,
+            security_key: false,
+        };
+        let mut f = Flow::new(true, now);
+        offered(&mut f, now, code_only);
+        f.type_text(PASSWORD);
+        f.tab(false);
+        f.type_text(CODE);
+        let _ = cmd(f.enter());
+        let mut i = info(code_only, 900);
+        i.factor_enrollment_required = true;
+        assert!(f
+            .on_reply(
+                Reply::SignedIn {
+                    username: "alice".into(),
+                    result: Ok(i),
+                },
+                now,
+            )
+            .is_empty());
+        let v = f.view(now);
+        assert!(v.session.as_ref().unwrap().restricted);
+        assert!(v.factors.as_ref().unwrap().restricted);
+        f.open_step_up();
+        assert!(f.view(now).step_up.is_none(), "no step-up here");
+        assert!(
+            f.open_factors().is_empty(),
+            "the panel is already all there is"
+        );
+        let Cmd::BeginAddFactor {
+            method: FactorMethod::SecurityKey,
+        } = cmd(f.add_factor(FactorMethod::SecurityKey))
+        else {
+            panic!("a key is added");
+        };
+        f.on_reply(
+            Reply::AddFactorBegun(Ok((nonce(), AddOffer::SecurityKey(key_request())))),
+            now,
+        );
+        f.type_text("Desk key");
+        f.tab(false);
+        f.type_text(CODE);
+        clean(&f, now);
+        let Cmd::CompleteAddKey {
+            label,
+            proof: FactorChoice::Code(code),
+            ..
+        } = cmd(f.enter())
+        else {
+            panic!("the key, proven with the code");
+        };
+        assert_eq!((label.as_str(), code.expose()), ("Desk key", CODE));
+        assert_eq!(f.view(now).busy, Some(Busy::Factors { key: true }));
+        let effects = f.on_reply(Reply::FactorAdded(Ok("wa_1".into())), now);
+        assert!(ends(&effects), "sign in again, with the key");
+        let v = f.view(now);
+        assert_eq!(v.notice, Some(Notice::KeyRegistered));
+        assert!(v.session.is_none() && v.factors.is_none());
+    }
+
+    #[test]
+    fn adding_a_factor_steps_up_first_when_asked_and_then_goes_on() {
+        let now = Instant::now();
+        let mut f = signed_in(now, BOTH, 900);
+        let Cmd::ListFactors = cmd(f.open_factors()) else {
+            panic!("the list first");
+        };
+        f.on_reply(Reply::Factors(Ok(vec![totp_row()])), now);
+        let v = f.view(now);
+        assert_eq!(v.factors.as_ref().unwrap().rows.len(), 1);
+        assert_eq!(
+            v.session.unwrap().methods,
+            Methods {
+                totp: true,
+                security_key: false
+            },
+            "no key held yet"
+        );
+        let _ = cmd(f.add_factor(FactorMethod::SecurityKey));
+        let stale = ferrogate_admin_client::error::RpcError::local(
+            ferrogate_admin_client::error::Code::FailedPrecondition,
+            "step_up_required",
+        );
+        f.on_reply(Reply::AddFactorBegun(Err(ClientError::Other(stale))), now);
+        let v = f.view(now);
+        assert_eq!(v.notice, Some(Notice::StepUpFirst));
+        assert!(v.step_up.is_some());
+        f.type_text("654321");
+        let Cmd::StepUp { .. } = cmd(f.enter()) else {
+            panic!("the step-up");
+        };
+        let Cmd::BeginAddFactor {
+            method: FactorMethod::SecurityKey,
+        } = cmd(f.on_reply(Reply::SteppedUp(Ok(1_800_000_000)), now))
+        else {
+            panic!("the add goes on by itself");
+        };
+    }
+
+    #[test]
+    fn a_totp_add_shows_the_seed_once_and_relists_after() {
+        let now = Instant::now();
+        let mut f = signed_in(now, BOTH, 900);
+        let _ = cmd(f.open_factors());
+        let key_row = FactorInfo {
+            factor_id: "wa_1".into(),
+            method: FactorMethod::SecurityKey,
+            label: "Desk".into(),
+            created_at: 0,
+            last_used_at: 0,
+        };
+        f.on_reply(Reply::Factors(Ok(vec![key_row])), now);
+        assert!(f.view(now).factors.unwrap().can_add_totp);
+        let _ = cmd(f.add_factor(FactorMethod::Totp));
+        f.on_reply(
+            Reply::AddFactorBegun(Ok((
+                nonce(),
+                AddOffer::Totp(crate::admin::seed::tests::seed()),
+            ))),
+            now,
+        );
+        assert!(f.seed_display().is_some());
+        f.toggle_seed_text();
+        assert!(f.seed_display().unwrap().text.is_some());
+        let json = serde_json::to_string(&f.view(now)).unwrap();
+        assert!(!json.contains(crate::admin::seed::tests::SECRET));
+        assert!(!json.contains("JBSW"));
+        f.type_text(CODE);
+        let Cmd::CompleteAddTotp {
+            proof: FactorChoice::SecurityKey,
+            ..
+        } = cmd(f.enter())
+        else {
+            panic!("proven by the key");
+        };
+        assert!(f.seed_display().is_none(), "gone once used");
+        let Cmd::ListFactors = cmd(f.on_reply(Reply::FactorAdded(Ok("totp".into())), now)) else {
+            panic!("the list is read again");
+        };
+        assert_eq!(f.view(now).notice, Some(Notice::FactorAdded));
+    }
+
+    #[test]
+    fn a_lock_or_a_sign_out_drops_a_late_seed_and_the_wizard() {
+        let now = Instant::now();
+        let mut f = signed_in(now, BOTH, 900);
+        let _ = cmd(f.open_factors());
+        f.on_reply(Reply::Factors(Ok(vec![totp_row()])), now);
+        let _ = cmd(f.add_factor(FactorMethod::SecurityKey));
+        assert!(ends(&f.sign_out()));
+        let late = f.on_reply(
+            Reply::AddFactorBegun(Ok((
+                nonce(),
+                AddOffer::Totp(crate::admin::seed::tests::seed()),
+            ))),
+            now,
+        );
+        assert!(late.is_empty());
+        assert!(f.seed_display().is_none() && f.view(now).factors.is_none());
+
+        // A wizard holding a seed is wiped by the idle lock.
+        let mut g = Flow::new(false, now);
+        g.open_enrollment();
+        g.type_text("fgae_token");
+        let _ = cmd(g.enter());
+        g.on_reply(
+            Reply::EnrollmentBegun(Ok(Box::new(enrollment_offer()))),
+            now,
+        );
+        assert!(g.seed_display().is_some());
+        assert!(ends(&g.tick(now + DEFAULT_IDLE)));
+        assert!(g.seed_display().is_none() && g.view(now).enroll.is_none());
+        assert_eq!(g.view(now).notice, Some(Notice::Locked));
+    }
+
+    fn enrollment_offer() -> ferrogate_admin_client::enroll::EnrollmentOffer {
+        ferrogate_admin_client::enroll::EnrollmentOffer {
+            username: "new.person".into(),
+            username_choosable: false,
+            display_name: "New Person".into(),
+            password_min_len: 24,
+            totp: Some(crate::admin::seed::tests::seed()),
+            key: None,
+        }
+    }
+
+    #[test]
+    fn enrollment_runs_through_the_flow_and_ends_on_the_sign_in_form() {
+        const NEW_PASSWORD: &str = "Tr0ub4dor&3-Correct!Horse_Battery";
+        let now = Instant::now();
+        let mut f = Flow::new(false, now);
+        f.type_text("half-typed");
+        f.open_enrollment();
+        assert_eq!(f.view(now).login.username, "", "the form is wiped");
+        f.type_text("fgae_token");
+        let Cmd::BeginEnrollment { token } = cmd(f.enter()) else {
+            panic!("BeginEnrollment");
+        };
+        assert_eq!(token.expose(), "fgae_token");
+        assert_eq!(f.view(now).busy, Some(Busy::Enroll { key: false }));
+        f.on_reply(
+            Reply::EnrollmentBegun(Ok(Box::new(enrollment_offer()))),
+            now,
+        );
+        let v = f.view(now).enroll.unwrap();
+        assert!(v.totp_offered && v.stage == EnrollStage::Details);
+        f.type_text(NEW_PASSWORD);
+        f.tab(false);
+        f.type_text(NEW_PASSWORD);
+        f.tab(false);
+        f.type_text(CODE);
+        let json = serde_json::to_string(&f.view(now)).unwrap();
+        for secret in [NEW_PASSWORD, CODE, "fgae_token", "JBSW"] {
+            assert!(!json.contains(secret), "{secret}");
+        }
+        let Cmd::CompleteEnrollment {
+            password,
+            code,
+            key,
+            ..
+        } = cmd(f.enter())
+        else {
+            panic!("CompleteEnrollment");
+        };
+        assert_eq!(password.expose(), NEW_PASSWORD);
+        assert_eq!(code.as_ref().map(Secret::expose), Some(CODE));
+        assert!(key.is_none());
+        // A refused attempt keeps the wizard and says so generically.
+        f.on_reply(Reply::Enrolled(Err(ClientError::Rejected)), now);
+        let v = f.view(now);
+        assert_eq!(v.notice, Some(Notice::Problem(Problem::EnrollmentRejected)));
+        assert_eq!(v.enroll.unwrap().password_len, 0, "typed again");
+        f.type_text(NEW_PASSWORD);
+        f.tab(false);
+        f.type_text(NEW_PASSWORD);
+        f.tab(false);
+        f.type_text(CODE);
+        let _ = cmd(f.enter());
+        f.on_reply(Reply::Enrolled(Ok("adm_2".into())), now);
+        let v = f.view(now);
+        assert_eq!(v.notice, Some(Notice::Enrolled));
+        assert!(v.enroll.is_none() && f.seed_display().is_none());
+        assert_eq!(v.login.stage, Stage::Username);
     }
 
     #[test]

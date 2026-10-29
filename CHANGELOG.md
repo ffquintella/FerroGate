@@ -48,6 +48,20 @@ record them.
   node until T223: run it on every replica. Superseded SVIDs that have not
   expired are not tracked and become acceptable again; `docs/operations.md`
   §"Revocation" says when to wait instead.
+- Enroll with a token and manage TOTP and FIDO2 second factors from `mia-tray-admin`, through `ferrogate-admin-client` (S53, S51, M40, T282)
+  **Enroll with a token…** redeems an enrollment or reset token: the new
+  password, a TOTP seed shown once as an in-memory QR code (text on
+  request) with its confirming code, and/or a security key registered over
+  the client's own `clientDataJSON`; at least one factor, both recommended.
+  **Second factors** lists the account's factors, adds an authenticator app
+  or a key (after a step-up, with a fresh proof of a factor already held)
+  and removes one (never the last). A key-less session under
+  `CMIS_ADMIN_TRAY_FIDO2_GROUPS` opens only "Register a security key", then
+  ends so the administrator signs in again with it. The seed lives in wiped
+  buffers and is painted as squares and single glyphs, never as a string.
+  No platform key backend ships yet (tested with a software key against an
+  in-process CMIS). New optional dependency `qrcode` 0.14 (no default
+  features) in the admin build only.
 - Sign in to CMIS and step up from `mia-tray-admin` with a password plus a TOTP code or a FIDO2 security key, through the new shared `ferrogate-admin-client` crate (S53, S51, M40, T281)
   The user name is sent first (`BeginLogin`), so the window offers only the
   factors the server allows (a key only under `CMIS_ADMIN_TRAY_FIDO2_GROUPS`);

@@ -10,14 +10,22 @@
 //! The CMIS link is a worker thread ([`crate::admin::session`]) that alone
 //! holds the session token. Nothing is persisted: no `persistence` feature,
 //! [`eframe::NativeOptions::persist_window`] off, no `save`, no
-//! `persist_egui_memory`.
+//! `persist_egui_memory`. Enrollment and second factors: [`enroll`],
+//! [`factors`]; a TOTP seed is painted by [`seed`], never as a string.
+
+mod enroll;
+mod factors;
+mod seed;
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use ferrogate_admin_client::factors::FactorMethod;
 
+use crate::admin::enroll::EnrollField;
+use crate::admin::factors::FactorField;
 use crate::admin::flow::{Busy, Effect, Flow, FlowView, Notice, Problem};
 use crate::admin::login::{Field, Stage, Submission};
 use crate::admin::session::{self, Link, SHUTDOWN_WAIT};
@@ -31,7 +39,7 @@ pub fn run(lang: Lang) -> ExitCode {
         viewport: egui::ViewportBuilder::default()
             // Never the user name or any record data (F22 §3).
             .with_title(Msg::AdminAppName.text(lang))
-            .with_inner_size([540.0, 480.0])
+            .with_inner_size([560.0, 620.0])
             .with_min_inner_size([440.0, 380.0]),
         persist_window: false,
         ..Default::default()
@@ -215,8 +223,12 @@ impl AdminApp {
             Problem::ServerError => Msg::AdminServerError.text(lang).to_string(),
             Problem::Incomplete => Msg::AdminMissingFields.text(lang).to_string(),
             Problem::NotSent => Msg::AdminNotSent.text(lang).to_string(),
+            Problem::EnrollmentRejected => Msg::AdminEnrollRejected.text(lang).to_string(),
+            Problem::PasswordPolicy => Msg::AdminPasswordPolicy.text(lang).to_string(),
+            Problem::FactorRejected => Msg::AdminFactorRejected.text(lang).to_string(),
+            Problem::LastFactor => Msg::AdminLastFactor.text(lang).to_string(),
         };
-        if view.login.error.is_some() && view.session.is_none() {
+        if view.login.error.is_some() && view.session.is_none() && view.enroll.is_none() {
             // Generic on purpose (F20): never says which part was wrong.
             return Some(Msg::AdminMissingFields.text(lang).to_string());
         }
@@ -227,6 +239,11 @@ impl AdminApp {
             Notice::SessionEnded => Msg::AdminSessionEnded.text(lang).to_string(),
             Notice::PasswordExpired => Msg::AdminPasswordExpired.text(lang).to_string(),
             Notice::KeyRegistrationRequired => Msg::AdminKeyRequired.text(lang).to_string(),
+            Notice::StepUpFirst => Msg::AdminStepUpFirst.text(lang).to_string(),
+            Notice::Enrolled => Msg::AdminEnrolled.text(lang).to_string(),
+            Notice::FactorAdded => Msg::AdminFactorAdded.text(lang).to_string(),
+            Notice::FactorRemoved => Msg::AdminFactorRemoved.text(lang).to_string(),
+            Notice::KeyRegistered => Msg::AdminKeyRegistered.text(lang).to_string(),
             Notice::SteppedUp => {
                 let left = view
                     .session
@@ -242,51 +259,98 @@ impl AdminApp {
         Some(text)
     }
 
+    /// The window's content for `view` (buttons pressed go to `actions`).
+    fn body(
+        &self,
+        ui: &mut egui::Ui,
+        view: &FlowView,
+        actions: &mut Vec<Action>,
+        clicked: &mut Option<Field>,
+    ) {
+        let lang = self.lang;
+        match &self.server {
+            Server::Ready { endpoint, pin } => {
+                ui.weak(fill(
+                    Msg::AdminServerLine.text(lang),
+                    &[("endpoint", endpoint), ("pin", pin)],
+                ));
+            }
+            Server::Missing(why) => {
+                ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminNoServer.text(lang));
+                ui.weak(why);
+            }
+        }
+        ui.add_space(6.0);
+        let idle = view.busy.is_none();
+        // Borrowed for this frame only; never copied into a view model.
+        let shown = self.flow.seed_display();
+        if view.session.is_some() {
+            signed_in(ui, lang, view, actions);
+            if let Some(f) = &view.factors {
+                ui.separator();
+                factors::panel(ui, lang, f, shown.as_ref(), idle, actions);
+            }
+        } else if let Some(w) = &view.enroll {
+            enroll::wizard(ui, lang, w, shown.as_ref(), idle, actions);
+        } else {
+            sign_in(ui, lang, view, actions, clicked);
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(
+                    idle,
+                    egui::Button::new(Msg::AdminEnrollOpen.text(lang)).small(),
+                )
+                .clicked()
+            {
+                actions.push(Action::OpenEnrollment);
+            }
+        }
+        ui.add_space(8.0);
+        if let Some(busy) = view.busy {
+            let msg = match busy {
+                Busy::Offer => Msg::AdminChecking,
+                Busy::SignIn { key: true }
+                | Busy::StepUp { key: true }
+                | Busy::Enroll { key: true }
+                | Busy::Factors { key: true } => Msg::AdminTouchKey,
+                Busy::SignIn { key: false } => Msg::AdminSigningIn,
+                Busy::StepUp { key: false } => Msg::AdminConfirming,
+                Busy::Enroll { key: false } | Busy::Factors { key: false } => Msg::AdminWorking,
+            };
+            ui.label(msg.text(lang));
+        } else if let Some(text) = self.notice_text(view) {
+            ui.label(text);
+        }
+        ui.add_space(12.0);
+        ui.weak(Msg::AdminMemoryOnly.text(lang));
+    }
+
     /// Draw one frame at `now`.
     fn show(&mut self, ui: &mut egui::Ui, now: Instant) {
         let ctx = ui.ctx().clone();
         self.read_input(&ctx, now);
         let view = self.flow.view(now);
-        let lang = self.lang;
         let mut clicked: Option<Field> = None;
         let mut actions: Vec<Action> = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {
-            match &self.server {
-                Server::Ready { endpoint, pin } => {
-                    ui.weak(fill(
-                        Msg::AdminServerLine.text(lang),
-                        &[("endpoint", endpoint), ("pin", pin)],
-                    ));
-                }
-                Server::Missing(why) => {
-                    ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminNoServer.text(lang));
-                    ui.weak(why);
-                }
-            }
-            ui.add_space(6.0);
-            if view.session.is_some() {
-                signed_in(ui, lang, &view, &mut actions);
-            } else {
-                sign_in(ui, lang, &view, &mut actions, &mut clicked);
-            }
-            ui.add_space(8.0);
-            if let Some(busy) = view.busy {
-                let msg = match busy {
-                    Busy::Offer => Msg::AdminChecking,
-                    Busy::SignIn { key: true } | Busy::StepUp { key: true } => Msg::AdminTouchKey,
-                    Busy::SignIn { key: false } => Msg::AdminSigningIn,
-                    Busy::StepUp { key: false } => Msg::AdminConfirming,
-                };
-                ui.label(msg.text(lang));
-            } else if let Some(text) = self.notice_text(&view) {
-                ui.label(text);
-            }
-            ui.add_space(12.0);
-            ui.weak(Msg::AdminMemoryOnly.text(lang));
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.body(ui, &view, &mut actions, &mut clicked);
+            });
         });
         if let Some(field) = clicked {
             self.flow.focus(field);
         }
+        self.act(actions);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let effects = self.flow.close();
+            self.apply(effects);
+        }
+        // The idle lock and the throttle countdown need a clock.
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    /// Carry out the buttons pressed this frame.
+    fn act(&mut self, actions: Vec<Action>) {
         for action in actions {
             let effects = match action {
                 Action::Continue => self.flow.continue_with(),
@@ -305,20 +369,52 @@ impl AdminApp {
                     Vec::new()
                 }
                 Action::SignOut => self.flow.sign_out(),
+                Action::OpenEnrollment => {
+                    self.flow.open_enrollment();
+                    Vec::new()
+                }
+                Action::CloseEnrollment => {
+                    self.flow.close_enrollment();
+                    Vec::new()
+                }
+                Action::FocusEnroll(field) => {
+                    self.flow.focus_enroll(field);
+                    Vec::new()
+                }
+                Action::EnrollContinue => self.flow.enroll_continue(),
+                Action::EnrollRegisterKey => self.flow.enroll_register_key(),
+                Action::EnrollFinish => self.flow.enroll_finish(),
+                Action::ToggleSeedText => {
+                    self.flow.toggle_seed_text();
+                    Vec::new()
+                }
+                Action::OpenFactors => self.flow.open_factors(),
+                Action::CloseFactors => {
+                    self.flow.close_factors();
+                    Vec::new()
+                }
+                Action::FocusFactor(field) => {
+                    self.flow.focus_factor(field);
+                    Vec::new()
+                }
+                Action::AddFactor(method) => self.flow.add_factor(method),
+                Action::RemoveFactor(id) => {
+                    self.flow.remove_factor(&id);
+                    Vec::new()
+                }
+                Action::CancelFactorForm => {
+                    self.flow.cancel_factor_form();
+                    Vec::new()
+                }
+                Action::SubmitFactor(how) => self.flow.submit_factor(how),
             };
             self.apply(effects);
         }
-        if ctx.input(|i| i.viewport().close_requested()) {
-            let effects = self.flow.close();
-            self.apply(effects);
-        }
-        // The idle lock and the throttle countdown need a clock.
-        ctx.request_repaint_after(Duration::from_secs(1));
     }
 }
 
 /// A button the administrator pressed this frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
     Continue,
     ChangeUser,
@@ -327,6 +423,20 @@ enum Action {
     StepUp(Submission),
     CancelStepUp,
     SignOut,
+    OpenEnrollment,
+    CloseEnrollment,
+    FocusEnroll(EnrollField),
+    EnrollContinue,
+    EnrollRegisterKey,
+    EnrollFinish,
+    ToggleSeedText,
+    OpenFactors,
+    CloseFactors,
+    FocusFactor(FactorField),
+    AddFactor(FactorMethod),
+    RemoveFactor(String),
+    CancelFactorForm,
+    SubmitFactor(Submission),
 }
 
 fn sign_in(
@@ -433,6 +543,17 @@ fn signed_in(ui: &mut egui::Ui, lang: Lang, view: &FlowView, actions: &mut Vec<A
         return;
     };
     let idle = view.busy.is_none();
+    if s.restricted {
+        // Held to registering a key: nothing else is offered.
+        ui.label(fill(
+            Msg::AdminSignedInAs.text(lang),
+            &[("name", &s.display_name)],
+        ));
+        if ui.button(Msg::AdminSignOut.text(lang)).clicked() {
+            actions.push(Action::SignOut);
+        }
+        return;
+    }
     ui.heading(fill(
         Msg::AdminSignedInAs.text(lang),
         &[("name", &s.display_name)],
@@ -502,6 +623,13 @@ fn signed_in(ui: &mut egui::Ui, lang: Lang, view: &FlowView, actions: &mut Vec<A
                 .clicked()
             {
                 actions.push(Action::OpenStepUp);
+            }
+            if view.factors.is_none()
+                && ui
+                    .add_enabled(idle, egui::Button::new(Msg::AdminFactorsOpen.text(lang)))
+                    .clicked()
+            {
+                actions.push(Action::OpenFactors);
             }
             if ui.button(Msg::AdminSignOut.text(lang)).clicked() {
                 actions.push(Action::SignOut);
@@ -601,6 +729,15 @@ mod tests {
                         && matches!(factor, FactorChoice::Code(c) if c.expose() == "123456");
                 }
                 Cmd::StepUp { .. } => seen.cmds.push("step_up"),
+                Cmd::BeginEnrollment { .. } => seen.cmds.push("begin_enrollment"),
+                Cmd::EnrollKey { .. } => seen.cmds.push("enroll_key"),
+                Cmd::CompleteEnrollment { .. } => seen.cmds.push("complete_enrollment"),
+                Cmd::ListFactors => seen.cmds.push("list_factors"),
+                Cmd::BeginAddFactor { .. } => seen.cmds.push("begin_add_factor"),
+                Cmd::CompleteAddTotp { .. } | Cmd::CompleteAddKey { .. } => {
+                    seen.cmds.push("complete_add_factor");
+                }
+                Cmd::RemoveFactor { .. } => seen.cmds.push("remove_factor"),
             }
             true
         }
@@ -869,6 +1006,176 @@ mod tests {
         let (ends, password_len) = run(vec![click]);
         assert_eq!(ends, 0, "a click is activity");
         assert!(password_len > 0);
+    }
+
+    /// Run one frame; count the filled rectangles it painted and return
+    /// its texts.
+    fn frame_rects(
+        ctx: &egui::Context,
+        app: &mut AdminApp,
+        events: Vec<egui::Event>,
+    ) -> (usize, Vec<String>) {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let mut output = ctx.run_ui(input, |ui| app.show(ui, now));
+        output.textures_delta.clear();
+        let mut rects = 0;
+        let mut texts = Vec::new();
+        for s in &output.shapes {
+            match &s.shape {
+                egui::epaint::Shape::Rect(_) => rects += 1,
+                egui::epaint::Shape::Text(t) => texts.push(t.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        (rects, texts)
+    }
+
+    fn enrollment_offer() -> ferrogate_admin_client::enroll::EnrollmentOffer {
+        ferrogate_admin_client::enroll::EnrollmentOffer {
+            username: "new.person".into(),
+            username_choosable: false,
+            display_name: "New\u{1b}[2J Person".into(),
+            password_min_len: 24,
+            totp: Some(crate::admin::seed::tests::seed()),
+            key: None,
+        }
+    }
+
+    #[test]
+    fn the_seed_is_painted_as_squares_and_single_glyphs_only() {
+        use crate::admin::seed::tests::SECRET;
+        const TOKEN: &str = "fgae_0123456789abcdef";
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        app.flow.open_enrollment();
+        let mut painted = frame(&ctx, &mut app, vec![egui::Event::Paste(TOKEN.into())]);
+        painted.extend(frame(&ctx, &mut app, vec![key(egui::Key::Enter)]));
+        assert_eq!(seen.borrow().cmds, vec!["begin_enrollment"]);
+        seen.borrow_mut()
+            .replies
+            .push_back(Reply::EnrollmentBegun(Ok(Box::new(enrollment_offer()))));
+        let (rects, texts) = frame_rects(&ctx, &mut app, Vec::new());
+        assert!(rects > 200, "the QR modules are painted: {rects}");
+        painted.extend(texts);
+        app.flow.toggle_seed_text();
+        let (_, texts) = frame_rects(&ctx, &mut app, Vec::new());
+        let glyphs: String = texts
+            .iter()
+            .filter(|t| t.chars().count() == 1)
+            .map(String::as_str)
+            .collect();
+        assert!(
+            glyphs.contains(&SECRET[..16]),
+            "the text is shown: {glyphs}"
+        );
+        painted.extend(texts);
+        let joined = painted.join("\n");
+        assert!(joined.contains("new.person") && !joined.contains('\u{1b}'));
+        // No galley ever held three characters of the seed in a row, or the
+        // token; neither did egui's memory.
+        for window in SECRET.as_bytes().windows(3) {
+            let run = std::str::from_utf8(window).unwrap();
+            assert!(
+                painted.iter().all(|t| !t.contains(run)),
+                "{run} painted in one galley"
+            );
+        }
+        assert!(painted
+            .iter()
+            .all(|t| !t.contains(SECRET) && !t.contains(TOKEN)));
+        let memory = ctx.memory(|m| format!("{m:?}"));
+        assert!(!memory.contains(&SECRET[..8]) && !memory.contains(TOKEN));
+        // Closing the wizard wipes it: nothing of the seed is painted again.
+        app.flow.close_enrollment();
+        let (rects, _) = frame_rects(&ctx, &mut app, Vec::new());
+        assert!(rects < 50, "{rects}");
+        assert!(app.flow.seed_display().is_none());
+    }
+
+    #[test]
+    fn the_factors_panel_shows_inert_labels_and_sends_a_removal() {
+        use ferrogate_admin_client::factors::FactorInfo;
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        signed_in_as(&ctx, &mut app, &seen, "Alice");
+        let effects = app.flow.open_factors();
+        app.apply(effects);
+        let row = |id: &str, method, label: &str| FactorInfo {
+            factor_id: id.into(),
+            method,
+            label: label.into(),
+            created_at: 1_790_000_000,
+            last_used_at: 0,
+        };
+        seen.borrow_mut().replies.push_back(Reply::Factors(Ok(vec![
+            row("totp", FactorMethod::Totp, "TOTP authenticator"),
+            row("wa_1", FactorMethod::SecurityKey, "Desk\u{1b}[2J\u{202e}"),
+        ])));
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("Your second factors"), "{painted}");
+        assert!(painted.contains("Security key: Desk"), "{painted}");
+        assert!(!painted.contains('\u{1b}') && !painted.contains('\u{202e}'));
+        assert!(painted.contains("2026-09-21"), "{painted}");
+        assert!(painted.contains("Remove"));
+        app.flow.remove_factor("wa_1");
+        frame(&ctx, &mut app, vec![egui::Event::Text("123456".into())]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(!painted.contains("123456"), "masked");
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert_eq!(
+            seen.borrow().cmds,
+            vec!["offer", "sign_in", "list_factors", "remove_factor"]
+        );
+    }
+
+    #[test]
+    fn a_restricted_session_shows_only_key_registration() {
+        let ctx = egui::Context::default();
+        let seen = Rc::new(RefCell::new(Seen::default()));
+        let server = Server::Ready {
+            endpoint: "https://cmis:8444".into(),
+            pin: fingerprint(&"ab".repeat(48)),
+        };
+        let mut app = AdminApp::new(
+            Lang::En,
+            server,
+            Some(Box::new(FakeLink(Rc::clone(&seen)))),
+            true,
+        );
+        to_secrets(&ctx, &mut app, &seen);
+        frame(&ctx, &mut app, vec![egui::Event::Text(PASSWORD.into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Tab)]);
+        frame(&ctx, &mut app, vec![egui::Event::Text("123456".into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        seen.borrow_mut().replies.push_back(Reply::SignedIn {
+            username: "alice".into(),
+            result: Ok(LoginInfo {
+                idle_timeout_secs: 900,
+                absolute_expires_at: 0,
+                aal: 2,
+                password_change_required: false,
+                factor_enrollment_required: true,
+                admin_id: "adm_1".into(),
+                display_name: "Alice".into(),
+                groups: vec!["ferrogate-approvers".into()],
+                methods: Methods {
+                    totp: true,
+                    security_key: false,
+                },
+            }),
+        });
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(
+            painted.contains("Register a security key to continue"),
+            "{painted}"
+        );
+        assert!(!painted.contains("Confirm it is you"), "{painted}");
+        assert!(!painted.contains("Second factors"), "{painted}");
+        assert!(painted.contains("Register security key"), "{painted}");
     }
 
     #[test]

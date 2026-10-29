@@ -268,8 +268,9 @@ check-tray-isolation` asserts that the `mia-tray` dependency graph contains no
 admin build does link `ferrogate-admin-client` (so the check is not blind), and
 that `eframe` persistence stays off.
 
-Current state (T281): sign-in and step-up against CMIS. Factor enrollment, the
-approval views, "Add application" and packaging follow in T282 to T285.
+Current state (T282): sign-in and step-up against CMIS, token enrollment and
+second-factor management. The approval views, "Add application" and packaging
+follow in T283 to T285.
 
 ### Configuration
 
@@ -311,8 +312,9 @@ compare. A first-run setup screen is not built yet.
 Failures are generic ("Sign-in failed"), a throttle shows its countdown, and a
 factor that is not offered or a cancelled key prompt sends no `Login`, so it
 counts no throttle failure. An expired password ends the session with a pointer
-to `ferrogate-tui` or the CLI; an account that must register a key first
-(FIDO2 policy) is told so (registration arrives with T282).
+to `ferrogate-tui` or the CLI. An account that must register a key first
+(FIDO2 policy) gets the restricted session described below; without a key
+backend in this build it is told so and the session ends.
 
 The window locks 30 s before the server's idle timeout (the server value is
 clamped to 1–15 min), also on a half-typed form: everything is wiped and the
@@ -332,6 +334,47 @@ is reached through the `ferrogate_admin_client::webauthn::Authenticator` trait.
 AuthenticationServices, Linux CTAP2 over USB HID): the key button is disabled
 with an explanation, and TOTP works unless the FIDO2 policy requires a key.
 The flows are tested with a software authenticator against an in-process CMIS.
+
+### Enrolling and managing second factors
+
+**Enroll with a token…** (on the sign-in screen) redeems a single-use
+enrollment or reset token, pasted into a masked field (`BeginEnrollment`). The
+wizard shows the account name, asks for the new password twice (at least the
+policy's length; the server checks the rest and a reset that kept the password
+ignores it), and then, as the token offers:
+
+- **authenticator app (TOTP):** the seed as a QR code painted in memory, and as
+  text on request (**Show the key as text**), then the code the app shows;
+- **security key:** an optional label and **Register security key** (the
+  key's own `makeCredential` prompt, user verification required, `none`
+  attestation; the client writes the `clientDataJSON` as for sign-in).
+
+At least one factor is required and both are recommended; **Finish
+enrollment** sends the password and the proof of each (`CompleteEnrollment`). A
+password-only reset asks for the current authenticator's code instead. A
+bootstrap token is refused here: the first operator enrolls with `ferrogate
+admin bootstrap` on the server host.
+
+Signed in, **Second factors** lists the account's factors (`ListMyFactors`,
+labels escaped) and offers **Add an authenticator app** (when the account has
+none; proven with a security key), **Add a security key** (proven with a code
+or another key) and **Remove** (never the last one; the account's other
+sessions end). Adding asks the server first (`BeginAddFactor`, which needs a
+step-up in the last 5 minutes: the window asks for it and then goes on), then
+a fresh proof of a factor already held (`CompleteAddFactor`; a key proof signs
+a fresh `BeginStepUp` challenge). A refused code or proof changes nothing and
+the add starts again with a new seed.
+
+Under `CMIS_ADMIN_TRAY_FIDO2_GROUPS`, an account without a key that signs in
+with its code gets a **restricted** session: the window offers only **Register
+a security key** (proven with the code), then ends the session so the
+administrator signs in again with the key.
+
+The seed is shown once: it lives in wiped buffers (the URI is wiped as soon as
+the QR matrix and the text are made), is never copied to the clipboard, and is
+dropped when the wizard or form closes, is used, or the window locks. The QR
+code is painted as squares and the text one character at a time, so no `egui`
+galley holds the seed (tests scan the painted shapes and `egui` memory).
 
 Credential handling:
 
@@ -354,8 +397,9 @@ Credential handling:
 
 Residual risk: the toolkit keeps a typed character in its per-frame input queue
 until the frame ends, and input-method (IME) composition is not supported in the
-secret fields. prost's request buffers cannot be wiped (F20 §13): a password or
-code is in one encoded request for the duration of that call. If closing the
+secret fields. prost's request buffers cannot be wiped (F20 §13): a password,
+code or enrollment token is in one encoded request for the duration of that
+call, and the QR encoder's scratch buffers are freed unwiped. If closing the
 window cannot get the `Logout` out within 3 s, the process exits anyway and the
 server's idle timeout ends the session.
 

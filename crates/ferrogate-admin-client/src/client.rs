@@ -152,14 +152,14 @@ impl AdminSession {
         self.slot.handle(logout_tx)
     }
 
-    fn client_info(&self) -> Option<ClientInfo> {
+    pub(crate) fn client_info(&self) -> Option<ClientInfo> {
         Some(ClientInfo {
             kind: self.cfg.client_kind,
             version: env!("CARGO_PKG_VERSION").to_string(),
         })
     }
 
-    async fn channel(&mut self) -> Result<Channel, String> {
+    pub(crate) async fn channel(&mut self) -> Result<Channel, String> {
         if let Some(ch) = &self.channel {
             return Ok(ch.clone());
         }
@@ -184,11 +184,20 @@ impl AdminSession {
     }
 
     /// A deadline drops the channel, so the next call redials.
-    fn settle<T>(&mut self, r: Result<T, ClientError>) -> Result<T, ClientError> {
+    pub(crate) fn settle<T>(&mut self, r: Result<T, ClientError>) -> Result<T, ClientError> {
         if r.as_ref().err().is_some_and(ClientError::is_deadline) {
             self.channel = None;
         }
         r
+    }
+
+    /// Settle an authenticated call: a session the server ended is wiped
+    /// here (the window then shows it as ended), and a deadline redials.
+    pub(crate) fn finish<T>(&mut self, r: Result<T, ClientError>) -> Result<T, ClientError> {
+        if matches!(r, Err(ClientError::SessionEnded)) {
+            self.slot.wipe();
+        }
+        self.settle(r)
     }
 
     /// `BeginLogin` only: which second factors the server offers `username`
@@ -427,7 +436,7 @@ impl AdminSession {
 }
 
 /// Classify a failure of an authenticated, non-credential call.
-fn authenticated_error(s: &tonic::Status) -> ClientError {
+pub(crate) fn authenticated_error(s: &tonic::Status) -> ClientError {
     let e = RpcError::from_status(s);
     if e.is_session_invalid() {
         ClientError::SessionEnded
@@ -438,7 +447,7 @@ fn authenticated_error(s: &tonic::Status) -> ClientError {
 
 /// Ask `key` for an assertion over `challenge`, off the async threads (the
 /// operating system's prompt blocks until a touch, a cancel or the timeout).
-async fn ask_key(
+pub(crate) async fn ask_key(
     key: Arc<dyn Authenticator>,
     challenge: &WebAuthnChallenge,
 ) -> Result<WebAuthnAssertion, ClientError> {

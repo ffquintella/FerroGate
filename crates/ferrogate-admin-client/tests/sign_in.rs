@@ -9,154 +9,19 @@
 #[path = "../../cmis/tests/support/mod.rs"]
 mod support;
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use ferro_audit::AuditEvent;
 use ferro_crypto::pin::SpkiPin;
-use ferro_crypto::tls::ProviderMode;
-use ferrogate_admin_client::client::{AdminSession, ClientConfig, Factor, Methods};
+use ferrogate_admin_client::client::{Factor, Methods};
 use ferrogate_admin_client::error::ClientError;
-use ferrogate_admin_client::secret::Secret;
 use ferrogate_admin_client::session::SessionHandle;
-use ferrogate_admin_client::transport::{CONNECT_TIMEOUT, RPC_TIMEOUT};
-use ferrogate_admin_client::webauthn::{
-    AssertionRequest, Authenticator, AuthenticatorAssertion, AuthenticatorError,
-};
-use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use support::soft_authenticator::{SoftAuthenticator, UP, UV};
-use support::{Admin1, Harness};
-use tokio::net::TcpListener;
+use ferrogate_admin_client::webauthn::AuthenticatorError;
+use support::soft_authenticator::SoftAuthenticator;
 
-const APPROVERS: &str = "ferrogate-approvers";
-
-/// The harness's software key behind the client's trait: it signs the
-/// `clientDataJSON` hash the client built, as a CTAP2 device would.
-struct SoftKey {
-    key: Mutex<SoftAuthenticator>,
-    /// Runs inside the "prompt" (to lock the client meanwhile).
-    during: Option<Box<dyn Fn() + Send + Sync>>,
-    /// Answer with this error instead (a cancelled prompt).
-    fail: Option<AuthenticatorError>,
-}
-
-impl SoftKey {
-    fn new(key: SoftAuthenticator) -> Arc<Self> {
-        Arc::new(Self {
-            key: Mutex::new(key),
-            during: None,
-            fail: None,
-        })
-    }
-}
-
-impl Authenticator for SoftKey {
-    fn get_assertion(
-        &self,
-        req: &AssertionRequest,
-    ) -> Result<AuthenticatorAssertion, AuthenticatorError> {
-        if let Some(f) = &self.during {
-            f();
-        }
-        if let Some(e) = &self.fail {
-            return Err(e.clone());
-        }
-        let mut k = self.key.lock().unwrap();
-        if !req.allow_credential_ids.is_empty()
-            && !req.allow_credential_ids.contains(&k.credential_id)
-        {
-            return Err(AuthenticatorError::NoCredential);
-        }
-        if k.counter != 0 {
-            k.counter += 1;
-        }
-        let authenticator_data = k.auth_data(&req.rp_id, UP | UV, k.counter, false);
-        let mut signed = authenticator_data.clone();
-        signed.extend_from_slice(&req.client_data_hash);
-        Ok(AuthenticatorAssertion {
-            credential_id: k.credential_id.clone(),
-            signature: k.sign(&signed),
-            authenticator_data,
-            user_handle: Vec::new(),
-        })
-    }
-}
-
-/// An in-process CMIS behind a real TLS admin listener.
-struct Server {
-    h: Harness,
-    endpoint: String,
-    pin: SpkiPin,
-    root: Admin1,
-    root_token: String,
-}
-
-async fn server(tag: &str, fido2_groups: &[&str]) -> Server {
-    let groups: Vec<String> = fido2_groups.iter().map(|g| (*g).to_string()).collect();
-    let h = support::harness_with(tag, |c| c.tray_fido2_groups = groups).await;
-    let ck = rcgen::generate_simple_self_signed(vec!["cmis.test.ferrogate.invalid".to_string()])
-        .unwrap();
-    let pin = SpkiPin::from_certificate_der(ck.cert.der().as_ref()).unwrap();
-    let tls = ferro_crypto::transport::server_config(
-        ProviderMode::HybridOnly,
-        vec![ck.cert.der().clone()],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der())),
-    )
-    .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(cmis::server::serve_admin(
-        listener,
-        tls,
-        Arc::clone(&h.cmis),
-        Arc::clone(&h.authz),
-    ));
-    let root = support::bootstrap(&h, "root-admin").await;
-    let root_token = h.login(&root).await;
-    Server {
-        h,
-        endpoint: format!("https://{addr}"),
-        pin,
-        root,
-        root_token,
-    }
-}
-
-impl Server {
-    fn session(&self, pin: SpkiPin) -> AdminSession {
-        AdminSession::new(ClientConfig {
-            endpoint: self.endpoint.clone(),
-            pins: vec![pin],
-            device_token_path: None,
-            connect_timeout: CONNECT_TIMEOUT,
-            rpc_timeout: RPC_TIMEOUT,
-            client_kind: ferrogate_admin_client::client_kind::TRAY,
-        })
-    }
-
-    async fn key_holder(&self, name: &str, groups: &[&str], key: &SoftAuthenticator) -> Admin1 {
-        self.h
-            .create_and_enroll_key(&self.root, &self.root_token, name, groups, key, true)
-            .await
-    }
-
-    fn count(&self, want: impl Fn(&AuditEvent) -> bool) -> usize {
-        self.h.audit_events().iter().filter(|e| want(e)).count()
-    }
-
-    fn failed_logins(&self) -> usize {
-        self.count(|e| matches!(e, AuditEvent::AdminLoginFailed { .. }))
-    }
-}
-
-fn secret(text: &str) -> Secret {
-    let mut s = Secret::new();
-    s.push_str(text);
-    s
-}
-
-fn totp(s: &Server, who: &Admin1) -> Factor {
-    Factor::Totp(secret(&s.h.fresh_code(who)))
-}
+use common::{secret, server, totp, Server, SoftKey, APPROVERS};
 
 #[tokio::test]
 async fn a_tray_signs_in_and_steps_up_with_a_totp_code() {
