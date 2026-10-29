@@ -2755,6 +2755,7 @@ dependencies = [
  "ciborium",
  "cmis",
  "ed25519-dalek",
+ "ferro-appid",
  "ferro-attest",
  "ferro-audit",
  "ferro-crypto",

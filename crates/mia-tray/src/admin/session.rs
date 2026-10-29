@@ -10,11 +10,17 @@
 
 //! Enrollment and factor management (F22 §3a) ride the same queue; the
 //! worker keeps no state between commands (nonces and creation requests go
-//! back and forth with the window).
+//! back and forth with the window). So do the request and approval reads
+//! and decisions (F22 §4), which carry no secret.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use ferrogate_admin_client::approvals::proto::{
+    GetAppRequestResponse, GetApprovalResponse, ListAppRequestsRequest, ListAppRequestsResponse,
+    ListApprovalsRequest, ListApprovalsResponse,
+};
+use ferrogate_admin_client::approvals::{Mutated, Mutation};
 use ferrogate_admin_client::client::{
     logout_task, AdminSession, ClientConfig, Factor, LoginInfo, Methods,
 };
@@ -121,6 +127,18 @@ pub enum Cmd {
         /// Proof of a factor the account keeps.
         proof: FactorChoice,
     },
+    /// `WhoAmI`, for the permissions that gate the decision buttons.
+    Permissions,
+    /// `ListAppRequests`.
+    ListRequests(Box<ListAppRequestsRequest>),
+    /// `GetAppRequest`.
+    GetRequest(String),
+    /// `ListApprovals`.
+    ListApprovals(Box<ListApprovalsRequest>),
+    /// `GetApproval`.
+    GetApproval(String),
+    /// A decision or edit (kept by the window for the one step-up retry).
+    Mutate(Box<Mutation>),
 }
 
 static_assertions::assert_not_impl_any!(Cmd: std::fmt::Debug, std::fmt::Display, Clone);
@@ -166,6 +184,18 @@ pub enum Reply {
     FactorAdded(Result<String, ClientError>),
     /// Answer to [`Cmd::RemoveFactor`].
     FactorRemoved(Result<(), ClientError>),
+    /// Answer to [`Cmd::Permissions`].
+    Permissions(Result<Vec<String>, ClientError>),
+    /// Answer to [`Cmd::ListRequests`].
+    Requests(Result<ListAppRequestsResponse, ClientError>),
+    /// Answer to [`Cmd::GetRequest`].
+    Request(Result<Box<GetAppRequestResponse>, ClientError>),
+    /// Answer to [`Cmd::ListApprovals`].
+    Approvals(Result<ListApprovalsResponse, ClientError>),
+    /// Answer to [`Cmd::GetApproval`].
+    Approval(Result<Box<GetApprovalResponse>, ClientError>),
+    /// Answer to [`Cmd::Mutate`].
+    Mutated(Result<Box<Mutated>, ClientError>),
 }
 
 static_assertions::assert_not_impl_any!(Reply: std::fmt::Debug, std::fmt::Display, Clone);
@@ -378,9 +408,44 @@ async fn run_factors(
             log_failure("remove_factor", result.as_ref().err());
             Reply::FactorRemoved(result)
         }
-        Cmd::Offer { .. } | Cmd::SignIn { .. } | Cmd::StepUp { .. } => {
-            refused(cmd, &ClientError::FactorNotOffered).1
+        other => run_views(conn, other).await,
+    }
+}
+
+/// [`run`] for the request and approval views and decisions.
+async fn run_views(conn: &mut AdminSession, cmd: Cmd) -> Reply {
+    match cmd {
+        Cmd::Permissions => {
+            let result = conn.who_am_i().await.map(|w| w.permissions);
+            log_failure("who_am_i", result.as_ref().err());
+            Reply::Permissions(result)
         }
+        Cmd::ListRequests(req) => {
+            let result = conn.list_requests(*req).await;
+            log_failure("list_requests", result.as_ref().err());
+            Reply::Requests(result)
+        }
+        Cmd::GetRequest(id) => {
+            let result = conn.get_request(&id).await.map(Box::new);
+            log_failure("get_request", result.as_ref().err());
+            Reply::Request(result)
+        }
+        Cmd::ListApprovals(req) => {
+            let result = conn.list_approvals(*req).await;
+            log_failure("list_approvals", result.as_ref().err());
+            Reply::Approvals(result)
+        }
+        Cmd::GetApproval(id) => {
+            let result = conn.get_approval(&id).await.map(Box::new);
+            log_failure("get_approval", result.as_ref().err());
+            Reply::Approval(result)
+        }
+        Cmd::Mutate(m) => {
+            let result = conn.mutate(*m).await.map(Box::new);
+            log_failure("mutate", result.as_ref().err());
+            Reply::Mutated(result)
+        }
+        other => refused(other, &ClientError::FactorNotOffered).1,
     }
 }
 
@@ -415,6 +480,12 @@ fn refused(cmd: Cmd, e: &ClientError) -> (&'static str, Reply) {
             ("complete_add_factor", Reply::FactorAdded(failed(err())))
         }
         Cmd::RemoveFactor { .. } => ("remove_factor", Reply::FactorRemoved(failed(err()))),
+        Cmd::Permissions => ("who_am_i", Reply::Permissions(failed(err()))),
+        Cmd::ListRequests(_) => ("list_requests", Reply::Requests(failed(err()))),
+        Cmd::GetRequest(_) => ("get_request", Reply::Request(failed(err()))),
+        Cmd::ListApprovals(_) => ("list_approvals", Reply::Approvals(failed(err()))),
+        Cmd::GetApproval(_) => ("get_approval", Reply::Approval(failed(err()))),
+        Cmd::Mutate(_) => ("mutate", Reply::Mutated(failed(err()))),
     }
 }
 
@@ -611,6 +682,11 @@ mod tests {
                 factor_id: "totp".into(),
                 proof: FactorChoice::Code(secret("123456")),
             },
+            Cmd::Permissions,
+            Cmd::GetRequest("r-1".into()),
+            Cmd::Mutate(Box::new(Mutation::Freeze(
+                ferrogate_admin_client::approvals::rules::freeze_request("lin", true, "k".into()),
+            ))),
         ];
         for cmd in stale {
             let ended = match rt.block_on(run(&mut conn, queued_at, cmd, None)) {
@@ -619,6 +695,9 @@ mod tests {
                 Reply::Factors(r) => r.err(),
                 Reply::AddFactorBegun(r) => r.err(),
                 Reply::FactorRemoved(r) => r.err(),
+                Reply::Permissions(r) => r.err(),
+                Reply::Request(r) => r.err(),
+                Reply::Mutated(r) => r.err(),
                 _ => panic!("a reply of another kind"),
             };
             assert_eq!(ended, Some(ClientError::SessionEnded));
@@ -675,6 +754,29 @@ mod tests {
             user_verification: 1,
             attestation: 1,
         }
+    }
+
+    #[test]
+    fn view_commands_without_a_session_send_nothing() {
+        let mut w = spawn(refused_config(), None, Arc::new(|| {})).unwrap();
+        assert!(w.send(Cmd::ListRequests(Box::default())));
+        assert!(matches!(
+            next(&mut w),
+            Reply::Requests(Err(ClientError::SessionEnded))
+        ));
+        assert!(w.send(Cmd::GetApproval("a-1".into())));
+        assert!(matches!(
+            next(&mut w),
+            Reply::Approval(Err(ClientError::SessionEnded))
+        ));
+        assert!(w.send(Cmd::Mutate(Box::new(Mutation::Freeze(
+            ferrogate_admin_client::approvals::rules::freeze_request("lin", true, "k".into()),
+        )))));
+        assert!(matches!(
+            next(&mut w),
+            Reply::Mutated(Err(ClientError::SessionEnded))
+        ));
+        w.stop(SHUTDOWN_WAIT);
     }
 
     #[test]

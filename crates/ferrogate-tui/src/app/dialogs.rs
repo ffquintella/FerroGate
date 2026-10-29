@@ -9,42 +9,32 @@
 //! sends nothing. The server re-checks every rule; the client-side checks are
 //! there so a mistake is explained before it costs a TOTP code.
 
-use std::fmt::Write as _;
+//! The rules themselves (defaults, wide scope, narrowing-only edits, the
+//! typed short id, the requests built) are shared with the tray admin
+//! client (`ferrogate_admin_client::approvals::rules`, T283).
 
 use ferro_appid::flags::RiskFlags;
 use ferro_proto::admin_v1::{
-    approve_app_request_request::Choice, AdminRegisterApplicationRequest, AppBinaryDesc,
-    AppRequestInfo, AppUser, ApprovalInfo, ApprovalTerms, ApproveAppRequestRequest,
-    DenyAppRequestRequest, GetAppRequestResponse, RevokeApprovalRequest,
-    SetLineageAutoUpdateFrozenRequest, UpdateApprovalRequest,
+    AdminRegisterApplicationRequest, AppBinaryDesc, AppRequestInfo, AppUser, ApprovalInfo,
+    ApprovalTerms, GetAppRequestResponse, UpdateApprovalRequest,
+};
+use ferrogate_admin_client::approvals::rules::{self, EditExpiry, Terms, EXPIRY_DAYS};
+pub use ferrogate_admin_client::approvals::rules::{
+    auto_update_preselected, short_host, short_id, user_label, DENY_REASONS, REVOKE_REASONS,
 };
 
 use super::filters::warning_flags;
 use super::form::{Field, Form, FormEvent};
 use crate::client::Mutation;
 use crate::input::Key;
-use crate::timefmt::{self, DAY};
+use crate::timefmt;
+#[cfg(test)]
+use crate::timefmt::DAY;
+#[cfg(test)]
+use ferro_proto::admin_v1::approve_app_request_request::Choice;
 
-/// Deny reason codes (wire codes 1…6, F21 §6 "Deny").
-pub const DENY_REASONS: [&str; 6] = [
-    "unknown_software",
-    "policy_violation",
-    "insufficient_justification",
-    "duplicate",
-    "security_risk",
-    "other",
-];
-/// Revoke reason codes (wire codes 1…5; 1000 is reserved for the legacy
-/// import, F19 §11).
-pub const REVOKE_REASONS: [&str; 5] = [
-    "no_longer_needed",
-    "security_risk",
-    "policy_violation",
-    "replaced",
-    "other",
-];
 /// Index of `replaced` in [`REVOKE_REASONS`] (default for "also revoke").
-const REPLACED: usize = 3;
+const REPLACED: usize = rules::REVOKE_REPLACED;
 
 const POLICY_OPTIONS: [&str; 2] = [
     "Manual approval for every new binary",
@@ -56,9 +46,8 @@ const CONTINUITY_OPTIONS: [&str; 2] = [
 ];
 const SCOPE_OPTIONS: [&str; 2] = ["This user only", "Any user ⚠"];
 const PATH_OPTIONS: [&str; 2] = ["Exact path", "Any path"];
-/// Expiry choices of a new approval: 0 days is the server default
-/// (`CMIS_APPROVAL_DEFAULT_TTL_SECS`).
-const EXPIRY_DAYS: [i64; 5] = [0, 30, 90, 180, 365];
+/// Labels of [`EXPIRY_DAYS`] (0 days is the server default,
+/// `CMIS_APPROVAL_DEFAULT_TTL_SECS`).
 const EXPIRY_OPTIONS: [&str; 5] = [
     "Server default",
     "30 days",
@@ -77,38 +66,6 @@ const EDIT_EXPIRY_OPTIONS: [&str; 6] = [
 ];
 const PLATFORMS: [&str; 3] = ["Linux", "macOS", "Windows"];
 const USER_KINDS: [&str; 2] = ["Unix", "Windows"];
-
-/// The short id an administrator types to confirm a revocation: `A-` and the
-/// last eight characters of the approval id. The tail is used because the
-/// head of a time-ordered UUIDv7 is the same for every approval created in the
-/// same hours.
-#[must_use]
-pub fn short_id(prefix: &str, id: &str) -> String {
-    let tail: Vec<char> = id.chars().filter(char::is_ascii_alphanumeric).collect();
-    let start = tail.len().saturating_sub(8);
-    let s: String = tail[start..].iter().collect();
-    format!("{prefix}-{}", s.to_ascii_uppercase())
-}
-
-/// A display label for an operating-system user.
-#[must_use]
-pub fn user_label(u: Option<&AppUser>) -> String {
-    let Some(u) = u else {
-        return "—".to_string();
-    };
-    let mut s = if u.name.is_empty() {
-        "?".to_string()
-    } else {
-        u.name.clone()
-    };
-    if let Some(uid) = u.uid {
-        let _ = write!(s, " ({uid})");
-    }
-    if !u.sid.is_empty() {
-        let _ = write!(s, " ({})", u.sid);
-    }
-    s
-}
 
 fn policy_name(code: u32) -> &'static str {
     if code == 2 {
@@ -246,10 +203,6 @@ pub struct Dialog {
     pub scroll: u16,
 }
 
-fn new_key() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 /// The approval-terms fields shared by approve and add.
 fn terms_fields(auto: bool) -> Vec<Field> {
     vec![
@@ -265,45 +218,6 @@ fn terms_fields(auto: bool) -> Vec<Field> {
         Field::choice("expires", "Expires", &EXPIRY_OPTIONS, 0),
         Field::text("note", "Note", "", 500).with_hint("≤ 500"),
     ]
-}
-
-/// The auto-update preselection rule (F21 §6 "Approve", step 1): only when
-/// the request is on a protected path, or its binary has a valid signer equal
-/// to the signer of the lineage's previous approved revision.
-#[must_use]
-pub fn auto_update_preselected(detail: &GetAppRequestResponse) -> bool {
-    let Some(request) = &detail.request else {
-        return false;
-    };
-    if request.flags & RiskFlags::PATH_PROTECTED != 0 {
-        return true;
-    }
-    if request.flags & RiskFlags::SIGNER_CHANGED != 0 {
-        return false;
-    }
-    let Some(bin) = &detail.binary else {
-        return false;
-    };
-    if bin.signer_kind == 0 || !bin.signer_valid || bin.signer_id.is_empty() {
-        return false;
-    }
-    let previous = detail
-        .lineage_approvals
-        .iter()
-        // Active or expired approvals only: a revoked revision was withdrawn
-        // and vouches for nothing.
-        .filter(|a| matches!(a.state, 1 | 2) && a.revision > 0 && a.revision < request.revision)
-        .max_by_key(|a| a.revision);
-    let Some(prev) = previous else {
-        return false;
-    };
-    detail
-        .lineage_binaries
-        .iter()
-        .find(|b| b.bin_sha == prev.bin_sha)
-        .is_some_and(|p| {
-            p.signer_valid && p.signer_kind == bin.signer_kind && p.signer_id == bin.signer_id
-        })
 }
 
 impl Dialog {
@@ -324,12 +238,7 @@ impl Dialog {
     pub fn approve(detail: &GetAppRequestResponse) -> Option<Self> {
         let request = detail.request.clone()?;
         let auto = auto_update_preselected(detail);
-        let also: Vec<ApprovalInfo> = detail
-            .lineage_approvals
-            .iter()
-            .filter(|a| a.state == 1)
-            .cloned()
-            .collect();
+        let also = rules::also_revocable(detail);
         let mut fields = terms_fields(auto);
         if !also.is_empty() {
             let labels = also
@@ -530,14 +439,10 @@ impl Dialog {
     #[must_use]
     pub fn is_wide(&self) -> bool {
         match &self.ctx {
-            Ctx::Approve { .. } | Ctx::Register { .. } => {
-                self.form.choice("scope") == 1 || self.form.choice("continuity") == 1
-            }
+            Ctx::Approve { .. } | Ctx::Register { .. } => self.terms_choice().is_wide(),
             // An edit can only narrow the user and path scope, but it can
             // loosen continuity: that needs the same extra `y`.
-            Ctx::Edit { approval } => {
-                self.form.choice("continuity") == 1 && approval.continuity != 2
-            }
+            Ctx::Edit { approval } => self.edit_choice().loosens_continuity(approval),
             _ => false,
         }
     }
@@ -569,10 +474,7 @@ impl Dialog {
                 if self.kind == DialogKind::Register {
                     self.validate_register();
                 }
-                if self.form.choice("scope") == 1
-                    && self.form.choice("policy") == 1
-                    && self.flags() & RiskFlags::PATH_PROTECTED == 0
-                {
+                if self.terms_choice().breaks_any_user_rule(self.flags()) {
                     self.form.set_error(
                         "scope",
                         "auto-update for any user needs a protected path (server rule)",
@@ -587,8 +489,7 @@ impl Dialog {
             DialogKind::Revoke => {
                 if let Ctx::Revoke { approval } = &self.ctx {
                     let want = short_id("A", &approval.approval_id);
-                    let typed = self.form.text("confirm").trim().to_string();
-                    if !typed.eq_ignore_ascii_case(&want) {
+                    if !rules::revoke_confirmed(&approval.approval_id, self.form.text("confirm")) {
                         self.form
                             .set_error("confirm", &format!("type {want} to confirm"));
                     }
@@ -685,30 +586,25 @@ impl Dialog {
         }
     }
 
-    fn terms(&self, now: i64) -> ApprovalTerms {
-        let days = EXPIRY_DAYS
-            .get(self.form.choice("expires"))
-            .copied()
-            .unwrap_or(0);
-        ApprovalTerms {
-            user_scope: if self.form.choice("scope") == 1 { 2 } else { 1 },
-            path_match: if self.form.choice("path") == 1 { 2 } else { 1 },
-            update_policy: if self.form.choice("policy") == 1 {
-                2
-            } else {
-                1
-            },
-            continuity: if self.form.choice("continuity") == 1 {
-                2
-            } else {
-                1
-            },
-            expires_at: if days == 0 { 0 } else { now + days * DAY },
-            no_expiry: false,
-            note: self.form.text("note").trim().to_string(),
-            // Only reachable after the extra `y` of the wide confirmation.
-            confirm_any_user: self.form.choice("scope") == 1,
+    /// The terms chosen in the form (approve and add).
+    fn terms_choice(&self) -> Terms {
+        Terms {
+            auto_update: self.form.choice("policy") == 1,
+            path_user_continuity: self.form.choice("continuity") == 1,
+            any_user: self.form.choice("scope") == 1,
+            any_path: self.form.choice("path") == 1,
+            expiry_days: EXPIRY_DAYS
+                .get(self.form.choice("expires"))
+                .copied()
+                .unwrap_or(0),
+            note: self.form.text("note").to_string(),
         }
+    }
+
+    fn terms(&self, now: i64) -> ApprovalTerms {
+        // `confirm_any_user` is only reachable after the extra `y` of the
+        // wide confirmation.
+        self.terms_choice().to_proto(now)
     }
 
     fn also_revoke(&self) -> Vec<String> {
@@ -725,68 +621,28 @@ impl Dialog {
         }
     }
 
+    /// The edit chosen in the form (only narrowing toggles are offered).
+    fn edit_choice(&self) -> rules::Edit {
+        let expiry = match self.form.choice("expires") {
+            0 => EditExpiry::Keep,
+            5 => EditExpiry::NoExpiry,
+            i => EditExpiry::Days(rules::EDIT_EXPIRY_DAYS.get(i - 1).copied().unwrap_or(30)),
+        };
+        rules::Edit {
+            auto_update: self.form.choice("policy") == 1,
+            path_user_continuity: self.form.choice("continuity") == 1,
+            expiry,
+            note: self.form.text("note").to_string(),
+            narrow_user: self.form.toggled("narrow_user"),
+            narrow_path: self.form.toggled("narrow_path"),
+        }
+    }
+
     fn edit_request(&self, now: i64, key: String) -> Option<UpdateApprovalRequest> {
         let Ctx::Edit { approval } = &self.ctx else {
             return None;
         };
-        let policy = if self.form.choice("policy") == 1 {
-            2
-        } else {
-            1
-        };
-        let continuity = if self.form.choice("continuity") == 1 {
-            2
-        } else {
-            1
-        };
-        let current_policy = if approval.update_policy == 2 { 2 } else { 1 };
-        let current_continuity = if approval.continuity == 2 { 2 } else { 1 };
-        let mut req = UpdateApprovalRequest {
-            idempotency_key: key,
-            approval_id: approval.approval_id.clone(),
-            expected_row_version: approval.row_version,
-            ..UpdateApprovalRequest::default()
-        };
-        let mut changed = false;
-        if policy != current_policy {
-            req.update_policy = Some(policy);
-            changed = true;
-        }
-        if continuity != current_continuity {
-            req.continuity = Some(continuity);
-            changed = true;
-        }
-        match self.form.choice("expires") {
-            0 => {}
-            5 => {
-                req.clear_expiry = true;
-                changed = true;
-            }
-            i => {
-                let days = [30, 90, 180, 365].get(i - 1).copied().unwrap_or(30);
-                req.expires_at = Some(now + days * DAY);
-                changed = true;
-            }
-        }
-        let note = self.form.text("note").trim().to_string();
-        let current: String = approval.note.chars().filter(|c| !c.is_control()).collect();
-        if note != current.trim() {
-            if note.is_empty() {
-                req.clear_note = true;
-            } else {
-                req.note = Some(note);
-            }
-            changed = true;
-        }
-        if self.form.toggled("narrow_user") {
-            req.narrow_to_exact_user = true;
-            changed = true;
-        }
-        if self.form.toggled("narrow_path") {
-            req.narrow_to_exact_path = true;
-            changed = true;
-        }
-        changed.then_some(req)
+        self.edit_choice().request(approval, now, key)
     }
 
     fn register_request(&self, now: i64, key: String) -> AdminRegisterApplicationRequest {
@@ -828,50 +684,32 @@ impl Dialog {
     }
 
     fn build(&self, now: i64) -> Outcome {
-        let key = new_key();
+        let key = rules::new_idempotency_key();
         match &self.ctx {
             Ctx::Approve { request, .. } => {
-                let also = self.also_revoke();
-                let reason = if also.is_empty() {
-                    0
-                } else {
-                    u32::try_from(self.form.choice("revoke_reason") + 1).unwrap_or(4)
-                };
-                Outcome::Send(Box::new(Mutation::Approve(ApproveAppRequestRequest {
-                    idempotency_key: key,
-                    request_id: request.request_id.clone(),
-                    choice: Some(Choice::Terms(self.terms(now))),
-                    also_revoke_approval_ids: also,
-                    also_revoke_reason_code: reason,
-                    proof: None,
-                })))
+                Outcome::Send(Box::new(Mutation::Approve(rules::approve_request(
+                    &request.request_id,
+                    self.terms(now),
+                    self.also_revoke(),
+                    self.form.choice("revoke_reason"),
+                    key,
+                ))))
             }
-            Ctx::Deny { request } => {
-                Outcome::Send(Box::new(Mutation::Deny(DenyAppRequestRequest {
-                    idempotency_key: key,
-                    request_id: request.request_id.clone(),
-                    reason_code: u32::try_from(self.form.choice("reason") + 1).unwrap_or(6),
-                    message: self.form.text("message").trim().to_string(),
-                })))
-            }
+            Ctx::Deny { request } => Outcome::Send(Box::new(Mutation::Deny(rules::deny_request(
+                &request.request_id,
+                self.form.choice("reason"),
+                self.form.text("message"),
+                key,
+            )))),
             Ctx::Edit { .. } => match self.edit_request(now, key) {
                 Some(req) => Outcome::Send(Box::new(Mutation::Update(req))),
                 None => Outcome::Stay,
             },
-            Ctx::Revoke { approval } => {
-                Outcome::Send(Box::new(Mutation::Revoke(RevokeApprovalRequest {
-                    idempotency_key: key,
-                    approval_id: approval.approval_id.clone(),
-                    reason_code: u32::try_from(self.form.choice("reason") + 1).unwrap_or(5),
-                    expected_row_version: approval.row_version,
-                })))
-            }
+            Ctx::Revoke { approval } => Outcome::Send(Box::new(Mutation::Revoke(
+                rules::revoke_request(approval, self.form.choice("reason"), key),
+            ))),
             Ctx::Freeze { lineage_id, .. } => Outcome::Send(Box::new(Mutation::Freeze(
-                SetLineageAutoUpdateFrozenRequest {
-                    idempotency_key: key,
-                    lineage_id: lineage_id.clone(),
-                    frozen: self.form.choice("action") == 0,
-                },
+                rules::freeze_request(lineage_id, self.form.choice("action") == 0, key),
             ))),
             Ctx::Register { .. } => Outcome::Register(Box::new(self.register_request(now, key))),
         }
@@ -1093,12 +931,6 @@ impl Dialog {
         }
         out
     }
-}
-
-/// The first eight characters of a host UUID.
-#[must_use]
-pub fn short_host(uuid: &str) -> String {
-    uuid.chars().take(8).collect()
 }
 
 #[cfg(test)]

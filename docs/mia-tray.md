@@ -376,6 +376,50 @@ dropped when the wizard or form closes, is used, or the window locks. The QR
 code is painted as squares and the text one character at a time, so no `egui`
 galley holds the seed (tests scan the painted shapes and `egui` memory).
 
+### Requests and approvals
+
+Signed in, **Requests** and **Approvals** open the administration views
+(F22 §4, the F21 flows). The window first reads the session's permissions
+(`WhoAmI`): they decide which buttons are drawn, as a convenience only, since
+CMIS's `AdminAuthz` checks every call. The lists page through
+`ListAppRequests` / `ListApprovals` (50 rows a page) with **Search and
+filters…**: state, origin, kind or policy, preset, superseded, oldest first,
+free text, path, product, version, host UUID, user, hash prefix, dates and
+lineage. Values are checked before anything is sent (a date is `YYYY-MM-DD`, a
+hash prefix 8 to 96 hex, a host a UUID, texts at most 128 characters) and go as
+separate protobuf fields.
+
+**Open** shows a request (path, SHA-384, version, host, user, requester, the
+requester's reason, signer, risk warnings, the lineage's approvals) or an
+approval (terms, expiry, note, row version). From there:
+
+- **Approve…** starts from the safe defaults: manual, anchored, this user,
+  exact path, server-default expiry. Auto-update is preselected only on a
+  protected path or the same valid signer as the lineage's previous active or
+  expired revision; older approvals of the lineage can be revoked with it;
+- **Deny…** takes a reason code and an optional message (at most 200
+  characters, no personal data);
+- **Edit or renew…** only narrows the user and path scope; a future expiry
+  renews an expired approval;
+- **Revoke…** takes a reason and the typed short id (`A-` and the last eight
+  characters of the id);
+- **Freeze or unfreeze…** stops or resumes auto-updates of the lineage.
+
+"Any user" and "path + user only" need an extra **Accept the wider scope**,
+and auto-update for any user needs a protected path. Every decision ends on a
+review page; only **Confirm and send** sends it, with a fresh idempotency key.
+When the server asks for a step-up, the window opens the step-up prompt and then
+sends the same request once more (same key); a second request for a step-up is
+not looped, and cancelling the prompt sends nothing more. An edit refused as
+changed meanwhile (`ABORTED`) reloads the approval, names what changed and asks
+again. After each decision the window shows its outcome and reloads the record.
+
+The rules, the filters and the calls are the TUI's, from
+`ferrogate-admin-client::approvals`. Every server string is shown as plain text
+with controls, bidi and zero-width characters made visible, failures are shown
+by kind only (the reason goes to the log), and an idle lock, sign-out or close
+drops every record shown.
+
 Credential handling:
 
 - the password and the TOTP code live in fixed-capacity `Zeroizing` buffers

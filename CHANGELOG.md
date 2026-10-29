@@ -48,6 +48,23 @@ record them.
   node until T223: run it on every replica. Superseded SVIDs that have not
   expired are not tracked and become acceptable again; `docs/operations.md`
   §"Revocation" says when to wait instead.
+- Administer requests and approvals from `mia-tray-admin`: lists with search and filters, details, and approve, deny, edit or renew, revoke and freeze with review, step-up and typed confirmation (S53, M40, T283)
+  **Requests** and **Approvals** page through `ListAppRequests` /
+  `ListApprovals` with checked filters, open a record, and decide on it
+  from the safe defaults (manual, anchored, this user, exact path, server
+  expiry). "Any user" and "path + user only" need an extra confirmation,
+  every decision ends on a review page, a `step_up_required` answer opens
+  the step-up prompt and then sends the same request once more (same
+  idempotency key), revoke needs the typed short id, and an edit refused
+  as `ABORTED` reloads, names what changed and asks again. Buttons follow
+  the session's `WhoAmI` permissions; the server still checks every call.
+  Server text is made inert (controls, bidi and zero-width characters),
+  failures are shown by kind only, and a lock drops every record. The
+  decision rules, list filters, `Mutation`/`Mutated`, the read and decision
+  calls, `timefmt` and the permission names moved from `ferrogate-tui` into
+  `ferrogate-admin-client` (`approvals`, `timefmt`, `perm`); the TUI uses
+  them with no behaviour change. The shared crate now depends on
+  `ferro-appid` (risk-flag bits) and `uuid` (v4 keys).
 - Enroll with a token and manage TOTP and FIDO2 second factors from `mia-tray-admin`, through `ferrogate-admin-client` (S53, S51, M40, T282)
   **Enroll with a token…** redeems an enrollment or reset token: the new
   password, a TOTP seed shown once as an in-memory QR code (text on

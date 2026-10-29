@@ -1,8 +1,10 @@
 //! The admin window's state machine (F22 §3), headless: sign-in (user name,
 //! then password with a TOTP code or a security key), token enrollment, the
-//! signed-in summary, second-factor management, the step-up prompt,
-//! sign-out and the idle lock. Input goes in as calls, [`Reply`]s from the
-//! worker through [`Flow::on_reply`], and out come [`Effect`]s.
+//! signed-in summary, second-factor management, the request and approval
+//! views (a decision that asks for a step-up is sent once more after it),
+//! the step-up prompt, sign-out and the idle lock. Input goes in as calls,
+//! [`Reply`]s from the worker through [`Flow::on_reply`], and out come
+//! [`Effect`]s.
 
 //! The models hold the typed secrets; [`FlowView`] holds none (masks are
 //! lengths) and never the session token, which only the worker has. Every
@@ -22,6 +24,7 @@ use super::login::{Field, LoginModel, LoginView, Stage, Submission};
 use super::secret::Secret;
 use super::seed::SeedDisplay;
 use super::session::{Cmd, FactorChoice, Reply};
+use super::views::{AdminViews, Tab, ViewAction, ViewsEvent, ViewsView};
 use crate::text::display_safe;
 
 /// Idle limit before the server's timeout is known (F20 §7: 15 min).
@@ -71,6 +74,8 @@ pub enum Busy {
         /// The platform's key is prompting.
         key: bool,
     },
+    /// Loading requests or approvals, or sending a decision.
+    Views,
 }
 
 /// Why something did not work, as the window words it (generic, F20 §6).
@@ -192,6 +197,8 @@ pub struct FlowView {
     pub enroll: Option<EnrollView>,
     /// The second-factor panel, when open (signed in).
     pub factors: Option<FactorsView>,
+    /// The request and approval views, when open (signed in).
+    pub views: Option<ViewsView>,
 }
 
 struct Session {
@@ -208,6 +215,15 @@ struct StepUpForm {
     error: Option<Problem>,
 }
 
+/// What goes on after a successful step-up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AfterStepUp {
+    /// The factor add that asked for it.
+    AddFactor(FactorMethod),
+    /// The decision that asked for it, once more with the same key.
+    Resend,
+}
+
 /// The window's state.
 pub struct Flow {
     login: LoginModel,
@@ -219,9 +235,10 @@ pub struct Flow {
     step_up: Option<StepUpForm>,
     enroll: Option<EnrollWizard>,
     factors: Option<FactorsPanel>,
+    views: Option<AdminViews>,
     /// The factor being added (resent after a required step-up).
     adding: Option<FactorMethod>,
-    after_step_up: Option<FactorMethod>,
+    after_step_up: Option<AfterStepUp>,
     /// The methods last offered for the form's user name.
     offered: Methods,
     last_activity: Instant,
@@ -287,6 +304,7 @@ impl Flow {
             step_up: None,
             enroll: None,
             factors: None,
+            views: None,
             adding: None,
             after_step_up: None,
             offered: Methods::default(),
@@ -335,6 +353,8 @@ impl Flow {
         } else if self.session.is_some() {
             if let Some(p) = &mut self.factors {
                 p.type_text(text);
+            } else if let Some(v) = &mut self.views {
+                v.type_text(text);
             }
         } else if let Some(w) = &mut self.enroll {
             w.type_text(text);
@@ -354,6 +374,8 @@ impl Flow {
         } else if self.session.is_some() {
             if let Some(p) = &mut self.factors {
                 p.backspace();
+            } else if let Some(v) = &mut self.views {
+                v.backspace();
             }
         } else if let Some(w) = &mut self.enroll {
             w.backspace();
@@ -370,6 +392,8 @@ impl Flow {
         if self.session.is_some() {
             if let Some(p) = &mut self.factors {
                 p.tab(back);
+            } else if let Some(v) = &mut self.views {
+                v.tab_key(back);
             }
         } else if let Some(w) = &mut self.enroll {
             w.tab(back);
@@ -407,10 +431,12 @@ impl Flow {
         }
         if self.step_up.is_some() {
             self.step_up = None;
-            self.after_step_up = None;
+            self.step_up_abandoned();
         } else if self.session.is_some() {
             if let Some(p) = &mut self.factors {
                 p.cancel();
+            } else if let Some(v) = &mut self.views {
+                v.escape();
             }
         } else if let Some(w) = &mut self.enroll {
             w.escape();
@@ -435,6 +461,12 @@ impl Flow {
             if let Some(p) = self.factors.as_ref().filter(|p| p.editing()) {
                 let how = p.default_submission();
                 return self.submit_factor(how);
+            }
+            if self.busy.is_none() {
+                let cmd = self.views.as_mut().and_then(|v| v.enter(crate::unix_now()));
+                if let Some(cmd) = cmd {
+                    return self.send(cmd, Busy::Views);
+                }
             }
             return Vec::new();
         }
@@ -561,7 +593,17 @@ impl Flow {
     pub fn cancel_step_up(&mut self) {
         if self.busy.is_none() {
             self.step_up = None;
-            self.after_step_up = None;
+            self.step_up_abandoned();
+        }
+    }
+
+    /// The step-up prompt closed unconfirmed: what waited for it is
+    /// dropped, unsent.
+    fn step_up_abandoned(&mut self) {
+        if self.after_step_up.take() == Some(AfterStepUp::Resend) {
+            if let Some(v) = &mut self.views {
+                v.drop_pending();
+            }
         }
     }
 
@@ -638,9 +680,62 @@ impl Flow {
         if self.busy.is_some() || self.step_up.is_some() || s.restricted {
             return Vec::new();
         }
+        if self.views.as_ref().is_some_and(AdminViews::has_pending) {
+            return Vec::new();
+        }
+        self.views = None;
         self.factors = Some(FactorsPanel::new(false, s.info.methods, self.key_available));
         self.notice = None;
         self.send(Cmd::ListFactors, Busy::Factors { key: false })
+    }
+
+    /// "Requests" / "Approvals" (signed in): open the views on `tab`. The
+    /// session's permissions are read first (they gate the buttons).
+    pub fn open_views(&mut self, tab: Tab) -> Vec<Effect> {
+        let Some(s) = &self.session else {
+            return Vec::new();
+        };
+        if self.busy.is_some() || self.step_up.is_some() || s.restricted {
+            return Vec::new();
+        }
+        self.factors = None;
+        self.notice = None;
+        let views = self.views.get_or_insert_with(|| AdminViews::new(tab));
+        let cmd = if views.knows_permissions() {
+            match views.act(ViewAction::Tab(tab), crate::unix_now()) {
+                Some(cmd) => cmd,
+                None => return Vec::new(),
+            }
+        } else {
+            Cmd::Permissions
+        };
+        self.send(cmd, Busy::Views)
+    }
+
+    /// Close the views (every record shown is dropped); not while a
+    /// decision waits for its outcome.
+    pub fn close_views(&mut self) {
+        if self.busy.is_none() && !self.views.as_ref().is_some_and(AdminViews::has_pending) {
+            self.views = None;
+        }
+    }
+
+    /// Something done on the views.
+    pub fn views_action(&mut self, action: ViewAction) -> Vec<Effect> {
+        if self.busy.is_some() || self.session.is_none() || self.step_up.is_some() {
+            return Vec::new();
+        }
+        let cmd = self
+            .views
+            .as_mut()
+            .and_then(|v| v.act(action, crate::unix_now()));
+        match cmd {
+            Some(cmd) => {
+                self.notice = None;
+                self.send(cmd, Busy::Views)
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Close the panel (not in a restricted session, which is only it).
@@ -723,6 +818,7 @@ impl Flow {
         self.step_up = None;
         self.enroll = None;
         self.factors = None;
+        self.views = None;
         self.adding = None;
         self.after_step_up = None;
         self.busy = None;
@@ -827,6 +923,40 @@ impl Flow {
             Reply::AddFactorBegun(result) => self.add_begun_reply(result, now),
             Reply::FactorAdded(result) => self.factor_changed_reply(result.map(|_| ()), true, now),
             Reply::FactorRemoved(result) => self.factor_changed_reply(result, false, now),
+            other => self.views_reply(other),
+        }
+    }
+
+    /// A reply for the request and approval views.
+    fn views_reply(&mut self, reply: Reply) -> Vec<Effect> {
+        let unix = crate::unix_now();
+        let Some(v) = &mut self.views else {
+            return Vec::new();
+        };
+        let event = match reply {
+            Reply::Permissions(r) => v.on_permissions(r, unix),
+            Reply::Requests(r) => v.on_requests(r),
+            Reply::Request(r) => v.on_request(r),
+            Reply::Approvals(r) => v.on_approvals(r),
+            Reply::Approval(r) => v.on_approval(r),
+            Reply::Mutated(r) => v.on_mutated(r, unix),
+            _ => ViewsEvent::None,
+        };
+        match event {
+            ViewsEvent::None => Vec::new(),
+            ViewsEvent::Send(cmd) => self.send(cmd, Busy::Views),
+            ViewsEvent::SessionEnded => self.end(Some(Notice::SessionEnded)),
+            ViewsEvent::StepUp => {
+                // Confirm first, then the same decision goes once more.
+                self.open_step_up();
+                if self.step_up.is_some() {
+                    self.after_step_up = Some(AfterStepUp::Resend);
+                    self.notice = Some(Notice::StepUpFirst);
+                } else if let Some(v) = &mut self.views {
+                    v.drop_pending();
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -885,7 +1015,7 @@ impl Flow {
             }
             Err(e) if e.needs_step_up() && self.session.as_ref().is_some_and(|s| !s.restricted) => {
                 // Confirm first, then the add goes on by itself.
-                self.after_step_up = self.adding;
+                self.after_step_up = self.adding.map(AfterStepUp::AddFactor);
                 self.open_step_up();
                 self.notice = Some(Notice::StepUpFirst);
                 Vec::new()
@@ -979,7 +1109,14 @@ impl Flow {
                 self.notice = Some(Notice::SteppedUp);
                 match self.after_step_up.take() {
                     // The add that asked for it goes on.
-                    Some(method) => self.add_factor(method),
+                    Some(AfterStepUp::AddFactor(method)) => self.add_factor(method),
+                    // The decision that asked for it goes once more.
+                    Some(AfterStepUp::Resend) => {
+                        match self.views.as_mut().and_then(AdminViews::resend) {
+                            Some(cmd) => self.send(cmd, Busy::Views),
+                            None => Vec::new(),
+                        }
+                    }
                     None => Vec::new(),
                 }
             }
@@ -1054,6 +1191,11 @@ impl Flow {
                 .as_ref()
                 .filter(|_| signed_in)
                 .map(FactorsPanel::view),
+            views: self
+                .views
+                .as_ref()
+                .filter(|_| signed_in)
+                .map(|v| v.view(crate::unix_now())),
         }
     }
 }
@@ -1717,5 +1859,145 @@ mod tests {
         let s = f.view(now).session.unwrap();
         assert!(!s.display_name.contains('\u{1b}') && !s.display_name.contains('\u{202e}'));
         assert!(!s.groups[0].contains('\u{1b}'));
+    }
+
+    // ---- request and approval views (T283) ------------------------------
+
+    use crate::admin::decide::tests::{detail, request};
+    use crate::admin::decide::DecisionKind;
+    use crate::admin::views::Outcome;
+    use ferrogate_admin_client::approvals::proto::{
+        ApproveAppRequestResponse, ListAppRequestsResponse,
+    };
+    use ferrogate_admin_client::approvals::Mutated;
+    use ferrogate_admin_client::error::{Code, RpcError};
+
+    /// Signed in, the Requests view open on one loaded and opened request.
+    fn on_a_request(now: Instant) -> Flow {
+        let mut f = signed_in(now, BOTH, 900);
+        let Cmd::Permissions = cmd(f.open_views(Tab::Requests)) else {
+            panic!("the permissions are read first");
+        };
+        assert_eq!(f.view(now).busy, Some(Busy::Views));
+        let perms = vec![
+            "app_request.approve".to_string(),
+            "app_request.deny".to_string(),
+        ];
+        let Cmd::ListRequests(_) = cmd(f.on_reply(Reply::Permissions(Ok(perms)), now)) else {
+            panic!("then the list");
+        };
+        let none = f.on_reply(
+            Reply::Requests(Ok(ListAppRequestsResponse {
+                items: vec![request(0)],
+                next_page_token: String::new(),
+            })),
+            now,
+        );
+        assert!(none.is_empty());
+        let Cmd::GetRequest(_) = cmd(f.views_action(ViewAction::OpenRequest(0))) else {
+            panic!("the request");
+        };
+        f.on_reply(Reply::Request(Ok(Box::new(detail(0)))), now);
+        assert!(f.view(now).views.unwrap().request.is_some());
+        f
+    }
+
+    fn step_up_required() -> ClientError {
+        ClientError::Other(RpcError::local(
+            Code::FailedPrecondition,
+            "step_up_required",
+        ))
+    }
+
+    #[test]
+    fn a_decision_steps_up_then_goes_once_more_with_the_same_key() {
+        let now = Instant::now();
+        let mut f = on_a_request(now);
+        assert!(f
+            .views_action(ViewAction::Decide(DecisionKind::Approve))
+            .is_empty());
+        f.type_text("ticket 42");
+        assert_eq!(
+            f.view(now).views.unwrap().decision.unwrap().note,
+            "ticket 42"
+        );
+        assert!(
+            f.enter().is_empty(),
+            "Enter moves the form on, never confirms"
+        );
+        let Cmd::Mutate(m) = cmd(f.views_action(ViewAction::DecisionConfirm)) else {
+            panic!("the approval");
+        };
+        let key = m.idempotency_key().to_string();
+        assert!(f
+            .on_reply(Reply::Mutated(Err(step_up_required())), now)
+            .is_empty());
+        let v = f.view(now);
+        assert!(v.step_up.is_some(), "the step-up prompt opens");
+        assert_eq!(v.notice, Some(Notice::StepUpFirst));
+        f.type_text(CODE);
+        let Cmd::StepUp { .. } = cmd(f.enter()) else {
+            panic!("the step-up");
+        };
+        clean(&f, now);
+        let Cmd::Mutate(again) = cmd(f.on_reply(Reply::SteppedUp(Ok(1)), now)) else {
+            panic!("the same decision once more");
+        };
+        assert_eq!(again.idempotency_key(), key);
+        let done = Mutated::Approved(ApproveAppRequestResponse {
+            allowlist_generation: 9,
+            ..ApproveAppRequestResponse::default()
+        });
+        let Cmd::GetRequest(_) = cmd(f.on_reply(Reply::Mutated(Ok(Box::new(done))), now)) else {
+            panic!("the request is reloaded");
+        };
+        assert!(matches!(
+            f.view(now).views.unwrap().outcome,
+            Some(Outcome::Approved { generation: 9, .. })
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_step_up_sends_nothing_and_a_lock_drops_every_record() {
+        let now = Instant::now();
+        let mut f = on_a_request(now);
+        f.views_action(ViewAction::Decide(DecisionKind::Deny));
+        f.views_action(ViewAction::DecisionNext);
+        let Cmd::Mutate(_) = cmd(f.views_action(ViewAction::DecisionConfirm)) else {
+            panic!("the denial");
+        };
+        f.on_reply(Reply::Mutated(Err(step_up_required())), now);
+        f.cancel_step_up();
+        let v = f.view(now).views.unwrap();
+        assert_eq!(v.outcome, Some(Outcome::NotSent));
+        assert!(!v.pending);
+        assert!(f.view(now).step_up.is_none());
+
+        let later = now + Duration::from_secs(2000);
+        assert!(ends(&f.tick(later)));
+        assert!(f.view(later).views.is_none(), "every record is dropped");
+        // A list answered after the lock is never shown.
+        let late = f.on_reply(
+            Reply::Requests(Ok(ListAppRequestsResponse {
+                items: vec![request(0)],
+                next_page_token: String::new(),
+            })),
+            later,
+        );
+        assert!(late.is_empty() && f.view(later).views.is_none());
+    }
+
+    #[test]
+    fn the_views_close_the_factor_panel_and_a_dead_session_ends() {
+        let now = Instant::now();
+        let mut f = signed_in(now, BOTH, 900);
+        let _ = cmd(f.open_factors());
+        f.on_reply(Reply::Factors(Ok(Vec::new())), now);
+        let _ = cmd(f.open_views(Tab::Approvals));
+        assert!(f.view(now).factors.is_none());
+        let effects = f.on_reply(Reply::Permissions(Err(ClientError::SessionEnded)), now);
+        assert!(ends(&effects));
+        assert_eq!(f.view(now).notice, Some(Notice::SessionEnded));
+        assert!(!f.signed_in());
     }
 }

@@ -9,6 +9,8 @@
 //! - [`login`] — the sign-in form: user name, then password with a code or a key;
 //! - [`enroll`] — the token-enrollment wizard (password, TOTP and/or a key);
 //! - [`factors`] — "My account → Second factors": list, add, remove;
+//! - [`views`] — Requests and Approvals: lists, filters, details;
+//! - [`decide`] — approve, deny, edit, revoke and freeze dialogs;
 //! - [`seed`] — a TOTP seed on screen: its QR code and text, wiped;
 //! - [`flow`] — the window's state machine: offer, sign-in, step-up, idle lock;
 //! - [`session`] — the worker thread that talks to CMIS for the window;
@@ -18,6 +20,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod decide;
 pub mod enroll;
 pub mod factors;
 pub mod flow;
@@ -25,4 +28,5 @@ pub mod login;
 pub mod secret;
 pub mod seed;
 pub mod session;
+pub mod views;
 pub mod webauthn;

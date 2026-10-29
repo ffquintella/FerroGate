@@ -13,7 +13,9 @@ publish                = false
 # the tray admin client (F22). Session token in memory only; only the pinned
 # hybrid-PQC admin listener; F20 sign-in and step-up with TOTP or FIDO2. The
 # FIDO2 authenticator sits behind `webauthn::Authenticator` (each front end
-# supplies its platform's, or a test double). No GUI, terminal or database code.
+# supplies its platform's, or a test double). Request and approval reads,
+# decisions, rules and filters (`approvals`) are shared with the TUI (T283).
+# No GUI, terminal or database code.
 [lib]
 name = "ferrogate_admin_client"
 path = "src/lib.rs"
@@ -25,6 +27,8 @@ workspace = true
 ferro-proto     = { path = "../ferro-proto" }
 ferro-crypto    = { path = "../ferro-crypto" }
 ferro-transport = { path = "../ferro-transport" }
+# F19 §4.5 risk-flag bits for the approval rules and filters (no I/O used).
+ferro-appid     = { path = "../ferro-appid" }
 
 tokio             = { workspace = true }
 tonic             = { workspace = true }
@@ -36,6 +40,8 @@ zeroize           = { workspace = true }
 base64            = { workspace = true }
 sha2              = { workspace = true }
 static_assertions = { workspace = true }
+# Idempotency keys (v4) and host-UUID filter checks.
+uuid              = { workspace = true, features = ["v4"] }
 
 # Unix: owner/mode checks and `O_NOFOLLOW` opens through safe wrappers.
 [target.'cfg(unix)'.dependencies]
@@ -57,4 +63,3 @@ p256          = { workspace = true }
 ed25519-dalek = { workspace = true }
 rcgen         = { workspace = true }
 rustls-pki-types = { workspace = true }
-uuid          = { workspace = true }

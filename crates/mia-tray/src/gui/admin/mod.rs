@@ -12,10 +12,12 @@
 //! [`eframe::NativeOptions::persist_window`] off, no `save`, no
 //! `persist_egui_memory`. Enrollment and second factors: [`enroll`],
 //! [`factors`]; a TOTP seed is painted by [`seed`], never as a string.
+//! Requests, approvals and their decisions: [`views`].
 
 mod enroll;
 mod factors;
 mod seed;
+mod views;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -29,6 +31,7 @@ use crate::admin::factors::FactorField;
 use crate::admin::flow::{Busy, Effect, Flow, FlowView, Notice, Problem};
 use crate::admin::login::{Field, Stage, Submission};
 use crate::admin::session::{self, Link, SHUTDOWN_WAIT};
+use crate::admin::views::{Tab, ViewAction};
 use crate::i18n::{fill, Lang, Msg};
 use crate::text::{display_safe, display_safe_block, human_duration};
 
@@ -39,7 +42,7 @@ pub fn run(lang: Lang) -> ExitCode {
         viewport: egui::ViewportBuilder::default()
             // Never the user name or any record data (F22 §3).
             .with_title(Msg::AdminAppName.text(lang))
-            .with_inner_size([560.0, 620.0])
+            .with_inner_size([820.0, 700.0])
             .with_min_inner_size([440.0, 380.0]),
         persist_window: false,
         ..Default::default()
@@ -290,6 +293,10 @@ impl AdminApp {
                 ui.separator();
                 factors::panel(ui, lang, f, shown.as_ref(), idle, actions);
             }
+            if let Some(v) = &view.views {
+                ui.separator();
+                views::panel(ui, lang, v, idle, actions);
+            }
         } else if let Some(w) = &view.enroll {
             enroll::wizard(ui, lang, w, shown.as_ref(), idle, actions);
         } else {
@@ -315,7 +322,9 @@ impl AdminApp {
                 | Busy::Factors { key: true } => Msg::AdminTouchKey,
                 Busy::SignIn { key: false } => Msg::AdminSigningIn,
                 Busy::StepUp { key: false } => Msg::AdminConfirming,
-                Busy::Enroll { key: false } | Busy::Factors { key: false } => Msg::AdminWorking,
+                Busy::Enroll { key: false } | Busy::Factors { key: false } | Busy::Views => {
+                    Msg::AdminWorking
+                }
             };
             ui.label(msg.text(lang));
         } else if let Some(text) = self.notice_text(view) {
@@ -407,6 +416,12 @@ impl AdminApp {
                     Vec::new()
                 }
                 Action::SubmitFactor(how) => self.flow.submit_factor(how),
+                Action::OpenViews(tab) => self.flow.open_views(tab),
+                Action::CloseViews => {
+                    self.flow.close_views();
+                    Vec::new()
+                }
+                Action::View(action) => self.flow.views_action(action),
             };
             self.apply(effects);
         }
@@ -437,6 +452,9 @@ enum Action {
     RemoveFactor(String),
     CancelFactorForm,
     SubmitFactor(Submission),
+    OpenViews(Tab),
+    CloseViews,
+    View(ViewAction),
 }
 
 fn sign_in(
@@ -617,24 +635,51 @@ fn signed_in(ui: &mut egui::Ui, lang: Lang, view: &FlowView, actions: &mut Vec<A
             }
         });
     } else {
-        ui.horizontal(|ui| {
+        ui.horizontal(|ui| session_buttons(ui, lang, view, idle, actions));
+    }
+}
+
+/// The signed-in summary's buttons: step up, the views, second factors,
+/// sign out.
+fn session_buttons(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    view: &FlowView,
+    idle: bool,
+    actions: &mut Vec<Action>,
+) {
+    if ui
+        .add_enabled(idle, egui::Button::new(Msg::AdminStepUp.text(lang)))
+        .clicked()
+    {
+        actions.push(Action::OpenStepUp);
+    }
+    if view.views.is_none() {
+        for (tab, msg) in [
+            (Tab::Requests, Msg::AdminRequestsOpen),
+            (Tab::Approvals, Msg::AdminApprovalsOpen),
+        ] {
             if ui
-                .add_enabled(idle, egui::Button::new(Msg::AdminStepUp.text(lang)))
+                .add_enabled(idle, egui::Button::new(msg.text(lang)))
                 .clicked()
             {
-                actions.push(Action::OpenStepUp);
+                actions.push(Action::OpenViews(tab));
             }
-            if view.factors.is_none()
-                && ui
-                    .add_enabled(idle, egui::Button::new(Msg::AdminFactorsOpen.text(lang)))
-                    .clicked()
-            {
-                actions.push(Action::OpenFactors);
-            }
-            if ui.button(Msg::AdminSignOut.text(lang)).clicked() {
-                actions.push(Action::SignOut);
-            }
-        });
+        }
+    }
+    let deciding = view.views.as_ref().is_some_and(|v| v.pending);
+    if view.factors.is_none()
+        && ui
+            .add_enabled(
+                idle && !deciding,
+                egui::Button::new(Msg::AdminFactorsOpen.text(lang)),
+            )
+            .clicked()
+    {
+        actions.push(Action::OpenFactors);
+    }
+    if ui.button(Msg::AdminSignOut.text(lang)).clicked() {
+        actions.push(Action::SignOut);
     }
 }
 
@@ -712,6 +757,8 @@ mod tests {
         secrets_ok: bool,
         ends: usize,
         replies: VecDeque<Reply>,
+        /// Idempotency keys of the decisions sent.
+        keys: Vec<String>,
     }
 
     struct FakeLink(Rc<RefCell<Seen>>);
@@ -738,6 +785,15 @@ mod tests {
                     seen.cmds.push("complete_add_factor");
                 }
                 Cmd::RemoveFactor { .. } => seen.cmds.push("remove_factor"),
+                Cmd::Permissions => seen.cmds.push("permissions"),
+                Cmd::ListRequests(_) => seen.cmds.push("list_requests"),
+                Cmd::GetRequest(_) => seen.cmds.push("get_request"),
+                Cmd::ListApprovals(_) => seen.cmds.push("list_approvals"),
+                Cmd::GetApproval(_) => seen.cmds.push("get_approval"),
+                Cmd::Mutate(m) => {
+                    seen.cmds.push("mutate");
+                    seen.keys.push(m.idempotency_key().to_string());
+                }
             }
             true
         }
@@ -1176,6 +1232,126 @@ mod tests {
         assert!(!painted.contains("Confirm it is you"), "{painted}");
         assert!(!painted.contains("Second factors"), "{painted}");
         assert!(painted.contains("Register security key"), "{painted}");
+    }
+
+    fn push(seen: &Rc<RefCell<Seen>>, reply: Reply) {
+        seen.borrow_mut().replies.push_back(reply);
+    }
+
+    /// Signed in with `permissions`, the Requests view on one hostile
+    /// pending request; returns what the list frame painted.
+    fn on_the_requests(
+        ctx: &egui::Context,
+        app: &mut AdminApp,
+        seen: &Rc<RefCell<Seen>>,
+        permissions: &[&str],
+    ) -> String {
+        use crate::admin::decide::tests::request;
+        use ferrogate_admin_client::approvals::filters::RiskFlags;
+        use ferrogate_admin_client::approvals::proto::ListAppRequestsResponse;
+        signed_in_as(ctx, app, seen, "Alice");
+        app.act(vec![Action::OpenViews(Tab::Requests)]);
+        let perms = permissions.iter().map(|p| (*p).to_string()).collect();
+        push(seen, Reply::Permissions(Ok(perms)));
+        frame(ctx, app, Vec::new());
+        push(
+            seen,
+            Reply::Requests(Ok(ListAppRequestsResponse {
+                items: vec![request(RiskFlags::UNSIGNED)],
+                next_page_token: String::new(),
+            })),
+        );
+        frame(ctx, app, Vec::new()).join("\n")
+    }
+
+    #[test]
+    fn the_views_show_inert_text_and_resend_a_decision_once_after_a_step_up() {
+        use crate::admin::decide::tests::detail;
+        use crate::admin::decide::DecisionKind;
+        use ferrogate_admin_client::approvals::proto::ApproveAppRequestResponse;
+        use ferrogate_admin_client::approvals::Mutated;
+        use ferrogate_admin_client::error::{ClientError, Code, RpcError};
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        let painted = on_the_requests(
+            &ctx,
+            &mut app,
+            &seen,
+            &["app_request.approve", "app_request.deny"],
+        );
+        assert!(painted.contains("R-0000A1B2"), "{painted}");
+        assert!(!painted.contains('\u{202e}') && !painted.contains('\u{1b}'));
+        assert!(painted.contains("⚠1"), "the risk flag is counted");
+        app.act(vec![Action::View(ViewAction::OpenRequest(0))]);
+        push(&seen, Reply::Request(Ok(Box::new(detail(0)))));
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("Request R-0000A1B2"), "{painted}");
+        assert!(painted.contains("Approve…") && painted.contains("Deny…"));
+
+        app.act(vec![Action::View(ViewAction::Decide(
+            DecisionKind::Approve,
+        ))]);
+        let painted = frame(&ctx, &mut app, vec![egui::Event::Text("ticket 42".into())]);
+        assert!(painted
+            .join("\n")
+            .contains("Manual approval for every new binary"));
+        app.act(vec![Action::View(ViewAction::DecisionNext)]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("Review what will be sent"), "{painted}");
+        assert!(painted.contains("Note: ticket 42"), "{painted}");
+        app.act(vec![Action::View(ViewAction::DecisionConfirm)]);
+        let step_up = ClientError::Other(RpcError::local(
+            Code::FailedPrecondition,
+            "step_up_required",
+        ));
+        push(&seen, Reply::Mutated(Err(step_up)));
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(
+            painted.contains("Confirm with your second factor"),
+            "{painted}"
+        );
+        frame(&ctx, &mut app, vec![egui::Event::Text("123456".into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        push(&seen, Reply::SteppedUp(Ok(crate::unix_now() + 300)));
+        frame(&ctx, &mut app, Vec::new());
+        {
+            let s = seen.borrow();
+            assert!(
+                s.cmds.ends_with(&["mutate", "step_up", "mutate"]),
+                "{:?}",
+                s.cmds
+            );
+            assert_eq!(s.keys.len(), 2);
+            assert_eq!(s.keys[0], s.keys[1], "the retry reuses the key");
+        }
+        let done = Mutated::Approved(ApproveAppRequestResponse {
+            allowlist_generation: 9,
+            ..ApproveAppRequestResponse::default()
+        });
+        push(&seen, Reply::Mutated(Ok(Box::new(done))));
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(seen.borrow().cmds.last(), Some(&"get_request"), "reloaded");
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("host generation 9"), "{painted}");
+        let memory = ctx.memory(|m| format!("{m:?}"));
+        assert!(!memory.contains("123456"));
+    }
+
+    #[test]
+    fn a_viewer_sees_no_decision_buttons_and_a_lock_clears_the_views() {
+        use crate::admin::decide::tests::detail;
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        on_the_requests(&ctx, &mut app, &seen, &["app_request.list"]);
+        app.act(vec![Action::View(ViewAction::OpenRequest(0))]);
+        push(&seen, Reply::Request(Ok(Box::new(detail(0)))));
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("Request R-0000A1B2"), "{painted}");
+        assert!(!painted.contains("Approve…") && !painted.contains("Deny…"));
+        let later = Instant::now() + LONG_IDLE;
+        let painted = frame_at(&ctx, &mut app, Vec::new(), later).join("\n");
+        assert!(!painted.contains("R-0000A1B2"), "{painted}");
+        assert!(app.flow.view(later).views.is_none());
     }
 
     #[test]

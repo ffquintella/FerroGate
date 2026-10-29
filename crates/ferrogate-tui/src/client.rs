@@ -33,15 +33,13 @@ use ferro_crypto::pin::SpkiPin;
 use ferro_proto::admin_v1::admin_client::AdminClient;
 use ferro_proto::admin_v1::{
     login_request::SecondFactor, mfa_proof, AdminAccountInfo, AdminRegisterApplicationRequest,
-    AdminRegisterApplicationResponse, ApproveAppRequestRequest, ApproveAppRequestResponse,
-    BeginLoginRequest, BeginStepUpRequest, ChangePasswordRequest, ClientInfo,
-    DenyAppRequestRequest, DenyAppRequestResponse, GetAppRequestRequest, GetAppRequestResponse,
-    GetApprovalRequest, GetApprovalResponse, ListAdminAccountsRequest, ListAppRequestsRequest,
-    ListAppRequestsResponse, ListApprovalsRequest, ListApprovalsResponse, ListMySessionsRequest,
-    LoginRequest, LogoutRequest, MfaProof, PageRequest, RevokeApprovalRequest,
-    RevokeApprovalResponse, SessionInfo, SetLineageAutoUpdateFrozenRequest, StepUpRequest,
-    UpdateApprovalRequest, UpdateApprovalResponse, WhoAmIRequest, WhoAmIResponse,
+    AdminRegisterApplicationResponse, BeginLoginRequest, BeginStepUpRequest, ChangePasswordRequest,
+    ClientInfo, GetAppRequestResponse, GetApprovalResponse, ListAdminAccountsRequest,
+    ListAppRequestsRequest, ListAppRequestsResponse, ListApprovalsRequest, ListApprovalsResponse,
+    ListMySessionsRequest, LoginRequest, LogoutRequest, MfaProof, PageRequest, SessionInfo,
+    StepUpRequest, WhoAmIRequest, WhoAmIResponse,
 };
+use ferrogate_admin_client::approvals;
 use tokio::sync::mpsc;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -124,35 +122,9 @@ pub enum Query {
     Sessions,
 }
 
-/// A decision or edit (step-up operations, F20 §7 "S"). Carries no secret, so
-/// it can be kept for the single retry after a step-up.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Mutation {
-    /// `ApproveAppRequest`.
-    Approve(ApproveAppRequestRequest),
-    /// `DenyAppRequest`.
-    Deny(DenyAppRequestRequest),
-    /// `UpdateApproval`.
-    Update(UpdateApprovalRequest),
-    /// `RevokeApproval`.
-    Revoke(RevokeApprovalRequest),
-    /// `SetLineageAutoUpdateFrozen`.
-    Freeze(SetLineageAutoUpdateFrozenRequest),
-}
-
-impl Mutation {
-    /// The idempotency key the request carries.
-    #[must_use]
-    pub fn idempotency_key(&self) -> &str {
-        match self {
-            Self::Approve(r) => &r.idempotency_key,
-            Self::Deny(r) => &r.idempotency_key,
-            Self::Update(r) => &r.idempotency_key,
-            Self::Revoke(r) => &r.idempotency_key,
-            Self::Freeze(r) => &r.idempotency_key,
-        }
-    }
-}
+// A decision or edit (`Mutation`) and its outcome (`Mutated`), and the RPCs
+// behind them, are shared with the tray admin client (T283).
+pub use ferrogate_admin_client::approvals::{Mutated, Mutation};
 
 /// A command from the UI to the client task.
 pub enum Cmd {
@@ -327,22 +299,6 @@ pub enum LoginError {
     Throttled(u64),
     /// Another server error.
     Other(RpcError),
-}
-
-/// The outcome of a mutation (boxed in [`Reply::Mutated`]).
-#[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)] // one value per mutation, already boxed in `Reply`.
-pub enum Mutated {
-    /// `ApproveAppRequest`.
-    Approved(ApproveAppRequestResponse),
-    /// `DenyAppRequest`.
-    Denied(DenyAppRequestResponse),
-    /// `UpdateApproval`.
-    Updated(UpdateApprovalResponse),
-    /// `RevokeApproval`.
-    Revoked(RevokeApprovalResponse),
-    /// `SetLineageAutoUpdateFrozen` (the new state).
-    Frozen(bool),
 }
 
 /// A reply from the client task.
@@ -702,29 +658,7 @@ impl AdminConnection {
                 )
             }
         };
-        let result = match m.clone() {
-            Mutation::Approve(r) => within(self.cfg.rpc_timeout, admin.approve_app_request(r))
-                .await
-                .map(|x| Mutated::Approved(x.into_inner())),
-            Mutation::Deny(r) => within(self.cfg.rpc_timeout, admin.deny_app_request(r))
-                .await
-                .map(|x| Mutated::Denied(x.into_inner())),
-            Mutation::Update(r) => within(self.cfg.rpc_timeout, admin.update_approval(r))
-                .await
-                .map(|x| Mutated::Updated(x.into_inner())),
-            Mutation::Revoke(r) => within(self.cfg.rpc_timeout, admin.revoke_approval(r))
-                .await
-                .map(|x| Mutated::Revoked(x.into_inner())),
-            Mutation::Freeze(r) => {
-                let frozen = r.frozen;
-                within(
-                    self.cfg.rpc_timeout,
-                    admin.set_lineage_auto_update_frozen(r),
-                )
-                .await
-                .map(|_| Mutated::Frozen(frozen))
-            }
-        };
+        let result = approvals::send(&mut admin, self.cfg.rpc_timeout, m.clone()).await;
         match result {
             Ok(done) => Reply::Mutated(Box::new(done)),
             Err(s) => self.fail(Op::Mutation(m), &s),
@@ -776,27 +710,25 @@ impl AdminConnection {
                 .await
                 .map(|r| Reply::WhoAmI(Box::new(r.into_inner()))),
             Query::Requests { seq, req } => {
-                within(self.cfg.rpc_timeout, admin.list_app_requests(req))
+                approvals::list_requests(&mut admin, self.cfg.rpc_timeout, req)
                     .await
-                    .map(|r| Reply::Requests(seq, r.into_inner()))
+                    .map(|r| Reply::Requests(seq, r))
             }
-            Query::Request { seq, id } => within(
-                self.cfg.rpc_timeout,
-                admin.get_app_request(GetAppRequestRequest { request_id: id }),
-            )
-            .await
-            .map(|r| Reply::Request(seq, Box::new(r.into_inner()))),
+            Query::Request { seq, id } => {
+                approvals::get_request(&mut admin, self.cfg.rpc_timeout, id)
+                    .await
+                    .map(|r| Reply::Request(seq, Box::new(r)))
+            }
             Query::Approvals { seq, req } => {
-                within(self.cfg.rpc_timeout, admin.list_approvals(req))
+                approvals::list_approvals(&mut admin, self.cfg.rpc_timeout, req)
                     .await
-                    .map(|r| Reply::Approvals(seq, r.into_inner()))
+                    .map(|r| Reply::Approvals(seq, r))
             }
-            Query::Approval { seq, id } => within(
-                self.cfg.rpc_timeout,
-                admin.get_approval(GetApprovalRequest { approval_id: id }),
-            )
-            .await
-            .map(|r| Reply::Approval(seq, Box::new(r.into_inner()))),
+            Query::Approval { seq, id } => {
+                approvals::get_approval(&mut admin, self.cfg.rpc_timeout, id)
+                    .await
+                    .map(|r| Reply::Approval(seq, Box::new(r)))
+            }
             Query::Dashboard { now } => return self.dashboard(&mut admin, now).await,
             Query::Accounts => within(
                 self.cfg.rpc_timeout,

@@ -1,150 +1,26 @@
 //! The search and filter panel (F21 §5), mapped one-to-one to the structured
 //! fields of `ListAppRequests` and `ListApprovals` (F19 §7.5).
 //!
-//! Values are validated here, inline, and an invalid panel is never sent: a
-//! date must be `YYYY-MM-DD`, a hash prefix 8 to 96 hex characters, a host a
-//! UUID, and every text at most 128 characters (the server's limit). Filters
-//! travel as separate protobuf fields and are never concatenated into a query
-//! string; the server binds them as SQL parameters.
+//! The filter values, their checks and the listing requests are shared with
+//! the tray admin client (`ferrogate_admin_client::approvals::filters`,
+//! T283); this module draws them as the TUI's panel ([`FilterForm`]).
 
-use std::fmt::Write as _;
+//! Values are validated inline and an invalid panel is never sent. Filters
+//! travel as separate protobuf fields; the server binds them as SQL
+//! parameters.
 
+#[cfg(test)]
 use ferro_appid::flags::RiskFlags;
-use ferro_proto::admin_v1::{ListAppRequestsRequest, ListApprovalsRequest, PageRequest};
+
+pub use ferrogate_admin_client::approvals::filters::{
+    check, warning_flags, ApprovalFilters, RequestFilters, APPROVAL_ORIGINS, APPROVAL_STATES,
+    FLAG_NAMES, MAX_TEXT, PAGE_SIZE, POLICIES, PRESETS, REQUEST_KINDS, REQUEST_ORIGINS,
+    REQUEST_STATES,
+};
 
 use super::form::{Field, Form};
+#[cfg(test)]
 use crate::timefmt;
-
-/// Longest free-text filter (the server's `MAX_TEXT_CHARS`).
-pub const MAX_TEXT: usize = 128;
-/// Rows per page requested from the server.
-pub const PAGE_SIZE: u32 = 50;
-
-/// Request states, in wire-code order (1…5).
-pub const REQUEST_STATES: [&str; 5] = ["pending", "approved", "auto-approved", "denied", "expired"];
-/// Request origins, in wire-code order (1…4).
-pub const REQUEST_ORIGINS: [&str; 4] = ["self", "assisted", "admin_direct", "observed"];
-/// Request kinds (0 = any, then wire codes 1…2).
-pub const REQUEST_KINDS: [&str; 3] = ["any", "register", "update"];
-/// Approval states, in wire-code order (1…3).
-pub const APPROVAL_STATES: [&str; 3] = ["active", "expired", "revoked"];
-/// Update policies, in wire-code order (1…2).
-pub const POLICIES: [&str; 2] = ["manual", "auto-update"];
-/// Approval origins, in wire-code order (1…4).
-pub const APPROVAL_ORIGINS: [&str; 4] = ["manual", "auto_update", "admin_direct", "legacy_import"];
-/// Approval presets.
-pub const PRESETS: [&str; 5] = [
-    "none",
-    "expiring ≤ 14 d",
-    "legacy, no expiry",
-    "superseded",
-    "auto-update",
-];
-
-/// The F19 §4.5 risk flags with their short names, in bit order.
-pub const FLAG_NAMES: [(u32, &str); 15] = [
-    (RiskFlags::PATH_PROTECTED, "path protected"),
-    (RiskFlags::USER_WRITABLE_PATH, "user-writable path"),
-    (RiskFlags::WORLD_WRITABLE, "world-writable"),
-    (RiskFlags::TEMP_DIR, "temp dir"),
-    (RiskFlags::NETWORK_PATH, "network path"),
-    (RiskFlags::INTERPRETER, "interpreter"),
-    (RiskFlags::UNSIGNED, "unsigned"),
-    (RiskFlags::SIGNER_CHANGED, "signer changed"),
-    (RiskFlags::VERSION_COLLISION, "version collision"),
-    (RiskFlags::VERSION_DOWNGRADE, "version downgrade"),
-    (RiskFlags::HASH_PREVIOUSLY_REVOKED, "hash revoked before"),
-    (RiskFlags::HASH_PREVIOUSLY_DENIED, "hash denied before"),
-    (RiskFlags::DELETED_ON_DISK, "deleted on disk"),
-    (RiskFlags::IMA_UNVERIFIED, "IMA unverified"),
-    (RiskFlags::HOST_TIER_B, "host-key tier"),
-];
-
-/// The names of the bits set in `flags` that warrant a warning (every flag
-/// except `path protected`, which is good news).
-#[must_use]
-pub fn warning_flags(flags: u32) -> Vec<&'static str> {
-    FLAG_NAMES
-        .iter()
-        .filter(|(bit, _)| *bit != RiskFlags::PATH_PROTECTED && flags & bit != 0)
-        .map(|(_, name)| *name)
-        .collect()
-}
-
-fn codes(checked: &[bool]) -> Vec<u32> {
-    checked
-        .iter()
-        .zip(1u32..)
-        .filter(|(on, _)| **on)
-        .map(|(_, code)| code)
-        .collect()
-}
-
-fn names(checked: &[bool], labels: &[&str]) -> String {
-    let picked: Vec<&str> = checked
-        .iter()
-        .zip(labels)
-        .filter(|(on, _)| **on)
-        .map(|(_, l)| *l)
-        .collect();
-    if picked.is_empty() || picked.len() == labels.len() {
-        "any".to_string()
-    } else {
-        picked.join(",")
-    }
-}
-
-/// Inline checks shared by both panels.
-pub mod check {
-    use super::MAX_TEXT;
-    use crate::timefmt;
-
-    /// Text within the server limit.
-    pub fn text(v: &str) -> Result<(), String> {
-        if v.chars().count() > MAX_TEXT {
-            return Err(format!("at most {MAX_TEXT} characters"));
-        }
-        Ok(())
-    }
-
-    /// Empty, or a `YYYY-MM-DD` date.
-    pub fn date(v: &str) -> Result<Option<i64>, String> {
-        if v.is_empty() {
-            return Ok(None);
-        }
-        timefmt::parse_date(v)
-            .map(Some)
-            .ok_or_else(|| "use YYYY-MM-DD (a real date)".to_string())
-    }
-
-    /// Empty, or 8 to 96 hex characters.
-    pub fn hash_prefix(v: &str) -> Result<(), String> {
-        if v.is_empty() || ((8..=96).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            Ok(())
-        } else {
-            Err("8 to 96 hex characters".to_string())
-        }
-    }
-
-    /// Empty, or a UUID.
-    pub fn uuid(v: &str) -> Result<(), String> {
-        if v.is_empty() || uuid::Uuid::parse_str(v).is_ok() {
-            Ok(())
-        } else {
-            Err("a host UUID (8-4-4-4-12 hex)".to_string())
-        }
-    }
-
-    /// Empty, or at most 64 printable ASCII characters (an id).
-    pub fn id(v: &str) -> Result<(), String> {
-        if v.len() <= 64 && v.bytes().all(|b| b.is_ascii_graphic()) {
-            Ok(())
-        } else {
-            Err("an id (at most 64 printable characters)".to_string())
-        }
-    }
-}
 
 /// Run `f` on the text of `key` and record its error inline.
 fn validated<T>(form: &mut Form, key: &str, f: impl Fn(&str) -> Result<T, String>) -> Option<T> {
@@ -158,62 +34,18 @@ fn validated<T>(form: &mut Form, key: &str, f: impl Fn(&str) -> Result<T, String
     }
 }
 
-/// Filters of the Requests screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestFilters {
-    /// States, wire-code order.
-    pub states: Vec<bool>,
-    /// Origins, wire-code order.
-    pub origins: Vec<bool>,
-    /// Kind (0 any).
-    pub kind: usize,
-    /// Host UUID (exact).
-    pub host: String,
-    /// Path contains.
-    pub path: String,
-    /// Product contains.
-    pub product: String,
-    /// User name (exact).
-    pub user: String,
-    /// Declared version (exact).
-    pub version: String,
-    /// Hash prefix.
-    pub sha_prefix: String,
-    /// Flags (any of), bit order of [`FLAG_NAMES`].
-    pub flags: Vec<bool>,
-    /// Submitted on or after (`YYYY-MM-DD`).
-    pub from: String,
-    /// Submitted before the end of (`YYYY-MM-DD`).
-    pub to: String,
-    /// Free text.
-    pub text: String,
-}
-
-impl Default for RequestFilters {
-    /// Pending requests only.
-    fn default() -> Self {
-        Self {
-            states: vec![true, false, false, false, false],
-            origins: vec![false; REQUEST_ORIGINS.len()],
-            kind: 0,
-            host: String::new(),
-            path: String::new(),
-            product: String::new(),
-            user: String::new(),
-            version: String::new(),
-            sha_prefix: String::new(),
-            flags: vec![false; FLAG_NAMES.len()],
-            from: String::new(),
-            to: String::new(),
-            text: String::new(),
-        }
-    }
-}
-
-impl RequestFilters {
+/// The TUI's filter panel over a set of filters.
+pub trait FilterForm: Sized {
     /// The filter panel pre-filled with these values.
     #[must_use]
-    pub fn form(&self) -> Form {
+    fn form(&self) -> Form;
+
+    /// Read the panel back; `None` (with inline errors set) when invalid.
+    fn from_form(form: &mut Form) -> Option<Self>;
+}
+
+impl FilterForm for RequestFilters {
+    fn form(&self) -> Form {
         let flag_labels: Vec<&str> = FLAG_NAMES.iter().map(|(_, n)| *n).collect();
         Form::new(vec![
             Field::multi("states", "State", &REQUEST_STATES, &self.states),
@@ -232,8 +64,7 @@ impl RequestFilters {
         ])
     }
 
-    /// Read the panel back; `None` (with inline errors set) when invalid.
-    pub fn from_form(form: &mut Form) -> Option<Self> {
+    fn from_form(form: &mut Form) -> Option<Self> {
         form.clear_errors();
         let host = validated(form, "host", |v| check::uuid(v).map(|()| v.to_string()));
         let path = validated(form, "path", |v| check::text(v).map(|()| v.to_string()));
@@ -271,147 +102,10 @@ impl RequestFilters {
             text: text?,
         })
     }
-
-    /// The listing request for one page.
-    #[must_use]
-    pub fn to_request(&self, ascending: bool, page_token: &str) -> ListAppRequestsRequest {
-        let flags_any = self
-            .flags
-            .iter()
-            .zip(FLAG_NAMES)
-            .filter(|(on, _)| **on)
-            .fold(0u32, |acc, (_, (bit, _))| acc | bit);
-        ListAppRequestsRequest {
-            states: codes(&self.states),
-            host_uuid: self.host.clone(),
-            path_contains: self.path.clone(),
-            product_contains: self.product.clone(),
-            user_name: self.user.clone(),
-            declared_version: self.version.clone(),
-            bin_sha_prefix: self.sha_prefix.clone(),
-            origins: codes(&self.origins),
-            kinds: if self.kind == 0 {
-                Vec::new()
-            } else {
-                vec![u32::try_from(self.kind).unwrap_or(0)]
-            },
-            flags_any,
-            submitted_after: timefmt::parse_date(&self.from).unwrap_or(0),
-            // Inclusive "to": before the end of that day.
-            submitted_before: timefmt::parse_date(&self.to).map_or(0, |t| t + timefmt::DAY),
-            text: self.text.clone(),
-            ascending,
-            page: Some(PageRequest {
-                page_size: PAGE_SIZE,
-                page_token: page_token.to_string(),
-            }),
-        }
-    }
-
-    /// A one-line summary for the list header.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        let mut s = format!(
-            "state:{} origin:{} kind:{} host:{}",
-            names(&self.states, &REQUEST_STATES),
-            names(&self.origins, &REQUEST_ORIGINS),
-            REQUEST_KINDS.get(self.kind).unwrap_or(&"any"),
-            if self.host.is_empty() {
-                "*".to_string()
-            } else {
-                self.host.chars().take(8).collect::<String>()
-            }
-        );
-        for (label, v) in [
-            ("path", &self.path),
-            ("product", &self.product),
-            ("user", &self.user),
-            ("version", &self.version),
-            ("sha", &self.sha_prefix),
-            ("from", &self.from),
-            ("to", &self.to),
-        ] {
-            if !v.is_empty() {
-                let _ = write!(s, " {label}:{v}");
-            }
-        }
-        if self.flags.iter().any(|f| *f) {
-            s.push_str(" flags:…");
-        }
-        s
-    }
 }
 
-/// Filters of the Approvals screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovalFilters {
-    /// Preset (index into [`PRESETS`]).
-    pub preset: usize,
-    /// States, wire-code order.
-    pub states: Vec<bool>,
-    /// Policies, wire-code order.
-    pub policies: Vec<bool>,
-    /// Approval origins, wire-code order.
-    pub origins: Vec<bool>,
-    /// Expires on or after (`YYYY-MM-DD`).
-    pub expires_after: String,
-    /// Expires before the end of (`YYYY-MM-DD`).
-    pub expires_before: String,
-    /// Include superseded approvals.
-    pub include_superseded: bool,
-    /// Lineage id (exact).
-    pub lineage: String,
-    /// Host UUID (exact).
-    pub host: String,
-    /// Path contains.
-    pub path: String,
-    /// Product contains.
-    pub product: String,
-    /// User name (exact).
-    pub user: String,
-    /// Hash prefix.
-    pub sha_prefix: String,
-    /// Free text.
-    pub text: String,
-}
-
-impl Default for ApprovalFilters {
-    /// Active approvals.
-    fn default() -> Self {
-        Self {
-            preset: 0,
-            states: vec![true, false, false],
-            policies: vec![false; POLICIES.len()],
-            origins: vec![false; APPROVAL_ORIGINS.len()],
-            expires_after: String::new(),
-            expires_before: String::new(),
-            include_superseded: false,
-            lineage: String::new(),
-            host: String::new(),
-            path: String::new(),
-            product: String::new(),
-            user: String::new(),
-            sha_prefix: String::new(),
-            text: String::new(),
-        }
-    }
-}
-
-impl ApprovalFilters {
-    /// Every approval of one lineage (the `l` jump from a request).
-    #[must_use]
-    pub fn lineage(lineage_id: &str) -> Self {
-        Self {
-            states: vec![false; APPROVAL_STATES.len()],
-            include_superseded: true,
-            lineage: lineage_id.to_string(),
-            ..Self::default()
-        }
-    }
-
-    /// The filter panel pre-filled with these values.
-    #[must_use]
-    pub fn form(&self) -> Form {
+impl FilterForm for ApprovalFilters {
+    fn form(&self) -> Form {
         Form::new(vec![
             Field::choice("preset", "Preset", &PRESETS, self.preset),
             Field::multi("states", "State", &APPROVAL_STATES, &self.states),
@@ -431,8 +125,7 @@ impl ApprovalFilters {
         ])
     }
 
-    /// Read the panel back; `None` (with inline errors set) when invalid.
-    pub fn from_form(form: &mut Form) -> Option<Self> {
+    fn from_form(form: &mut Form) -> Option<Self> {
         form.clear_errors();
         let after = validated(form, "after", check::date);
         let before = validated(form, "before", check::date);
@@ -470,80 +163,6 @@ impl ApprovalFilters {
             sha_prefix: sha?,
             text: text?,
         })
-    }
-
-    /// The listing request for one page at Unix time `now` (for presets).
-    #[must_use]
-    pub fn to_request(&self, now: i64, ascending: bool, page_token: &str) -> ListApprovalsRequest {
-        let mut req = ListApprovalsRequest {
-            states: codes(&self.states),
-            host_uuid: self.host.clone(),
-            lineage_id: self.lineage.clone(),
-            path_contains: self.path.clone(),
-            product_contains: self.product.clone(),
-            user_name: self.user.clone(),
-            bin_sha_prefix: self.sha_prefix.clone(),
-            policies: codes(&self.policies),
-            approval_origins: codes(&self.origins),
-            expires_after: timefmt::parse_date(&self.expires_after).unwrap_or(0),
-            expires_before: timefmt::parse_date(&self.expires_before)
-                .map_or(0, |t| t + timefmt::DAY),
-            include_superseded: self.include_superseded,
-            text: self.text.clone(),
-            ascending,
-            page: Some(PageRequest {
-                page_size: PAGE_SIZE,
-                page_token: page_token.to_string(),
-            }),
-            ..ListApprovalsRequest::default()
-        };
-        match self.preset {
-            1 => {
-                req.states = vec![1];
-                req.expires_after = now;
-                req.expires_before = now + 14 * timefmt::DAY;
-            }
-            2 => {
-                req.legacy_only = true;
-                req.no_expiry_only = true;
-            }
-            3 => req.include_superseded = true,
-            4 => req.policies = vec![2],
-            _ => {}
-        }
-        req
-    }
-
-    /// A one-line summary for the list header.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        let mut s = format!(
-            "state:{} policy:{} origin:{}",
-            names(&self.states, &APPROVAL_STATES),
-            names(&self.policies, &POLICIES),
-            names(&self.origins, &APPROVAL_ORIGINS),
-        );
-        if self.preset != 0 {
-            let _ = write!(s, " preset:{}", PRESETS[self.preset.min(PRESETS.len() - 1)]);
-        }
-        if self.include_superseded {
-            s.push_str(" +superseded");
-        }
-        for (label, v) in [
-            ("lineage", &self.lineage),
-            ("host", &self.host),
-            ("path", &self.path),
-            ("product", &self.product),
-            ("user", &self.user),
-            ("sha", &self.sha_prefix),
-            ("after", &self.expires_after),
-            ("before", &self.expires_before),
-        ] {
-            if !v.is_empty() {
-                let _ = write!(s, " {label}:{v}");
-            }
-        }
-        s
     }
 }
 
