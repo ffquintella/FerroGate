@@ -147,7 +147,7 @@ hickory-resolver = "0.26"
 # any tree exists: the stable `Value` API builds a tree whose recursive drop
 # overflows the stack on hostile nesting. That reader sits behind plist's
 # "unstable" feature, hence the exact pin; re-check the API when bumping.
-plist = { version = "=1.10.1", default-features = false, features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
+plist = { version = "=1.10.3", default-features = false, features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
 
 # misc
 parking_lot = "0.12"
