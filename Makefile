@@ -65,10 +65,17 @@ tray: ## Build the mia-tray desktop companion with its GUI (release)
 tray-admin: ## Build the mia-tray-admin administrator client (release)
 	cargo build --release $(TRAY_ADMIN) --bin mia-tray-admin
 
+# The admin build legitimately links the shared admin client (T281: tonic,
+# tokio, rustls, ferro-transport); the plain tray must link none of it.
+TRAY_FORBIDDEN := tonic|ferro-transport|ferrogate-admin-client|zeroize|tokio|hyper|h2|rustls|prost|ferro-proto|ferro-crypto
+
 check-tray-isolation: ## Assert the mia-tray binary links no admin or network crate (F22)
 	@deps="$$(cargo tree -p mia-tray --features mia-tray/gui -e normal --prefix none)" || exit 1; \
-	if echo "$$deps" | grep -E '^(tonic|ferro-transport|ferrogate-admin-client|zeroize) v'; then \
+	if echo "$$deps" | grep -E '^($(TRAY_FORBIDDEN)) v'; then \
 	  echo "ERROR: the mia-tray binary links admin or network code (see above)"; exit 1; fi; \
+	admin="$$(cargo tree -p mia-tray --features mia-tray/admin -e normal --prefix none)" || exit 1; \
+	if ! echo "$$admin" | grep -qE '^ferrogate-admin-client v'; then \
+	  echo "ERROR: the admin build no longer shows ferrogate-admin-client: this check is blind"; exit 1; fi; \
 	feats="$$(cargo tree -p mia-tray --features mia-tray/admin -e features --prefix none)" || exit 1; \
 	if echo "$$feats" | grep -E 'eframe feature "persistence"'; then \
 	  echo "ERROR: eframe persistence is enabled; the admin client must persist nothing"; exit 1; fi; \

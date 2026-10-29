@@ -35,8 +35,9 @@
 //! - [`cli`] — the binary's own (tiny) argument parser.
 //!
 //! The `admin-core` feature adds [`admin`], the headless core of the separate
-//! `mia-tray-admin` administrator client (F22): secret buffers, the login model
-//! and the binary's argument parser. The tray itself links none of it.
+//! `mia-tray-admin` administrator client (F22): secret buffers, the sign-in
+//! and window state machines, the CMIS link (`ferrogate-admin-client`) and the
+//! binary's argument parser. The tray itself links none of it.
 //!
 //! The `gui` feature adds the `gui` module (tray icon, menus, windows); see the crate
 //! manifest for why it is off by default.

@@ -2748,6 +2748,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrogate-admin-client"
+version = "0.30.5"
+dependencies = [
+ "base64 0.23.1",
+ "ciborium",
+ "cmis",
+ "ed25519-dalek",
+ "ferro-attest",
+ "ferro-audit",
+ "ferro-crypto",
+ "ferro-proto",
+ "ferro-raft",
+ "ferro-sep",
+ "ferro-svid",
+ "ferro-transport",
+ "hex",
+ "p256",
+ "rcgen",
+ "rustix 1.1.5",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "static_assertions",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 1.1.6+spec-1.1.0",
+ "tonic",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "ferrogate-cli"
 version = "0.30.5"
 dependencies = [
@@ -2809,12 +2842,12 @@ dependencies = [
  "ferro-sep",
  "ferro-svid",
  "ferro-transport",
+ "ferrogate-admin-client",
  "hex",
  "p256",
  "proptest",
  "ratatui",
  "rcgen",
- "rustix 1.1.5",
  "rustls-pki-types",
  "serde",
  "sha2 0.11.1",
@@ -4711,6 +4744,7 @@ dependencies = [
  "arboard",
  "eframe",
  "ferro-winauth",
+ "ferrogate-admin-client",
  "gtk",
  "mia-status-proto",
  "notify-rust",
@@ -4722,6 +4756,7 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",

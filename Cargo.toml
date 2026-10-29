@@ -23,6 +23,7 @@ members = [
     "crates/ferro-appid",
     "crates/ferro-sep",
     "crates/ferrogate-cli",
+    "crates/ferrogate-admin-client",
     "crates/ferrogate-tui",
     "crates/ferrogate-sdk-rust",
     "tools/fleet-manifest",

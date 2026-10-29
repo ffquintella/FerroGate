@@ -263,18 +263,86 @@ is not part of the tray: `mia-tray` holds no credentials and links none of the
 admin code, and nothing flows between the two. Build it with
 `make tray-admin` (cargo feature `admin`, which implies `gui`); `make
 check-tray-isolation` asserts that the `mia-tray` dependency graph contains no
-`tonic`, `ferro-transport` or admin crate and that `eframe` persistence stays
-off.
+`tonic`, `tokio`, `rustls`, `hyper`, `prost`, `ferro-transport`,
+`ferro-proto`, `ferro-crypto`, `zeroize` or `ferrogate-admin-client`, that the
+admin build does link `ferrogate-admin-client` (so the check is not blind), and
+that `eframe` persistence stays off.
 
-Current state (T280): the window, the login model and the credential handling.
-Signing in to CMIS, factor enrollment, the approval views and "Add application"
-follow in T281 to T285, so today a submitted form is wiped unsent.
+Current state (T281): sign-in and step-up against CMIS. Factor enrollment, the
+approval views, "Add application" and packaging follow in T282 to T285.
+
+### Configuration
+
+`admin.toml` holds the admin endpoint and its SPKI pin, nothing secret. The
+client reads the first file that exists among the per-user file —
+`~/.config/ferrogate/admin.toml` (or `$XDG_CONFIG_HOME/ferrogate/`) on Linux,
+`~/Library/Application Support/FerroGate/admin.toml` on macOS,
+`%APPDATA%\FerroGate\admin.toml` on Windows — and `/etc/ferrogate/admin.toml`
+(Unix):
+
+```toml
+endpoint          = "https://cmis-admin.example.internal:8444"  # explicit port
+spki_pins         = ["<sha384-hex>"]                            # required
+device_token_path = ""   # default: device-token beside the per-user file (0600)
+```
+
+`FERROGATE_ADMIN_ENDPOINT` and `FERROGATE_ADMIN_SPKI_PIN` override the file.
+The file is the same format the TUI reads and passes the same checks (opened
+without following a symlink, owned by you or root, not group/other-writable,
+directories above it too; unknown keys refused). Without a pin the window says
+so and sends nothing: there is no trust on first use. Get the pin from
+operations over a trusted channel (`ferrogate spki-pin --tls-cert …` on a CMIS
+node); the sign-in window shows the endpoint and a short pin fingerprint to
+compare. A first-run setup screen is not built yet.
+
+### Signing in and stepping up
+
+1. Type the user name and press **Continue**. Only the user name is sent
+   (`BeginLogin`, client kind 2); the answer says which second factors the
+   account may use here. Unknown names get the same plausible answer.
+2. Type the password, then either the authenticator code (**Sign in**) or press
+   **Use security key**. Under `CMIS_ADMIN_TRAY_FIDO2_GROUPS` the code field is
+   not shown. A fresh `BeginLogin` runs before `Login`, so a slow typist never
+   meets an expired nonce.
+3. Signed in, the window shows the display name, groups and assurance level
+   (AAL3 for a device-bound key) and **Confirm it is you** (step-up:
+   `BeginStepUp`/`StepUp` with a code or a key; the server rotates the token).
+
+Failures are generic ("Sign-in failed"), a throttle shows its countdown, and a
+factor that is not offered or a cancelled key prompt sends no `Login`, so it
+counts no throttle failure. An expired password ends the session with a pointer
+to `ferrogate-tui` or the CLI; an account that must register a key first
+(FIDO2 policy) is told so (registration arrives with T282).
+
+The window locks 30 s before the server's idle timeout (the server value is
+clamped to 1–15 min), also on a half-typed form: everything is wiped and the
+session is logged out. **Sign out**, the lock and closing the window end the
+session at once (the token leaves memory before any network call) and a
+separate task sends `Logout`; a session answered after a lock is logged out,
+never shown.
+
+**Security keys.** The client builds the WebAuthn `clientDataJSON` itself with
+origin `https://<RP ID>` (CMIS's default origin; if `CMIS_ADMIN_WEBAUTHN_ORIGINS`
+is set it must include it) and refuses any RP ID that is not
+`ferrogate-admin.<trust domain>`, so a server cannot use the key for another
+site; user verification is always required (the PIN or biometric is entered in
+the key's or the system's own prompt, never in this window). The authenticator
+is reached through the `ferrogate_admin_client::webauthn::Authenticator` trait.
+**No platform backend ships yet** (Windows `webauthn.dll`, macOS
+AuthenticationServices, Linux CTAP2 over USB HID): the key button is disabled
+with an explanation, and TOTP works unless the FIDO2 policy requires a key.
+The flows are tested with a software authenticator against an in-process CMIS.
 
 Credential handling:
 
 - the password and the TOTP code live in fixed-capacity `Zeroizing` buffers
-  (`admin::secret::Secret`) with no `Debug`, `Display` or `Clone`, checked at
-  compile time; the session token has the same type of guarantee;
+  (`admin::secret::Secret`, shared with the TUI through
+  `ferrogate-admin-client`) with no `Debug`, `Display` or `Clone`, checked at
+  compile time; they are moved into the one request that carries them and
+  wiped when it returns;
+- the session token has the same guarantees and lives only in the worker
+  thread's session slot: never in a view model (tests serialise the views and
+  scan them), a file, the clipboard or a log;
 - the window never gives a secret to an `egui` text widget: it reads the
   keystrokes straight from the input events and hands them to the model by
   reference, and draws the mask from a length, so `egui`'s undo history and
@@ -286,7 +354,10 @@ Credential handling:
 
 Residual risk: the toolkit keeps a typed character in its per-frame input queue
 until the frame ends, and input-method (IME) composition is not supported in the
-secret fields.
+secret fields. prost's request buffers cannot be wiped (F20 §13): a password or
+code is in one encoded request for the duration of that call. If closing the
+window cannot get the `Logout` out within 3 s, the process exits anyway and the
+server's idle timeout ends the session.
 
 ## Limitations
 

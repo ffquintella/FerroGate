@@ -1,0 +1,60 @@
+[package]
+name        = "ferrogate-admin-client"
+description = "FerroGate — shared administrator client (F20 §12): pinned admin channel, sign-in with TOTP or FIDO2, step-up, zeroized secrets"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish                = false
+
+# The client side every administrator front end shares (F20 §12): the TUI and
+# the tray admin client (F22). Session token in memory only; only the pinned
+# hybrid-PQC admin listener; F20 sign-in and step-up with TOTP or FIDO2. The
+# FIDO2 authenticator sits behind `webauthn::Authenticator` (each front end
+# supplies its platform's, or a test double). No GUI, terminal or database code.
+[lib]
+name = "ferrogate_admin_client"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ferro-proto     = { path = "../ferro-proto" }
+ferro-crypto    = { path = "../ferro-crypto" }
+ferro-transport = { path = "../ferro-transport" }
+
+tokio             = { workspace = true }
+tonic             = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+toml              = { workspace = true }
+thiserror         = { workspace = true }
+zeroize           = { workspace = true }
+base64            = { workspace = true }
+sha2              = { workspace = true }
+static_assertions = { workspace = true }
+
+# Unix: owner/mode checks and `O_NOFOLLOW` opens through safe wrappers.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["std", "process", "fs"] }
+
+# The integration test signs in against the in-process CMIS harness of
+# `crates/cmis/tests/support` (included by path) behind a real TLS listener,
+# with that harness's software FIDO2 authenticator.
+[dev-dependencies]
+cmis          = { path = "../cmis" }
+ferro-attest  = { path = "../ferro-attest" }
+ferro-audit   = { path = "../ferro-audit" }
+ferro-raft    = { path = "../ferro-raft" }
+ferro-sep     = { path = "../ferro-sep" }
+ferro-svid    = { path = "../ferro-svid" }
+ciborium      = { workspace = true }
+hex           = { workspace = true }
+p256          = { workspace = true }
+ed25519-dalek = { workspace = true }
+rcgen         = { workspace = true }
+rustls-pki-types = { workspace = true }
+uuid          = { workspace = true }

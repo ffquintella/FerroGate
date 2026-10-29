@@ -32,6 +32,9 @@ workspace = true
 ferro-proto     = { path = "../ferro-proto" }
 ferro-crypto    = { path = "../ferro-crypto" }
 ferro-transport = { path = "../ferro-transport" }
+# Shared admin client: session slot, bearer interceptor, pinned dialling,
+# secrets, configuration and device-token files (F20 §12).
+ferrogate-admin-client = { path = "../ferrogate-admin-client" }
 # F19 §4.5 risk-flag bits (single source of truth; no I/O used).
 ferro-appid     = { path = "../ferro-appid" }
 
@@ -46,12 +49,8 @@ ratatui           = { workspace = true }
 unicode-width     = { workspace = true }
 unicode-segmentation = { workspace = true }
 static_assertions = { workspace = true }
-
-# Unix: the effective uid for the configuration trust check and the
-# `O_NOFOLLOW | O_NONBLOCK` open of the configuration and device-token files,
-# through safe wrappers (no libc calls in this crate).
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["std", "process", "fs"] }
+# (The configuration trust check and the `O_NOFOLLOW` opens moved to
+# `ferrogate-admin-client::files`, with its `rustix` dependency.)
 
 [dev-dependencies]
 # The integration tests drive the TUI against the in-process CMIS harness of

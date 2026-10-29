@@ -27,24 +27,26 @@
 //! writable by group or others) and read from that handle; every directory
 //! above it must pass the same ownership check (sticky directories excepted)
 //! (Unix).
+//!
+//! The file checks, the endpoint check, the `admin.toml` parser and the
+//! device-token file are shared with the tray admin client through
+//! `ferrogate-admin-client` (T281).
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use ferro_crypto::pin::SpkiPin;
-use serde::Deserialize;
+use ferrogate_admin_client::config as shared;
 
-/// The default admin listener (F20 §2).
-pub const DEFAULT_ENDPOINT: &str = "https://127.0.0.1:8444";
+pub use ferrogate_admin_client::endpoint::{check_endpoint, DEFAULT_ENDPOINT};
+pub use ferrogate_admin_client::files::{
+    open_no_follow, read_device_token, store_device_token, trusted_owner_and_mode,
+};
+
 /// Default list auto-refresh period, in seconds.
 pub const DEFAULT_REFRESH_SECS: u64 = 30;
 /// Shortest auto-refresh period honoured (a smaller non-zero value is raised
 /// to it, so a typo cannot turn the TUI into a load generator).
 pub const MIN_REFRESH_SECS: u64 = 5;
-/// Longest configuration file read, in bytes.
-const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-/// Longest device-token file read, in bytes.
-const MAX_DEVICE_TOKEN_BYTES: u64 = 1024;
 
 /// How to obtain a pin, printed when none is configured (`transport-tls.md`).
 pub const PIN_HELP: &str = "ferrogate-tui needs the SPKI pin of the CMIS admin listener and never \
@@ -60,17 +62,6 @@ Obtain the pin on a CMIS node from its certificate, then configure it:\n\
 \n\
 See docs/transport-tls.md (\"Computing the SPKI pin\") and docs/operations.md\n\
 (\"Administering approvals with ferrogate-tui\").";
-
-/// The configuration file as written.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileConfig {
-    endpoint: Option<String>,
-    #[serde(default)]
-    spki_pins: Vec<String>,
-    device_token_path: Option<String>,
-    refresh_secs: Option<u64>,
-}
 
 /// The resolved configuration.
 #[derive(Debug, Clone)]
@@ -105,6 +96,15 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+impl From<shared::ConfigError> for ConfigError {
+    fn from(e: shared::ConfigError) -> Self {
+        match e {
+            shared::ConfigError::NoPin => Self::NoPin,
+            shared::ConfigError::Invalid(m) => Self::Invalid(m),
+        }
+    }
+}
+
 /// The configuration files to look for, in order.
 #[must_use]
 pub fn candidate_files(env: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
@@ -128,173 +128,14 @@ fn default_device_token_path(env: &dyn Fn(&str) -> Option<String>) -> Option<Pat
         .map(|h| PathBuf::from(h).join(".local/state/ferrogate/device-token"))
 }
 
-/// Whether an owner and mode are trustworthy for the configuration (or its
-/// directory, when `dir`): owned by the effective user or root, and not
-/// writable by group or others (a sticky directory is accepted, as `/tmp`).
+/// Read a configuration file the administrator can trust (the default files
+/// and `--config`): [`ferrogate_admin_client::files::read_trusted_file`].
 ///
 /// # Errors
-///
-/// A short reason when they are not.
-pub fn trusted_owner_and_mode(
-    uid: u32,
-    mode: u32,
-    euid: u32,
-    dir: bool,
-) -> Result<(), &'static str> {
-    if uid != euid && uid != 0 {
-        return Err("is owned by another user (neither you nor root)");
-    }
-    let sticky = mode & 0o1000 != 0;
-    if mode & 0o022 != 0 && !(dir && sticky) {
-        return Err("is writable by group or others");
-    }
-    Ok(())
-}
-
-/// Open `path` read-only without following a symbolic link in its last
-/// component and without blocking on a FIFO (Unix: `O_NOFOLLOW |
-/// O_NONBLOCK`). Checks then apply to the opened handle, so the file cannot
-/// be swapped between the check and the read.
-///
-/// # Errors
-///
-/// The file cannot be opened, or is a symbolic link.
-pub fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use rustix::fs::{Mode, OFlags};
-        let fd = rustix::fs::open(
-            path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| {
-            if e == rustix::io::Errno::LOOP {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "is a symbolic link (refused)",
-                )
-            } else {
-                std::io::Error::from(e)
-            }
-        })?;
-        Ok(std::fs::File::from(fd))
-    }
-    #[cfg(not(unix))]
-    {
-        // No O_NOFOLLOW: refuse a link by its own metadata, then check the
-        // opened handle as on Unix.
-        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "is a symbolic link (refused)",
-            ));
-        }
-        std::fs::File::open(path)
-    }
-}
-
-/// Read at most `max` bytes from `file`; `None` when it holds more.
-fn read_bounded(file: std::fs::File, max: u64) -> std::io::Result<Option<Vec<u8>>> {
-    let mut buf = Vec::new();
-    file.take(max.saturating_add(1)).read_to_end(&mut buf)?;
-    let fits = u64::try_from(buf.len()).is_ok_and(|n| n <= max);
-    Ok(fits.then_some(buf))
-}
-
-/// Read a configuration file the administrator can trust. It decides where
-/// the password and TOTP codes go, so it is opened once without following a
-/// symlink ([`open_no_follow`]), and the **opened handle** must be a regular
-/// file of bounded size, owned by the effective user or root and not
-/// writable by group or others; the contents are read from that handle.
-/// Every directory above it (resolved) must be owned by the effective user
-/// or root and not writable by group or others, unless sticky. Applies to
-/// the default files and to `--config`.
-///
-/// # Errors
-///
 /// The file cannot be opened or read, is a symlink, is too large, or fails
 /// the trust check.
 pub fn read_file(path: &Path) -> Result<String, ConfigError> {
-    let invalid =
-        |e: &dyn std::fmt::Display| ConfigError::Invalid(format!("{}: {e}", path.display()));
-    let file = open_no_follow(path).map_err(|e| invalid(&e))?;
-    let meta = file.metadata().map_err(|e| invalid(&e))?;
-    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
-        return Err(ConfigError::Invalid(format!(
-            "{} is not a regular file of at most {MAX_CONFIG_BYTES} bytes",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let euid = rustix::process::geteuid().as_raw();
-        let refuse = |what: &Path, why: &str| {
-            ConfigError::Invalid(format!(
-                "{} {why}; refusing the configuration (it decides where your password goes)",
-                what.display()
-            ))
-        };
-        trusted_owner_and_mode(meta.uid(), meta.mode(), euid, false)
-            .map_err(|why| refuse(path, why))?;
-        let parent = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        let dir = std::fs::canonicalize(parent).map_err(|e| invalid(&e))?;
-        for ancestor in dir.ancestors() {
-            let dmeta = std::fs::metadata(ancestor).map_err(|e| invalid(&e))?;
-            trusted_owner_and_mode(dmeta.uid(), dmeta.mode(), euid, true)
-                .map_err(|why| refuse(ancestor, why))?;
-        }
-    }
-    let bytes = read_bounded(file, MAX_CONFIG_BYTES)
-        .map_err(|e| invalid(&e))?
-        .ok_or_else(|| invalid(&format!("larger than {MAX_CONFIG_BYTES} bytes")))?;
-    String::from_utf8(bytes).map_err(|_| invalid(&"not UTF-8 text"))
-}
-
-/// Check an admin endpoint: `https://host:port` with an explicit, non-zero
-/// port, no user information, path or query. A missing port is refused
-/// rather than guessed: the transport's default (8443) is the main
-/// listener, whose certificate the admin listener shares by default.
-///
-/// # Errors
-///
-/// An operator-facing reason.
-pub fn check_endpoint(endpoint: &str) -> Result<(), String> {
-    let shown = crate::sanitize::truncate_end(endpoint, 80);
-    if endpoint.len() > 512 || !endpoint.starts_with("https://") {
-        return Err(format!(
-            "the admin endpoint must be an https:// URL (got `{shown}`): admin traffic is never plaintext"
-        ));
-    }
-    let uri: tonic::transport::Uri = endpoint
-        .parse()
-        .map_err(|_| format!("the admin endpoint `{shown}` is not a valid URL"))?;
-    let authority = uri
-        .authority()
-        .map(tonic::codegen::http::uri::Authority::as_str)
-        .unwrap_or_default();
-    if authority.contains('@') || uri.host().is_none_or(str::is_empty) {
-        return Err(format!(
-            "the admin endpoint `{shown}` needs a host and no user information"
-        ));
-    }
-    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
-        return Err(format!(
-            "the admin endpoint `{shown}` takes no path or query (https://host:port)"
-        ));
-    }
-    match uri.port_u16() {
-        Some(p) if p != 0 => Ok(()),
-        _ => Err(format!(
-            "the admin endpoint `{shown}` needs an explicit port, e.g. {DEFAULT_ENDPOINT} \
-             (the admin listener's default); without one the main listener (8443) would \
-             receive your password"
-        )),
-    }
+    ferrogate_admin_client::files::read_trusted_file(path).map_err(ConfigError::Invalid)
 }
 
 /// Resolve the configuration from the file text (if any) and the environment.
@@ -307,47 +148,14 @@ pub fn resolve(
     file: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Config, ConfigError> {
-    let parsed: FileConfig = match file {
-        Some(text) => toml::from_str(text)
-            .map_err(|e| ConfigError::Invalid(format!("admin.toml: {}", e.message())))?,
-        None => FileConfig::default(),
-    };
-    let endpoint = env("FERROGATE_ADMIN_ENDPOINT")
-        .filter(|v| !v.is_empty())
-        .or(parsed.endpoint)
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-    check_endpoint(&endpoint).map_err(ConfigError::Invalid)?;
-    let pin_texts: Vec<String> = match env("FERROGATE_ADMIN_SPKI_PIN").filter(|v| !v.is_empty()) {
-        Some(v) => v
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => parsed.spki_pins,
-    };
-    if pin_texts.is_empty() {
-        return Err(ConfigError::NoPin);
-    }
-    let spki_pins = pin_texts
-        .iter()
-        .map(|p| {
-            SpkiPin::from_hex(p).map_err(|e| {
-                ConfigError::Invalid(format!(
-                    "invalid SPKI pin `{}`: {e}",
-                    crate::sanitize::truncate_end(p, 100)
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let device_token_path = match parsed.device_token_path.filter(|p| !p.is_empty()) {
-        Some(p) => Some(PathBuf::from(p)),
-        None => default_device_token_path(env),
-    };
+    let s = shared::resolve(file, env)?;
     Ok(Config {
-        endpoint,
-        spki_pins,
-        device_token_path,
-        refresh_secs: match parsed.refresh_secs.unwrap_or(DEFAULT_REFRESH_SECS) {
+        endpoint: s.endpoint,
+        spki_pins: s.spki_pins,
+        device_token_path: s
+            .device_token_path
+            .or_else(|| default_device_token_path(env)),
+        refresh_secs: match s.refresh_secs.unwrap_or(DEFAULT_REFRESH_SECS) {
             0 => 0,
             secs => secs.max(MIN_REFRESH_SECS),
         },
@@ -370,85 +178,6 @@ pub fn load(explicit: Option<&Path>) -> Result<Config, ConfigError> {
         },
     };
     resolve(text.as_deref(), &env)
-}
-
-/// Read the device token from `path`: opened without following a symlink,
-/// and empty when absent, not a regular file, not owned by the effective
-/// user, readable by group or others, larger than 1 KiB or not printable
-/// ASCII. Every check applies to the opened handle.
-#[must_use]
-pub fn read_device_token(path: Option<&Path>) -> String {
-    let Some(path) = path else {
-        return String::new();
-    };
-    let Ok(file) = open_no_follow(path) else {
-        return String::new();
-    };
-    let Ok(meta) = file.metadata() else {
-        return String::new();
-    };
-    if !meta.is_file() || meta.len() > MAX_DEVICE_TOKEN_BYTES {
-        return String::new();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if meta.mode() & 0o077 != 0 || meta.uid() != rustix::process::geteuid().as_raw() {
-            return String::new();
-        }
-    }
-    let Ok(Some(bytes)) = read_bounded(file, MAX_DEVICE_TOKEN_BYTES) else {
-        return String::new();
-    };
-    String::from_utf8(bytes)
-        .map(|t| t.trim().to_string())
-        .ok()
-        .filter(|t| t.bytes().all(|b| b.is_ascii_graphic()))
-        .unwrap_or_default()
-}
-
-/// Keep the device token in a fresh `0600` file at `path` (directory `0700`),
-/// never through a symlink. Errors are returned for the caller to ignore: the
-/// token is a throttle hint only.
-///
-/// # Errors
-///
-/// The directory or file cannot be created, or `path` is not a regular file.
-pub fn store_device_token(path: &Path, token: &str) -> std::io::Result<()> {
-    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
-        return Ok(());
-    }
-    if let Some(dir) = path.parent() {
-        let mut b = std::fs::DirBuilder::new();
-        b.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            b.mode(0o700);
-        }
-        b.create(dir)?;
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => std::fs::remove_file(path)?,
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "device token path is not a regular file",
-            ))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    std::io::Write::write_all(&mut f, token.as_bytes())?;
-    f.sync_all()
 }
 
 #[cfg(test)]

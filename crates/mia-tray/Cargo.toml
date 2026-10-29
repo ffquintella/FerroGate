@@ -47,9 +47,15 @@ workspace = true
 [features]
 default = []
 # The administrator client's headless core (F22): secret buffers, the login
-# model and its argument parser. It pulls in no GUI, gRPC or transport crate,
-# so it is built and tested on every host.
-admin-core = ["dep:zeroize", "dep:static_assertions"]
+# and window state machines, the CMIS link (`ferrogate-admin-client`: pinned
+# gRPC, sign-in and step-up with TOTP or FIDO2) and its worker thread. No GUI
+# crate, so it is built and tested on every host.
+admin-core = [
+    "dep:zeroize",
+    "dep:static_assertions",
+    "dep:ferrogate-admin-client",
+    "dep:tokio",
+]
 # The administrator client `mia-tray-admin` (F22): a separate binary with its
 # own link graph. `cargo tree -p mia-tray --bin mia-tray -e normal` must stay
 # free of everything this feature adds (`make check-tray-isolation`).
@@ -80,9 +86,13 @@ tempfile   = "3"
 # The OS UI language (English / Portuguese string table).
 sys-locale = "0.3"
 
-# Administrator client (features `admin-core` / `admin`): wiped secret buffers.
-zeroize           = { workspace = true, optional = true }
-static_assertions = { workspace = true, optional = true }
+# Administrator client (features `admin-core` / `admin`): wiped secret
+# buffers, the shared admin client and the worker's runtime. Never in the
+# `mia-tray` binary's graph (`make check-tray-isolation`).
+zeroize                = { workspace = true, optional = true }
+static_assertions      = { workspace = true, optional = true }
+ferrogate-admin-client = { path = "../ferrogate-admin-client", optional = true }
+tokio                  = { workspace = true, optional = true }
 
 # ── GUI (feature `gui`) ──────────────────────────────────────────────────────
 # Native rendering only — no embedded web view, so log text and config values

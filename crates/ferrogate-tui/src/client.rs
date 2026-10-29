@@ -26,9 +26,7 @@
 //! prost messages cannot be wiped, which is the same residual exposure as the
 //! CLI's (they are dropped as soon as the call is encoded).
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use ferro_crypto::pin::SpkiPin;
@@ -45,31 +43,25 @@ use ferro_proto::admin_v1::{
     UpdateApprovalRequest, UpdateApprovalResponse, WhoAmIRequest, WhoAmIResponse,
 };
 use tokio::sync::mpsc;
-use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
-use tonic::service::Interceptor;
 use tonic::transport::Channel;
-use zeroize::Zeroizing;
 
 use crate::sanitize;
 use crate::secret::{Secret, SessionToken};
 
+// The session slot, bearer interceptor, pinned dialling and deadlines are
+// shared with the tray admin client (`ferrogate-admin-client`, T281).
+use ferrogate_admin_client::session::bearer_value;
+pub use ferrogate_admin_client::session::{Bearer, SessionHandle, SessionSlot};
+pub use ferrogate_admin_client::transport::{within, CONNECT_TIMEOUT, RPC_TIMEOUT};
+
 /// `ClientInfo.kind` of the TUI (`admin.proto`: 1 tui, 2 tray, 3 cli).
-pub const CLIENT_KIND_TUI: u32 = 1;
+pub const CLIENT_KIND_TUI: u32 = ferrogate_admin_client::client_kind::TUI;
 /// Capacity of each direction of the UI ↔ client channels.
 pub const CHANNEL_CAPACITY: usize = 64;
 /// Largest page the server accepts (`ferro_raft::apps::MAX_PAGE_SIZE`); the
 /// dashboard counts up to this many rows per figure.
 pub const DASHBOARD_PAGE: u32 = 200;
-/// How long dialling the admin listener (TCP + pinned TLS handshake) may
-/// take by default before the sign-in reports it unreachable, instead of
-/// waiting for the operating system's TCP timeout behind a firewall that
-/// drops packets.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Default deadline of one admin RPC (including waiting for the connection to
-/// be ready). A server that stops answering cannot hold the serial client
-/// task, so a lock's `Logout` or a sign-in never waits longer than this.
-pub const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where and how to connect.
 #[derive(Debug, Clone)]
@@ -392,74 +384,6 @@ pub enum Reply {
     LoggedOut,
 }
 
-/// The session token and its epoch, shared by the client task, the
-/// [`Bearer`] interceptor and the UI's [`SessionHandle`].
-///
-/// Ending a session (lock, quit) empties the slot and moves the epoch, so a
-/// token still in flight (a sign-in or step-up answered after the lock) is
-/// logged out instead of adopted.
-pub struct Slot {
-    token: SessionToken,
-    epoch: u64,
-}
-
-/// The shared [`Slot`].
-pub type Shared = Arc<Mutex<Slot>>;
-
-static_assertions::assert_not_impl_any!(Slot: std::fmt::Debug, std::fmt::Display, Clone);
-
-/// Lock the slot. A poisoned lock is still used: wiping must never fail.
-fn slot(shared: &Shared) -> MutexGuard<'_, Slot> {
-    shared.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Take the token out of the slot and move the epoch.
-fn end_session(shared: &Shared) -> SessionToken {
-    let mut s = slot(shared);
-    s.epoch = s.epoch.wrapping_add(1);
-    std::mem::replace(&mut s.token, SessionToken::none())
-}
-
-/// `Bearer <token>`, marked sensitive (never printed by tonic or `http`).
-fn bearer_value(token: &SessionToken) -> Result<MetadataValue<Ascii>, tonic::Status> {
-    let header = Zeroizing::new(format!("Bearer {}", token.expose()));
-    let mut value: MetadataValue<Ascii> = header
-        .parse()
-        .map_err(|_| tonic::Status::internal("session token is not ASCII"))?;
-    value.set_sensitive(true);
-    Ok(value)
-}
-
-/// Run one RPC with a deadline: a server that stops answering (or a
-/// connection that cannot be re-established) yields `DEADLINE_EXCEEDED`
-/// instead of holding the client task.
-async fn within<T>(
-    limit: Duration,
-    call: impl Future<Output = Result<T, tonic::Status>>,
-) -> Result<T, tonic::Status> {
-    tokio::time::timeout(limit, call)
-        .await
-        .unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded("timeout")))
-}
-
-/// Adds `authorization: Bearer <token>` while a session exists.
-#[derive(Clone)]
-pub struct Bearer(Shared);
-
-impl Interceptor for Bearer {
-    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        let value = {
-            let s = slot(&self.0);
-            if !s.token.is_set() {
-                return Ok(req);
-            }
-            bearer_value(&s.token)?
-        };
-        req.metadata_mut().insert("authorization", value);
-        Ok(req)
-    }
-}
-
 /// The typed client with the session interceptor.
 type Admin = AdminClient<InterceptedService<Channel, Bearer>>;
 
@@ -481,7 +405,7 @@ fn totp_proof(code: &Secret) -> Option<MfaProof> {
 pub struct AdminConnection {
     cfg: ClientConfig,
     channel: Option<Channel>,
-    slot: Shared,
+    slot: SessionSlot,
 }
 
 static_assertions::assert_not_impl_any!(AdminConnection: std::fmt::Debug, std::fmt::Display, Clone);
@@ -493,49 +417,36 @@ impl AdminConnection {
         Self {
             cfg,
             channel: None,
-            slot: Arc::new(Mutex::new(Slot {
-                token: SessionToken::none(),
-                epoch: 0,
-            })),
+            slot: SessionSlot::new(),
         }
     }
 
     /// Whether a session token is held (for tests and the quit path).
     #[must_use]
     pub fn has_session(&self) -> bool {
-        slot(&self.slot).token.is_set()
+        self.slot.has_token()
     }
 
     /// The UI's handle on this connection's session: [`SessionHandle::end`]
     /// wipes the token at once and hands the `Logout` to `logout_tx`.
     #[must_use]
     pub fn session_handle(&self, logout_tx: mpsc::UnboundedSender<SessionToken>) -> SessionHandle {
-        SessionHandle {
-            slot: Arc::clone(&self.slot),
-            logout_tx,
-        }
+        self.slot.handle(logout_tx)
     }
 
     fn epoch(&self) -> u64 {
-        slot(&self.slot).epoch
+        self.slot.epoch()
     }
 
     /// Drop the token (the server already ended the session).
     fn wipe(&self) {
-        slot(&self.slot).token = SessionToken::none();
+        self.slot.wipe();
     }
 
     /// Keep `token` when no lock or quit happened since `epoch`; otherwise
     /// hand it back so the caller logs it out.
     fn adopt(&self, token: String, epoch: u64) -> Option<SessionToken> {
-        let token = SessionToken::from_server(token);
-        let mut s = slot(&self.slot);
-        if s.epoch == epoch {
-            s.token = token;
-            None
-        } else {
-            Some(token)
-        }
+        self.slot.adopt(token, epoch)
     }
 
     /// Best-effort `Logout` for `token`, carried explicitly (it already left
@@ -548,7 +459,9 @@ impl AdminConnection {
         let Ok(value) = bearer_value(&token) else {
             return;
         };
-        if let Ok(mut admin) = self.admin().await {
+        if let Ok(ch) = self.channel().await {
+            // No interceptor: the header is this token's, whatever the slot holds.
+            let mut admin = AdminClient::new(ch);
             let mut req = tonic::Request::new(LogoutRequest {});
             req.metadata_mut().insert("authorization", value);
             let _ = within(self.cfg.rpc_timeout, admin.logout(req)).await;
@@ -562,36 +475,27 @@ impl AdminConnection {
         Reply::SessionEnded
     }
 
-    /// Dial the admin listener (pinned hybrid-PQC TLS). The pin is checked
-    /// during the handshake, before any RPC.
-    async fn admin(&mut self) -> Result<Admin, String> {
-        if self.channel.is_none() {
-            crate::config::check_endpoint(&self.cfg.endpoint)?;
-            if self.cfg.pins.is_empty() {
-                return Err("the admin endpoint needs an SPKI pin".into());
-            }
-            let dial = ferro_transport::connect_pinned(&self.cfg.endpoint, self.cfg.pins.clone());
-            let ch = tokio::time::timeout(self.cfg.connect_timeout, dial)
-                .await
-                .map_err(|_| {
-                    format!(
-                        "no answer within {:?} (endpoint unreachable?)",
-                        self.cfg.connect_timeout
-                    )
-                })?
-                .map_err(|e| {
-                    // The chain names the cause (refused, pin mismatch, no
-                    // hybrid group); keep it short and inert.
-                    let text = format!("{e:#}");
-                    sanitize::truncate_end(&text, 160)
-                })?;
-            self.channel = Some(ch);
+    /// Dial the admin listener (pinned hybrid-PQC TLS, shared dialler). The
+    /// pin is checked during the handshake, before any RPC.
+    async fn channel(&mut self) -> Result<Channel, String> {
+        if let Some(ch) = &self.channel {
+            return Ok(ch.clone());
         }
-        let ch = self.channel.clone().ok_or_else(String::new)?;
-        Ok(AdminClient::with_interceptor(
-            ch,
-            Bearer(Arc::clone(&self.slot)),
-        ))
+        let ch = ferrogate_admin_client::transport::dial(
+            &self.cfg.endpoint,
+            &self.cfg.pins,
+            self.cfg.connect_timeout,
+        )
+        .await
+        .map_err(|e| sanitize::truncate_end(&e, 160))?;
+        self.channel = Some(ch.clone());
+        Ok(ch)
+    }
+
+    /// The typed client carrying this session's bearer token.
+    async fn admin(&mut self) -> Result<Admin, String> {
+        let ch = self.channel().await?;
+        Ok(AdminClient::with_interceptor(ch, self.slot.bearer()))
     }
 
     /// Classify a failure of an authenticated call: a dead session wipes the
@@ -631,7 +535,7 @@ impl AdminConnection {
             Cmd::Query(q) => vec![self.query(q).await],
             Cmd::Logout => {
                 // The token leaves the slot before any network I/O.
-                let token = end_session(&self.slot);
+                let token = self.slot.end();
                 self.logout_with(token).await;
                 vec![Reply::LoggedOut]
             }
@@ -999,29 +903,6 @@ fn timed_out(reply: &Reply) -> bool {
     }
 }
 
-/// The UI's hold on the session: ends it at once on lock and quit, without
-/// waiting for the client task (which may be inside an RPC) or the network.
-pub struct SessionHandle {
-    slot: Shared,
-    logout_tx: mpsc::UnboundedSender<SessionToken>,
-}
-
-static_assertions::assert_not_impl_any!(SessionHandle: std::fmt::Debug, std::fmt::Display, Clone);
-
-impl SessionHandle {
-    /// End the session now: the token leaves the shared slot (no later RPC
-    /// carries it), the epoch moves (a token still in flight is logged out,
-    /// not adopted), and the token goes to the logout task, which sends
-    /// `Logout` within the deadlines and wipes it. Never blocks on the
-    /// network; if the logout task is gone the token is wiped here.
-    pub fn end(&self) {
-        let token = end_session(&self.slot);
-        // A send error hands the token back inside the error, dropped (and
-        // wiped) right here.
-        let _ = self.logout_tx.send(token);
-    }
-}
-
 /// The UI side of the client: the bounded command queue and the session
 /// handle.
 pub struct ClientHandle {
@@ -1101,7 +982,7 @@ pub fn spawn(cfg: ClientConfig) -> (ClientHandle, mpsc::Receiver<Reply>) {
             }
         }
         // Whatever is left (normally nothing: the UI ended the session).
-        let token = end_session(&conn.slot);
+        let token = conn.slot.end();
         conn.logout_with(token).await;
     });
     let logout = tokio::spawn(async move {
@@ -1138,17 +1019,17 @@ mod tests {
 
     #[test]
     fn the_bearer_header_is_sensitive_and_follows_rotation() {
+        use tonic::service::Interceptor as _;
         let conn = AdminConnection::new(config("https://127.0.0.1:1"));
-        let token = Arc::clone(&conn.slot);
-        let mut b = Bearer(Arc::clone(&token));
+        let mut b = conn.slot.bearer();
         let req = b.call(tonic::Request::new(())).unwrap();
         assert!(req.metadata().get("authorization").is_none());
-        slot(&token).token = SessionToken::from_server("fgas_abc".into());
+        assert!(conn.adopt("fgas_abc".into(), conn.epoch()).is_none());
         let req = b.call(tonic::Request::new(())).unwrap();
         let v = req.metadata().get("authorization").unwrap();
         assert_eq!(v, "Bearer fgas_abc");
         assert!(v.is_sensitive());
-        slot(&token).token = SessionToken::from_server("fgas_def".into());
+        assert!(conn.adopt("fgas_def".into(), conn.epoch()).is_none());
         let req = b.call(tonic::Request::new(())).unwrap();
         assert_eq!(
             req.metadata().get("authorization").unwrap(),

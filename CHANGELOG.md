@@ -44,6 +44,17 @@ record them.
   node until T223: run it on every replica. Superseded SVIDs that have not
   expired are not tracked and become acceptable again; `docs/operations.md`
   §"Revocation" says when to wait instead.
+- Sign in to CMIS and step up from `mia-tray-admin` with a password plus a TOTP code or a FIDO2 security key, through the new shared `ferrogate-admin-client` crate (S53, S51, M40, T281)
+  The user name is sent first (`BeginLogin`), so the window offers only the
+  factors the server allows (a key only under `CMIS_ADMIN_TRAY_FIDO2_GROUPS`);
+  a factor that is not offered, or a cancelled key prompt, sends no `Login`.
+  The session token lives only in the worker thread's session slot; the
+  window locks 30 s before the server idle timeout, and sign-out, lock and
+  close log the session out. No platform security-key backend ships yet
+  (`webauthn::Authenticator` trait, tested with a software key against an
+  in-process CMIS). `ferrogate-tui` now uses the same crate for its session
+  slot, pinned dialling, secrets, `admin.toml` and device-token files, with
+  no behaviour change.
 
 ## [0.30.5] - 2026-10-29
 
