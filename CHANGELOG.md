@@ -25,6 +25,8 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.6] - 2026-11-04
+
 ### Abandoned
 
 - Abandon the host-side `mia request-allowlist` / `mia allowlist-status` commands and the unauthenticated `GetProposalStatus` RPC: ADR-0004 (accepted 2026-10-29) supersedes ADR-0003 and rebuilds them on the approval ledger (S22, S54, M35, T231, T232, T233, T234, T235, T248)
