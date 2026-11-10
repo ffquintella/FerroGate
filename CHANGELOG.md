@@ -25,6 +25,12 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.8] - 2026-11-10
+
+### Added
+
+- Add the admin client's **Admin server** screen: with no usable `admin.toml` (or from **Change server…**) the CMIS admin endpoint and its pasted SPKI pin are checked by the shared parser, written to the per-user file (`0600`, private directory, atomic, trust-checked, old-versus-new pin confirmed before a replacement) and reloaded straight into the sign-in form; never trust on first use, environment overrides announced (S53)
+
 ## [0.30.7] - 2026-11-10
 
 ### Changed
