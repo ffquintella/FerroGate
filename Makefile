@@ -423,9 +423,9 @@ TRAY_DIST := crates/mia-tray/dist
 # binary and an MSI feature that is off by default. MIA_TRAY_ADMIN=0 builds
 # the Windows packages without it (it also needs MIA_TRAY != 0).
 MIA_TRAY_ADMIN ?= 1
-# The macOS .pkg leaves the admin client out unless MIA_TRAY_ADMIN_MACOS=1
-# (opt-in, F22 "Migration and rollout"); the MSI feature is off by default.
-MIA_TRAY_ADMIN_MACOS ?= 0
+# The macOS .pkg ships the admin client by default; MIA_TRAY_ADMIN_MACOS=0
+# leaves it out (it also needs MIA_TRAY != 0). The MSI feature is off by default.
+MIA_TRAY_ADMIN_MACOS ?= 1
 
 pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
 	cargo install --locked cargo-deb cargo-generate-rpm
@@ -487,7 +487,7 @@ endif
 pkg-tray-admin: ## Build the optional administrator-client Linux packages (.deb + .rpm); not part of 'make pkg'
 	@case "$(UNAME_S)" in \
 	  Linux) $(MAKE) --no-print-directory pkg-deb-tray-admin pkg-rpm-tray-admin ;; \
-	  *)     echo "Host is $(UNAME_S): the admin client ships inside 'make pkg-win' (MIA_TRAY_ADMIN=0 to omit) and, opt-in, 'make pkg-macos' (MIA_TRAY_ADMIN_MACOS=1)." ;; \
+	  *)     echo "Host is $(UNAME_S): the admin client ships inside 'make pkg-win' (MIA_TRAY_ADMIN=0 to omit) and 'make pkg-macos' (MIA_TRAY_ADMIN_MACOS=0 to omit)." ;; \
 	esac
 
 pkg-rpm: ## Build the mia .rpm package for x86_64/amd64 (Fedora/RHEL/SUSE)
