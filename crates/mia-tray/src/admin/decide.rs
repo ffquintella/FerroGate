@@ -141,6 +141,8 @@ pub enum DecisionError {
     ShortIdMismatch,
     /// Fields of the add dialog are refused (see `RegisterView::invalid`).
     FieldsInvalid,
+    /// The application chosen on this machine could not be read.
+    PickFailed,
 }
 
 /// A choice on the form.
@@ -544,6 +546,39 @@ impl Decision {
             },
             Some(DecisionField::Host),
         )
+    }
+
+    /// The add dialog with this machine's facts as defaults (host UUID,
+    /// platform, current user); the administrator can overwrite any of them.
+    #[must_use]
+    pub fn register_for(can_approve: bool, local: &super::local::LocalHost) -> Self {
+        let mut d = Self::register(can_approve);
+        if let Ctx::Register { facts, .. } = &mut d.ctx {
+            if let Some(h) = &local.host_uuid {
+                facts.host_uuid.clone_from(h);
+            }
+            facts.platform = local.platform.min(PLATFORMS.len() - 1);
+            facts.windows_user = local.windows_user;
+            facts.uid.clone_from(&local.uid);
+            facts.user_name.clone_from(&local.user);
+        }
+        d
+    }
+
+    /// Fill the path and hash from an application chosen on this machine.
+    pub fn fill_app(&mut self, app: &super::local::LocalApp) {
+        if let Ctx::Register { facts, .. } = &mut self.ctx {
+            facts.canonical_path.clone_from(&app.path);
+            facts.sha384.clone_from(&app.sha384);
+            self.invalid
+                .retain(|(f, _)| !matches!(f, RegisterField::Path | RegisterField::Sha));
+            self.error = None;
+        }
+    }
+
+    /// The chosen application could not be read.
+    pub fn pick_failed(&mut self) {
+        self.error = Some(DecisionError::PickFailed);
     }
 
     /// The edit re-asked after a concurrent change, on the reloaded row.
@@ -1351,6 +1386,33 @@ pub(crate) mod tests {
             d.focus(field);
             d.type_text(&text);
         }
+    }
+
+    #[test]
+    fn an_add_starts_from_this_machine_and_takes_a_chosen_application() {
+        use crate::admin::local::{LocalApp, LocalHost};
+        let local = LocalHost {
+            host_uuid: Some("0a1b2c3d-0000-8000-8000-000000000001".into()),
+            platform: 1,
+            windows_user: false,
+            uid: "501".into(),
+            user: "felipe".into(),
+        };
+        let mut d = Decision::register_for(true, &local);
+        let r = d.view(NOW).register.unwrap();
+        assert_eq!(r.host, "0a1b2c3d-0000-8000-8000-000000000001");
+        assert_eq!(
+            (r.platform, r.uid.as_str(), r.user.as_str()),
+            (1, "501", "felipe")
+        );
+        assert!(r.path.is_empty() && r.sha.is_empty());
+        d.fill_app(&LocalApp {
+            path: "/usr/bin/tool".into(),
+            sha384: "ab".repeat(48),
+        });
+        let r = d.view(NOW).register.unwrap();
+        assert_eq!(r.path, "/usr/bin/tool");
+        assert_eq!(r.sha.len(), 96);
     }
 
     #[test]

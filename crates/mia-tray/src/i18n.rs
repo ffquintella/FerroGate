@@ -461,6 +461,8 @@ messages! {
     AdminDismiss => "OK", "OK";
     AdminAddOpen => "Add application…", "Adicionar aplicação…";
     AdminDecideRegister => "Add an application by known hash and path", "Adicionar uma aplicação por hash e caminho conhecidos";
+    AdminRegPick => "Choose an application on this machine…", "Escolher uma aplicação desta máquina…";
+    AdminErrPick => "Could not read that file.", "Não foi possível ler esse arquivo.";
     AdminRegHost => "Host UUID", "UUID do host";
     AdminRegPlatform => "Platform", "Plataforma";
     AdminRegPath => "Canonical path on that host", "Caminho canônico nesse host";

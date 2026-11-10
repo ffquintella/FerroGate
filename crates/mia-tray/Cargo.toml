@@ -57,6 +57,9 @@ admin-core = [
     "dep:ferrogate-admin-client",
     "dep:tokio",
     "dep:qrcode",
+    "dep:ferro-machineid",
+    "dep:ferro-svid",
+    "dep:sha2",
 ]
 # The administrator client `mia-tray-admin` (F22): a separate binary with its
 # own link graph. `cargo tree -p mia-tray --bin mia-tray -e normal` must stay
@@ -98,6 +101,9 @@ tokio                  = { workspace = true, optional = true }
 # The TOTP seed's QR code, drawn in memory (F22 §3a): encoder only, no image
 # or SVG back ends, no dependencies.
 qrcode                 = { version = "0.14", optional = true, default-features = false }
+ferro-machineid        = { path = "../ferro-machineid", optional = true }
+ferro-svid             = { path = "../ferro-svid", optional = true }
+sha2                   = { workspace = true, optional = true }
 
 # ── GUI (feature `gui`) ──────────────────────────────────────────────────────
 # Native rendering only — no embedded web view, so log text and config values
@@ -120,6 +126,9 @@ gtk = { version = "0.18", optional = true }
 
 # Windows: the Program Files and Windows directories for the elevation trust
 # rule come from HKLM, not from environment variables the user controls.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["std", "process"] }
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
 

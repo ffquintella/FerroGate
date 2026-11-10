@@ -20,6 +20,7 @@ use crate::admin::decide::{
     Choice, DecisionError, DecisionField, DecisionKind, DecisionStage, DecisionView, RegisterView,
     ReviewLine,
 };
+use crate::admin::local::LocalApp;
 use crate::admin::views::{
     origin_names, policy_names, ApprovalDetail, ApprovalRow, FilterChoice, FilterField,
     FiltersView, Outcome, Refusal, RequestDetail, Screen, Tab, ViewAction, ViewsView,
@@ -794,6 +795,18 @@ fn register_field(
     text_field(ui, value, d, field, actions);
 }
 
+/// Let the administrator choose an application on this machine (the native
+/// file dialog, like the log export) and hash it; nothing is sent.
+fn pick_local_app(actions: &mut Vec<Action>) {
+    let Some(path) = rfd::FileDialog::new().pick_file() else {
+        return;
+    };
+    match LocalApp::from_path(&path) {
+        Ok(app) => actions.push(view(ViewAction::FillLocalApp(app))),
+        Err(_) => actions.push(view(ViewAction::LocalAppFailed)),
+    }
+}
+
 /// The add dialog's facts: host, platform, path, hash, user, version,
 /// reason and the protected-path assertion.
 fn register_form(ui: &mut egui::Ui, lang: Lang, d: &DecisionView, actions: &mut Vec<Action>) {
@@ -803,6 +816,9 @@ fn register_form(ui: &mut egui::Ui, lang: Lang, d: &DecisionView, actions: &mut 
     let field = |ui: &mut egui::Ui, at: (Msg, DecisionField), value: &str, a: &mut Vec<Action>| {
         register_field(ui, lang, at, (d, r), value, a);
     };
+    if ui.button(Msg::AdminRegPick.text(lang)).clicked() {
+        pick_local_app(actions);
+    }
     field(
         ui,
         (Msg::AdminRegHost, DecisionField::Host),
@@ -1222,6 +1238,7 @@ fn decision(
                         DecisionError::AnyUserNeedsProtectedPath => Msg::AdminErrAnyUser,
                         DecisionError::NothingToChange => Msg::AdminErrNothing,
                         DecisionError::ShortIdMismatch => Msg::AdminErrShortId,
+                        DecisionError::PickFailed => Msg::AdminErrPick,
                         DecisionError::FieldsInvalid => Msg::AdminErrFields,
                     };
                     ui.colored_label(ui.visuals().error_fg_color, msg.text(lang));

@@ -201,6 +201,10 @@ pub enum ViewAction {
     Choose(Choice),
     /// Focus a typed dialog field.
     FocusDecision(DecisionField),
+    /// An application chosen on this machine fills the add dialog.
+    FillLocalApp(super::local::LocalApp),
+    /// The application chosen on this machine could not be read.
+    LocalAppFailed,
     /// "Continue" / "Accept".
     DecisionNext,
     /// "Back" to the dialog's form.
@@ -921,6 +925,18 @@ impl AdminViews {
                 }
                 None
             }
+            ViewAction::FillLocalApp(app) => {
+                if let Some(d) = &mut self.decision {
+                    d.fill_app(&app);
+                }
+                None
+            }
+            ViewAction::LocalAppFailed => {
+                if let Some(d) = &mut self.decision {
+                    d.pick_failed();
+                }
+                None
+            }
             ViewAction::DecisionNext => {
                 if let Some(d) = &mut self.decision {
                     d.next();
@@ -1055,7 +1071,10 @@ impl AdminViews {
         }
         self.decision = match (self.screen, kind) {
             // From any screen: the add is about no record shown.
-            (_, DecisionKind::Register) => Some(Decision::register(self.can(perm::APPROVE))),
+            (_, DecisionKind::Register) => Some(Decision::register_for(
+                self.can(perm::APPROVE),
+                super::local::LocalHost::cached(),
+            )),
             (Screen::Request, DecisionKind::Approve) => request.and_then(Decision::approve),
             (Screen::Request, DecisionKind::Deny) => request
                 .and_then(|d| d.request.as_ref())

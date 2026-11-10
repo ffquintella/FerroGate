@@ -25,6 +25,7 @@ pub mod decide;
 pub mod enroll;
 pub mod factors;
 pub mod flow;
+pub mod local;
 pub mod login;
 pub mod secret;
 pub mod seed;
