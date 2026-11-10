@@ -22,6 +22,8 @@ use hiqlite::tls::{ServerTlsConfig, ServerTlsConfigCerts};
 use hiqlite::{Client, LogSync, Node, NodeConfig, Param};
 use tokio::time::timeout;
 
+use crate::raft_timing::{RaftTiming, RaftTimingOverrides};
+
 /// TLS for the inter-node Raft + management transports.
 ///
 /// Hiqlite encrypts the peer transport with rustls and authenticates the two
@@ -192,7 +194,7 @@ impl ClusterConfig {
             })
             .collect();
 
-        NodeConfig {
+        let mut node_config = NodeConfig {
             node_id: self.node_id,
             nodes,
             listen_addr_api: Cow::Owned(self.listen_addr_api.clone()),
@@ -206,6 +208,23 @@ impl ClusterConfig {
             health_check_delay: Duration::ZERO,
             wal_sync: LogSync::ImmediateAsync,
             ..NodeConfig::default()
+        };
+        // Already validated by `Cluster::start`; unset fields keep hiqlite's values.
+        let rc = &mut node_config.raft_config;
+        let o = &self.raft_timing;
+        rc.heartbeat_interval = o.heartbeat_ms.unwrap_or(rc.heartbeat_interval);
+        rc.election_timeout_min = o.election_min_ms.unwrap_or(rc.election_timeout_min);
+        rc.election_timeout_max = o.election_max_ms.unwrap_or(rc.election_timeout_max);
+        node_config
+    }
+
+    /// hiqlite's own timings, which the overrides are validated against.
+    fn default_raft_timing() -> RaftTiming {
+        let rc = NodeConfig::default().raft_config;
+        RaftTiming {
+            heartbeat_ms: rc.heartbeat_interval,
+            election_min_ms: rc.election_timeout_min,
+            election_max_ms: rc.election_timeout_max,
         }
     }
 }
@@ -256,6 +275,9 @@ pub struct ClusterConfig {
     /// `Some(_)` encrypts and secret-authenticates it so the cluster can span
     /// an untrusted network. Must be the same variant on every node.
     pub peer_tls: Option<PeerTls>,
+    /// Operator overrides for the Raft heartbeat and election timeouts.
+    /// Empty by default, which keeps hiqlite's own values.
+    pub raft_timing: RaftTimingOverrides,
 }
 
 impl ClusterConfig {
@@ -274,7 +296,15 @@ impl ClusterConfig {
             listen_addr_api: "127.0.0.1".to_string(),
             filename_db: "hiqlite.db".to_string(),
             peer_tls: None,
+            raft_timing: RaftTimingOverrides::default(),
         }
+    }
+
+    /// Set the Raft timing overrides and return `self` (builder-style).
+    #[must_use]
+    pub fn with_raft_timing(mut self, raft_timing: RaftTimingOverrides) -> Self {
+        self.raft_timing = raft_timing;
+        self
     }
 
     /// Set the inter-node TLS mode and return `self` (builder-style).
@@ -349,6 +379,9 @@ pub enum ClusterError {
     /// Deriving the deterministic shared peer-TLS certificate failed.
     #[error("peer-tls cert derivation: {0}")]
     PeerCert(String),
+    /// An operator-supplied cluster setting is invalid.
+    #[error("cluster config: {0}")]
+    Config(String),
     /// A conditional write did not apply: a compare-and-set lost, a unique
     /// key was taken, or a referenced row does not exist.
     #[error("conflict: {0}")]
@@ -380,6 +413,18 @@ impl Cluster {
             tracing::info!(
                 node_id,
                 "inter-node transport: rustls (secret-authenticated)"
+            );
+        }
+        let defaults = ClusterConfig::default_raft_timing();
+        let timing = cfg.raft_timing.resolve(defaults)?;
+        if timing != defaults {
+            tracing::info!(
+                node_id,
+                heartbeat_ms = timing.heartbeat_ms,
+                election_min_ms = timing.election_min_ms,
+                election_max_ms = timing.election_max_ms,
+                default_heartbeat_ms = defaults.heartbeat_ms,
+                "raft timing overridden"
             );
         }
         let node_config = cfg.node_config(peer_tls);
@@ -955,6 +1000,36 @@ mod tests {
                 addr_api: format!("127.0.0.1:{}", 18_200 + id),
             })
             .collect()
+    }
+
+    #[test]
+    fn raft_timing_defaults_are_hiqlites_own() {
+        let nc = ClusterConfig::for_node(1, three_peers(), "/data").node_config(None);
+        let d = ClusterConfig::default_raft_timing();
+        assert_eq!(nc.raft_config.heartbeat_interval, d.heartbeat_ms);
+        assert_eq!(nc.raft_config.election_timeout_min, d.election_min_ms);
+        assert_eq!(nc.raft_config.election_timeout_max, d.election_max_ms);
+        assert_eq!(
+            (d.heartbeat_ms, d.election_min_ms, d.election_max_ms),
+            (500, 1500, 3000)
+        );
+    }
+
+    #[test]
+    fn raft_timing_overrides_reach_the_node_config() {
+        let o = RaftTimingOverrides {
+            heartbeat_ms: Some(2000),
+            election_min_ms: Some(6000),
+            election_max_ms: Some(12_000),
+            allow_aggressive: false,
+        };
+        assert!(o.resolve(ClusterConfig::default_raft_timing()).is_ok());
+        let nc = ClusterConfig::for_node(1, three_peers(), "/data")
+            .with_raft_timing(o)
+            .node_config(None);
+        assert_eq!(nc.raft_config.heartbeat_interval, 2000);
+        assert_eq!(nc.raft_config.election_timeout_min, 6000);
+        assert_eq!(nc.raft_config.election_timeout_max, 12_000);
     }
 
     fn specific_tls() -> ServerTlsConfig {

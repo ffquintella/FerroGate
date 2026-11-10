@@ -846,6 +846,13 @@ Each replica needs the same view of the cluster and a shared secret pair:
   (default `0.0.0.0` for a multi-node cluster, so peers can reach this node).
   Must be an IP literal (`0.0.0.0`, `10.0.0.5`, or bracketed IPv6 such as
   `[::]`); a hostname fails startup.
+- `CMIS_RAFT_HEARTBEAT_MS`, `CMIS_RAFT_ELECTION_MIN_MS`,
+  `CMIS_RAFT_ELECTION_MAX_MS` — widen the Raft timing on a lossy or jittery
+  peer link (defaults 500 / 1500 / 3000 ms). The heartbeat is also the
+  time-to-live of each `AppendEntries` call, so raise it together with the
+  election window (minimum at least 3 × heartbeat), e.g. 2000 / 6000 / 12000.
+  Values below the defaults need `CMIS_RAFT_ALLOW_AGGRESSIVE_TIMEOUTS=true`;
+  any invalid value stops startup. See `docs/features/raft-timeout-tuning.md`.
 - `CMIS_PEER_TLS=1` — encrypt the inter-node transport with TLS (recommended
   whenever the peers are not on a trusted private network). Zero-config: every
   node derives the same peer certificate from the shared secret, so split-brain

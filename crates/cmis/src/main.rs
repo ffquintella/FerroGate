@@ -386,6 +386,10 @@ async fn start_cluster() -> anyhow::Result<Arc<Cluster>> {
         cfg.peer_tls = resolve_peer_tls()?;
     }
 
+    // Raft timing overrides (CMIS_RAFT_HEARTBEAT_MS and friends). Invalid
+    // values stop startup; see docs/features/raft-timeout-tuning.md.
+    cfg.raft_timing = ferro_raft::RaftTimingOverrides::from_lookup(|k| std::env::var(k).ok())?;
+
     match (
         std::env::var("CMIS_RAFT_SECRET"),
         std::env::var("CMIS_API_SECRET"),

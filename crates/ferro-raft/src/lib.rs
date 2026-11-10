@@ -40,6 +40,8 @@ pub mod apps;
 pub mod cluster;
 mod migrations;
 mod peer_cert;
+pub mod raft_timing;
 
 pub use apps::LedgerError;
 pub use cluster::{Cluster, ClusterConfig, ClusterError, NodeRole, PeerNode, PeerTls};
+pub use raft_timing::{RaftTiming, RaftTimingOverrides};
