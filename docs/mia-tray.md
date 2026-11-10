@@ -336,11 +336,34 @@ device_token_path = ""   # default: device-token beside the per-user file (0600)
 `FERROGATE_ADMIN_ENDPOINT` and `FERROGATE_ADMIN_SPKI_PIN` override the file.
 The file is the same format the TUI reads and passes the same checks (opened
 without following a symlink, owned by you or root, not group/other-writable,
-directories above it too; unknown keys refused). Without a pin the window says
-so and sends nothing: there is no trust on first use. Get the pin from
-operations over a trusted channel (`ferrogate spki-pin --tls-cert …` on a CMIS
-node); the sign-in window shows the endpoint and a short pin fingerprint to
-compare. A first-run setup screen is not built yet.
+directories above it too; unknown keys refused). Without a pin the window sends
+nothing: there is no trust on first use. Get the pin from operations over a
+trusted channel (`ferrogate spki-pin --tls-cert …` on a CMIS node); the sign-in
+window shows the endpoint and a short pin fingerprint to compare.
+
+**Admin server screen.** With no usable configuration the window opens on the
+**Admin server** screen instead of the sign-in form; **Change server…** beside
+the server line (signed out only) opens it too. It has two fields, the admin
+endpoint (`https://host:port`) and the SPKI pin (96 hex digits), and **Save**.
+Both are checked by the same parser as the file (https only, a host and an
+explicit port, no user information, path or query; exactly one SHA-384 in hex),
+and the screen names what is wrong. The pin is only ever what you paste: the
+client never fetches the server's certificate to pin it, and **Change server…**
+pre-fills the endpoint but never the pin. Save writes the per-user file above
+(directory created `0700`, an existing one of yours made private; file `0600`,
+written to a temporary file and renamed over the old one; a symlink, a file of
+another user or a group/other-writable file or directory is refused and
+nothing is written), then reloads it and shows the sign-in form; no restart.
+When a file is in effect, Save first shows its endpoint and every pin beside the
+new ones and asks you to **Replace**. Its `device_token_path` and
+`refresh_secs` are kept, every old pin is replaced by the one pasted, and
+comments are not kept; a file that does not parse is replaced by the endpoint
+and pin only. A system file (`/etc/ferrogate/admin.toml`) is never written: a
+per-user file is created that takes precedence over it. When
+`FERROGATE_ADMIN_ENDPOINT` or `FERROGATE_ADMIN_SPKI_PIN` is set the screen says
+so: the variable keeps winning over what you save. Each save logs
+`admin.client.server_config_changed` with the endpoint and the new and previous
+pin fingerprints (no path, nothing secret).
 
 ### Signing in and stepping up
 

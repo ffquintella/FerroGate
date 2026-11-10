@@ -132,6 +132,177 @@ pub fn read_trusted_file(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| invalid(&"not UTF-8 text"))
 }
 
+/// Why [`write_trusted_file`] wrote nothing. `Display` is for logs (it may
+/// name a path); a window words each kind itself.
+#[derive(Debug)]
+pub enum WriteError {
+    /// The text is larger than [`MAX_CONFIG_BYTES`].
+    TooLarge,
+    /// The directory, one above it or the file in place fails the trust
+    /// checks (a link, another owner, writable by group or others).
+    Untrusted(String),
+    /// The file system refused.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge => write!(f, "larger than {MAX_CONFIG_BYTES} bytes"),
+            Self::Untrusted(why) => f.write_str(why),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// Write `text` to `path` the way [`read_trusted_file`] trusts it: directory
+/// `0700` (an existing one of yours made private), file `0600`, through a
+/// synced temporary file renamed over `path` (the old file or the new one).
+///
+/// # Errors
+/// A non-regular or untrusted file in place, or an untrusted directory.
+pub fn write_trusted_file(path: &Path, text: &str) -> Result<(), WriteError> {
+    if u64::try_from(text.len()).map_or(true, |n| n > MAX_CONFIG_BYTES) {
+        return Err(WriteError::TooLarge);
+    }
+    let shown = |why: &str| WriteError::Untrusted(format!("{} {why}", path.display()));
+    let Some(name) = path.file_name() else {
+        return Err(shown("has no file name"));
+    };
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    #[cfg(unix)]
+    trusted_tree(dir)?;
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        b.mode(0o700);
+    }
+    b.create(dir).map_err(WriteError::Io)?;
+    #[cfg(unix)]
+    private_dir(dir)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(shown(
+                "is not a regular file (a link or a directory); refused",
+            ));
+        }
+        Ok(meta) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let euid = rustix::process::geteuid().as_raw();
+                trusted_owner_and_mode(meta.uid(), meta.mode(), euid, false).map_err(shown)?;
+            }
+            #[cfg(not(unix))]
+            let _ = meta;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(WriteError::Io(e)),
+    }
+    let (tmp, mut file) = create_temp(dir, name)?;
+    let written = std::io::Write::write_all(&mut file, text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(WriteError::Io(e));
+    }
+    // The rename reaches the disk with the directory (best effort).
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn untrusted(what: &Path, why: &str) -> WriteError {
+    WriteError::Untrusted(format!("{} {why}", what.display()))
+}
+
+/// Unix: the deepest existing directory of `dir` and every one above it
+/// pass [`read_trusted_file`]'s rule, before anything is created there.
+#[cfg(unix)]
+fn trusted_tree(dir: &Path) -> Result<(), WriteError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let euid = rustix::process::geteuid().as_raw();
+    let existing = dir
+        .ancestors()
+        .find(|a| !a.as_os_str().is_empty() && a.exists())
+        .unwrap_or(Path::new("."));
+    let real = std::fs::canonicalize(existing).map_err(WriteError::Io)?;
+    for ancestor in real.ancestors() {
+        let meta = std::fs::metadata(ancestor).map_err(WriteError::Io)?;
+        trusted_owner_and_mode(meta.uid(), meta.mode(), euid, true)
+            .map_err(|why| untrusted(ancestor, why))?;
+    }
+    Ok(())
+}
+
+/// Unix: `dir` (created or checked by [`trusted_tree`]) is a directory
+/// owned by the effective user, made `0700`.
+#[cfg(unix)]
+fn private_dir(dir: &Path) -> Result<(), WriteError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let euid = rustix::process::geteuid().as_raw();
+    let real = std::fs::canonicalize(dir).map_err(WriteError::Io)?;
+    let refuse = untrusted;
+    let meta = std::fs::symlink_metadata(&real).map_err(WriteError::Io)?;
+    if !meta.is_dir() {
+        return Err(refuse(&real, "is not a directory"));
+    }
+    if meta.uid() != euid {
+        return Err(refuse(&real, "is owned by another user"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
+            .map_err(WriteError::Io)?;
+    }
+    Ok(())
+}
+
+/// A new, empty `0600` file beside the target (`create_new`: never an
+/// existing path or a link).
+fn create_temp(
+    dir: &Path,
+    name: &std::ffi::OsStr,
+) -> Result<(std::path::PathBuf, std::fs::File), WriteError> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let mut last = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+    for _ in 0..16 {
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp = dir.join(tmp_name);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        match opts.open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e,
+            Err(e) => return Err(WriteError::Io(e)),
+        }
+    }
+    Err(WriteError::Io(last))
+}
+
 /// Read the device token from `path`, opened without following a symlink.
 /// Empty when absent, not a regular file, not owned by the effective user,
 /// readable by group or others, larger than 1 KiB or not printable ASCII.
@@ -303,5 +474,81 @@ mod tests {
         chmod(&big, 0o600);
         assert!(read_trusted_file(&big).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The names in `dir` (to find a leftover temporary file).
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_written_configuration_is_private_atomic_and_trusted_on_read() {
+        let base = private_dir("write");
+        let dir = base.join("a/ferrogate");
+        let file = dir.join("admin.toml");
+        write_trusted_file(&file, "endpoint = \"https://h:1\"\n").unwrap();
+        assert_eq!(
+            read_trusted_file(&file).unwrap(),
+            "endpoint = \"https://h:1\"\n"
+        );
+        write_trusted_file(&file, "endpoint = \"https://h:2\"\n").unwrap();
+        assert_eq!(
+            read_trusted_file(&file).unwrap(),
+            "endpoint = \"https://h:2\"\n"
+        );
+        assert_eq!(names(&dir), vec!["admin.toml"], "no temporary file is left");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&file), 0o600);
+            assert_eq!(mode(&dir), 0o700);
+            // An existing directory of yours is made private.
+            chmod(&dir, 0o755);
+            write_trusted_file(&file, "x = 1\n").unwrap();
+            assert_eq!(mode(&dir), 0o700);
+        }
+        assert!(matches!(
+            write_trusted_file(&file, &"#".repeat(70 * 1024)),
+            Err(WriteError::TooLarge)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_a_writable_file_or_an_open_directory_is_never_written_through() {
+        let base = private_dir("write-refused");
+        let dir = base.join("cfg");
+        let file = dir.join("admin.toml");
+        write_trusted_file(&file, "a = 1\n").unwrap();
+        // A symlink in place of the file: refused, its target untouched.
+        let elsewhere = base.join("elsewhere.toml");
+        std::fs::write(&elsewhere, "kept\n").unwrap();
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let e = write_trusted_file(&link, "b = 2\n").unwrap_err();
+        assert!(matches!(e, WriteError::Untrusted(_)), "{e}");
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "kept\n");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // A group-writable file in place: refused, unchanged.
+        chmod(&file, 0o660);
+        let e = write_trusted_file(&file, "c = 3\n").unwrap_err();
+        assert!(e.to_string().contains("writable"), "{e}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a = 1\n");
+        // A world-writable directory above: refused before anything is made.
+        chmod(&base, 0o777);
+        let e = write_trusted_file(&base.join("new/admin.toml"), "d = 4\n").unwrap_err();
+        assert!(e.to_string().contains("writable"), "{e}");
+        chmod(&base, 0o700);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

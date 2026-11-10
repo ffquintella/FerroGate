@@ -15,6 +15,7 @@
 //! - [`flow`] — the window's state machine: offer, sign-in, step-up, idle lock;
 //! - [`session`] — the worker thread that talks to CMIS for the window;
 //! - [`config`] — `admin.toml` (endpoint and SPKI pin, no secrets);
+//! - [`server`] — the "admin server" screen that writes it;
 //! - [`webauthn`] — the platform's security-key backend (none built yet);
 //! - [`cli`] — the binary's own (tiny) argument parser.
 
@@ -27,6 +28,7 @@ pub mod flow;
 pub mod login;
 pub mod secret;
 pub mod seed;
+pub mod server;
 pub mod session;
 pub mod views;
 pub mod webauthn;

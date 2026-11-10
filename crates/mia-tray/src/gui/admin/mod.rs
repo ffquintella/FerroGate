@@ -12,11 +12,13 @@
 //! [`eframe::NativeOptions::persist_window`] off, no `save`, no
 //! `persist_egui_memory`. Enrollment and second factors: [`enroll`],
 //! [`factors`]; a TOTP seed is painted by [`seed`], never as a string.
-//! Requests, approvals and their decisions: [`views`].
+//! Requests, approvals and their decisions: [`views`]. The admin endpoint
+//! and its pin are entered on the "admin server" screen ([`server`]).
 
 mod enroll;
 mod factors;
 mod seed;
+mod server;
 mod views;
 
 use std::process::ExitCode;
@@ -24,12 +26,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use ferrogate_admin_client::client::ClientConfig;
+use ferrogate_admin_client::config::ConfigError;
+use ferrogate_admin_client::display::inert;
 use ferrogate_admin_client::factors::FactorMethod;
+use ferrogate_admin_client::files::WriteError;
 
+use crate::admin::config::{self, Location, SaveError, SaveTarget, SETUP_HELP};
 use crate::admin::enroll::EnrollField;
 use crate::admin::factors::FactorField;
 use crate::admin::flow::{Busy, Effect, Flow, FlowView, Notice, Problem};
 use crate::admin::login::{Field, Stage, Submission};
+use crate::admin::server::{SavePlan, SaveProblem, ServerField, ServerForm};
 use crate::admin::session::{self, Link, SHUTDOWN_WAIT};
 use crate::admin::views::{Tab, ViewAction};
 use crate::i18n::{fill, Lang, Msg};
@@ -72,11 +80,64 @@ enum Server {
     Missing(String),
 }
 
+/// Starts the worker on a configuration (`None` when it could not start).
+type StartWorker = Box<dyn Fn(ClientConfig) -> Option<Box<dyn Link>>>;
+/// Reads one environment variable.
+type Env = Box<dyn Fn(&str) -> Option<String>>;
+
+/// Where the window's configuration lives and how its worker starts (tests
+/// use a temporary directory and a fake worker).
+struct Setup {
+    os: &'static str,
+    env: Env,
+    location: Location,
+    start: StartWorker,
+}
+
+impl Setup {
+    /// This user's files and environment; the worker repaints `ctx`.
+    fn system(ctx: &egui::Context) -> Self {
+        let env = |k: &str| std::env::var(k).ok();
+        let os = std::env::consts::OS;
+        let ctx = ctx.clone();
+        Self {
+            os,
+            location: Location::of(os, &env),
+            env: Box::new(env),
+            start: Box::new(move |cfg| {
+                let ctx = ctx.clone();
+                let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
+                match session::spawn(cfg, crate::admin::webauthn::platform(), wake) {
+                    Ok(worker) => Some(Box::new(worker) as Box<dyn Link>),
+                    Err(e) => {
+                        tracing::error!(error = %e, "the admin client worker could not start");
+                        None
+                    }
+                }
+            }),
+        }
+    }
+
+    fn load(&self) -> Result<ClientConfig, ConfigError> {
+        config::load_from(&self.location, self.os, &*self.env)
+    }
+
+    fn target(&self) -> SaveTarget {
+        config::save_target(&self.location, &*self.env)
+    }
+}
+
 struct AdminApp {
     lang: Lang,
     flow: Flow,
     link: Option<Box<dyn Link>>,
     server: Server,
+    key_available: bool,
+    setup: Setup,
+    /// The "admin server" screen, when shown (it replaces the sign-in).
+    server_form: Option<ServerForm>,
+    /// A server was just saved (shown until the next input).
+    saved: bool,
 }
 
 /// Whether `event` is the administrator's own input (a key, typed or pasted
@@ -103,11 +164,49 @@ fn fingerprint(hex: &str) -> String {
 impl AdminApp {
     /// Load `admin.toml` and start the worker; repaint on each reply.
     fn connect(lang: Lang, ctx: &egui::Context) -> Self {
-        let key = crate::admin::webauthn::platform();
-        let key_available = key.is_some();
-        match crate::admin::config::load() {
+        let key_available = crate::admin::webauthn::platform().is_some();
+        Self::open(lang, Setup::system(ctx), key_available)
+    }
+
+    /// Load the configuration and start the worker on it; without a usable
+    /// one, the "admin server" screen.
+    fn open(lang: Lang, setup: Setup, key_available: bool) -> Self {
+        let missing = Server::Missing(String::new());
+        let mut app = Self::new(lang, missing, None, key_available, setup);
+        if !app.reload() {
+            app.open_server();
+        }
+        app
+    }
+
+    fn new(
+        lang: Lang,
+        server: Server,
+        link: Option<Box<dyn Link>>,
+        key_available: bool,
+        setup: Setup,
+    ) -> Self {
+        Self {
+            lang,
+            flow: Flow::new(key_available, Instant::now()),
+            link,
+            server,
+            key_available,
+            setup,
+            server_form: None,
+            saved: false,
+        }
+    }
+
+    /// (Re)load the configuration and (re)start the worker on it; `false`
+    /// when no server is usable (the old worker is stopped either way).
+    fn reload(&mut self) -> bool {
+        if let Some(old) = self.link.take() {
+            old.shutdown(SHUTDOWN_WAIT);
+        }
+        match self.setup.load() {
             Ok(cfg) => {
-                let server = Server::Ready {
+                let ready = Server::Ready {
                     endpoint: display_safe(&cfg.endpoint, 80),
                     pin: cfg
                         .pins
@@ -115,34 +214,72 @@ impl AdminApp {
                         .map(|p| fingerprint(&p.to_hex()))
                         .unwrap_or_default(),
                 };
-                let ctx = ctx.clone();
-                let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-                match session::spawn(cfg, key, wake) {
-                    Ok(worker) => Self::new(lang, server, Some(Box::new(worker)), key_available),
-                    Err(e) => {
-                        tracing::error!(error = %e, "the admin client worker could not start");
-                        Self::new(lang, Server::Missing(String::new()), None, key_available)
-                    }
-                }
+                self.link = (self.setup.start)(cfg);
+                self.server = if self.link.is_some() {
+                    ready
+                } else {
+                    Server::Missing(String::new())
+                };
             }
             Err(e) => {
-                let why = format!("{e}\n\n{}", crate::admin::config::SETUP_HELP);
-                Self::new(
-                    lang,
-                    Server::Missing(display_safe_block(&why, 2000)),
-                    None,
-                    false,
-                )
+                let why = e.to_string();
+                tracing::warn!(event = "admin.client.config_unusable", reason = %inert(&why, 300));
+                self.server = Server::Missing(display_safe_block(&why, 2000));
             }
         }
+        self.link.is_some()
     }
 
-    fn new(lang: Lang, server: Server, link: Option<Box<dyn Link>>, key_available: bool) -> Self {
-        Self {
-            lang,
-            flow: Flow::new(key_available, Instant::now()),
-            link,
-            server,
+    /// Show the "admin server" screen (signed out and idle only); whatever
+    /// secret was half-typed is wiped first.
+    fn open_server(&mut self) {
+        if self.flow.signed_in() || self.flow.view(Instant::now()).busy.is_some() {
+            return;
+        }
+        self.flow.escape();
+        let cancellable = matches!(self.server, Server::Ready { .. });
+        self.server_form = Some(ServerForm::new(self.setup.target(), cancellable));
+    }
+
+    /// Write the checked server, then reload and go to the sign-in form.
+    fn save_server(&mut self, plan: SavePlan) {
+        if let Err(e) = config::save(&plan.path, &plan.choice, plan.keep.as_ref()) {
+            tracing::warn!(
+                event = "admin.client.server_config_not_saved",
+                reason = %inert(&e.to_string(), 300)
+            );
+            let problem = match e {
+                SaveError::Write(WriteError::Untrusted(_)) => SaveProblem::Untrusted,
+                _ => SaveProblem::WriteFailed,
+            };
+            if let Some(form) = self.server_form.as_mut() {
+                form.failed(problem);
+            }
+            return;
+        }
+        // Not secret, but worth an audit line: who reads the log sees the
+        // server change (the full pin is in the file; the log has its ends).
+        let previous: Vec<String> = plan
+            .keep
+            .iter()
+            .flat_map(|k| k.spki_pins.iter().map(|p| fingerprint(&inert(p, 100))))
+            .collect();
+        tracing::info!(
+            event = "admin.client.server_config_changed",
+            endpoint = %inert(plan.choice.endpoint(), 120),
+            pin = %fingerprint(&plan.choice.pin_hex()),
+            previous_pins = %previous.join(","),
+            replaced = plan.replaces,
+        );
+        let effects = self.flow.close();
+        self.apply(effects);
+        let usable = self.reload();
+        self.flow = Flow::new(self.key_available, Instant::now());
+        if usable {
+            self.server_form = None;
+            self.saved = true;
+        } else if let Some(form) = self.server_form.as_mut() {
+            form.failed(SaveProblem::StillUnusable);
         }
     }
 
@@ -177,11 +314,17 @@ impl AdminApp {
             let effects = self.flow.on_reply(reply, now);
             self.apply(effects);
         }
+        if self.server_form.is_some() {
+            self.read_server_input(ctx, now);
+            return;
+        }
         let mut effects = Vec::new();
         let flow = &mut self.flow;
+        let saved = &mut self.saved;
         ctx.input(|input| {
             if input.events.iter().any(is_user_input) {
                 flow.activity(now);
+                *saved = false;
             }
             for event in &input.events {
                 match event {
@@ -203,6 +346,41 @@ impl AdminApp {
             }
         });
         self.apply(effects);
+    }
+
+    /// This frame's keystrokes for the "admin server" screen (nothing in
+    /// it is secret; the idle clock still runs).
+    fn read_server_input(&mut self, ctx: &egui::Context, now: Instant) {
+        let Some(form) = self.server_form.as_mut() else {
+            return;
+        };
+        let mut actions = Vec::new();
+        let flow = &mut self.flow;
+        ctx.input(|input| {
+            if input.events.iter().any(is_user_input) {
+                flow.activity(now);
+            }
+            for event in &input.events {
+                match event {
+                    egui::Event::Text(text) | egui::Event::Paste(text) => form.type_text(text),
+                    egui::Event::Key {
+                        key, pressed: true, ..
+                    } => match key {
+                        egui::Key::Backspace => form.backspace(),
+                        egui::Key::Tab => form.tab(),
+                        egui::Key::Escape => {
+                            if form.escape() {
+                                actions.push(Action::ServerCancel);
+                            }
+                        }
+                        egui::Key::Enter => actions.push(Action::ServerEnter),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        });
+        self.act(actions);
     }
 
     fn notice_text(&self, view: &FlowView) -> Option<String> {
@@ -271,20 +449,55 @@ impl AdminApp {
         clicked: &mut Option<Field>,
     ) {
         let lang = self.lang;
+        if let Some(form) = &self.server_form {
+            let missing = match &self.server {
+                Server::Missing(why) => Some(why.as_str()),
+                Server::Ready { .. } => None,
+            };
+            server::screen(ui, lang, &form.view(), missing, actions);
+            return;
+        }
+        let idle = view.busy.is_none();
+        // The server can be changed from the sign-in form only.
+        let signed_out = view.session.is_none() && view.enroll.is_none();
         match &self.server {
             Server::Ready { endpoint, pin } => {
-                ui.weak(fill(
-                    Msg::AdminServerLine.text(lang),
-                    &[("endpoint", endpoint), ("pin", pin)],
-                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(fill(
+                        Msg::AdminServerLine.text(lang),
+                        &[("endpoint", endpoint), ("pin", pin)],
+                    ));
+                    if signed_out
+                        && ui
+                            .add_enabled(
+                                idle,
+                                egui::Button::new(Msg::AdminServerChange.text(lang)).small(),
+                            )
+                            .clicked()
+                    {
+                        actions.push(Action::OpenServer);
+                    }
+                });
             }
             Server::Missing(why) => {
                 ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminNoServer.text(lang));
-                ui.weak(why);
+                if !why.is_empty() {
+                    ui.weak(why);
+                }
+                ui.weak(SETUP_HELP);
+                if signed_out
+                    && ui
+                        .add_enabled(idle, egui::Button::new(Msg::AdminServerSetUp.text(lang)))
+                        .clicked()
+                {
+                    actions.push(Action::OpenServer);
+                }
             }
         }
+        if self.saved {
+            ui.label(Msg::AdminServerSaved.text(lang));
+        }
         ui.add_space(6.0);
-        let idle = view.busy.is_none();
         // Borrowed for this frame only; never copied into a view model.
         let shown = self.flow.seed_display();
         if view.session.is_some() {
@@ -424,8 +637,52 @@ impl AdminApp {
                     Vec::new()
                 }
                 Action::View(action) => self.flow.views_action(action),
+                Action::OpenServer
+                | Action::FocusServer(_)
+                | Action::ServerSave
+                | Action::ServerConfirm
+                | Action::ServerEnter
+                | Action::ServerBack
+                | Action::ServerCancel => {
+                    self.act_server(&action);
+                    Vec::new()
+                }
             };
             self.apply(effects);
+        }
+    }
+
+    /// The "admin server" screen's buttons and keys.
+    fn act_server(&mut self, action: &Action) {
+        if *action == Action::OpenServer {
+            self.open_server();
+            return;
+        }
+        let Some(form) = self.server_form.as_mut() else {
+            return;
+        };
+        let plan = match action {
+            Action::FocusServer(field) => {
+                form.focus(*field);
+                None
+            }
+            Action::ServerSave => form.save(),
+            Action::ServerConfirm => form.confirm(),
+            Action::ServerEnter => form.enter(),
+            Action::ServerBack => {
+                form.back();
+                None
+            }
+            Action::ServerCancel => {
+                if form.cancellable() {
+                    self.server_form = None;
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(plan) = plan {
+            self.save_server(plan);
         }
     }
 }
@@ -457,6 +714,13 @@ enum Action {
     OpenViews(Tab),
     CloseViews,
     View(ViewAction),
+    OpenServer,
+    FocusServer(ServerField),
+    ServerSave,
+    ServerConfirm,
+    ServerEnter,
+    ServerBack,
+    ServerCancel,
 }
 
 fn sign_in(
@@ -792,6 +1056,8 @@ mod tests {
         replies: VecDeque<Reply>,
         /// Idempotency keys of the decisions sent.
         keys: Vec<String>,
+        /// Workers started.
+        starts: usize,
     }
 
     struct FakeLink(Rc<RefCell<Seen>>);
@@ -857,8 +1123,51 @@ mod tests {
             server,
             Some(Box::new(FakeLink(Rc::clone(&seen)))),
             false,
+            Setup::inert(),
         );
         (app, seen)
+    }
+
+    impl Setup {
+        /// No file, no environment, no worker.
+        fn inert() -> Self {
+            Self {
+                os: "linux",
+                env: Box::new(|_| None),
+                location: Location {
+                    user_file: None,
+                    candidates: Vec::new(),
+                },
+                start: Box::new(|_| None),
+            }
+        }
+
+        /// Files in `dir` (never the real home or `/etc`), the environment
+        /// `env`, a fake worker on `seen` counting its starts.
+        fn temp(
+            dir: &std::path::Path,
+            env: &'static [(&'static str, &'static str)],
+            seen: &Rc<RefCell<Seen>>,
+        ) -> Self {
+            let user = dir.join("home/ferrogate/admin.toml");
+            let seen = Rc::clone(seen);
+            Self {
+                os: "linux",
+                env: Box::new(move |k| {
+                    env.iter()
+                        .find(|(n, _)| *n == k)
+                        .map(|(_, v)| (*v).to_string())
+                }),
+                location: Location {
+                    user_file: Some(user.clone()),
+                    candidates: vec![user, dir.join("etc/admin.toml")],
+                },
+                start: Box::new(move |_| {
+                    seen.borrow_mut().starts += 1;
+                    Some(Box::new(FakeLink(Rc::clone(&seen))) as Box<dyn Link>)
+                }),
+            }
+        }
     }
 
     fn key(key: egui::Key) -> egui::Event {
@@ -1010,7 +1319,13 @@ mod tests {
     #[test]
     fn without_a_configuration_nothing_is_sent() {
         let ctx = egui::Context::default();
-        let mut app = AdminApp::new(Lang::En, Server::Missing("no pin".into()), None, false);
+        let mut app = AdminApp::new(
+            Lang::En,
+            Server::Missing("no pin".into()),
+            None,
+            false,
+            Setup::inert(),
+        );
         let painted = frame(&ctx, &mut app, vec![egui::Event::Text("alice".into())]).join("\n");
         assert!(
             painted.contains("No admin server is configured"),
@@ -1240,6 +1555,7 @@ mod tests {
             server,
             Some(Box::new(FakeLink(Rc::clone(&seen)))),
             true,
+            Setup::inert(),
         );
         to_secrets(&ctx, &mut app, &seen);
         frame(&ctx, &mut app, vec![egui::Event::Text(PASSWORD.into())]);
@@ -1507,6 +1823,161 @@ mod tests {
     fn nothing_is_persisted() {
         let (app, _) = app();
         assert!(!eframe::App::persist_egui_memory(&app));
+    }
+
+    const PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// Type `endpoint` and `pin` into the server screen, then press Enter.
+    fn enter_server(ctx: &egui::Context, app: &mut AdminApp, endpoint: &str, pin: &str) -> String {
+        app.act(vec![Action::FocusServer(ServerField::Endpoint)]);
+        frame(ctx, app, vec![egui::Event::Paste(endpoint.into())]);
+        frame(ctx, app, vec![key(egui::Key::Tab)]);
+        frame(ctx, app, vec![egui::Event::Paste(pin.into())]);
+        frame(ctx, app, vec![key(egui::Key::Enter)]).join("\n")
+    }
+
+    #[test]
+    fn without_a_server_the_window_opens_the_server_screen_and_a_save_goes_to_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Rc::new(RefCell::new(Seen::default()));
+        let mut app = AdminApp::open(Lang::En, Setup::temp(dir.path(), &[], &seen), false);
+        let ctx = egui::Context::default();
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        for want in [
+            "Admin server",
+            "No admin server is configured",
+            "never trusts a server on first use",
+            "ferrogate spki-pin --tls-cert",
+            "Saved to",
+        ] {
+            assert!(painted.contains(want), "{want}: {painted}");
+        }
+        assert!(!painted.contains("Cancel"), "nothing usable to go back to");
+        // The URL goes to the endpoint field, never to the user name.
+        let painted = enter_server(&ctx, &mut app, "http://cmis-admin.test:8444", PIN);
+        assert!(painted.contains("must start with https://"), "{painted}");
+        assert_eq!(seen.borrow().starts, 0, "nothing saved, nothing started");
+        app.act(vec![Action::FocusServer(ServerField::Endpoint)]);
+        let mut events = vec![key(egui::Key::Backspace); 40];
+        events.push(egui::Event::Paste("https://cmis-admin.test:8444".into()));
+        frame(&ctx, &mut app, events);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert!(app.server_form.is_none(), "straight to the sign-in form");
+        assert_eq!(seen.borrow().starts, 1);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(
+            painted.contains("Admin server saved. Sign in."),
+            "{painted}"
+        );
+        assert!(
+            painted.contains("https://cmis-admin.test:8444"),
+            "{painted}"
+        );
+        assert!(painted.contains("User name"), "{painted}");
+        let text = std::fs::read_to_string(dir.path().join("home/ferrogate/admin.toml")).unwrap();
+        assert!(text.contains(PIN), "{text}");
+        // Typing now goes to the user name and reaches the new worker.
+        frame(&ctx, &mut app, vec![egui::Event::Text("alice".into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert_eq!(seen.borrow().cmds, vec!["offer"]);
+    }
+
+    #[test]
+    fn changing_the_server_confirms_the_old_and_new_pins_and_keeps_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_pin = "b".repeat(96);
+        let user = dir.path().join("home/ferrogate/admin.toml");
+        ferrogate_admin_client::files::write_trusted_file(
+            &user,
+            &format!(
+                "endpoint = \"https://old.test:8444\"\nspki_pins = [\"{old_pin}\"]\n\
+                 device_token_path = \"/var/dt\"\n"
+            ),
+        )
+        .unwrap();
+        let seen = Rc::new(RefCell::new(Seen::default()));
+        let mut app = AdminApp::open(Lang::En, Setup::temp(dir.path(), &[], &seen), false);
+        assert!(
+            app.server_form.is_none(),
+            "a usable server: the sign-in form"
+        );
+        let ctx = egui::Context::default();
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("Change server…"), "{painted}");
+        // A half-typed password is wiped when the screen opens.
+        to_secrets(&ctx, &mut app, &seen);
+        frame(&ctx, &mut app, vec![egui::Event::Text(PASSWORD.into())]);
+        app.act(vec![Action::OpenServer]);
+        assert_eq!(app.flow.view(Instant::now()).login.password_len, 0);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(
+            painted.contains("https://old.test:8444"),
+            "pre-filled: {painted}"
+        );
+        assert!(painted.contains("Cancel"), "{painted}");
+        // The pin is never pre-filled: paste the new one and save.
+        frame(&ctx, &mut app, vec![egui::Event::Paste(PIN.into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        for want in [
+            "Replace the admin server?",
+            &format!("Pin: {old_pin}"),
+            &format!("Pin: {PIN}"),
+            "other settings are kept",
+            "character by character",
+        ] {
+            assert!(painted.contains(want), "{want}: {painted}");
+        }
+        assert_eq!(
+            seen.borrow().starts,
+            1,
+            "nothing written before the confirmation"
+        );
+        app.act(vec![Action::ServerConfirm]);
+        assert!(app.server_form.is_none());
+        assert_eq!(
+            seen.borrow().starts,
+            2,
+            "the worker restarts on the new server"
+        );
+        let back = ferrogate_admin_client::config::parse_file(
+            &ferrogate_admin_client::files::read_trusted_file(&user).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.spki_pins, vec![PIN.to_string()]);
+        assert_eq!(back.device_token_path.as_deref(), Some("/var/dt"));
+        assert_eq!(
+            app.flow.view(Instant::now()).login.username,
+            "",
+            "a fresh form"
+        );
+    }
+
+    #[test]
+    fn an_environment_override_is_announced_and_cancel_keeps_the_old_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Rc::new(RefCell::new(Seen::default()));
+        let env: &'static [(&'static str, &'static str)] = &[
+            ("FERROGATE_ADMIN_ENDPOINT", "https://env.test:8444"),
+            ("FERROGATE_ADMIN_SPKI_PIN", PIN),
+        ];
+        let mut app = AdminApp::open(Lang::Pt, Setup::temp(dir.path(), env, &seen), false);
+        assert!(app.server_form.is_none(), "the environment alone is usable");
+        app.act(vec![Action::OpenServer]);
+        let ctx = egui::Context::default();
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        for want in [
+            "Servidor de administração",
+            "FERROGATE_ADMIN_ENDPOINT está definida",
+            "FERROGATE_ADMIN_SPKI_PIN está definida",
+            "nunca confia em um servidor no primeiro uso",
+        ] {
+            assert!(painted.contains(want), "{want}: {painted}");
+        }
+        frame(&ctx, &mut app, vec![key(egui::Key::Escape)]);
+        assert!(app.server_form.is_none(), "Esc leaves without saving");
+        assert!(!dir.path().join("home").exists(), "nothing was written");
+        assert_eq!(seen.borrow().starts, 1);
     }
 
     #[test]
