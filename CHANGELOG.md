@@ -25,6 +25,12 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.10] - 2026-11-10
+
+### Added
+
+- Prefill the admin client's **Add an application by known hash and path** form from the machine in use (host UUID as `mia machine-id` derives it, platform, uid and user name; the UUID is left empty when the hardware identifiers are incomplete) and add **Choose an application on this machine…**, which opens the native file dialog and fills the canonical path and SHA-384 (a macOS `.app` resolves to its executable). The protected-path flag stays the administrator's assertion. Unit-tested only; the dialog was not exercised in a running window
+
 ## [0.30.9] - 2026-11-10
 
 ### Added
