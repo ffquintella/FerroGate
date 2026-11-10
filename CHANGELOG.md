@@ -25,6 +25,8 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.9] - 2026-11-10
+
 ### Added
 
 - Add operator-set Raft timing to CMIS: `CMIS_RAFT_HEARTBEAT_MS` (default 500), `CMIS_RAFT_ELECTION_MIN_MS` (1500), `CMIS_RAFT_ELECTION_MAX_MS` (3000) and `CMIS_RAFT_ALLOW_AGGRESSIVE_TIMEOUTS`, so a lossy or jittery peer link no longer trips `CheckIsLeaderError: not enough for a quorum` on a healthy two-node cluster. Absent variables change nothing; invalid values stop startup instead of being clamped, the election minimum must stay at least three heartbeats, and a value below the default needs the opt-in. Unit-tested only, not yet run on a cluster with induced packet loss; the two-node topology's lack of fault tolerance is not addressed
