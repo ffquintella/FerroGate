@@ -25,6 +25,8 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.7] - 2026-11-10
+
 ### Changed
 
 - Ship the admin client (`mia-tray-admin`) in the macOS `.pkg` by default; `MIA_TRAY_ADMIN_MACOS=0 make pkg-macos` leaves it out (S53)
