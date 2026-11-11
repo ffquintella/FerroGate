@@ -83,18 +83,80 @@ impl CallerIdentity {
     }
 }
 
+/// The failing step of reading a caller's image and the OS's answer, carried
+/// by [`AuthError::ExeUnreadable`] / [`AuthError::ImageUnreadable`].
+///
+/// For the daemon's local WARN log only ([`AuthError::detail`]): replies and
+/// `LocalDenied` events carry just [`AuthError::reason`]. No contents/hashes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableDetail {
+    /// The failing step. macOS: `pid-range`, `proc_pidpath`, `open`, `read`.
+    /// Linux: `read_link`, `path-utf8`, `open`, `read`. Windows:
+    /// `process_image_path`, `open`, `read`, `process_user_rid`.
+    pub step: &'static str,
+    /// The `io::ErrorKind` plus, from the OS, its text and raw code (or
+    /// `libproc`'s error string). `None` for `pid-range` and `path-utf8`.
+    pub os_error: Option<String>,
+    /// The resolved executable path, when the failure came after resolving it.
+    pub path: Option<String>,
+}
+
+impl UnreadableDetail {
+    /// A failure at `step`, with no OS error and no resolved path yet.
+    #[must_use]
+    pub const fn new(step: &'static str) -> Self {
+        Self {
+            step,
+            os_error: None,
+            path: None,
+        }
+    }
+
+    /// The same detail with [`Self::os_error`] from an `io::Error`: its kind,
+    /// then the OS text and raw code when the OS reported one. A non-OS error
+    /// contributes only its kind, so no free-form message reaches the log.
+    #[must_use]
+    pub fn with_io_error(mut self, e: &std::io::Error) -> Self {
+        self.os_error = Some(match e.raw_os_error() {
+            Some(_) => format!("{:?}: {e}", e.kind()),
+            None => format!("{:?}", e.kind()),
+        });
+        self
+    }
+
+    /// The same detail with [`Self::os_error`] set verbatim (a library's
+    /// error string, such as `libproc`'s `errno` message).
+    #[must_use]
+    pub fn with_os_error(mut self, os_error: impl Into<String>) -> Self {
+        self.os_error = Some(os_error.into());
+        self
+    }
+
+    /// The same detail with the resolved executable path.
+    #[must_use]
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+}
+
 /// Why caller authentication failed. Each variant maps to a stable opcode for
-/// the audit log; none of them echoes caller-controlled bytes.
+/// the audit log ([`AuthError::reason`], also the `Display`) that echoes no
+/// caller-controlled bytes; the image-read variants also carry an
+/// [`UnreadableDetail`] for the local log only.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
     /// `SO_PEERCRED` could not be read from the socket.
     #[error("peer-cred-unavailable")]
     PeerCredUnavailable,
-    /// `/proc/<pid>/exe` could not be read to hash the caller binary.
+    /// The caller's executable (`/proc/<pid>/exe` on Linux, the
+    /// `proc_pidpath` image on macOS) could not be read to hash it.
     #[error("exe-unreadable")]
     ExeUnreadable {
         /// PID/UID recovered from peer-cred before the failure, if any.
         partial: Option<(u32, u32)>,
+        /// The failing step and the OS's answer, for the local log only.
+        detail: UnreadableDetail,
     },
     /// IMA is not available/enforced on this host.
     #[error("ima-unavailable")]
@@ -119,6 +181,8 @@ pub enum AuthError {
     ImageUnreadable {
         /// PID/UID recovered before the failure, if any.
         partial: Option<(u32, u32)>,
+        /// The failing step and the OS's answer, for the local log only.
+        detail: UnreadableDetail,
     },
     /// **Windows.** The caller's image failed Authenticode / Code-Integrity
     /// verification (the analogue of an IMA mismatch).
@@ -150,14 +214,62 @@ impl AuthError {
     pub fn partial(&self) -> Option<(u32, u32)> {
         match self {
             AuthError::PeerCredUnavailable => None,
-            AuthError::ExeUnreadable { partial }
+            AuthError::ExeUnreadable { partial, .. }
             | AuthError::ImaUnavailable { partial }
             | AuthError::ImaMissingEntry { partial }
             | AuthError::ImaMismatch { partial }
-            | AuthError::ImageUnreadable { partial }
+            | AuthError::ImageUnreadable { partial, .. }
             | AuthError::Untrusted { partial } => *partial,
         }
     }
+
+    /// Which step of reading the caller's image failed and the OS's answer,
+    /// for [`AuthError::ExeUnreadable`] and [`AuthError::ImageUnreadable`];
+    /// `None` for the other variants.
+    ///
+    /// Log it locally (the helper server does, at WARN). Never put it in an
+    /// audit event or a client reply: those carry only [`AuthError::reason`].
+    #[must_use]
+    pub fn detail(&self) -> Option<&UnreadableDetail> {
+        match self {
+            AuthError::ExeUnreadable { detail, .. } | AuthError::ImageUnreadable { detail, .. } => {
+                Some(detail)
+            }
+            AuthError::PeerCredUnavailable
+            | AuthError::ImaUnavailable { .. }
+            | AuthError::ImaMissingEntry { .. }
+            | AuthError::ImaMismatch { .. }
+            | AuthError::Untrusted { .. } => None,
+        }
+    }
+}
+
+/// Open the caller's image at `open` and `SHA-384` its bytes, naming the
+/// failing step (`open` or `read`) with `shown` — the resolved executable
+/// path — in the returned [`UnreadableDetail`].
+///
+/// The open file is returned so the caller can derive the canonical path
+/// from the same image it hashed (F19 §4.1).
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
+fn open_and_hash(
+    open: &std::path::Path,
+    shown: &str,
+) -> Result<(std::fs::File, [u8; 48]), UnreadableDetail> {
+    let mut file = std::fs::File::open(open).map_err(|e| {
+        UnreadableDetail::new("open")
+            .with_io_error(&e)
+            .with_path(shown)
+    })?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| {
+        UnreadableDetail::new("read")
+            .with_io_error(&e)
+            .with_path(shown)
+    })?;
+    Ok((file, bin_sha384(&bytes)))
 }
 
 /// Establishes the identity of a peer from its `SO_PEERCRED` credentials.
@@ -272,7 +384,7 @@ pub use windows_auth::WindowsCallerAuth;
 
 #[cfg(windows)]
 mod windows_auth {
-    use super::{bin_sha384, AuthError, CallerAuth, CallerIdentity, PeerCred};
+    use super::{AuthError, CallerAuth, CallerIdentity, PeerCred, UnreadableDetail};
 
     /// The production Windows caller authenticator.
     ///
@@ -315,11 +427,15 @@ mod windows_auth {
         fn identify(&self, cred: PeerCred) -> Result<CallerIdentity, AuthError> {
             let pid = cred.pid.ok_or(AuthError::PeerCredUnavailable)?;
             let partial = Some((pid, 0));
+            let unreadable =
+                |detail: UnreadableDetail| AuthError::ImageUnreadable { partial, detail };
 
-            let path = ferro_winauth::process_image_path(pid)
-                .map_err(|_| AuthError::ImageUnreadable { partial })?;
-            let bytes = std::fs::read(&path).map_err(|_| AuthError::ImageUnreadable { partial })?;
-            let bin_sha = bin_sha384(&bytes);
+            let path = ferro_winauth::process_image_path(pid).map_err(|e| {
+                unreadable(UnreadableDetail::new("process_image_path").with_io_error(&e))
+            })?;
+            let shown = path.to_string_lossy().into_owned();
+            // The handle is dropped at once, as `std::fs::read` did.
+            let (_, bin_sha) = super::open_and_hash(&path, &shown).map_err(unreadable)?;
             // `canonicalize` opens the image and asks for its final path name
             // (`GetFinalPathNameByHandleW`), which expands 8.3 names; the
             // F19 rules then strip `\\?\` and map `\\?\UNC\` to `\\`.
@@ -330,8 +446,13 @@ mod windows_auth {
                 .map(|c| c.path);
             let user_sid = ferro_winauth::process_user_sid(pid).ok();
 
-            let uid = ferro_winauth::process_user_rid(pid)
-                .map_err(|_| AuthError::ImageUnreadable { partial })?;
+            let uid = ferro_winauth::process_user_rid(pid).map_err(|e| {
+                unreadable(
+                    UnreadableDetail::new("process_user_rid")
+                        .with_io_error(&e)
+                        .with_path(shown.as_str()),
+                )
+            })?;
             let partial = Some((pid, uid));
 
             if self.require_authenticode {
@@ -359,7 +480,7 @@ pub use macos_auth::MacCallerAuth;
 
 #[cfg(target_os = "macos")]
 mod macos_auth {
-    use super::{bin_sha384, AuthError, CallerAuth, CallerIdentity, PeerCred};
+    use super::{AuthError, CallerAuth, CallerIdentity, PeerCred, UnreadableDetail};
 
     /// The macOS caller authenticator: `getpeereid`/`LOCAL_PEERPID` peer
     /// credentials plus an on-disk image hash.
@@ -394,18 +515,17 @@ mod macos_auth {
         fn identify(&self, cred: PeerCred) -> Result<CallerIdentity, AuthError> {
             let pid = cred.pid.ok_or(AuthError::PeerCredUnavailable)?;
             let partial = Some((pid, cred.uid));
-            let pid_i32 = i32::try_from(pid).map_err(|_| AuthError::ExeUnreadable { partial })?;
+            let unreadable =
+                |detail: UnreadableDetail| AuthError::ExeUnreadable { partial, detail };
+            let pid_i32 =
+                i32::try_from(pid).map_err(|_| unreadable(UnreadableDetail::new("pid-range")))?;
 
             let path = libproc::proc_pid::pidpath(pid_i32)
-                .map_err(|_| AuthError::ExeUnreadable { partial })?;
+                .map_err(|e| unreadable(UnreadableDetail::new("proc_pidpath").with_os_error(e)))?;
             // Hash and canonical path come from one open file, so they
             // describe the same image (F19 §4.1).
-            let mut file =
-                std::fs::File::open(&path).map_err(|_| AuthError::ExeUnreadable { partial })?;
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut bytes)
-                .map_err(|_| AuthError::ExeUnreadable { partial })?;
-            let bin_sha = bin_sha384(&bytes);
+            let (file, bin_sha) =
+                super::open_and_hash(std::path::Path::new(&path), &path).map_err(unreadable)?;
             let exe_path = crate::helper::exe_path::macos_canonical(&file);
 
             Ok(CallerIdentity {
@@ -425,8 +545,10 @@ pub use linux::ImaCallerAuth;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{bin_sha384, AuthError, CallerAuth, CallerIdentity, MismatchOutcome, PeerCred};
-    use std::path::PathBuf;
+    use super::{
+        AuthError, CallerAuth, CallerIdentity, MismatchOutcome, PeerCred, UnreadableDetail,
+    };
+    use std::path::{Path, PathBuf};
 
     /// Default location of the IMA runtime measurement log.
     pub(crate) const DEFAULT_IMA_LOG: &str = "/sys/kernel/security/ima/binary_runtime_measurements";
@@ -490,22 +612,24 @@ mod linux {
             let uid = cred.uid;
             let gid = cred.gid;
             let partial = Some((pid, uid));
+            let unreadable =
+                |detail: UnreadableDetail| AuthError::ExeUnreadable { partial, detail };
 
             let exe_link = format!("/proc/{pid}/exe");
-            let exe_path =
-                std::fs::read_link(&exe_link).map_err(|_| AuthError::ExeUnreadable { partial })?;
+            let exe_path = std::fs::read_link(&exe_link)
+                .map_err(|e| unreadable(UnreadableDetail::new("read_link").with_io_error(&e)))?;
             let exe_path_str = exe_path
                 .to_str()
-                .ok_or(AuthError::ExeUnreadable { partial })?
+                .ok_or_else(|| {
+                    unreadable(
+                        UnreadableDetail::new("path-utf8").with_path(exe_path.to_string_lossy()),
+                    )
+                })?
                 .to_string();
             // Read through the /proc/<pid>/exe handle so we hash the bytes the
             // running process was loaded from, even if the on-disk name moved.
-            let mut image =
-                std::fs::File::open(&exe_link).map_err(|_| AuthError::ExeUnreadable { partial })?;
-            let mut contents = Vec::new();
-            std::io::Read::read_to_end(&mut image, &mut contents)
-                .map_err(|_| AuthError::ExeUnreadable { partial })?;
-            let disk_sha = bin_sha384(&contents);
+            let (image, disk_sha) =
+                super::open_and_hash(Path::new(&exe_link), &exe_path_str).map_err(unreadable)?;
             // The F19 §4.2 canonical form (` (deleted)` stripped, so a process
             // still running after an upgrade keeps matching by path), taken
             // from the same open image and bound to it in the daemon's mount
@@ -646,25 +770,191 @@ mod tests {
         );
     }
 
+    fn detail(step: &'static str) -> UnreadableDetail {
+        UnreadableDetail::new(step)
+            .with_os_error("NotFound: No such file or directory (os error 2)")
+            .with_path("/Applications/Some.app/Contents/MacOS/some")
+    }
+
+    /// Every variant keeps its `LocalDenied` opcode, and `Display` stays that
+    /// bare opcode: the diagnostic detail reaches neither.
     #[test]
     fn auth_error_reason_codes_are_stable() {
-        assert_eq!(
-            AuthError::PeerCredUnavailable.reason(),
-            "peer-cred-unavailable"
+        let p = Some((7, 8));
+        let cases = [
+            (AuthError::PeerCredUnavailable, "peer-cred-unavailable"),
+            (
+                AuthError::ExeUnreadable {
+                    partial: p,
+                    detail: detail("open"),
+                },
+                "exe-unreadable",
+            ),
+            (AuthError::ImaUnavailable { partial: p }, "ima-unavailable"),
+            (
+                AuthError::ImaMissingEntry { partial: p },
+                "ima-missing-entry",
+            ),
+            (AuthError::ImaMismatch { partial: p }, "ima-mismatch"),
+            (
+                AuthError::ImageUnreadable {
+                    partial: p,
+                    detail: detail("read"),
+                },
+                "image-unreadable",
+            ),
+            (AuthError::Untrusted { partial: p }, "untrusted-binary"),
+        ];
+        for (e, code) in cases {
+            assert_eq!(e.reason(), code);
+            assert_eq!(e.to_string(), code, "Display must stay the bare opcode");
+            let want = (e != AuthError::PeerCredUnavailable).then_some((7, 8));
+            assert_eq!(e.partial(), want, "{code}");
+        }
+    }
+
+    #[test]
+    fn detail_is_only_on_the_image_read_variants() {
+        let d = detail("open");
+        let exe = AuthError::ExeUnreadable {
+            partial: None,
+            detail: d.clone(),
+        };
+        let image = AuthError::ImageUnreadable {
+            partial: None,
+            detail: d.clone(),
+        };
+        assert_eq!(exe.detail(), Some(&d));
+        assert_eq!(image.detail(), Some(&d));
+        for e in [
+            AuthError::PeerCredUnavailable,
+            AuthError::ImaUnavailable { partial: None },
+            AuthError::ImaMissingEntry { partial: None },
+            AuthError::ImaMismatch { partial: None },
+            AuthError::Untrusted { partial: None },
+        ] {
+            assert_eq!(e.detail(), None, "{e}");
+        }
+    }
+
+    /// An OS error names its kind, text and raw code; any other `io::Error`
+    /// names only its kind, so a free-form message never reaches the log.
+    #[cfg(unix)]
+    #[test]
+    fn io_error_detail_names_kind_and_os_code_only() {
+        // 13 is `EACCES` on every Unix this crate targets.
+        let os =
+            UnreadableDetail::new("open").with_io_error(&std::io::Error::from_raw_os_error(13));
+        let text = os.os_error.unwrap();
+        assert!(text.starts_with("PermissionDenied: "), "{text}");
+        assert!(text.ends_with("(os error 13)"), "{text}");
+
+        let custom = UnreadableDetail::new("read")
+            .with_io_error(&std::io::Error::other("caller-chosen text"));
+        assert_eq!(custom.os_error.as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn open_failure_is_the_open_step_with_path_and_os_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "ferrogate-auth-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let shown = missing.to_string_lossy().into_owned();
+        let d = open_and_hash(&missing, &shown).unwrap_err();
+        assert_eq!(d.step, "open");
+        assert_eq!(d.path.as_deref(), Some(shown.as_str()));
+        let os = d.os_error.unwrap();
+        assert!(os.starts_with("NotFound: "), "{os}");
+        assert!(os.contains("os error"), "{os}");
+    }
+
+    /// A directory opens on Unix but cannot be read, which isolates the
+    /// `read` step.
+    #[cfg(unix)]
+    #[test]
+    fn read_failure_is_the_read_step_with_path_and_os_error() {
+        let dir = std::env::temp_dir();
+        let d = open_and_hash(&dir, "/shown/path").unwrap_err();
+        assert_eq!(d.step, "read");
+        assert_eq!(d.path.as_deref(), Some("/shown/path"));
+        assert!(d.os_error.unwrap().contains("os error"));
+    }
+
+    #[test]
+    fn open_and_hash_hashes_the_file_bytes() {
+        let exe = std::env::current_exe().unwrap();
+        let (_, sha) = open_and_hash(&exe, "shown").unwrap();
+        assert_eq!(sha, bin_sha384(&std::fs::read(&exe).unwrap()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pid_beyond_i32_is_the_pid_range_step() {
+        let cred = PeerCred {
+            pid: Some(u32::MAX),
+            uid: 501,
+            gid: 20,
+        };
+        let err = MacCallerAuth::new().identify(cred).unwrap_err();
+        assert_eq!(err.reason(), "exe-unreadable");
+        assert_eq!(err.partial(), Some((u32::MAX, 501)));
+        assert_eq!(err.detail(), Some(&UnreadableDetail::new("pid-range")));
+    }
+
+    /// macOS pids stay below 100 000, so `i32::MAX` names no process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unknown_pid_is_the_proc_pidpath_step() {
+        let cred = PeerCred {
+            pid: Some(0x7fff_ffff),
+            uid: 501,
+            gid: 20,
+        };
+        let err = MacCallerAuth::new().identify(cred).unwrap_err();
+        assert_eq!(err.reason(), "exe-unreadable");
+        let d = err.detail().unwrap();
+        assert_eq!(d.step, "proc_pidpath");
+        assert!(
+            d.os_error.as_deref().is_some_and(|e| e.contains("errno")),
+            "{d:?}"
         );
-        assert_eq!(
-            AuthError::ImaMismatch {
-                partial: Some((7, 8))
-            }
-            .reason(),
-            "ima-mismatch"
+        assert_eq!(d.path, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identifies_this_process() {
+        let cred = PeerCred {
+            pid: Some(std::process::id()),
+            uid: 501,
+            gid: 20,
+        };
+        let id = MacCallerAuth::new().identify(cred).unwrap();
+        assert_eq!(Some(id.bin_sha), running_exe_sha384());
+        assert_eq!((id.uid, id.gid), (501, 20));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unknown_pid_is_the_read_link_step() {
+        let cred = PeerCred {
+            pid: Some(u32::MAX),
+            uid: 1000,
+            gid: 1000,
+        };
+        let err = ImaCallerAuth::new().identify(cred).unwrap_err();
+        assert_eq!(err.reason(), "exe-unreadable");
+        assert_eq!(err.partial(), Some((u32::MAX, 1000)));
+        let d = err.detail().unwrap();
+        assert_eq!(d.step, "read_link");
+        assert!(
+            d.os_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("NotFound")),
+            "{d:?}"
         );
-        assert_eq!(
-            AuthError::ImaMismatch {
-                partial: Some((7, 8))
-            }
-            .partial(),
-            Some((7, 8))
-        );
+        assert_eq!(d.path, None);
     }
 }

@@ -25,10 +25,13 @@ use std::time::Duration;
 use ferro_audit::AuditEvent;
 use ferro_crypto::composite::{CompositePublicKey, CompositeSecretKey, CompositeSignature};
 use mia::helper::allowlist::{self, AllowEntry, Allowlist, AllowlistDoc};
-use mia::helper::auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
+use mia::helper::auth::{AuthError, CallerAuth, CallerIdentity, PeerCred, UnreadableDetail};
 use mia::helper::crl::CrlCache;
-use mia::helper::proto::{self, ChildToken, ErrorCode, HelperReq, HelperResp};
-use mia::helper::server::{Clock, HelperServer, HelperServerConfig};
+use mia::helper::proto::{
+    self, ChildToken, ErrorCode, HelperFrame, HelperOp, HelperReq, HelperResp, RegErrorCode,
+    RegistrationResp,
+};
+use mia::helper::server::{Clock, HelperServer, HelperServerConfig, RegistrationHandler};
 use mia::helper::token::{ChildTokenMinter, MinterConfig};
 use std::sync::Arc;
 use tokio::net::UnixStream;
@@ -153,6 +156,23 @@ fn spawn_server_with_crl(
     mpsc::Receiver<AuditEvent>,
     tokio::sync::oneshot::Sender<()>,
 ) {
+    spawn_server_full(auth, minter, allowlist, crl, now, None)
+}
+
+/// Like [`spawn_server_with_crl`], optionally installing a registration
+/// handler before serving.
+fn spawn_server_full(
+    auth: FixedAuth,
+    minter: Option<ChildTokenMinter>,
+    allowlist: Option<Allowlist>,
+    crl: Arc<CrlCache>,
+    now: i64,
+    registration: Option<Arc<dyn RegistrationHandler>>,
+) -> (
+    PathBuf,
+    mpsc::Receiver<AuditEvent>,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let path = unique_socket_path();
     let (audit_tx, audit_rx) = mpsc::channel(64);
     let cfg = HelperServerConfig {
@@ -174,6 +194,9 @@ fn spawn_server_with_crl(
         fixed_clock(now),
     )
     .unwrap();
+    if let Some(handler) = registration {
+        server.set_registration(handler);
+    }
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         server
@@ -390,6 +413,96 @@ async fn spoofed_exe_ima_mismatch_is_rejected() {
         }
         other => panic!("expected LocalDenied, got {other:?}"),
     }
+}
+
+/// An unreadable caller image whose error carries the OS diagnostic.
+fn unreadable_exe() -> FixedAuth {
+    FixedAuth(Err(AuthError::ExeUnreadable {
+        partial: Some((4321, APP_UID)),
+        detail: UnreadableDetail::new("open")
+            .with_os_error("PermissionDenied: Operation not permitted (os error 1)")
+            .with_path("/Applications/Diag.app/Contents/MacOS/diag"),
+    }))
+}
+
+#[tokio::test]
+async fn unreadable_exe_detail_stays_out_of_token_reply_and_audit() {
+    let (path, mut rx, _stop) = spawn_server(
+        unreadable_exe(),
+        Some(minter()),
+        Some(allowlist_with_app(1000)),
+        1000,
+    );
+
+    let resp = round_trip(&path, &good_req()).await;
+    assert_eq!(
+        resp,
+        HelperResp::Error {
+            code: ErrorCode::PermissionDenied,
+            retry_after: None,
+        }
+    );
+
+    let event = rx.recv().await.unwrap();
+    let rendered = format!("{event:?}");
+    match event {
+        AuditEvent::LocalDenied {
+            reason, pid, uid, ..
+        } => {
+            assert_eq!(reason, "exe-unreadable");
+            assert_eq!((pid, uid), (4321, APP_UID));
+        }
+        other => panic!("expected LocalDenied, got {other:?}"),
+    }
+    for leaked in ["Diag.app", "os error", "PermissionDenied"] {
+        assert!(!rendered.contains(leaked), "{leaked} in {rendered}");
+    }
+}
+
+/// A registration handler for an unauthenticated caller, which must never
+/// be reached.
+struct NeverRegistrar;
+
+impl RegistrationHandler for NeverRegistrar {
+    fn handle(
+        &self,
+        _caller: CallerIdentity,
+        _op: HelperOp,
+        _file: Option<std::fs::File>,
+    ) -> futures::future::BoxFuture<'_, RegistrationResp> {
+        Box::pin(async { RegistrationResp::Status(Vec::new()) })
+    }
+}
+
+#[tokio::test]
+async fn unreadable_exe_registration_reply_is_bare_permission_denied() {
+    let (path, mut rx, _stop) = spawn_server_full(
+        unreadable_exe(),
+        Some(minter()),
+        Some(allowlist_with_app(1000)),
+        fresh_crl_cache(1000),
+        1000,
+        Some(Arc::new(NeverRegistrar)),
+    );
+
+    let frame = mia_helper_proto::encode_frame(&HelperFrame::new(HelperOp::RequestStatus {
+        request_ids: Vec::new(),
+    }))
+    .unwrap();
+    let mut stream = connect(&path).await;
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &frame)
+        .await
+        .unwrap();
+    let resp: RegistrationResp = proto::read_frame(&mut stream).await.unwrap();
+    assert_eq!(
+        resp,
+        RegistrationResp::Error {
+            code: RegErrorCode::PermissionDenied,
+            retry_after: None,
+        }
+    );
+    // The registration path records no `LocalDenied`, before or after.
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]

@@ -33,7 +33,7 @@ pub mod token;
 pub mod server;
 
 pub use allowlist::{Allowlist, AllowlistError};
-pub use auth::{AuthError, CallerAuth, CallerIdentity, PeerCred};
+pub use auth::{AuthError, CallerAuth, CallerIdentity, PeerCred, UnreadableDetail};
 pub use crl::{CrlCache, CrlGate};
 pub use ledger::CallerLedger;
 pub use proto::{ChildToken, ErrorCode, HelperReq, HelperResp};

@@ -409,17 +409,40 @@ async fn serve_registration<A: CallerAuth>(
         Ok(cred) => match identify(shared, cred).await {
             Some(Ok(id)) => id,
             Some(Err(e)) => {
-                tracing::warn!(reason = e.reason(), "registration caller not authenticated");
+                warn_not_authenticated("registration", &e, Some(cred));
                 return refuse(RegErrorCode::PermissionDenied);
             }
             None => return refuse(RegErrorCode::Internal),
         },
         Err(e) => {
-            tracing::warn!(reason = e.reason(), "registration caller not authenticated");
+            warn_not_authenticated("registration", &e, None);
             return refuse(RegErrorCode::PermissionDenied);
         }
     };
     handler.handle(caller, op, file).await
+}
+
+/// Log at WARN why a caller on the `op` path ("registration" or "token") could
+/// not be authenticated: the stable `reason` opcode plus, for an unreadable
+/// image, the failing `step`, `os_error` and resolved `path`.
+///
+/// Local log only — the reply and the audit event carry just the opcode.
+fn warn_not_authenticated(op: &'static str, e: &AuthError, cred: Option<PeerCred>) {
+    let (pid, uid) = match (e.partial(), cred) {
+        (Some((pid, uid)), _) => (Some(pid), Some(uid)),
+        (None, Some(cred)) => (cred.pid, Some(cred.uid)),
+        (None, None) => (None, None),
+    };
+    let detail = e.detail();
+    tracing::warn!(
+        reason = e.reason(),
+        step = detail.map(|d| d.step),
+        os_error = detail.and_then(|d| d.os_error.as_deref()),
+        pid,
+        uid,
+        path = detail.and_then(|d| d.path.as_deref()),
+        "{op} caller not authenticated"
+    );
 }
 
 /// Authorize and mint (or refuse) for one decoded request given the caller
@@ -435,6 +458,7 @@ async fn process_request<A: CallerAuth>(
     let id = match id {
         Ok(id) => id,
         Err(e) => {
+            warn_not_authenticated("token", &e, None);
             let (pid, uid) = e.partial().unwrap_or((0, 0));
             deny(shared, pid, uid, [0u8; 48], e.reason()).await;
             return err(ErrorCode::PermissionDenied, None);
@@ -556,5 +580,103 @@ async fn deny<A: CallerAuth>(
 async fn record<A: CallerAuth>(shared: &Shared<A>, event: AuditEvent) {
     if shared.audit_tx.send(event).await.is_err() {
         tracing::warn!("helper-api audit sink closed; event dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::helper::auth::UnreadableDetail;
+    use std::sync::Mutex;
+
+    /// A `tracing` writer appending into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The plain-text fmt output (no time, colour or target) of `f`'s events.
+    fn captured(f: impl FnOnce()) -> String {
+        let out = Capture::default();
+        let writer = out.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = out.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn unreadable_caller_warn_names_step_os_error_pid_and_uid() {
+        let e = AuthError::ExeUnreadable {
+            partial: Some((4242, 501)),
+            detail: UnreadableDetail::new("proc_pidpath")
+                .with_os_error("return code = 0, errno = 3, message = 'No such process'"),
+        };
+        let log = captured(|| warn_not_authenticated("registration", &e, None));
+        assert!(log.contains("WARN"), "{log}");
+        assert!(
+            log.contains(
+                "registration caller not authenticated reason=\"exe-unreadable\" \
+                 step=\"proc_pidpath\" os_error=\"return code = 0, errno = 3, \
+                 message = 'No such process'\" pid=4242 uid=501"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("path="), "no path was resolved: {log}");
+    }
+
+    #[test]
+    fn unreadable_caller_warn_carries_the_resolved_path() {
+        let path = "/Applications/BastionVault.app/Contents/MacOS/bastion-vault-gui";
+        let e = AuthError::ExeUnreadable {
+            partial: Some((7, 0)),
+            detail: UnreadableDetail::new("open")
+                .with_io_error(&std::io::Error::from_raw_os_error(1))
+                .with_path(path),
+        };
+        let log = captured(|| warn_not_authenticated("token", &e, None));
+        assert!(
+            log.contains("token caller not authenticated reason=\"exe-unreadable\" step=\"open\""),
+            "{log}"
+        );
+        assert!(log.contains("(os error 1)\" pid=7 uid=0"), "{log}");
+        assert!(log.contains(&format!("path=\"{path}\"")), "{log}");
+    }
+
+    /// Without a detail only the opcode is logged; a registration caller
+    /// whose error lost the pid/uid falls back to the socket credentials.
+    #[test]
+    fn other_failures_log_the_reason_and_credential_fallback() {
+        let cred = PeerCred {
+            pid: None,
+            uid: 501,
+            gid: 20,
+        };
+        let log = captured(|| {
+            warn_not_authenticated("registration", &AuthError::PeerCredUnavailable, Some(cred));
+        });
+        assert!(
+            log.contains(
+                "registration caller not authenticated reason=\"peer-cred-unavailable\" uid=501"
+            ),
+            "{log}"
+        );
+        for absent in ["step=", "os_error=", "pid=", "path="] {
+            assert!(!log.contains(absent), "{absent} in {log}");
+        }
     }
 }
