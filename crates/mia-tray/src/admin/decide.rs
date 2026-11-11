@@ -468,6 +468,9 @@ impl Decision {
             Some(DecisionField::Note),
         );
         d.terms = Terms::safe_defaults(auto_update_preselected(detail));
+        // A pre-F19 proposal has no path: the server refuses an exact-path
+        // scope for it, so start on "any path" (the only valid choice).
+        d.terms.any_path = rules::request_path_unknown(detail.request.as_ref()?);
         d.also = vec![false; also.len()];
         d.revoke_reason = REVOKE_REPLACED;
         if let Ctx::Approve { also: a, .. } = &mut d.ctx {
@@ -1212,6 +1215,15 @@ pub(crate) mod tests {
             row_version: 7,
             ..ApprovalInfo::default()
         }
+    }
+
+    #[test]
+    fn approve_of_a_pre_f19_request_starts_on_any_path() {
+        let mut det = detail(0);
+        det.request.as_mut().unwrap().canonical_path = rules::UNKNOWN_PATH.into();
+        let d = Decision::approve(&det).unwrap();
+        assert!(d.view(NOW).any_path);
+        assert!(!Decision::approve(&detail(0)).unwrap().view(NOW).any_path);
     }
 
     #[test]

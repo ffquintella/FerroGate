@@ -25,6 +25,12 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.14] - 2026-11-11
+
+### Fixed
+
+- Approving a request proposed by a pre-F19 agent no longer fails with "a value is not valid": such a request has no path, and the server only accepts an any-path scope for it (`path_unknown`), but the approve dialog of the tray and the TUI always started on "exact path". Both now start on "any path" for these requests (S8)
+
 ## [0.30.13] - 2026-11-11
 
 ### Changed

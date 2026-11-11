@@ -158,6 +158,18 @@ pub fn also_revocable(detail: &GetAppRequestResponse) -> Vec<ApprovalInfo> {
         .collect()
 }
 
+/// The display path CMIS gives a request proposed by a pre-F19 agent (it
+/// carries no path). Kept equal to `cmis::apps::proposals::UNKNOWN_PATH` by a
+/// test.
+pub const UNKNOWN_PATH: &str = "(unknown path: proposed by a pre-F19 agent)";
+
+/// Whether `request` has no real path (a pre-F19 proposal): the server only
+/// accepts an any-path scope for it (`INVALID_ARGUMENT path_unknown`).
+#[must_use]
+pub fn request_path_unknown(request: &ferro_proto::admin_v1::AppRequestInfo) -> bool {
+    request.canonical_path == UNKNOWN_PATH
+}
+
 /// The terms of a new approval as chosen in a dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // one flag per two-way choice of the dialog.
@@ -470,6 +482,15 @@ mod tests {
     use ferro_proto::admin_v1::{AppBinaryInfo, AppRequestInfo};
 
     const NOW: i64 = 1_791_936_000;
+
+    #[test]
+    fn unknown_path_matches_the_server_placeholder() {
+        assert_eq!(UNKNOWN_PATH, cmis::apps::proposals::UNKNOWN_PATH);
+        let mut r = AppRequestInfo::default();
+        assert!(!request_path_unknown(&r));
+        r.canonical_path = UNKNOWN_PATH.into();
+        assert!(request_path_unknown(&r));
+    }
 
     fn detail(flags: u32, signer_now: &str, signer_before: &str) -> GetAppRequestResponse {
         let bin = |sha: &str, signer: &str| AppBinaryInfo {

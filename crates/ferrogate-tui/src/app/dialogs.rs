@@ -245,6 +245,13 @@ impl Dialog {
         let auto = auto_update_preselected(detail);
         let also = rules::also_revocable(detail);
         let mut fields = terms_fields(auto);
+        if rules::request_path_unknown(&request) {
+            // A pre-F19 proposal has no path: the server only accepts "any
+            // path" for it.
+            if let Some(f) = fields.iter_mut().find(|f| f.key == "path") {
+                *f = Field::choice("path", "Path match", &PATH_OPTIONS, 1);
+            }
+        }
         if !also.is_empty() {
             let labels = also
                 .iter()
