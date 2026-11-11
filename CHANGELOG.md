@@ -25,6 +25,12 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.13] - 2026-11-11
+
+### Changed
+
+- `ferrogate allowlist show` prints the v2 view in `approvals` mode: every active, unexpired approval of the host (superseded revisions included) with uid, `bin_sha`, approval id, revision, path match, expiry and an `in_v1` column, so an exact-path `policy=auto` approval is visible. It now needs an admin session; `show --v1` keeps the unauthenticated v1 body and legacy mode is unchanged. `allowlist list` still lists the stored legacy bodies (S8)
+
 ## [0.30.12] - 2026-11-11
 
 ### Changed

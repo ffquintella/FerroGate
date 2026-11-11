@@ -718,8 +718,8 @@ start-only `fetch`. Turning `allowlist.sync` off takes a restart.
 so in `approvals` mode CMIS leaves out every approval it cannot express there:
 exact-path (the CLI default), Windows SID and expiring ones. Such an approval
 is `active` in `ferrogate admin apps approvals` yet denied `not-allowlisted`
-on a v1 agent. `ferrogate allowlist show` prints that v1 view, not what a v2
-agent holds.
+on a v1 agent. `ferrogate allowlist show` prints the v2 view (the live approvals, with an
+`in_v1` column) in approvals mode; `show --v1` prints the v1 body.
 
 **Superseded revisions.** An auto-update creates a new approval and marks its
 parent `superseded_by`, but the parent stays `active`, so older revision

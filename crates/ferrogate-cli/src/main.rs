@@ -215,9 +215,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     // Public reads keep using the main endpoint and need no session.
-    let public = command == "status"
-        || (command == "allowlist"
-            && matches!(rest.first().map(String::as_str), Some("get" | "show")));
+    let public = is_public_read(command, rest);
     if public {
         let mut client = connect(&global).await?;
         return dispatch(&mut client, None, command, rest).await;
@@ -250,6 +248,18 @@ async fn run() -> anyhow::Result<()> {
     }
     admin::finish(channel, &session).await;
     result
+}
+
+/// Reads that need no admin session: `status`, `allowlist get`, and
+/// `allowlist show --v1` (the v2 view of `show` reads the approvals).
+fn is_public_read(command: &str, rest: &[String]) -> bool {
+    command == "status"
+        || (command == "allowlist"
+            && match rest.first().map(String::as_str) {
+                Some("get") => true,
+                Some("show") => rest.iter().any(|a| a == "--v1"),
+                _ => false,
+            })
 }
 
 async fn dispatch(

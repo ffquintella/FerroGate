@@ -333,8 +333,10 @@ async fn bootstrap_login_allowlist_logout_and_the_old_session_is_refused() {
         "token never printed"
     );
 
-    // `show` is a public read on the main endpoint.
-    let (ok, stdout, _) = cmis.run(&["allowlist", "show", "--host", host], &[]).await;
+    // `show --v1` (the stored body) is a public read on the main endpoint.
+    let (ok, stdout, _) = cmis
+        .run(&["allowlist", "show", "--v1", "--host", host], &[])
+        .await;
     assert!(ok && stdout.contains("uid=1000"), "{stdout}");
     let (ok, stdout, stderr) = cmis
         .run(&["--session-file", s, "allowlist", "list"], &[])
@@ -404,7 +406,9 @@ async fn allowlist_set_show_list_get_delete_roundtrip() {
         )
         .await;
     assert!(ok, "set: {stderr}");
-    let (ok, stdout, _) = cmis.run(&["allowlist", "show", "--host", host], &[]).await;
+    let (ok, stdout, _) = cmis
+        .run(&["allowlist", "show", "--v1", "--host", host], &[])
+        .await;
     assert!(
         ok && stdout.contains(&bin_sha) && stdout.contains("uid=1000"),
         "{stdout}"
@@ -449,7 +453,9 @@ async fn allowlist_set_show_list_get_delete_roundtrip() {
         )
         .await;
     assert!(ok, "wildcard set: {stderr}");
-    let (_, stdout, _) = cmis.run(&["allowlist", "show", "--host", host], &[]).await;
+    let (_, stdout, _) = cmis
+        .run(&["allowlist", "show", "--v1", "--host", host], &[])
+        .await;
     assert!(stdout.contains("uid=*"), "{stdout}");
 
     let (ok, stdout, _) = cmis
@@ -459,7 +465,9 @@ async fn allowlist_set_show_list_get_delete_roundtrip() {
         )
         .await;
     assert!(ok && stdout.contains("deleted"), "{stdout}");
-    let (ok, _, _) = cmis.run(&["allowlist", "show", "--host", host], &[]).await;
+    let (ok, _, _) = cmis
+        .run(&["allowlist", "show", "--v1", "--host", host], &[])
+        .await;
     assert!(!ok, "show after delete must fail");
 
     // After the step-up window a write asks for a fresh TOTP code, rotates
@@ -1010,6 +1018,24 @@ async fn migrate_allowlists_switch_modes_and_map_the_allowlist_commands() {
     assert!(ok, "remove: {stderr}");
     assert_eq!(stdout.matches("revoked approval").count(), 1, "{stdout}");
 
+    // `show` in approvals mode prints the v2 view: the live approvals, not the
+    // v1 body (revoked uid 1000 is gone, the registered uid 1001 is there).
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &["--session-file", s, "allowlist", "show", "--host", host],
+            &[],
+        )
+        .await;
+    assert!(ok, "show: {stderr}");
+    assert!(
+        stdout.contains("view:") && stdout.contains("v2"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&sha2) && stdout.contains("uid=1001") && !stdout.contains("uid=1000 "),
+        "{stdout}"
+    );
+
     // A rollback shows what changes and needs confirmation (--yes without a
     // terminal).
     let (ok, stdout, stderr) = cmis
@@ -1044,7 +1070,9 @@ async fn migrate_allowlists_switch_modes_and_map_the_allowlist_commands() {
     );
 
     // The preserved legacy body is served again.
-    let (ok, stdout, _) = cmis.run(&["allowlist", "show", "--host", host], &[]).await;
+    let (ok, stdout, _) = cmis
+        .run(&["allowlist", "show", "--v1", "--host", host], &[])
+        .await;
     assert!(
         ok && stdout.contains(&sha) && stdout.contains("uid=1000"),
         "{stdout}"

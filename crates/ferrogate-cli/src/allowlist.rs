@@ -68,7 +68,8 @@ pub(crate) fn usage() -> &'static str {
      \x20 remove  <selector> (--uid N | --bin-sha hex|* | --uid N --bin-sha hex|*) [--ttl secs]\n\
      \x20                  drop matching callers (a uid, a binary, or one pinned pair) and re-sign\n\
      \x20 get     <selector> [--out path]   fetch the raw signed CBOR (stdout if no --out)\n\
-     \x20 show    <selector>                fetch and print the entries + validity\n\
+     \x20 show    <selector> [--v1]         print what the host is served: in approvals mode the\n\
+     \x20                                    v2 entries (needs a session; --v1: the legacy body)\n\
      \x20 list                              every host that has a stored allowlist\n\
      \x20 delete  <selector>                remove the host's stored allowlist\n\
      \x20 proposals                         every pending host-driven proposal\n\
@@ -110,7 +111,7 @@ pub(crate) struct AdminCtx<'a> {
 }
 
 /// Flags of the approvals-mode `add` that take no value.
-const SWITCHES: [&str; 3] = ["--any-path", "--no-expiry", "--path-protected"];
+const SWITCHES: [&str; 4] = ["--any-path", "--no-expiry", "--path-protected", "--v1"];
 
 /// Confirms the approvals-mode `remove` without a prompt.
 const YES: &str = "--yes";
@@ -177,11 +178,13 @@ pub(crate) async fn run(
         .collect();
     let flags = Flags::parse(&valued);
     if let Some(ctx) = ctx {
-        if matches!(sub, "add" | "remove") && approvals_mode(ctx).await? {
-            return if sub == "add" {
-                approvals_add(ctx, &flags, args).await
-            } else {
-                approvals_remove(ctx, &flags, has_flag(args, YES)).await
+        // `show --v1` stays the plain GetAllowlist body.
+        let wants_v1 = sub == "show" && has_flag(args, "--v1");
+        if matches!(sub, "add" | "remove" | "show") && !wants_v1 && approvals_mode(ctx).await? {
+            return match sub {
+                "add" => approvals_add(ctx, &flags, args).await,
+                "show" => approvals_show(ctx, &flags).await,
+                _ => approvals_remove(ctx, &flags, has_flag(args, YES)).await,
             };
         }
     }
@@ -317,6 +320,99 @@ async fn matching_approvals(
         }
         token = page.next_page_token;
     }
+}
+
+/// One line per approval a v2 agent holds: every active, unexpired approval
+/// of the host, whatever its policy or revision (superseded revisions stay
+/// allowed until revoked). Also reports whether the v1 body can carry it.
+fn v2_view_lines(items: &[ApprovalInfo], now: i64) -> Vec<String> {
+    let mut live: Vec<&ApprovalInfo> = items
+        .iter()
+        .filter(|a| a.state == 1 && (a.expires_at == 0 || a.expires_at > now))
+        .collect();
+    live.sort_by(|a, b| (&a.bin_sha, &a.approval_id).cmp(&(&b.bin_sha, &b.approval_id)));
+    live.iter()
+        .map(|a| {
+            let user = a.user.as_ref();
+            let who = match (a.user_scope, user) {
+                (_, Some(u)) if u.uid.is_some() => {
+                    u.uid.map_or_else(String::new, |x| x.to_string())
+                }
+                (_, Some(u)) if !u.sid.is_empty() => format!("sid:{}", printable(&u.sid)),
+                _ => "*".to_string(),
+            };
+            let exact_path = a.path_match != 2;
+            let v1 = if exact_path {
+                "no (exact path)"
+            } else if a.expires_at != 0 {
+                "only if it outlives the v1 window"
+            } else {
+                "yes"
+            };
+            let expires = if a.expires_at == 0 {
+                "never".to_string()
+            } else {
+                a.expires_at.to_string()
+            };
+            format!(
+                "  uid={who:<7} bin_sha={} approval={} r{} path={} expires={expires} in_v1={v1}",
+                printable(&a.bin_sha),
+                printable(&a.approval_id),
+                a.revision,
+                if exact_path { "exact" } else { "any" },
+            )
+        })
+        .collect()
+}
+
+/// `show` in approvals mode: the entries a v2 (`SyncAllowlist`) agent is
+/// served, from the host's live approvals. The v1 body `GetAllowlist`
+/// returns omits exact-path approvals, so it is not shown here.
+async fn approvals_show(ctx: &mut AdminCtx<'_>, flags: &Flags) -> anyhow::Result<()> {
+    let host_uuid = flags.host_uuid()?;
+    let mut items = Vec::new();
+    let mut token = String::new();
+    loop {
+        let page = ctx
+            .admin
+            .list_approvals(ListApprovalsRequest {
+                states: vec![1],
+                host_uuid: host_uuid.clone(),
+                include_superseded: true,
+                ascending: true,
+                page: Some(PageRequest {
+                    page_size: 100,
+                    page_token: token.clone(),
+                }),
+                ..ListApprovalsRequest::default()
+            })
+            .await
+            .map_err(rpc_err)?
+            .into_inner();
+        items.extend(page.items);
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        if items.len() >= MAX_REMOVE_SCAN {
+            anyhow::bail!("{host_uuid} has more than {MAX_REMOVE_SCAN} active approvals");
+        }
+        token = page.next_page_token;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let lines = v2_view_lines(&items, now);
+    println!("host_uuid:    {host_uuid}");
+    println!("view:         v2 (SyncAllowlist), from the host's live approvals");
+    println!("entries:      {}", lines.len());
+    for l in lines {
+        println!("{l}");
+    }
+    println!(
+        "(`in_v1` says whether a pre-F19 agent's GetAllowlist body carries the entry; \
+         `allowlist get` writes that v1 body.)"
+    );
+    Ok(())
 }
 
 /// `remove` in approvals mode: revoke every active or expired approval of
@@ -937,4 +1033,41 @@ fn normalize_sha(s: impl AsRef<str>) -> anyhow::Result<String> {
         );
     }
     Ok(s.to_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approval(id: &str, sha: &str, state: u32, path_match: u32, expires_at: i64) -> ApprovalInfo {
+        ApprovalInfo {
+            approval_id: id.into(),
+            bin_sha: sha.into(),
+            state,
+            path_match,
+            expires_at,
+            revision: 1,
+            user: Some(ferro_proto::admin_v1::AppUser {
+                kind: 1,
+                uid: Some(503),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v2_view_lists_every_live_approval_and_flags_v1_gaps() {
+        let items = [
+            approval("a", "11", 1, 2, 0),    // manual-style: path any, no expiry
+            approval("b", "22", 1, 1, 5000), // auto: exact path
+            approval("c", "33", 1, 1, 50),   // expired
+            approval("d", "44", 2, 2, 0),    // not active
+        ];
+        let lines = v2_view_lines(&items, 100);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("bin_sha=11") && lines[0].contains("in_v1=yes"));
+        assert!(lines[1].contains("bin_sha=22") && lines[1].contains("in_v1=no (exact path)"));
+        assert!(lines.iter().all(|l| l.contains("uid=503")));
+    }
 }
