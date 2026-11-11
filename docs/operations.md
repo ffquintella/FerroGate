@@ -633,8 +633,8 @@ session and a recent step-up (the CLI asks for a TOTP code when needed).
 1. **Prerequisites.** Every CMIS node runs this release (the mode is
    replicated; an older node would ignore it). F20 administrator accounts are
    in place.
-2. **Upgrade the MIA fleet** and turn on `allowlist.sync = true`
-   ([mia.md](mia.md)). Agents that are not upgraded keep using `GetAllowlist`
+2. **Upgrade the MIA fleet** (`allowlist.sync` is on by default
+   since this release; see [mia.md](mia.md)). Agents that are not upgraded keep using `GetAllowlist`
    (v1); they keep working through the switch with the limits in step 6.
 3. **Dry run.** `ferrogate admin migrate-allowlists --dry-run` lists, per
    host, the entries that would become approvals ("legacy, no expiry") and

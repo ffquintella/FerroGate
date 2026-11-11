@@ -142,7 +142,7 @@ pub fn start(inputs: ServiceInputs<'_>) -> Services {
             sync_trigger: Some(trigger),
         };
     }
-    if config.allowlist_sync_enabled() {
+    if config.allowlist.sync == Some(true) {
         tracing::warn!("allowlist.sync is set but CMIS is not configured; not syncing");
     }
     if let (Some(r), true) = (&registrar, resolver.is_some()) {

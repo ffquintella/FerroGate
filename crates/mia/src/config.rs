@@ -587,8 +587,8 @@ pub struct AllowlistConfig {
     /// and swapped in without a restart. Supersedes the start-only
     /// [`fetch`](Self::fetch); against a CMIS older than F19 it falls back to
     /// `GetAllowlist` at the same cadence. Needs `cmis.*`, `allowlist.key`
-    /// and a host SVID bound to the machine key. `None` ⇒ off (opt-in,
-    /// F19-OQ1).
+    /// and a host SVID bound to the machine key. `None` ⇒ on when CMIS is
+    /// configured (set `false` to keep the legacy start-only `fetch`).
     pub sync: Option<bool>,
     /// Sync interval in seconds, `60..=3600`; `None` ⇒ 300.
     pub sync_interval_secs: Option<u64>,
@@ -1387,10 +1387,13 @@ impl Config {
         )
     }
 
-    /// Whether the allowlist sync loop runs (`allowlist.sync`, default off).
+    /// Whether the allowlist sync loop is wanted (`allowlist.sync`, default
+    /// **on**: only `SyncAllowlist` (v2) carries exact-path and expiring
+    /// approvals; the v1 `GetAllowlist` body cannot). It still needs `cmis.*`;
+    /// without it the agent keeps the start-only `fetch`.
     #[must_use]
     pub fn allowlist_sync_enabled(&self) -> bool {
-        self.allowlist.sync.unwrap_or(false)
+        self.allowlist.sync.unwrap_or(true)
     }
 
     /// The sync interval, clamped to `60..=3600` s; default 300 s.
@@ -1608,6 +1611,18 @@ fn non_blank_path(path: Option<&Path>) -> Option<&Path> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn allowlist_sync_defaults_on_and_can_be_turned_off() {
+        // v2 (`SyncAllowlist`) is the default: v1 cannot carry exact-path or
+        // expiring approvals.
+        let mut c = Config::default();
+        assert!(c.allowlist_sync_enabled());
+        c.allowlist.sync = Some(false);
+        assert!(!c.allowlist_sync_enabled());
+        c.allowlist.sync = Some(true);
+        assert!(c.allowlist_sync_enabled());
+    }
 
     #[test]
     fn config_paths_are_os_appropriate() {

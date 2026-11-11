@@ -808,6 +808,139 @@ async fn sync_serves_signed_v2_bodies_with_monotonic_generations() {
     );
 }
 
+/// Regression for "an active `policy=auto` approval never reaches the host":
+/// the v2 body (what `SyncAllowlist` serves) carries every active approval,
+/// whatever its policy or revision, regenerates when an auto-update lands,
+/// keeps the superseded revision until it is revoked, and leaves revoked
+/// approvals out. The v1 body, by design (F19 §6.4), omits exact-path
+/// approvals, which is why MIA defaults to `allowlist.sync = true` (v2).
+#[tokio::test]
+async fn v2_body_projects_manual_auto_and_auto_update_approvals() {
+    const MANUAL: &str = "/opt/manual/bin/tool";
+    const REVOKED: &str = "/opt/revoked/bin/tool";
+    let (h, a, _) = setup("v2-projection").await;
+    approvals_mode(&h.cmis).await;
+    let expiry = now_unix() + 20 * DAY;
+
+    // Manual, auto r1 (protected path, so it can auto-update) and one that
+    // is revoked straight away.
+    let m = submit(&h, &a, &a.app_doc(MANUAL, sha(1), 1000, "alice", 0))
+        .await
+        .unwrap();
+    ledger_approve(
+        &h.cmis,
+        &m.request_id,
+        "admin-x",
+        terms(UpdatePolicy::ManualEachTime, None),
+    )
+    .await;
+    let r1 = submit(
+        &h,
+        &a,
+        &a.app_doc(PATH, sha(2), 1000, "alice", FLAG_PATH_PROTECTED),
+    )
+    .await
+    .unwrap();
+    let auto = ledger_approve(
+        &h.cmis,
+        &r1.request_id,
+        "admin-x",
+        terms(UpdatePolicy::AutoSamePathUser, Some(expiry)),
+    )
+    .await;
+    let rv = submit(&h, &a, &a.app_doc(REVOKED, sha(9), 1000, "alice", 0))
+        .await
+        .unwrap();
+    let revoked = ledger_approve(
+        &h.cmis,
+        &rv.request_id,
+        "admin-x",
+        terms(UpdatePolicy::ManualEachTime, None),
+    )
+    .await;
+    let now = now_unix();
+    h.cmis
+        .cluster()
+        .app_revoke_approval(
+            &Revoke {
+                approval_id: revoked.approval_id.clone(),
+                admin_id: "admin-x".into(),
+                reason_code: 1,
+                expected_row_version: None,
+            },
+            now,
+            now * 1000,
+        )
+        .await
+        .unwrap();
+
+    let Served::Body {
+        generation: g1,
+        signed,
+        ..
+    } = serve(&h.cmis, &a.uuid, 0, now_unix()).await.unwrap()
+    else {
+        panic!("expected a body");
+    };
+    let before = open_v2(&h.cmis, &signed);
+    assert_eq!(before.entries.len(), 2, "manual + auto r1, not the revoked");
+    assert!(before
+        .entries
+        .iter()
+        .any(|e| e.approval_id == id_bytes(&auto.approval_id) && e.uid == Some(1000)));
+    assert!(!before
+        .entries
+        .iter()
+        .any(|e| e.approval_id == id_bytes(&revoked.approval_id)));
+
+    // An auto-update r2 in the same lineage: the generation moves and the
+    // body now holds r2 as well; r1 stays until revoked.
+    let r2 = submit(
+        &h,
+        &a,
+        &a.app_doc(PATH, sha(3), 1000, "alice", FLAG_PATH_PROTECTED),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r2.state, AppRequestState::AutoApproved as i32);
+    let Served::Body {
+        generation: g2,
+        signed,
+        ..
+    } = serve(&h.cmis, &a.uuid, g1, now_unix()).await.unwrap()
+    else {
+        panic!("expected a new body after the auto-update");
+    };
+    assert!(g2 > g1, "regenerated after the update");
+    let after = open_v2(&h.cmis, &signed);
+    assert_eq!(after.entries.len(), 3, "manual + r1 + r2");
+    let child = id_bytes(&r2.approval_id);
+    let e2 = after
+        .entries
+        .iter()
+        .find(|e| e.approval_id == child)
+        .expect("the auto-update approval is served");
+    assert_eq!(e2.uid, Some(1000));
+    assert_eq!(e2.expires_at, Some(expiry), "inherited expiry");
+    assert!(after
+        .entries
+        .iter()
+        .any(|e| e.approval_id == id_bytes(&auto.approval_id)));
+
+    // The v1 compat body drops the exact-path approvals (lossy-safe).
+    let live = h
+        .cmis
+        .cluster()
+        .app_live_approvals(&a.uuid, now_unix())
+        .await
+        .unwrap();
+    let v1 = cmis::apps::v1::compile_v1(&live, now_unix() + 3600);
+    assert!(
+        v1.is_empty(),
+        "every approval here is exact-path: v1 cannot enforce it"
+    );
+}
+
 #[tokio::test]
 async fn legacy_mode_sync_serves_the_legacy_entries() {
     let (h, a, _) = setup("legacysync").await;

@@ -158,7 +158,11 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
     // body in force and refreshes it itself: writing the unauthenticated v1
     // body here could only roll it back. A reload asks the running agent to
     // sync now (`SyncAllowlist`).
-    if config.allowlist_sync_enabled() {
+    let cmis_configured = crate::endpoint::CmisResolver::from_config(&config.cmis)
+        .ok()
+        .flatten()
+        .is_some();
+    if config.allowlist_sync_enabled() && cmis_configured {
         println!(
             "allowlist.sync is on: the agent syncs this host's signed allowlist from CMIS every \
              {} s (SyncAllowlist).",

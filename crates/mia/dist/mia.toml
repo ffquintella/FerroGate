@@ -111,8 +111,9 @@
 # host-bound, rollback-protected) every sync_interval_secs ± sync_jitter_pct, and
 # swap it in without a restart. Supersedes `fetch`. The synced body and its state
 # live in the daemon's state directory (state_path). Needs cmis.* and
-# allowlist.key. Default: false.
-#sync = false
+# allowlist.key. Default: true (set false to keep only the start-time `fetch`,
+# which cannot carry exact-path or expiring approvals).
+#sync = true
 #sync_interval_secs = 300
 #sync_jitter_pct = 10
 #state_path = ""

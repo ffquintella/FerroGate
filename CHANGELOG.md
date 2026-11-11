@@ -25,6 +25,16 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.12] - 2026-11-11
+
+### Changed
+
+- MIA now syncs its allowlist through `SyncAllowlist` (v2) by default (`allowlist.sync` defaults to on when `cmis.*` is configured; `false` keeps the start-only `fetch`). The v1 `GetAllowlist` body cannot carry exact-path, Windows SID or expiring approvals, so in `approvals` mode a v1 agent denied callers whose approval was `active` (every default `policy=auto` approval is exact-path). Hosts that explicitly set `sync = false` are unchanged; `mia resync-allowlist` still writes the v1 body when CMIS is not configured. `docs/mia.md` documents that superseded revisions stay allowed until revoked, and `allowlist show` is the v1 view (S8)
+
+### Added
+
+- Regression test `v2_body_projects_manual_auto_and_auto_update_approvals`: manual, auto r1, auto-update r2 and a revoked approval project into the v2 body, regenerate after the update, and drop out of the v1 body (S8)
+
 ## [0.30.11] - 2026-11-11
 
 ### Changed

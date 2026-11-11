@@ -681,7 +681,8 @@ fail-closed rules:
 
 #### Allowlist sync (`allowlist.sync`, feature F19)
 
-With `allowlist.sync = true` (opt-in; `FERROGATE_ALLOWLIST_SYNC`) the daemon
+With `allowlist.sync` on (the **default** once `cmis.*` is configured; set
+`false` or `FERROGATE_ALLOWLIST_SYNC=false` for the legacy start-only `fetch`) the daemon
 keeps the allowlist current itself instead of the start-only `fetch`: every
 `sync_interval_secs` (default 300, `60..=3600`) ± `sync_jitter_pct` (default
 10 %) it calls the host-authenticated `SyncAllowlist` RPC, verifies the signed
@@ -712,6 +713,19 @@ failing (`allowlist_sync_failing`).
 The sync signs with the machine key the SVID's `cnf.jkt` binds, which today is
 the host-key tier: a TPM-attested host (SVID bound to the AIK) keeps the
 start-only `fetch`. Turning `allowlist.sync` off takes a restart.
+
+**Why v2 is the default.** The v1 `GetAllowlist` body is `(uid, bin_sha)` only,
+so in `approvals` mode CMIS leaves out every approval it cannot express there:
+exact-path (the CLI default), Windows SID and expiring ones. Such an approval
+is `active` in `ferrogate admin apps approvals` yet denied `not-allowlisted`
+on a v1 agent. `ferrogate allowlist show` prints that v1 view, not what a v2
+agent holds.
+
+**Superseded revisions.** An auto-update creates a new approval and marks its
+parent `superseded_by`, but the parent stays `active`, so older revision
+hashes remain allowed (and served) until revoked or expired. This keeps
+rollbacks and still-running older binaries working; revoke a revision to cut
+it off.
 
 #### App registration: `mia app` and `[registration]` (feature F19)
 

@@ -324,8 +324,9 @@ so `mia allowlist-key fetch --reload` needs no restart either. (Windows has no
 
 - **v1 is lossy in approvals mode.** An approval with an exact path, a
   Windows SID or an expiry before the served document's `not_after` is not in
-  the v1 body, so pre-F19 agents deny that application; upgrade them to
-  `allowlist.sync`.
+  the v1 body, so pre-F19 agents deny that application; upgrade them
+  (`allowlist.sync` is the default). `ferrogate allowlist show` prints this v1
+  view, so it can omit approvals a v2 agent does hold.
 - **No dedicated enrollment key.** The issuer key doubles as the allowlist
   signer (safe via context separation); a separate, independently-rotatable
   enrollment key is a possible future hardening.
