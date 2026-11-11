@@ -25,6 +25,12 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.11] - 2026-11-11
+
+### Changed
+
+- Log why the MIA could not identify a helper-socket caller: an `exe-unreadable` or `image-unreadable` denial now names the failing step (macOS `pid-range` / `proc_pidpath` / `open` / `read`, Linux `read_link` / `path-utf8` / `open` / `read`, Windows `process_image_path` / `open` / `read` / `process_user_rid`) with the OS error and the resolved path, in a WARN carrying `pid` and `uid` on both the registration and token paths. The client reply (`permission_denied` only), the `LocalDenied` reason opcode and the audit event are unchanged and never carry the detail. `AuthError::ExeUnreadable` and `AuthError::ImageUnreadable` gain a `detail` field, a source change for code that builds or destructures them (S8, T131)
+
 ## [0.30.10] - 2026-11-10
 
 ### Added
