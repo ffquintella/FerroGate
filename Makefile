@@ -6,6 +6,37 @@
         pkg-deb-tray-admin pkg-rpm-tray-admin pkg-tray-admin \
         publish-sdk publish-sdk-dry-run release deploy-release
 
+# ── Windows: run recipes under Git for Windows' POSIX shell ──────────────────
+#
+# Every recipe below is POSIX sh (awk, uname, grep, test, ...). A native
+# Windows GNU make (winget/ezwinports, choco, ...) would otherwise hand them to
+# cmd.exe and fail with "CreateProcess ... failed". Locate Git for Windows,
+# make its bash the recipe shell and put its usr/bin (awk, uname, sed, ...) on
+# PATH. WSL's C:\Windows\System32\bash.exe is deliberately NOT used: it runs
+# in a separate Linux userland. Override with GIT_ROOT=C:/path/to/Git.
+ifeq ($(OS),Windows_NT)
+  ifndef GIT_ROOT
+    # `git --exec-path` -> <root>/mingw64/libexec/git-core (or clangarm64/...).
+    # No stderr redirect: `2>NUL` would create a file named NUL whenever this
+    # runs under bash (e.g. from a Git Bash prompt or a sub-make).
+    GIT_EXEC_PATH := $(subst \,/,$(strip $(shell git --exec-path)))
+    ifneq ($(GIT_EXEC_PATH),)
+      GIT_ROOT := $(patsubst %/,%,$(dir $(patsubst %/,%,$(dir $(patsubst %/,%,$(dir $(GIT_EXEC_PATH)))))))
+    endif
+  endif
+  GIT_SH := $(firstword $(wildcard $(GIT_ROOT)/usr/bin/bash.exe) \
+                        $(wildcard $(subst \,/,$(LOCALAPPDATA))/Programs/Git/usr/bin/bash.exe) \
+                        $(wildcard C:/PROGRA~1/Git/usr/bin/bash.exe))
+  ifeq ($(GIT_SH),)
+    $(error Git for Windows not found: this Makefile needs its bash. Install Git (winget install Git.Git) or pass GIT_ROOT=C:/path/to/Git)
+  endif
+  # Exported so sub-makes ($(MAKE) ...) skip the lookup.
+  export GIT_ROOT := $(patsubst %/,%,$(dir $(patsubst %/,%,$(dir $(patsubst %/,%,$(dir $(GIT_SH)))))))
+  SHELL := $(GIT_SH)
+  .SHELLFLAGS := -c
+  export PATH := $(patsubst %/,%,$(dir $(GIT_SH)));$(PATH)
+endif
+
 # Default target: list available targets with their descriptions.
 .DEFAULT_GOAL := help
 
