@@ -224,3 +224,52 @@ mod uninstall {
         assert_eq!(std::fs::read(state(&root.0, "host-key.bin")).unwrap(), KEY);
     }
 }
+
+/// The Windows MSI puts the install directory on the system PATH (removed on
+/// uninstall), registers the `mia` service to start automatically, and both
+/// the MSI and the executables carry the FerroGate icon.
+#[test]
+fn the_windows_msi_sets_path_auto_start_and_icon() {
+    let wxs = read("wix/mia.wxs");
+    let element = |name: &str| -> String {
+        let start = wxs
+            .find(&format!("<{name} "))
+            .unwrap_or_else(|| panic!("mia.wxs declares <{name}>"));
+        let end = start + wxs[start..].find('>').expect("element is closed");
+        wxs[start..end].to_string()
+    };
+
+    let env = element("Environment");
+    for attr in [
+        r#"Name="PATH""#,
+        r#"Value="[INSTALLDIR]""#,
+        r#"Action="set""#,
+        r#"Part="last""#,
+        r#"System="yes""#,
+        r#"Permanent="no""#,
+    ] {
+        assert!(env.contains(attr), "<Environment> lacks {attr}: {env}");
+    }
+    assert!(
+        wxs.contains(r#"<ComponentRef Id="MiaPath" />"#),
+        "the PATH component is part of the default feature"
+    );
+
+    let svc = element("ServiceInstall");
+    for attr in [
+        r#"Name="mia""#,
+        r#"Start="auto""#,
+        r#"Arguments="service run""#,
+    ] {
+        assert!(svc.contains(attr), "<ServiceInstall> lacks {attr}: {svc}");
+    }
+    assert!(element("ServiceControl").contains(r#"Start="install""#));
+
+    assert!(wxs.contains(r#"<Property Id="ARPPRODUCTICON" Value="FerroGateMia.ico" />"#));
+    for build_rs in ["build.rs", "../mia-tray/build.rs"] {
+        assert!(
+            read(build_rs).contains("ferro_winres::embed_icon_for_windows_bins"),
+            "{build_rs} embeds the icon into the Windows executables"
+        );
+    }
+}

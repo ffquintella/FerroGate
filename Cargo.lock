@@ -2897,6 +2897,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-winres"
+version = "0.30.17"
+
+[[package]]
 name = "ferro-winwebauthn"
 version = "0.30.17"
 dependencies = [
@@ -4935,6 +4939,7 @@ dependencies = [
  "ferro-svid-verify",
  "ferro-transport",
  "ferro-winauth",
+ "ferro-winres",
  "futures",
  "getrandom 0.4.3",
  "hex",
@@ -5001,6 +5006,7 @@ dependencies = [
  "ferro-machineid",
  "ferro-svid",
  "ferro-winauth",
+ "ferro-winres",
  "ferro-winwebauthn",
  "ferrogate-admin-client",
  "gtk",

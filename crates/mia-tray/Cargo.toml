@@ -156,6 +156,10 @@ winreg = "0.56"
 # Administrator client, feature `fido2-windows`: the `webauthn.dll` FFI.
 ferro-winwebauthn = { path = "../ferro-winwebauthn", optional = true }
 
+[build-dependencies]
+# Embeds the product icon into the Windows binaries (see build.rs).
+ferro-winres = { path = "../ferro-winres" }
+
 [dev-dependencies]
 proptest = { workspace = true }
 # Only to pin the pipe access mask to the DACL contract in a test.

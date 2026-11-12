@@ -32,5 +32,4 @@ try {
     $ErrorActionPreference = $prevEap
 }
 
-# The PATH entry added via Install-ChocolateyPath is removed by Chocolatey
-# automatically when the package is uninstalled.
+# The system PATH entry is removed by the MSI's uninstall (component MiaPath).

@@ -62,9 +62,9 @@ try {
     $ErrorActionPreference = $prevEap
 }
 
-# 2. Add the install dir to the system PATH (Chocolatey records it for clean
-#    removal on uninstall).
-Install-ChocolateyPath -PathToInstall $installDir -PathType 'Machine'
+# 2. The system PATH entry for the install dir is owned by the MSI itself
+#    (component MiaPath in crates/mia/wix/mia.wxs): it is added on install and
+#    removed on uninstall by Windows Installer, so it is not added here.
 
 # 3. Install the bundled MSI. The MSI lays down mia.exe and registers + starts
 #    the mia Windows service. Keep a verbose msiexec log next to Chocolatey's

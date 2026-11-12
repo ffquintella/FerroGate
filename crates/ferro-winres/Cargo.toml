@@ -1,0 +1,22 @@
+[package]
+name        = "ferro-winres"
+description = "FerroGate — build-time helper that embeds the application icon into Windows executables (pure Rust .res writer)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish                = false
+
+# Used only as a build-dependency (build.rs of `mia` and `mia-tray`). It turns
+# a `.ico` into a compiled Win32 resource file (`.res`) without any external
+# tool — no rc.exe, llvm-rc or windres — so the native MSVC build and the
+# cargo-xwin cross build (scripts/build-msi-amd64.sh) behave the same. Both
+# link.exe and lld-link accept a `.res` file as a linker input. No
+# dependencies, no unsafe.
+
+[lints]
+workspace = true
+
+[dependencies]

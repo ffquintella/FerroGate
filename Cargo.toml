@@ -19,6 +19,7 @@ members = [
     "crates/ferro-ceremony",
     "crates/ferro-winauth",
     "crates/ferro-winwebauthn",
+    "crates/ferro-winres",
     "crates/ferro-harden",
     "crates/ferro-machineid",
     "crates/ferro-appid",

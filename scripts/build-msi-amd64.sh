@@ -15,9 +15,10 @@
 # The MSI installs mia.exe and registers + starts the mia service, plus the
 # mia-tray.exe desktop companion with a Startup entry (MIA_TRAY=0 to omit), and
 # the administrator client mia-tray-admin.exe (feature F22) as the optional MSI
-# feature "Admin client", OFF by default (MIA_TRAY_ADMIN=0 to omit it). The nupkg
-# additionally creates the FerroGateClients group and adds the install dir to
-# PATH before invoking the MSI (see crates/mia/nuget/ and crates/mia/wix/).
+# feature "Admin client", OFF by default (MIA_TRAY_ADMIN=0 to omit it). The MSI
+# also appends the install dir to the system PATH; the nupkg additionally
+# creates the FerroGateClients group before invoking the MSI (see
+# crates/mia/nuget/ and crates/mia/wix/).
 #
 # Optional Authenticode signing: mia's helper API refuses unsigned caller
 # binaries by default on Windows (`helper.require_authenticode`), so an

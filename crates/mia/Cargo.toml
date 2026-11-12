@@ -87,6 +87,10 @@ toml               = { workspace = true }
 p256               = { workspace = true, optional = true }
 rcgen              = { workspace = true, optional = true }
 
+[build-dependencies]
+# Embeds the product icon into the Windows binaries (see build.rs).
+ferro-winres = { path = "../ferro-winres" }
+
 [dev-dependencies]
 # Self dev-dependency with `virtual-tpm` on: this turns the feature on for the
 # crate's own test targets (so the software TPM is available to integration

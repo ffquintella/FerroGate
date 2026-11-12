@@ -15,13 +15,20 @@
   ferro-winauth::service): service name "mia", LocalSystem, auto-start, binpath
   `"<exe>" service run`.
 
-  Two things the legacy NSIS installer also did — appending to the system PATH
-  and creating the FerroGateClients helper group — are NOT done here: wixl
-  supports neither the Environment element nor arbitrary-command custom actions.
-  They are handled by the Chocolatey/NuGet wrapper (crates/mia/nuget/), which is
-  the recommended install path and configures both before invoking this MSI. A
-  bare-MSI install therefore yields the binary + service; an administrator must
-  create the FerroGateClients local group (see `mia test`) for the helper pipe.
+  The install directory is appended to the system PATH by the MiaPath
+  component (Environment element, Part="last", System="yes"), so `mia` and
+  `mia-tray-admin` resolve from any new shell; Windows Installer removes the
+  entry again on uninstall. The executables carry the FerroGate icon as a
+  Win32 resource (crates/ferro-winres, linked by each crate's build.rs), which
+  is what Explorer, Task Manager and the service's process show.
+
+  One thing the legacy NSIS installer also did — creating the FerroGateClients
+  helper group — is NOT done here: wixl does not support arbitrary-command
+  custom actions. The Chocolatey/NuGet wrapper (crates/mia/nuget/), the
+  recommended install path, creates it before invoking this MSI. A bare-MSI
+  install therefore yields the binaries, the PATH entry and the service; an
+  administrator must create the FerroGateClients local group (see `mia test`)
+  for the helper pipe.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
@@ -83,6 +90,27 @@
                         Remove="uninstall"
                         Wait="no" />
       </Component>
+
+      <!-- Put the install directory on the system PATH. "set" + Part="last"
+           appends "[INSTALLDIR]" to the existing value (written as
+           "[~];[INSTALLDIR]"); Permanent="no" removes just that part again
+           on uninstall. Own component, keyed on a registry value, so the
+           PATH entry's lifetime is independent of the file's. -->
+      <Component Id="MiaPath" Guid="8E4B6D2A-71C3-4F59-A0E8-3C9D5B1F7A62">
+        <RegistryValue Root="HKLM"
+                       Key="Software\FerroGate\MIA"
+                       Name="PathEntry"
+                       Type="string"
+                       Value="[INSTALLDIR]"
+                       KeyPath="yes" />
+        <Environment Id="MiaPathEnv"
+                     Name="PATH"
+                     Value="[INSTALLDIR]"
+                     Action="set"
+                     Part="last"
+                     System="yes"
+                     Permanent="no" />
+      </Component>
     </DirectoryRef>
 
     <!-- TRAY-BEGIN: the mia-tray desktop companion (feature F18).
@@ -116,6 +144,7 @@
 
     <Feature Id="Main" Title="FerroGate MIA" Level="1">
       <ComponentRef Id="MiaExe" />
+      <ComponentRef Id="MiaPath" />
       <ComponentRef Id="MiaTrayExe" /><!-- TRAY-REF -->
     </Feature>
 
