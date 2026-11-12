@@ -56,7 +56,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libudev-dev
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libudev-dev protobuf-compiler
+
+      # The admin client build compiles the gRPC protos (tonic-prost-build),
+      # which needs `protoc` on PATH; Linux gets it from the apt step above.
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --no-progress -y
 
       - name: Lint (GUI build, warnings denied)
         run: cargo clippy -p mia-tray --features mia-tray/gui -p mia-status-proto --all-targets -- -D warnings
