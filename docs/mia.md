@@ -296,7 +296,10 @@ helper-API surface. The startup hardening profile applies on Linux only.
 On Windows the daemon runs under the Service Control Manager as the **`mia`**
 service, so `Restart-Service mia` (or `sc start mia` / `sc stop mia`) works and
 the agent starts at boot. The Windows installer (`make pkg-win`) registers and
-starts it automatically; to manage it by hand:
+starts it automatically. `make pkg-win` builds natively when run on Windows
+(cargo with the MSVC build tools, `protoc`, and the WiX Toolset:
+`dotnet tool install --global wix --version 4.0.6`, or WiX v3), and in a
+linux/amd64 container on any other host. To manage the service by hand:
 
 ```powershell
 mia service install     # register an auto-start LocalSystem service (needs admin)

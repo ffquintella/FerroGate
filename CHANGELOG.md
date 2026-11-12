@@ -25,6 +25,14 @@ record them.
 
 ## [Unreleased]
 
+### Changed
+
+- Build the Windows MSI and NuGet package natively on a Windows host, without Docker: `make pkg-win` on Windows now runs `scripts/build-msi-windows.sh`, which compiles `mia.exe`, `mia-tray.exe` and `mia-tray-admin.exe` with cargo and MSVC, builds the MSI from the same `crates/mia/wix/mia.wxs` with the WiX Toolset (v4+ through a converted temporary copy, or v3), signs with `signtool` or `osslsigncode` when `WIN_SIGN_PFX` is set, and packs the `.nupkg` with Windows' bundled `tar`. Other hosts keep the containerised `scripts/build-msi-amd64.sh`
+
+### Fixed
+
+- `make` works with a native Windows GNU make (winget, Chocolatey): on `OS=Windows_NT` the Makefile finds Git for Windows and runs every recipe under its bash with its `usr/bin` tools on `PATH`, instead of failing with `CreateProcess … failed` even for `make help`
+
 ## [0.30.16] - 2026-11-12
 
 ### Added

@@ -1,0 +1,4 @@
+# Shell scripts run under bash on every host, including Git for Windows'
+# bash for `make` on Windows, which fails on CRLF line endings. Keep them LF
+# in the working tree regardless of core.autocrlf.
+*.sh text eol=lf

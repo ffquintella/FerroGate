@@ -463,7 +463,8 @@ MIA_TRAY_ADMIN_MACOS ?= 1
 
 pkg-tools: ## Install the Linux packaging tools (cargo-deb, cargo-generate-rpm)
 	cargo install --locked cargo-deb cargo-generate-rpm
-	@echo "NOTE: the Windows MSI + NuGet package build in a linux/amd64 container ('make pkg-win'); only Docker is required."
+	@echo "NOTE: 'make pkg-win' builds the Windows MSI + NuGet package natively on Windows (needs the WiX Toolset)"
+	@echo "      and in a linux/amd64 container elsewhere (needs only Docker)."
 	@echo "NOTE: the macOS .pkg builds on macOS ('make pkg-macos')."
 
 pkg-deb: ## Build the mia + system tray .deb package (Linux; needs cargo-deb + GTK 3 headers)
@@ -549,9 +550,16 @@ endif
 # and `mia test` step 5 fails with 'untrusted-binary' — see docs/mia.md.
 WIN_MSI   := target/wix/ferrogate-$(PKG_CRATE)-$(CARGO_VERSION)-x64.msi
 WIN_NUPKG := target/nuget/ferrogate-$(PKG_CRATE).$(CARGO_VERSION).nupkg
-pkg-win: ## Build the mia Windows MSI + Chocolatey/NuGet package in a linux/amd64 container (needs Docker)
+#
+# On a Windows host the same artifacts are built natively instead, without
+# Docker (cargo + MSVC, WiX Toolset, signtool): see scripts/build-msi-windows.sh.
+pkg-win: ## Build the mia Windows MSI + Chocolatey/NuGet package (native on Windows, else in a linux/amd64 container)
+ifeq ($(MIA_OS),windows)
+	MIA_TRAY=$(MIA_TRAY) MIA_TRAY_ADMIN=$(MIA_TRAY_ADMIN) ./scripts/build-msi-windows.sh $(CARGO_VERSION)
+else
 	@command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found — the Windows MSI/nupkg build runs in a linux/amd64 container"; exit 1; }
 	MIA_TRAY=$(MIA_TRAY) MIA_TRAY_ADMIN=$(MIA_TRAY_ADMIN) ./scripts/build-msi-amd64.sh $(CARGO_VERSION)
+endif
 
 # macOS component+product package built with the platform's own tools (no extra
 # cargo plugin). Stages a payload root, then pkgbuild → productbuild. Set
