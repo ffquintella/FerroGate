@@ -127,6 +127,53 @@ A client therefore opens the pipe with exactly:
 `SECURITY_IDENTIFICATION` keeps a server squatting the name from impersonating
 the client. In Rust, `ferro_winauth::open_client_pipe` does all of this.
 
+Blocking clients (no async runtime) open the pipe with `std::fs::OpenOptions`
+and `std::os::windows::fs::OpenOptionsExt`: `access_mode(0x8000_0002)` and
+`security_qos_flags(0x0001_0000)` (std adds `SECURITY_SQOS_PRESENT`).
+`ferro_winauth::open_client_pipe_blocking`, `ferrogate_sdk_rust::helper::HelperClient`,
+`mia app` and `mia status` do exactly this, and also:
+
+- accept only a **local** pipe name, `\\.\pipe\<name>` with no `\`, `/`, NUL,
+  `.` or `..` in `<name>`, and refuse anything else (a file path, `\\?\…`,
+  a remote `\\host\pipe\…`) before opening it, so a mistyped
+  `FERROGATE_HELPER_SOCKET` can never make a client write its request into a
+  file or send it to another machine
+  (`ferro_winauth::pipe_client::is_local_pipe_name`);
+- retry `ERROR_PIPE_BUSY` (231) for about a second — the agent creates the
+  next pipe instance right after each connect, so the window is short;
+- bound the whole exchange with a helper thread
+  (`ferro_winauth::pipe_client::with_deadline`), because a synchronous pipe
+  handle has no read timeout and a hung or squatting server would otherwise
+  block the caller forever.
+
+The agent creates every instance with remote clients rejected
+(`PIPE_REJECT_REMOTE_CLIENTS`, tokio's default) and the first one with
+`FILE_FLAG_FIRST_PIPE_INSTANCE`, so it refuses to start rather than share a
+name someone else created first.
+
+There is no handshake, token or session: the request is the same
+length-prefixed CBOR frame as on Unix, and the caller's identity comes from
+the kernel (`GetNamedPipeClientProcessId`), never from the frame.
+
+#### Why a named pipe and not loopback TCP
+
+A loopback TCP listener was considered for Windows and rejected. TCP has no
+peer credentials, so the agent could not learn *which binary* is calling, and
+the per-binary allowlist above would collapse. The usual patch — a random
+secret in an owner-only file that clients present — authenticates "can read
+that file", i.e. every process of that user (and every administrator), not a
+vetted binary; and the agent runs as `LocalSystem` for all users, so there is
+no single owner for that file. Mapping a loopback connection back to a PID
+(`GetExtendedTcpTable`) races port reuse. The named pipe gives the client PID
+from the kernel, takes a DACL, and is never reachable from the network.
+
+Residual risks on Windows, same as Unix: a process running as an allowlisted
+user *and* image can obtain tokens (that is the grant); an administrator or
+`SYSTEM` can do anything the agent can; a member of `FerroGateClients` can
+connect and be refused (one `LocalDenied` audit event per attempt), and can
+hold connections open up to the agent's concurrency limit (64) and 5 s read
+deadline.
+
 ### `mia` self-trust
 
 `mia` ships as a single binary that is simultaneously the daemon, the CLI, and

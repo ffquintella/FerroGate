@@ -8,10 +8,11 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{IntoRawHandle as _, RawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::Duration;
 
 use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -30,6 +31,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::pipe_acl::{pipe_sddl, PIPE_CLIENT_DESIRED_ACCESS, SECURITY_IDENTIFICATION};
+use crate::pipe_client::{is_local_pipe_name, not_a_local_pipe};
 
 /// `FILE_FLAG_OVERLAPPED`: tokio drives the pipe handle with overlapped I/O.
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
@@ -272,6 +274,9 @@ pub fn create_server_pipe(
 /// The `CreateFileW` error (e.g. `ERROR_FILE_NOT_FOUND`, `ERROR_PIPE_BUSY`,
 /// `ERROR_ACCESS_DENIED`), or a tokio registration error.
 pub fn open_client_pipe(addr: &OsStr) -> io::Result<NamedPipeClient> {
+    if !is_local_pipe_name(addr) {
+        return Err(not_a_local_pipe());
+    }
     let file = std::fs::OpenOptions::new()
         .access_mode(PIPE_CLIENT_DESIRED_ACCESS)
         // std ORs in SECURITY_SQOS_PRESENT.
@@ -284,6 +289,43 @@ pub fn open_client_pipe(addr: &OsStr) -> io::Result<NamedPipeClient> {
     // it), opened with FILE_FLAG_OVERLAPPED as tokio requires. On error tokio
     // drops the mio wrapper, which closes the handle.
     unsafe { NamedPipeClient::from_raw_handle(handle) }
+}
+
+/// Pause between attempts while every instance of the pipe is busy.
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Attempts on `ERROR_PIPE_BUSY` before giving up (about one second).
+const BUSY_ATTEMPTS: u32 = 20;
+
+/// Open a *blocking* client end of the local pipe `addr`, with the access and
+/// `SECURITY_IDENTIFICATION` of [`open_client_pipe`], retrying a busy pipe for
+/// about a second. Wrap the exchange in `pipe_client::with_deadline`.
+///
+/// # Errors
+///
+/// `InvalidInput` for a non-local pipe name, else the `CreateFileW` error.
+pub fn open_client_pipe_blocking(addr: &OsStr) -> io::Result<std::fs::File> {
+    if !is_local_pipe_name(addr) {
+        return Err(not_a_local_pipe());
+    }
+    let mut attempt = 1;
+    loop {
+        match std::fs::OpenOptions::new()
+            .access_mode(PIPE_CLIENT_DESIRED_ACCESS)
+            // std ORs in SECURITY_SQOS_PRESENT.
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(addr)
+        {
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed())
+                    && attempt < BUSY_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(BUSY_RETRY_DELAY);
+            }
+            other => return other,
+        }
+    }
 }
 
 /// `ERROR_ACCESS_DENIED` (os error 5) when creating the *first* pipe instance

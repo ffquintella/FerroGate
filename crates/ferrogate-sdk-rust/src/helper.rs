@@ -200,23 +200,24 @@ impl HelperClient {
 
     /// One request/response exchange. `v2`: an early close means the agent
     /// predates protocol v2.
-    fn exchange<Q: serde::Serialize, A: serde::de::DeserializeOwned>(
-        &self,
-        request: &Q,
-        v2: bool,
-    ) -> Result<A, HelperError> {
+    fn exchange<Q, A>(&self, request: &Q, v2: bool) -> Result<A, HelperError>
+    where
+        Q: serde::Serialize,
+        A: serde::de::DeserializeOwned + Send + 'static,
+    {
         let frame = mia_helper_proto::encode_frame(request)
             .map_err(|e| HelperError::Protocol(e.to_string()))?;
-        let mut conn = self.connect()?;
-        conn.write_all(&frame)
-            .and_then(|()| conn.flush())
-            .map_err(|e| HelperError::Protocol(e.to_string()))?;
-        match mia_helper_proto::read_frame::<_, A>(&mut conn) {
-            Ok(answer) => Ok(answer),
-            Err(ProtoError::Io(e)) if v2 && e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Err(HelperError::AgentTooOld)
-            }
-            Err(e) => Err(HelperError::Protocol(e.to_string())),
+        let conn = self.connect()?;
+        #[cfg(unix)]
+        {
+            exchange_on(conn, &frame, v2)
+        }
+        // A synchronous pipe handle has no read timeout: bound the exchange
+        // with a helper thread instead.
+        #[cfg(windows)]
+        {
+            let timeout = self.timeout;
+            with_deadline(timeout, move || exchange_on(conn, &frame, v2))
         }
     }
 
@@ -235,16 +236,130 @@ impl HelperClient {
         Ok(stream)
     }
 
+    /// Open the helper pipe as the documented client contract requires: only
+    /// a local `\\.\pipe\` name, desired access `GENERIC_READ |
+    /// FILE_WRITE_DATA` (the pipe DACL denies `GENERIC_WRITE` to the client
+    /// group), `SECURITY_IDENTIFICATION`, and a short retry while busy.
     #[cfg(windows)]
-    fn connect(&self) -> Result<impl Read + Write, HelperError> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.endpoint)
-            .map_err(|source| HelperError::Unavailable {
-                endpoint: self.endpoint.display().to_string(),
-                source,
-            })
+    fn connect(&self) -> Result<std::fs::File, HelperError> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let unavailable = |source| HelperError::Unavailable {
+            endpoint: self.endpoint.display().to_string(),
+            source,
+        };
+        if !is_local_pipe_name(self.endpoint.as_os_str()) {
+            return Err(unavailable(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                r"not a local named pipe (expected \\.\pipe\<name>)",
+            )));
+        }
+        let mut attempt = 1;
+        loop {
+            match std::fs::OpenOptions::new()
+                .access_mode(PIPE_CLIENT_DESIRED_ACCESS)
+                // std ORs in SECURITY_SQOS_PRESENT.
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(&self.endpoint)
+            {
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < BUSY_ATTEMPTS => {
+                    attempt += 1;
+                    std::thread::sleep(BUSY_RETRY_DELAY);
+                }
+                other => return other.map_err(unavailable),
+            }
+        }
+    }
+}
+
+/// Write `frame` on `conn` and read one answer. `v2`: an early close means
+/// the agent predates protocol v2.
+fn exchange_on<S: Read + Write, A: serde::de::DeserializeOwned>(
+    mut conn: S,
+    frame: &[u8],
+    v2: bool,
+) -> Result<A, HelperError> {
+    conn.write_all(frame)
+        .and_then(|()| conn.flush())
+        .map_err(|e| HelperError::Protocol(e.to_string()))?;
+    match mia_helper_proto::read_frame::<_, A>(&mut conn) {
+        Ok(answer) => Ok(answer),
+        Err(ProtoError::Io(e)) if v2 && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(HelperError::AgentTooOld)
+        }
+        Err(e) => Err(HelperError::Protocol(e.to_string())),
+    }
+}
+
+/// Desired access for the Windows helper pipe: `GENERIC_READ |
+/// FILE_WRITE_DATA`. Mirrors `ferro_winauth::pipe_acl::PIPE_CLIENT_DESIRED_ACCESS`
+/// (pinned by a test) without pulling that FFI crate into applications.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PIPE_CLIENT_DESIRED_ACCESS: u32 = 0x8000_0002;
+
+/// `SECURITY_IDENTIFICATION`: a server squatting the pipe name may learn who
+/// the caller is but never impersonate it. Mirrors `ferro_winauth::pipe_acl`.
+#[cfg_attr(not(windows), allow(dead_code))]
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+
+/// `ERROR_PIPE_BUSY`: every instance of the pipe is connected right now.
+#[cfg(windows)]
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// Attempts on `ERROR_PIPE_BUSY` before giving up (about one second).
+#[cfg(windows)]
+const BUSY_ATTEMPTS: u32 = 20;
+
+/// Pause between attempts while the pipe is busy.
+#[cfg(windows)]
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Whether `name` is a local pipe `\\.\pipe\<name>` that cannot resolve to a
+/// file or a remote host (no `\`, `/`, NUL, `.`/`..`; at most 256 UTF-16
+/// units). Mirrors `ferro_winauth::pipe_client::is_local_pipe_name` (pinned
+/// by a test): a client handed a file path must not write its frame into it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_local_pipe_name(name: &std::ffi::OsStr) -> bool {
+    const PREFIX: &str = r"\\.\pipe\";
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(prefix) = name.get(..PREFIX.len()) else {
+        return false;
+    };
+    let rest = &name[PREFIX.len()..];
+    prefix.eq_ignore_ascii_case(PREFIX)
+        && !rest.is_empty()
+        && rest != "."
+        && rest != ".."
+        && !rest.contains(['\\', '/', '\0'])
+        && name.encode_utf16().count() <= 256
+}
+
+/// Run `f` on a helper thread and give up after `timeout`. On timeout the
+/// thread is abandoned; it still owns the pipe handle and ends when the agent
+/// closes its end.
+#[cfg(any(windows, test))]
+fn with_deadline<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> Result<T, HelperError> + Send + 'static,
+) -> Result<T, HelperError> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("ferrogate-helper-io".into())
+        .spawn(move || {
+            // The receiver is gone after a timeout; nothing left to tell.
+            let _ = tx.send(f());
+        })
+        .map_err(|e| HelperError::Protocol(e.to_string()))?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(HelperError::Protocol(format!(
+            "no answer from the MIA helper within {} s",
+            timeout.as_secs_f32()
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(HelperError::Protocol(
+            "the helper exchange thread panicked".into(),
+        )),
     }
 }
 
@@ -273,6 +388,208 @@ pub fn register_self(reason: Option<&str>) -> Result<RegistrationResp, HelperErr
 /// [`HelperClient::registration_status`] on [`HelperClient::from_env`].
 pub fn registration_status(ids: &[[u8; ID_LEN]]) -> Result<Vec<LocalRequestStatus>, HelperError> {
     HelperClient::from_env().registration_status(ids)
+}
+
+/// Tests that run on every platform, so Windows CI covers the exchange logic
+/// and the pipe contract too.
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// An in-memory connection: reads `input`, records what is written.
+    struct Duplex {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_pipe_contract_matches_the_server_dacl() {
+        use ferro_winauth::pipe_acl;
+        assert_eq!(
+            PIPE_CLIENT_DESIRED_ACCESS,
+            pipe_acl::PIPE_CLIENT_DESIRED_ACCESS
+        );
+        assert_eq!(SECURITY_IDENTIFICATION, pipe_acl::SECURITY_IDENTIFICATION);
+    }
+
+    #[test]
+    fn pipe_names_are_checked_like_the_agent_side_check() {
+        for name in [
+            r"\\.\pipe\ferrogate-mia",
+            r"\\.\PIPE\ferrogate-mia-hml",
+            r"\\.\pipe\ferrogate-mia.default",
+            "",
+            r"C:\ProgramData\FerroGate\allowlist.cbor",
+            r"\\server\pipe\ferrogate-mia",
+            r"\\?\pipe\ferrogate-mia",
+            r"\\.\pipe\",
+            r"\\.\pipe\..",
+            r"\\.\pipe\..\C:\Windows\win.ini",
+            r"\\.\pipe\a/b",
+            "/run/ferrogate/mia.sock",
+        ] {
+            let name = std::ffi::OsStr::new(name);
+            assert_eq!(
+                is_local_pipe_name(name),
+                ferro_winauth::pipe_client::is_local_pipe_name(name),
+                "{name:?}"
+            );
+        }
+        assert!(is_local_pipe_name(std::ffi::OsStr::new(DEFAULT_PIPE)));
+    }
+
+    /// The Windows default, checked on every platform.
+    const DEFAULT_PIPE: &str = r"\\.\pipe\ferrogate-mia";
+
+    #[test]
+    fn one_exchange_writes_the_frame_and_decodes_the_answer() {
+        let req = HelperReq {
+            audience: "https://api.example.com".into(),
+            dpop_jkt: "jkt".into(),
+            ttl_secs: 60,
+        };
+        let frame = mia_helper_proto::encode_frame(&req).unwrap();
+        let answer = mia_helper_proto::encode_frame(&HelperResp::Token(ChildToken {
+            jws: "a.b.c".into(),
+            exp: 42,
+        }))
+        .unwrap();
+        let mut conn = Duplex {
+            input: Cursor::new(answer),
+            output: Vec::new(),
+        };
+        let resp: HelperResp = exchange_on(&mut conn, &frame, false).unwrap();
+        assert!(matches!(resp, HelperResp::Token(t) if t.jws == "a.b.c"));
+        assert_eq!(conn.output, frame);
+    }
+
+    #[test]
+    fn an_early_close_on_a_v2_frame_means_an_old_agent() {
+        let conn = Duplex {
+            input: Cursor::new(Vec::new()),
+            output: Vec::new(),
+        };
+        let res: Result<RegistrationResp, _> = exchange_on(conn, b"frame", true);
+        assert!(matches!(res, Err(HelperError::AgentTooOld)));
+    }
+
+    #[test]
+    fn a_silent_agent_times_out() {
+        let started = std::time::Instant::now();
+        let res = with_deadline(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        });
+        assert!(matches!(res, Err(HelperError::Protocol(_))));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+}
+
+/// Windows only: a real named pipe, served the way the agent serves it.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// A one-shot fake agent on a fresh pipe: answers the first request with
+    /// `answer(request body)`, or stays silent for `None`.
+    fn fake_pipe_agent(
+        tag: &str,
+        answer: impl FnOnce(Vec<u8>) -> Option<Vec<u8>> + Send + 'static,
+    ) -> (PathBuf, std::thread::JoinHandle<()>) {
+        let name = format!(r"\\.\pipe\ferrogate-sdk-{tag}-{}", std::process::id());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Created before the client dials, so there is no race; default DACL
+        // (the test user owns the pipe).
+        let mut server = {
+            let _guard = rt.enter();
+            ferro_winauth::create_server_pipe(&OsString::from(&name), true, None).unwrap()
+        };
+        let handle = std::thread::spawn(move || {
+            rt.block_on(async move {
+                server.connect().await.unwrap();
+                let mut len = [0u8; 4];
+                server.read_exact(&mut len).await.unwrap();
+                let mut body = vec![0u8; mia_helper_proto::frame_len(len).unwrap()];
+                server.read_exact(&mut body).await.unwrap();
+                match answer(body) {
+                    Some(reply) => server.write_all(&reply).await.unwrap(),
+                    None => tokio::time::sleep(Duration::from_secs(3)).await,
+                }
+            });
+        });
+        (PathBuf::from(name), handle)
+    }
+
+    #[test]
+    fn a_token_is_requested_over_the_pipe() {
+        let (pipe, h) = fake_pipe_agent("token", |body| {
+            let mia_helper_proto::Request::Legacy(req) =
+                mia_helper_proto::decode_request(&body).unwrap()
+            else {
+                panic!("expected a v1 request")
+            };
+            assert_eq!(req.audience, "https://api.example.com");
+            Some(
+                mia_helper_proto::encode_frame(&HelperResp::Token(ChildToken {
+                    jws: "a.b.c".into(),
+                    exp: 42,
+                }))
+                .unwrap(),
+            )
+        });
+        let token = HelperClient::new(&pipe)
+            .request_token("https://api.example.com", "jkt", 60)
+            .unwrap();
+        assert_eq!(token.jws, "a.b.c");
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn a_silent_pipe_server_times_out() {
+        let (pipe, h) = fake_pipe_agent("silent", |_| None);
+        let res = HelperClient::new(&pipe)
+            .with_timeout(Duration::from_millis(300))
+            .request_token("a", "b", 1);
+        assert!(matches!(res, Err(HelperError::Protocol(_))));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn a_file_endpoint_is_refused_and_left_untouched() {
+        let path = std::env::temp_dir().join(format!("sdk-not-a-pipe-{}", std::process::id()));
+        std::fs::write(&path, b"keep").unwrap();
+        let res = HelperClient::new(&path).request_token("a", "b", 1);
+        assert!(matches!(res, Err(HelperError::Unavailable { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_pipe_is_unavailable() {
+        let res = HelperClient::new(r"\\.\pipe\ferrogate-sdk-absent").request_token("a", "b", 1);
+        assert!(matches!(res, Err(HelperError::Unavailable { .. })));
+    }
 }
 
 #[cfg(all(test, unix))]

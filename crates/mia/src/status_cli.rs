@@ -269,9 +269,14 @@ fn connect(endpoint: &Path) -> Result<std::fs::File, QueryError> {
     // GENERIC_READ | FILE_WRITE_DATA: the pipe DACL denies the status group
     // GENERIC_WRITE (it includes FILE_CREATE_PIPE_INSTANCE).
     // ERROR_FILE_NOT_FOUND (2): no pipe; ERROR_PIPE_BUSY (231): retry once.
-    let _ = IO_TIMEOUT;
     use ferro_winauth::pipe_acl::{PIPE_CLIENT_DESIRED_ACCESS, SECURITY_IDENTIFICATION};
+    use ferro_winauth::pipe_client::{is_local_pipe_name, not_a_local_pipe};
     use std::os::windows::fs::OpenOptionsExt as _;
+    let _ = IO_TIMEOUT;
+    // Never write a request frame into a file named by a mistyped endpoint.
+    if !is_local_pipe_name(endpoint.as_os_str()) {
+        return Err(QueryError::Io(not_a_local_pipe()));
+    }
     for attempt in 0..2 {
         match std::fs::OpenOptions::new()
             .access_mode(PIPE_CLIENT_DESIRED_ACCESS)

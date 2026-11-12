@@ -38,11 +38,14 @@
 mod imp;
 #[cfg(windows)]
 pub use imp::{
-    client_process_id, create_server_pipe, open_client_pipe, process_image_path, process_user_rid,
-    process_user_sid, verify_authenticode,
+    client_process_id, create_server_pipe, open_client_pipe, open_client_pipe_blocking,
+    process_image_path, process_user_rid, process_user_sid, verify_authenticode,
 };
 
 pub mod pipe_acl;
+
+/// Blocking pipe clients: the local-pipe-name check and an exchange deadline.
+pub mod pipe_client;
 
 pub mod file_acl;
 
