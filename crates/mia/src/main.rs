@@ -341,6 +341,15 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
         }
     };
 
+    // The Windows service creates the local groups its pipe DACLs name when
+    // they are missing (a bare-MSI install never created them), so the status
+    // and helper pipes can be built. A failure is logged; the pipe naming that
+    // group then fails on its own, as before.
+    if service_log {
+        let groups = mia::host_groups::required_groups(instances.iter().map(|i| &i.config), false);
+        log_group_reports(&mia::host_groups::ensure(&groups));
+    }
+
     // Prefetch root-only inputs, hand the daemon's writable directories to the
     // privilege-drop user, then apply the hardening profile (feature F12) — all
     // on the single startup thread, *before* building the async runtime, so the
@@ -434,6 +443,24 @@ fn parse_daemon_flags(args: &[String]) -> anyhow::Result<mia::config::ConfigSour
     Ok(source)
 }
 
+/// Log what [`mia::host_groups::ensure`] did at service start.
+fn log_group_reports(reports: &[mia::host_groups::GroupReport]) {
+    use mia::host_groups::GroupReport;
+    for report in reports {
+        match report {
+            GroupReport::Exists(name) => tracing::debug!(group = %name, "local group present"),
+            GroupReport::Created(name) => tracing::warn!(
+                group = %name,
+                "created the missing local group (empty); add the accounts that need it"
+            ),
+            GroupReport::Failed(name, e) => tracing::error!(
+                group = %name, error = %e,
+                "could not create the missing local group; the pipe that names it will not start"
+            ),
+        }
+    }
+}
+
 /// Log what [`mia::system_dir::prepare`] found at service start (it runs before
 /// the subscriber exists). A repaired directory is a `warn`: until then any
 /// local user could create files in it.
@@ -522,8 +549,10 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         // Make %ProgramData%\FerroGate administrator-only, exactly as the
-        // service does at start (`mia::system_dir::prepare`). The installers
-        // run it, and so can an administrator; it needs elevation.
+        // service does at start (`mia::system_dir::prepare`), then create the
+        // pipe DACLs' local groups when missing (`ensure_installer_groups`).
+        // The installers run it, and so can an administrator; it needs
+        // elevation.
         Some("secure-config") => {
             let dir = mia::config::system_config_path()
                 .parent()
@@ -545,7 +574,7 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
                     println!("{} is administrator-only.", dir.display());
                 }
             }
-            Ok(())
+            ensure_installer_groups()
         }
         Some("stop") => {
             ferro_winauth::service::stop()?;
@@ -563,10 +592,55 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
                  LocalSystem service that runs `mia service run` (used internally\n\
                  by the Service Control Manager). `secure-config` makes\n\
                  %ProgramData%\\FerroGate administrator-only, as the service does\n\
-                 at every start (needs an elevated prompt)."
+                 at every start, and creates the FerroGateClients and\n\
+                 FerroGateStatus local groups (and any group the configuration\n\
+                 names) when they are missing (needs an elevated prompt)."
             );
             Ok(())
         }
+    }
+}
+
+/// `mia service secure-config`, second half: create the local groups the pipe
+/// DACLs name — the two conventional ones plus any the configuration files
+/// name (a file that fails to load is skipped; the service reports it) — so a
+/// bare-MSI install works without the Chocolatey wrapper. Fails when a group
+/// cannot be created, so the installer stops instead of leaving a service
+/// whose pipes cannot start.
+#[cfg(windows)]
+fn ensure_installer_groups() -> anyhow::Result<()> {
+    use mia::host_groups::GroupReport;
+    let configs: Vec<mia::config::Config> = mia::config::discover_environment_configs()
+        .into_iter()
+        .filter_map(|d| {
+            mia::config::ConfigSource {
+                path: Some(d.path),
+                environment: None,
+                discovered_named_env: d.environment.is_some(),
+            }
+            .load()
+            .ok()
+            .map(|(config, _)| config)
+        })
+        .collect();
+    let groups = mia::host_groups::required_groups(&configs, true);
+    let mut failed = Vec::new();
+    for report in mia::host_groups::ensure(&groups) {
+        match report {
+            GroupReport::Exists(name) => println!("local group {name} exists."),
+            GroupReport::Created(name) => println!(
+                "created local group {name} (empty); add the accounts that need it                  (net localgroup {name} <account> /add)."
+            ),
+            GroupReport::Failed(name, e) => {
+                eprintln!("could not create local group {name}: {e}");
+                failed.push(name);
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("could not create local group(s): {}", failed.join(", "))
     }
 }
 

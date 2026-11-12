@@ -201,6 +201,7 @@ messages! {
     StateAllowlistInvalid => "The caller allowlist is invalid", "A lista de permissões é inválida";
     StateSvidExpiring => "Machine identity is expiring", "A identidade da máquina está expirando";
     StateHealthy => "Healthy", "Saudável";
+    StateEndpointDown => "Agent running, status unavailable", "Agente em execução, status indisponível";
     StateAccessDenied => "Status not readable by this user", "Status não legível por este usuário";
 
     ExplainNotInstalled => "The tray could not find the mia program. Install the FerroGate MIA package for this platform.", "O tray não encontrou o programa mia. Instale o pacote FerroGate MIA desta plataforma.";
@@ -218,6 +219,7 @@ messages! {
     ExplainSvidExpiring => "The machine identity is past its renewal point and renewal is failing; the agent keeps retrying on its own. Run the self-test to see which step fails.", "A identidade da máquina passou do ponto de renovação e a renovação está falhando; o agente continua tentando sozinho. Execute o autoteste para ver qual etapa falha.";
     ExplainHealthy => "The machine identity is valid, the revocation list is fresh and the allowlist is loaded.", "A identidade da máquina é válida, a lista de revogação está atualizada e a lista de permissões está carregada.";
     ExplainUnknownError => "The agent reported a problem this version of the tray does not recognise. Run the self-test for details.", "O agente relatou um problema que esta versão do tray não reconhece. Execute o autoteste para detalhes.";
+    ExplainEndpointDown => "The mia service is running, but its status endpoint did not start — usually because the local status group (FerroGateStatus on Windows) is missing. Restart the service: it creates the group (administrator approval is required).", "O serviço mia está em execução, mas o endpoint de status não iniciou — normalmente porque o grupo local de status (FerroGateStatus no Windows) não existe. Reinicie o serviço: ele cria o grupo (requer aprovação do administrador).";
     ExplainAccessDenied => "Your account may not read the agent's status: it is not in the status group (ferrogate-status, or FerroGateStatus on Windows). Ask an administrator to add you, then log out and back in.", "Sua conta não pode ler o status do agente: ela não está no grupo de status (ferrogate-status, ou FerroGateStatus no Windows). Peça a um administrador para incluí-lo e depois saia e entre novamente.";
 
     DetailState => "State", "Estado";

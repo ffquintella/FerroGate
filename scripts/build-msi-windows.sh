@@ -182,8 +182,14 @@ if [ "$WIX_MODE" = v4 ]; then
   # wixl schedules RemoveExistingProducts for the <Upgrade> table implicitly;
   # WiX v4 needs it spelled out. afterInstallValidate is MajorUpgrade's default:
   # the old version (and its service) is removed before the new one goes in.
-  grep -q '</Package>' "$WXS" || die "unexpected WiX v4 layout (no </Package>)"
-  sed -i 's|</Package>|<InstallExecuteSequence><RemoveExistingProducts After="InstallValidate" /></InstallExecuteSequence></Package>|' "$WXS"
+  # mia.wxs already has an <InstallExecuteSequence> (the MiaSecureConfig
+  # custom action): add the action to it rather than declaring a second one.
+  if grep -q '<InstallExecuteSequence>' "$WXS"; then
+    sed -i '0,/<InstallExecuteSequence>/s||<InstallExecuteSequence><RemoveExistingProducts After="InstallValidate" />|' "$WXS"
+  else
+    grep -q '</Package>' "$WXS" || die "unexpected WiX v4 layout (no </Package>)"
+    sed -i 's|</Package>|<InstallExecuteSequence><RemoveExistingProducts After="InstallValidate" /></InstallExecuteSequence></Package>|' "$WXS"
+  fi
   MSYS2_ARG_CONV_EXCL='*' wix build -arch x64 \
     -d "Version=$VERSION" -d "BinDir=$BINDIR" \
     -o "$(cygpath -w "$MSI")" "$(cygpath -w "$WXS")"

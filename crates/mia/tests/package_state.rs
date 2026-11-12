@@ -242,7 +242,9 @@ fn the_windows_msi_sets_path_auto_start_and_icon() {
     let env = element("Environment");
     for attr in [
         r#"Name="PATH""#,
-        r#"Value="[INSTALLDIR]""#,
+        // Not [INSTALLDIR]: its trailing backslash would duplicate the entry
+        // older installers wrote.
+        r#"Value="[FerroGateDir]MIA""#,
         r#"Action="set""#,
         r#"Part="last""#,
         r#"System="yes""#,
@@ -264,6 +266,26 @@ fn the_windows_msi_sets_path_auto_start_and_icon() {
         assert!(svc.contains(attr), "<ServiceInstall> lacks {attr}: {svc}");
     }
     assert!(element("ServiceControl").contains(r#"Start="install""#));
+
+    // The host configuration (administrator-only %ProgramData%\FerroGate,
+    // the pipe DACLs' local groups) runs as LocalSystem before the service
+    // starts, and a failure aborts the install.
+    let ca = element("CustomAction");
+    for attr in [
+        r#"Id="MiaSecureConfig""#,
+        r#"FileKey="miaExe""#,
+        r#"ExeCommand="service secure-config""#,
+        r#"Execute="deferred""#,
+        r#"Impersonate="no""#,
+        r#"Return="check""#,
+    ] {
+        assert!(ca.contains(attr), "<CustomAction> lacks {attr}: {ca}");
+    }
+    let custom = element("Custom");
+    assert!(
+        custom.contains(r#"Action="MiaSecureConfig""#) && custom.contains(r#"Before="StartServices""#),
+        "{custom}"
+    );
 
     assert!(wxs.contains(r#"<Property Id="ARPPRODUCTICON" Value="FerroGateMia.ico" />"#));
     for build_rs in ["build.rs", "../mia-tray/build.rs"] {

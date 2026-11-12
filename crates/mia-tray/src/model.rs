@@ -11,7 +11,9 @@ use mia_status_proto::{
 };
 
 use crate::actions::{Action, Doc, EnvName};
-use crate::client::{Observation, Source, ACCESS_DENIED_CODE, NOT_INSTALLED_CODE};
+use crate::client::{
+    Observation, Source, ACCESS_DENIED_CODE, ENDPOINT_DOWN_CODE, NOT_INSTALLED_CODE,
+};
 use crate::i18n::{fill, Lang, Msg};
 use crate::text::{display_safe, human_duration, MAX_FIELD_CHARS};
 
@@ -200,6 +202,7 @@ pub fn is_known_error_code(code: &str) -> bool {
         c::SVID_EXPIRED,
         c::NOT_RUNNING,
         ACCESS_DENIED_CODE,
+        ENDPOINT_DOWN_CODE,
         NOT_INSTALLED_CODE,
     ]
     .contains(&code)
@@ -213,6 +216,11 @@ pub fn recoveries(snapshot: &StatusSnapshot) -> Vec<Recovery> {
     let code = snapshot.last_error.as_ref().map(|e| e.code.as_str());
     if code == Some(ACCESS_DENIED_CODE) {
         return vec![Read(Doc::Tray)];
+    }
+    if code == Some(ENDPOINT_DOWN_CODE) {
+        // Starting a running service fails; a restart lets it create the
+        // missing status group and bind the endpoint again.
+        return vec![Run(Action::ServiceRestart), Read(Doc::Tray)];
     }
     let mut out = match snapshot.state {
         AgentState::NotInstalled => vec![Read(Doc::Install)],
@@ -277,14 +285,10 @@ pub fn env_arg(snapshot: &StatusSnapshot) -> Option<EnvName> {
 /// The title for a snapshot, honouring the tray-side access-denied code.
 #[must_use]
 pub fn snapshot_title(snapshot: &StatusSnapshot) -> Msg {
-    if snapshot
-        .last_error
-        .as_ref()
-        .is_some_and(|e| e.code == ACCESS_DENIED_CODE)
-    {
-        Msg::StateAccessDenied
-    } else {
-        title(snapshot.state)
+    match snapshot.last_error.as_ref().map(|e| e.code.as_str()) {
+        Some(ACCESS_DENIED_CODE) => Msg::StateAccessDenied,
+        Some(ENDPOINT_DOWN_CODE) => Msg::StateEndpointDown,
+        _ => title(snapshot.state),
     }
 }
 
@@ -293,6 +297,7 @@ pub fn snapshot_title(snapshot: &StatusSnapshot) -> Msg {
 pub fn snapshot_explanation(snapshot: &StatusSnapshot) -> Msg {
     match snapshot.last_error.as_ref().map(|e| e.code.as_str()) {
         Some(ACCESS_DENIED_CODE) => Msg::ExplainAccessDenied,
+        Some(ENDPOINT_DOWN_CODE) => Msg::ExplainEndpointDown,
         Some(c) if !is_known_error_code(c) => Msg::ExplainUnknownError,
         _ => explanation(snapshot.state),
     }
@@ -883,6 +888,20 @@ mod tests {
         // Known codes keep the state's own explanation.
         let s = snap(AgentState::CrlStale, None, Some(error_codes::CRL_STALE));
         assert_eq!(snapshot_explanation(&s), Msg::ExplainCrlStale);
+    }
+
+    #[test]
+    fn endpoint_down_offers_a_restart_not_a_start() {
+        let s = snap(AgentState::NotRunning, None, Some(ENDPOINT_DOWN_CODE));
+        assert_eq!(snapshot_title(&s), Msg::StateEndpointDown);
+        assert_eq!(snapshot_explanation(&s), Msg::ExplainEndpointDown);
+        assert_eq!(
+            recoveries(&s),
+            vec![
+                Recovery::Run(Action::ServiceRestart),
+                Recovery::Read(Doc::Tray)
+            ]
+        );
     }
 
     #[test]

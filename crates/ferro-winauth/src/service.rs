@@ -176,6 +176,20 @@ pub fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether the `mia` service is installed and currently running. `None` when
+/// that cannot be determined (not installed, or the SCM refused the query).
+/// Needs no elevation: querying a service's status is open to every user.
+#[must_use]
+pub fn is_running() -> Option<bool> {
+    let manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .ok()?;
+    let status = service.query_status().ok()?;
+    Some(status.current_state == ServiceState::Running)
+}
+
 /// Start the installed `mia` service. Requires Administrator rights.
 pub fn start() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)

@@ -35,6 +35,11 @@ pub const STATUS_SOCKET_VAR: &str = "FERROGATE_STATUS_SOCKET";
 /// Tray-side error code: the endpoint exists but this user may not open it.
 pub const ACCESS_DENIED_CODE: &str = "status_access_denied";
 
+/// Tray-side error code: the status endpoint is absent although the `mia`
+/// service is running — the endpoint failed to start (on Windows, usually a
+/// missing status group), so "start the service" would not help.
+pub const ENDPOINT_DOWN_CODE: &str = "status_endpoint_down";
+
 /// Tray-side error code: no `mia` binary was found.
 pub const NOT_INSTALLED_CODE: &str = "not_installed";
 
@@ -432,6 +437,20 @@ pub fn parse_status_cli(out: &crate::process::Captured) -> Result<Vec<StatusSnap
     Ok(snapshots)
 }
 
+/// Whether the `mia` service is running, from the Service Control Manager
+/// (Windows; no privileges needed). `None` elsewhere or when unknown.
+#[must_use]
+pub fn service_running() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        ferro_winauth::service::is_running()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// A snapshot the tray made up because nothing answered.
 #[must_use]
 pub fn synthesised(state: AgentState, code: &str, message: &str, now: i64) -> StatusSnapshot {
@@ -478,6 +497,44 @@ fn access_denied(now: i64) -> Observation {
 /// for a transient refusal (rate limited), on which the caller keeps the
 /// previous observation.
 pub fn observe(
+    endpoint: &dyn Transport,
+    cli: Option<&dyn StatusCli>,
+    now: i64,
+) -> Result<Observation, ClientError> {
+    observe_with_service(endpoint, cli, &|| None, now)
+}
+
+/// [`observe`], asking `service_running` (only when the agent did not answer
+/// and everything reads "not running") whether the `mia` service is in fact
+/// running. When it is, the snapshots carry [`ENDPOINT_DOWN_CODE`] instead of
+/// "not running", so the tray offers a restart rather than a start that the
+/// Service Control Manager would refuse.
+pub fn observe_with_service(
+    endpoint: &dyn Transport,
+    cli: Option<&dyn StatusCli>,
+    service_running: &dyn Fn() -> Option<bool>,
+    now: i64,
+) -> Result<Observation, ClientError> {
+    let mut obs = observe_inner(endpoint, cli, now)?;
+    let all_not_running = obs.source != Source::Endpoint
+        && obs.snapshots.iter().all(|s| {
+            s.state == AgentState::NotRunning
+                && s.last_error
+                    .as_ref()
+                    .is_none_or(|e| e.code == error_codes::NOT_RUNNING)
+        });
+    if all_not_running && service_running() == Some(true) {
+        for s in &mut obs.snapshots {
+            s.last_error = Some(ErrorSummary {
+                code: ENDPOINT_DOWN_CODE.to_string(),
+                message: "the mia service is running but its status endpoint is absent".into(),
+            });
+        }
+    }
+    Ok(obs)
+}
+
+fn observe_inner(
     endpoint: &dyn Transport,
     cli: Option<&dyn StatusCli>,
     now: i64,
@@ -608,6 +665,47 @@ mod tests {
         let ep = Fake::new(vec![Err(ClientError::NotRunning)]);
         let obs = observe(&ep, None, 5).unwrap();
         assert_eq!(obs.snapshots[0].state, AgentState::NotInstalled);
+    }
+
+    #[test]
+    fn a_running_service_without_endpoint_is_endpoint_down_not_stopped() {
+        let not_running = || Cli(Err(CliError::Failed("no".into())));
+        let ep = Fake::new(vec![Err(ClientError::NotRunning)]);
+        let obs = observe_with_service(&ep, Some(&not_running()), &|| Some(true), 5).unwrap();
+        assert_eq!(obs.snapshots[0].state, AgentState::NotRunning);
+        assert_eq!(
+            obs.snapshots[0].last_error.as_ref().unwrap().code,
+            ENDPOINT_DOWN_CODE
+        );
+        // `mia status --json` reporting not_running is relabelled too.
+        let ep = Fake::new(vec![Err(ClientError::NotRunning)]);
+        let cli = Cli(Ok(vec![synthesised(
+            AgentState::NotRunning,
+            error_codes::NOT_RUNNING,
+            "x",
+            5,
+        )]));
+        let obs = observe_with_service(&ep, Some(&cli), &|| Some(true), 5).unwrap();
+        assert_eq!(
+            obs.snapshots[0].last_error.as_ref().unwrap().code,
+            ENDPOINT_DOWN_CODE
+        );
+        // A stopped (or unknown) service keeps "not running".
+        for state in [Some(false), None] {
+            let ep = Fake::new(vec![Err(ClientError::NotRunning)]);
+            let obs = observe_with_service(&ep, Some(&not_running()), &move || state, 5).unwrap();
+            assert_eq!(
+                obs.snapshots[0].last_error.as_ref().unwrap().code,
+                error_codes::NOT_RUNNING
+            );
+        }
+        // Access denied is never relabelled.
+        let ep = Fake::new(vec![Err(ClientError::PermissionDenied)]);
+        let obs = observe_with_service(&ep, None, &|| Some(true), 5).unwrap();
+        assert_eq!(
+            obs.snapshots[0].last_error.as_ref().unwrap().code,
+            ACCESS_DENIED_CODE
+        );
     }
 
     #[test]

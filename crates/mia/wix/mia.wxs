@@ -22,13 +22,16 @@
   Win32 resource (crates/ferro-winres, linked by each crate's build.rs), which
   is what Explorer, Task Manager and the service's process show.
 
-  One thing the legacy NSIS installer also did — creating the FerroGateClients
-  helper group — is NOT done here: wixl does not support arbitrary-command
-  custom actions. The Chocolatey/NuGet wrapper (crates/mia/nuget/), the
-  recommended install path, creates it before invoking this MSI. A bare-MSI
-  install therefore yields the binaries, the PATH entry and the service; an
-  administrator must create the FerroGateClients local group (see `mia test`)
-  for the helper pipe.
+  Host configuration: the MiaSecureConfig custom action runs the installed
+  `mia.exe service secure-config` (deferred, as LocalSystem, before
+  StartServices). It makes %ProgramData%\FerroGate administrator-only and
+  creates the FerroGateClients and FerroGateStatus local groups (plus any the
+  configuration names) when missing — the status pipe cannot start without its
+  group. A failure aborts the installation. The groups are created empty and
+  are kept on uninstall (an administrator may have added members). The service
+  creates missing groups at every start too. Only the FileKey + ExeCommand
+  form is used: wixl supports it (type 18), unlike the Directory + ExeCommand
+  form the v0.20.4 draft used.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
@@ -92,10 +95,16 @@
       </Component>
 
       <!-- Put the install directory on the system PATH. "set" + Part="last"
-           appends "[INSTALLDIR]" to the existing value (written as
-           "[~];[INSTALLDIR]"); Permanent="no" removes just that part again
-           on uninstall. Own component, keyed on a registry value, so the
-           PATH entry's lifetime is independent of the file's. -->
+           appends the value to the existing one (written as "[~];value");
+           Permanent="no" removes just that part again on uninstall. The value
+           is "[FerroGateDir]MIA", not "[INSTALLDIR]": INSTALLDIR resolves with
+           a trailing backslash, which Windows Installer would not recognise
+           as the entry the Chocolatey package and the NSIS installer wrote
+           ("...\FerroGate\MIA"), leaving PATH with the directory twice. (The
+           MSI has no directory dialog; an INSTALLDIR override on the msiexec
+           command line is not reflected here.) Own component, keyed on a
+           registry value, so the PATH entry's lifetime is independent of the
+           file's. -->
       <Component Id="MiaPath" Guid="8E4B6D2A-71C3-4F59-A0E8-3C9D5B1F7A62">
         <RegistryValue Root="HKLM"
                        Key="Software\FerroGate\MIA"
@@ -105,13 +114,28 @@
                        KeyPath="yes" />
         <Environment Id="MiaPathEnv"
                      Name="PATH"
-                     Value="[INSTALLDIR]"
+                     Value="[FerroGateDir]MIA"
                      Action="set"
                      Part="last"
                      System="yes"
                      Permanent="no" />
       </Component>
     </DirectoryRef>
+
+    <!-- Configure the host with the installed mia.exe (see the header):
+         administrator-only %ProgramData%\FerroGate and the local groups the
+         pipe DACLs name. Deferred + Impersonate="no" runs it as LocalSystem;
+         Return="check" aborts (and rolls back) the install on failure. It
+         runs before StartServices so the service finds its groups. -->
+    <CustomAction Id="MiaSecureConfig"
+                  FileKey="miaExe"
+                  ExeCommand="service secure-config"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="MiaSecureConfig" Before="StartServices">NOT REMOVE~="ALL"</Custom>
+    </InstallExecuteSequence>
 
     <!-- TRAY-BEGIN: the mia-tray desktop companion (feature F18).
          scripts/build-msi-amd64.sh strips this block (and the ComponentRef

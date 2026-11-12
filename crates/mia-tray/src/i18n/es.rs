@@ -36,6 +36,7 @@ spanish! {
     StateAllowlistInvalid => "La lista de permitidos de llamadores no es válida";
     StateSvidExpiring => "La identidad de la máquina está por expirar";
     StateHealthy => "En buen estado";
+    StateEndpointDown => "Agente en ejecución, estado no disponible";
     StateAccessDenied => "Estado no legible para este usuario";
 
     ExplainNotInstalled => "El tray no encontró el programa mia. Instale el paquete FerroGate MIA para esta plataforma.";
@@ -53,6 +54,7 @@ spanish! {
     ExplainSvidExpiring => "La identidad de la máquina superó su punto de renovación y la renovación está fallando; el agente sigue reintentando por sí solo. Ejecute el autodiagnóstico para ver qué paso falla.";
     ExplainHealthy => "La identidad de la máquina es válida, la lista de revocación está al día y la lista de permitidos está cargada.";
     ExplainUnknownError => "El agente reportó un problema que esta versión del tray no reconoce. Ejecute el autodiagnóstico para ver los detalles.";
+    ExplainEndpointDown => "El servicio mia está en ejecución, pero su endpoint de estado no se inició — normalmente porque falta el grupo local de estado (FerroGateStatus en Windows). Reinicie el servicio: crea el grupo (se requiere la aprobación de un administrador).";
     ExplainAccessDenied => "Su cuenta no puede leer el estado del agente: no pertenece al grupo de estado (ferrogate-status, o FerroGateStatus en Windows). Pida a un administrador que la agregue y luego cierre sesión y vuelva a iniciarla.";
 
     DetailState => "Estado";

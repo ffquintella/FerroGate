@@ -385,10 +385,16 @@ even read access. In SDDL: `O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`.
 
   A repair is logged as a `warn` naming each directory and why. A failed
   repair, or a reparse point, stops the service.
-- **Installers.** The Chocolatey package and the legacy NSIS installer run the
-  same code with `mia service secure-config` (elevated) on every install and
-  upgrade, and abort if it fails. The bare MSI cannot run commands (`wixl`);
-  there the service does it at its first start. An administrator can run
+- **Installers.** The MSI (custom action `MiaSecureConfig`, as LocalSystem
+  before the service starts), the Chocolatey package and the legacy NSIS
+  installer run the same code with `mia service secure-config` (elevated) on
+  every install and upgrade, and abort if it fails. The same command creates
+  the `FerroGateClients` and `FerroGateStatus` local groups (and any group
+  `helper.windows_group` / `status.group` names) when they are missing; the
+  service does too at every start, since a pipe whose DACL names a missing
+  group cannot be created (the status endpoint then never comes up and the
+  tray reports "Agent running, status unavailable"). The groups are created
+  empty: add the accounts that need them. An administrator can run
   `mia service secure-config` at any time to repair the directory; prefer it
   to `icacls` sequences such as `/reset` followed by `/inheritance:r`, which
   briefly re-open the directory to `Users` in between.

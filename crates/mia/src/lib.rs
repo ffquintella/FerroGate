@@ -71,6 +71,9 @@ pub mod config;
 /// only SYSTEM and Administrators can change them.
 pub mod system_dir;
 
+/// The local groups the Windows pipe DACLs name, and creating missing ones.
+pub mod host_groups;
+
 /// The host-wide default environment: which environment serves the helper
 /// API's well-known address (`environments.toml` /
 /// `FERROGATE_DEFAULT_ENVIRONMENT`).

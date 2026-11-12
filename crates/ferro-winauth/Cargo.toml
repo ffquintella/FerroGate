@@ -38,6 +38,9 @@ windows-sys = { version = "0.61", features = [
     # CreateDirectoryW and the open flags for the administrator-only
     # configuration directory (`file_security`).
     "Win32_Storage_FileSystem",
+    # NetLocalGroupAdd: create the pipe DACLs' local groups when missing
+    # (`local_group`).
+    "Win32_NetworkManagement_NetManagement",
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]

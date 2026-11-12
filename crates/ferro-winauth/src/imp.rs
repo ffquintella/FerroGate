@@ -352,7 +352,7 @@ fn map_first_instance_err(
 }
 
 /// Resolve a local group name to its SID, formatted as an SDDL `S-...` string.
-fn lookup_group_sid_string(group: &str) -> io::Result<String> {
+pub(crate) fn lookup_group_sid_string(group: &str) -> io::Result<String> {
     let name: Vec<u16> = group.encode_utf16().chain([0]).collect();
     let mut sid_len: u32 = 0;
     let mut dom_len: u32 = 0;

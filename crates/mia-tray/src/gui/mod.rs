@@ -32,7 +32,7 @@ use std::sync::{mpsc, Arc};
 use eframe::egui;
 
 use crate::actions::{Os, Tools};
-use crate::client::{observe, LocalEndpoint, MiaStatusCli, Observation, StatusCli};
+use crate::client::{observe_with_service, LocalEndpoint, MiaStatusCli, Observation, StatusCli};
 use crate::control::Command;
 use crate::i18n::Lang;
 use crate::model::WindowKind;
@@ -136,9 +136,10 @@ pub(crate) fn start_poller(
         .map(|m| MiaStatusCli::new(m.path.clone()));
     crate::poll::spawn(
         move || {
-            observe(
+            observe_with_service(
                 endpoint.as_ref(),
                 cli.as_ref().map(|c| c as &dyn StatusCli),
+                &crate::client::service_running,
                 crate::unix_now(),
             )
             .map_err(|e| tracing::debug!(error = %e, "transient status refusal"))

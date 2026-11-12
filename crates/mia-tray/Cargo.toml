@@ -153,6 +153,9 @@ rustix = { workspace = true, features = ["std", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+# Service Control Manager query: tell "service stopped" from "running but its
+# status endpoint is down" (`client::service_running`).
+ferro-winauth = { path = "../ferro-winauth" }
 # Administrator client, feature `fido2-windows`: the `webauthn.dll` FFI.
 ferro-winwebauthn = { path = "../ferro-winwebauthn", optional = true }
 

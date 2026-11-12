@@ -22,9 +22,12 @@
 //!   [`set_administrators_owner`] — read and set, through one handle that never
 //!   follows a reparse point, the owner and DACL of the MIA's
 //!   administrator-only system configuration directory and the files in it,
-//!   judged by the pure policy in [`file_acl`].
+//!   judged by the pure policy in [`file_acl`];
+//! - [`local_group::ensure_local_group`] — create a missing local group named
+//!   by a pipe DACL (`NetLocalGroupAdd`), under the pure name policy in
+//!   [`local_group::creatable_name_problem`].
 //!
-//! Everything except the pure [`pipe_acl`] and [`file_acl`] modules is
+//! Everything except the pure [`pipe_acl`], [`file_acl`] and name-policy code is
 //! `#[cfg(windows)]`; on other platforms the crate is otherwise empty so it can
 //! sit in the workspace and be a `cfg(windows)` dependency of `mia`.
 
@@ -56,6 +59,9 @@ pub use file_security::{
     create_admin_only_dir, object_info, open_no_follow, read_security, security_of, set_admin_only,
     set_administrators_owner,
 };
+
+/// Create the local groups the pipe DACLs name when they are missing.
+pub mod local_group;
 
 // Windows Service Control Manager integration for the `mia` daemon. Lives here
 // because `windows-service`'s service-main macro expands to `unsafe` glue and

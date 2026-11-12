@@ -129,9 +129,8 @@ fn run_inner(args: &[String]) -> anyhow::Result<i32> {
             print(&snapshots, opts.json)?;
             if !opts.json {
                 eprintln!(
-                    "\nno status endpoint at {} — the mia service is not running (start it: {})",
-                    endpoint.display(),
-                    crate::setup::restart_hint()
+                    "\n{}",
+                    no_endpoint_message(&endpoint, &config, service_running())
                 );
             }
             return Ok(EXIT_NOT_RUNNING);
@@ -161,6 +160,49 @@ fn run_inner(args: &[String]) -> anyhow::Result<i32> {
         }
     }
     Ok(exit_code(&snapshots))
+}
+
+/// Whether the agent's service is running, when the platform can tell
+/// without privileges (Windows: the Service Control Manager). `None`
+/// elsewhere, or when it cannot be queried.
+fn service_running() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        ferro_winauth::service::is_running()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The message for a missing status endpoint. When the service is known to be
+/// running, the endpoint failed to come up — on Windows almost always because
+/// the status group its pipe DACL names does not exist — so say that rather
+/// than "not running".
+#[must_use]
+pub fn no_endpoint_message(
+    endpoint: &std::path::Path,
+    config: &Config,
+    running: Option<bool>,
+) -> String {
+    if running == Some(true) {
+        format!(
+            "no status endpoint at {} although the mia service is running — the status \
+             endpoint failed to start; check that the local group {} exists (an elevated \
+             `mia service secure-config` creates it), then {}. The service log says why \
+             (%ProgramData%\\FerroGate\\logs\\mia.log, \"status endpoint stopped\").",
+            endpoint.display(),
+            config.status_group(),
+            crate::setup::restart_hint()
+        )
+    } else {
+        format!(
+            "no status endpoint at {} — the mia service is not running (start it: {})",
+            endpoint.display(),
+            crate::setup::restart_hint()
+        )
+    }
 }
 
 /// A hint for when an environment denies every caller for lack of a
@@ -560,6 +602,25 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_service_without_endpoint_is_not_called_stopped() {
+        let config = Config::from_toml("").unwrap();
+        let ep = std::path::Path::new("ep");
+        let running = no_endpoint_message(ep, &config, Some(true));
+        assert!(
+            running.contains("although the mia service is running"),
+            "{running}"
+        );
+        assert!(
+            running.contains(crate::config::DEFAULT_STATUS_GROUP),
+            "{running}"
+        );
+        for state in [None, Some(false)] {
+            let stopped = no_endpoint_message(ep, &config, state);
+            assert!(stopped.contains("is not running"), "{stopped}");
+        }
+    }
 
     fn snap(state: AgentState) -> StatusSnapshot {
         let mut s = not_running_snapshots(Some("prod")).remove(0);
