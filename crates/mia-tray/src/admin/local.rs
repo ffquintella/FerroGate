@@ -162,7 +162,7 @@ mod tests {
         // SHA-384("abc"), FIPS 180-4 test vector.
         assert!(app.sha384.starts_with("cb00753f45a35e8bb5a03d699ac65007"));
         assert_eq!(app.sha384.len(), 96);
-        assert!(app.path.ends_with("/app"));
+        assert!(Path::new(&app.path).ends_with("app"));
     }
 
     #[test]
@@ -185,6 +185,6 @@ mod tests {
         std::fs::create_dir_all(&macos).unwrap();
         std::fs::write(macos.join("Tool"), b"abc").unwrap();
         let app = LocalApp::from_path(&dir.path().join("Tool.app")).unwrap();
-        assert!(app.path.ends_with("Tool.app/Contents/MacOS/Tool"));
+        assert!(Path::new(&app.path).ends_with("Tool.app/Contents/MacOS/Tool"));
     }
 }
