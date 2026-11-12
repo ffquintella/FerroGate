@@ -173,6 +173,9 @@ mod tests {
         }
     }
 
+    // POSIX-style absolute paths are not absolute on Windows (no drive), so
+    // the Linux/macOS layouts are asserted on the other hosts only.
+    #[cfg(not(windows))]
     #[test]
     fn the_file_lives_in_the_per_user_directory() {
         let e = env(&[("HOME", "/home/a")]);
@@ -194,6 +197,20 @@ mod tests {
         // No home, or a relative one: no file.
         assert_eq!(path("linux", &env(&[])), None);
         assert_eq!(path("linux", &env(&[("HOME", "rel/home")])), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_file_lives_under_appdata_on_windows() {
+        let e = env(&[("APPDATA", "C:\\Users\\a\\AppData\\Roaming")]);
+        assert_eq!(
+            path("windows", &e),
+            Some(PathBuf::from(
+                "C:\\Users\\a\\AppData\\Roaming\\FerroGate\\mia-tray.toml"
+            ))
+        );
+        assert_eq!(path("windows", &env(&[])), None);
+        assert_eq!(path("windows", &env(&[("APPDATA", "rel")])), None);
     }
 
     #[test]
