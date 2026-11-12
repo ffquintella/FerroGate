@@ -12,7 +12,7 @@
 //! 3 pending or queued, 4 denied (or expired/refused), 1 error, 2 usage.
 
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
 
 use std::fmt::Write as _;
@@ -43,7 +43,7 @@ pub const EXIT_PENDING: i32 = 3;
 pub const EXIT_DENIED: i32 = 4;
 
 /// How long the daemon may take to identify a large binary.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const REPLY_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// A parsed `mia app` command.
@@ -423,13 +423,17 @@ fn exchange(
     {
         use std::io::Write as _;
         let _ = file; // Windows opens the file under the client's token (follow-up).
-        let mut pipe = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(endpoint)
+
+        // Least-privilege access + SECURITY_IDENTIFICATION (the pipe DACL
+        // denies GENERIC_WRITE to the client group); local `\\.\pipe\` only.
+        let mut pipe = ferro_winauth::open_client_pipe_blocking(endpoint.as_os_str())
             .with_context(|| format!("cannot reach the agent at {}", endpoint.display()))?;
-        pipe.write_all(&bytes)?;
-        read_reply(&mut pipe)
+        // A synchronous pipe has no read timeout: bound the exchange instead.
+        ferro_winauth::pipe_client::with_deadline(REPLY_TIMEOUT, move || {
+            pipe.write_all(&bytes)?;
+            Ok(read_reply(&mut pipe))
+        })
+        .context("the helper exchange with the agent failed")?
     }
 }
 

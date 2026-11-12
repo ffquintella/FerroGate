@@ -25,6 +25,10 @@ record them.
 
 ## [Unreleased]
 
+### Fixed
+
+- Make the blocking Windows helper clients follow the named-pipe contract, so a non-administrator in `FerroGateClients` can use them: `ferrogate_sdk_rust::helper::HelperClient` and `mia app` opened `\\.\pipe\ferrogate-mia` with `GENERIC_READ | GENERIC_WRITE`, which the pipe DACL denies to the client group, and without `SECURITY_IDENTIFICATION`, which let a server squatting the name impersonate the caller. Both now request `GENERIC_READ | FILE_WRITE_DATA` with `SECURITY_IDENTIFICATION`, retry a busy pipe for about a second, bound the exchange with the configured timeout (the SDK's `with_timeout`, `mia app`'s 180 s), and refuse any endpoint that is not a local `\\.\pipe\<name>` before opening it, so a mistyped `FERROGATE_HELPER_SOCKET` can no longer make a client write its request into a file or dial a remote pipe; `mia status` and the async `ferro_winauth::open_client_pipe` refuse such names too. New `ferro_winauth::open_client_pipe_blocking` and `ferro_winauth::pipe_client::{is_local_pipe_name, with_deadline}`; `docs/helper-api.md` documents the blocking-client recipe and why Windows keeps the named pipe rather than loopback TCP. Windows paths type-checked with `cargo clippy --target x86_64-pc-windows-msvc`, not yet run on Windows (S8, S31, M23, T298)
+
 ### Changed
 
 - Build the Windows MSI and NuGet package natively on a Windows host, without Docker: `make pkg-win` on Windows now runs `scripts/build-msi-windows.sh`, which compiles `mia.exe`, `mia-tray.exe` and `mia-tray-admin.exe` with cargo and MSVC, builds the MSI from the same `crates/mia/wix/mia.wxs` with the WiX Toolset (v4+ through a converted temporary copy, or v3), signs with `signtool` or `osslsigncode` when `WIN_SIGN_PFX` is set, and packs the `.nupkg` with Windows' bundled `tar`. Other hosts keep the containerised `scripts/build-msi-amd64.sh`

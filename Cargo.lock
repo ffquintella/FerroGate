@@ -2973,12 +2973,14 @@ dependencies = [
  "ferro-proto",
  "ferro-svid",
  "ferro-svid-verify",
+ "ferro-winauth",
  "ferrogate-sdk-rust",
  "getrandom 0.4.3",
  "mia-helper-proto",
  "rand_core 0.10.1",
  "serde",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

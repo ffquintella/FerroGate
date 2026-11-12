@@ -623,6 +623,8 @@ had no entry for it.
 - [x] T144 Build a self-contained NSIS installer with `make pkg-win` (S29)
   - note: Superseded by the container-built MSI (T145).
 - [x] T145 Cross-build the Windows MSI and Chocolatey package in a container (S29)
+- [x] T298 Make the blocking Windows helper clients follow the named-pipe contract (S8, S31)
+  - note: `ferrogate_sdk_rust::helper::HelperClient` and `mia app` opened the pipe with `GENERIC_READ | GENERIC_WRITE` (denied to `FerroGateClients` by the DACL) and without `SECURITY_IDENTIFICATION`. Now: `GENERIC_READ | FILE_WRITE_DATA` + `SECURITY_IDENTIFICATION`, ~1 s `ERROR_PIPE_BUSY` retry, a thread deadline for the exchange, and only local `\\.\pipe\<name>` endpoints (`ferro_winauth::pipe_client::is_local_pipe_name`, also enforced by `mia status` and `open_client_pipe`). Loopback TCP with a token file was considered and rejected (no peer credentials; see `docs/helper-api.md`). Tests: `ferro_winauth::pipe_client::tests`, `crates/ferro-winauth/tests/pipe_acl_windows.rs::{blocking_client_round_trips_with_least_privilege_access, a_file_path_is_never_opened_as_a_pipe, blocking_client_reports_missing_pipe}`, `ferrogate_sdk_rust::helper::{portable_tests, windows_tests}`. Windows paths type-checked with `cargo clippy --target x86_64-pc-windows-msvc` (the SDK helper and the `mia app`/`mia status` pipe code verbatim in isolated crates, since `mia` itself needs the target's C toolchain); not yet run on Windows.
 
 ## [M24] Allowlist provisioning and lifecycle
 > outcome: CMIS signs and serves per-host caller allowlists that hosts fetch, propose, renew and reload live, with an operator review queue and fail-closed handling of every bad or missing body.

@@ -10,7 +10,7 @@
 | A4 | Cryptographically Relevant Quantum Computer | Break ECC/RSA retroactively | ML-DSA-65 for signatures, ML-KEM-768 for KEX; both hybridized with classical (AND-combiner) |
 | A5 | Malicious peer host | Replay another node's TPM quote | Per-session 32-byte server nonce; EK certificate pinning; TPM2_ActivateCredential proof-of-residency |
 | A6 | Insider with SIEM write access | Tamper with audit trail | Merkle-chained STH signed inside TEE; write-once local-disk WORM store (`O_CREAT|O_EXCL`); public transparency anchor |
-| A7 | Local userspace attacker | Steal token from MIA UDS socket | SO_PEERCRED + IMA runtime hash + signed allowlist; DPoP sender-constraint |
+| A7 | Local userspace attacker | Steal token from the MIA helper socket (UDS) or named pipe (Windows) | SO_PEERCRED + IMA runtime hash (Windows: pipe client PID + image SHA-384 + Authenticode, client-only pipe DACL, remote clients rejected) + signed allowlist; DPoP sender-constraint |
 
 ## Security goals
 

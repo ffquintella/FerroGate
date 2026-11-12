@@ -52,3 +52,10 @@ thiserror          = { workspace = true, optional = true }
 # `cargo clippy --all-targets`) cover the helper client without making it a
 # default feature. It needs no protoc, unlike `proto`.
 ferrogate-sdk-rust = { path = ".", features = ["helper-client"] }
+# Only to pin the helper client's Windows pipe contract (access mask, SQOS,
+# pipe-name check) to the agent side in a test; pure data off Windows.
+ferro-winauth      = { path = "../ferro-winauth" }
+
+[target.'cfg(windows)'.dev-dependencies]
+# Serves a real named pipe in the Windows-only helper-client tests.
+tokio              = { workspace = true }
