@@ -1,9 +1,9 @@
 //! `mia-tray` — the FerroGate MIA desktop companion (feature F18).
 //!
 //! A small, **unprivileged** front end for capabilities `mia` already has: a
-//! tray icon whose colour reflects the agent's state, desktop notifications on
-//! transitions that need a human, a setup wizard, guided recovery and a
-//! redacted log viewer. It adds no trust: it holds no key material, never sends
+//! tray icon whose colour and glyph reflect the agent's state, desktop
+//! notifications on transitions that need a human, a setup wizard, guided
+//! recovery and a redacted log viewer (layout and flows: F23). It adds no trust: it holds no key material, never sends
 //! a helper-API `HelperReq`, never shows or copies SVIDs, tokens or keys, and
 //! every privileged step is a one-shot, fixed `mia` (or service-manager)
 //! command behind the operating system's own consent prompt.
@@ -22,7 +22,10 @@
 //!   lines, the per-OS elevation wrappers and outcome classification;
 //! - [`model`] — pure state → presentation mapping (icon colour, menu,
 //!   per-environment details, recovery suggestions);
-//! - [`alerts`] — notification de-duplication and rate limiting;
+//! - [`alerts`] — state-transition alerts and the shared rate limiter;
+//! - [`notice`] — the one notification format (OS, menu line, status bar);
+//! - [`control`] — the tray → window control pipe (raise, show a tab);
+//! - [`prefs`] — the per-user preference file (UI language);
 //! - [`wizard`] — the setup draft: `mia setup --dump` parsing, local field
 //!   validation, TOML rendering and the private `0600` draft file;
 //! - [`logview`] — following the daemon's log ring buffer and filtering it;
@@ -30,7 +33,7 @@
 //! - [`bundle`] — the diagnostics bundle;
 //! - [`poll`] — the background status poller and its backoff;
 //! - [`icon`] — the tray icon bitmaps;
-//! - [`i18n`] — the English / Portuguese string table;
+//! - [`i18n`] — the English / Portuguese / Spanish string table;
 //! - [`text`] — escaping untrusted text for display;
 //! - [`cli`] — the binary's own (tiny) argument parser.
 //!
@@ -53,12 +56,15 @@ pub mod alerts;
 pub mod bundle;
 pub mod cli;
 pub mod client;
+pub mod control;
 pub mod i18n;
 pub mod icon;
 pub mod locate;
 pub mod logview;
 pub mod model;
+pub mod notice;
 pub mod poll;
+pub mod prefs;
 pub mod process;
 pub mod selftest;
 pub mod text;

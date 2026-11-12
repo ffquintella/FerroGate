@@ -25,6 +25,23 @@ record them.
 
 ## [Unreleased]
 
+### Added
+
+- Add Spanish to the tray and the admin client, with a language selector in the window (System default, English, Português (Brasil), Español) saved per user in `mia-tray.toml`, the `MIA_TRAY_LANG` override, region fallback (`pt-*` → Portuguese, `es-*` → Spanish, else English), CLDR plurals, and a test that every message exists with the same placeholders in all three languages (F23, S18)
+- Add one notification layer for the tray and the admin client (`notice.rs`): native OS notifications titled "FerroGate" with the environment or app as the subtitle, five kinds (info, done, warning, error, approval pending) with urgency, Open / Review / Dismiss buttons on Linux and Windows and click-to-open on macOS, replacement per kind on Linux, the existing de-duplication and rate limits, and the same message in the menu and in a new window status bar. Notifications never carry codes, secrets, tokens, paths or user names and never decide anything (F23, S18)
+
+### Changed
+
+- Redesign the tray for fewer steps (F23, `docs/features/F23-tray-ux-redesign.md`). Details:
+  - The icon carries a glyph (✓ … ! × –) besides its colour and no longer blinks.
+  - The menu shows only what applies: the summary, the last result, the fixes for the worst state first, **Open FerroGate…**, Environments (only with several), **Review approvals…**, Setup and Quit. Details, Logs and the self-test moved to the window.
+  - On macOS and Windows a left click opens the window.
+  - One main window process is reused through a closed-set control pipe instead of one process per menu entry, and the admin client is brought to the front instead of being ignored.
+  - The window gains a header (state badge, explanation, last update, fix buttons, language) and per-environment cards. Setup gets **Check and apply**, which applies only the draft `mia` accepted.
+  - Every window is resizable with layouts that wrap.
+  - The admin client opens on the pending requests with a count, shows a breadcrumb instead of nested boxes, and sends a narrow approve or deny from its form with a live "What will be sent" preview. Wide scopes still need Accept → Review → Confirm, step-up is unchanged, and Enter never sends (F23, S18)
+- Sign in to the admin client on one screen: leaving the user name (Tab or Enter) asks `BeginLogin` once and reveals the password and the code or security-key fields below the name, with no Continue screen. The F20 protocol is unchanged (the same `BeginLogin` and `Login` calls, in the same order). Editing the name drops its answer and the secrets typed for it, a stale answer is ignored, and an answer older than the 2-minute nonce lifetime is asked again before the submit. Unknown names behave exactly like known ones. Secrets are still wiped at submit, and the user name is not remembered. The window also drops egui's keyboard focus when the page changes, so an Enter meant for one page never presses a button on the next (F23, S18)
+
 ## [0.30.14] - 2026-11-11
 
 ### Fixed

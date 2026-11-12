@@ -211,6 +211,10 @@ pub enum ViewAction {
     DecisionBack,
     /// "Confirm" on the review page.
     DecisionConfirm,
+    /// "Approve and send" / "Deny and send" on the form (F23): sends at
+    /// once when the scope is narrow; a wide scope goes to its
+    /// confirmation instead and nothing is sent.
+    DecisionSend,
     /// Close the dialog; nothing is sent.
     CancelDecision,
     /// Dismiss the outcome message.
@@ -950,6 +954,17 @@ impl AdminViews {
                 None
             }
             ViewAction::DecisionConfirm => self.confirm(now),
+            ViewAction::DecisionSend => {
+                if self.has_pending() {
+                    return None;
+                }
+                let reached_review = self.decision.as_mut()?.send_from_form();
+                if reached_review {
+                    self.confirm(now)
+                } else {
+                    None
+                }
+            }
             ViewAction::CancelDecision => {
                 self.decision = None;
                 None
@@ -1636,6 +1651,63 @@ mod tests {
         ));
         assert_eq!(v.view(NOW).outcome, Some(Outcome::StepUpAgain));
         assert!(!v.has_pending());
+    }
+
+    /// F23: a narrow approve or deny is sent from its form in one step,
+    /// the form showing exactly the lines the review page would; a wide
+    /// one stops at its confirmation and still needs the review; Enter
+    /// never sends.
+    #[test]
+    fn a_narrow_decision_is_sent_from_the_form_and_a_wide_one_is_not() {
+        let mut v = on_request(ALL);
+        let _ = v.act(ViewAction::Decide(DecisionKind::Approve), NOW);
+        let form = v.view(NOW).decision.unwrap();
+        assert!(form.sendable && !form.preview.is_empty());
+        assert!(v.enter(NOW).is_none(), "Enter never sends");
+        let review = v.view(NOW).decision.unwrap();
+        assert_eq!(review.stage, DecisionStage::Review);
+        assert_eq!(review.review, form.preview, "the preview is the review");
+        assert!(
+            v.act(ViewAction::DecisionSend, NOW).is_none(),
+            "only from the form"
+        );
+        let _ = v.act(ViewAction::DecisionBack, NOW);
+        let Some(Cmd::Mutate(_)) = v.act(ViewAction::DecisionSend, NOW) else {
+            panic!("a narrow approve is sent from the form");
+        };
+        assert!(v.has_pending() && v.view(NOW).decision.is_none());
+        assert!(
+            v.act(ViewAction::DecisionSend, NOW).is_none(),
+            "nothing while one waits"
+        );
+
+        // Wide: "any user" goes through Accept → Review → Confirm.
+        let mut v = on_request(ALL);
+        let _ = v.act(ViewAction::Decide(DecisionKind::Approve), NOW);
+        let _ = v.act(ViewAction::Choose(Choice::AutoUpdate(false)), NOW);
+        let _ = v.act(ViewAction::Choose(Choice::AnyUser(true)), NOW);
+        let form = v.view(NOW).decision.unwrap();
+        assert!(!form.sendable && !form.preview.is_empty());
+        assert!(v.act(ViewAction::DecisionSend, NOW).is_none());
+        assert_eq!(
+            v.view(NOW).decision.unwrap().stage,
+            DecisionStage::WideConfirm
+        );
+        let _ = v.act(ViewAction::DecisionNext, NOW);
+        assert_eq!(v.view(NOW).decision.unwrap().stage, DecisionStage::Review);
+        assert!(matches!(
+            v.act(ViewAction::DecisionConfirm, NOW),
+            Some(Cmd::Mutate(_))
+        ));
+
+        // Deny is narrow by nature; edits keep the old stages.
+        let mut v = on_request(ALL);
+        let _ = v.act(ViewAction::Decide(DecisionKind::Deny), NOW);
+        assert!(v.view(NOW).decision.unwrap().sendable);
+        assert!(matches!(
+            v.act(ViewAction::DecisionSend, NOW),
+            Some(Cmd::Mutate(_))
+        ));
     }
 
     #[test]

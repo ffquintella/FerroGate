@@ -3,8 +3,8 @@
 //!
 //! Flow: load (`--dump --editable`; the system file through the OS consent
 //! prompt where elevated output can be captured) → edit with local validation
-//! → "Check with mia" (`--check` on a private `0600` draft) → "Apply" (enabled
-//! only for exactly the draft `mia` accepted; `--apply --user` directly, or
+//! → "Check and apply" (`--check` on a private `0600` draft, then, only for
+//! exactly the draft `mia` accepted, `--apply --user` directly, or
 //! the system file through the OS consent prompt) → retain the applied
 //! values and refresh agent status. The tray never writes the configuration
 //! itself. A later explicit Load re-reads the protected system file through a
@@ -71,6 +71,22 @@ pub(crate) struct SetupView {
     target: Option<(Scope, Option<EnvName>)>,
     /// The target of the load in flight (or of the last failed load).
     pending_target: Option<(Scope, Option<EnvName>)>,
+    /// "Check and apply": apply as soon as `mia` accepts exactly this draft.
+    apply_after_check: bool,
+}
+
+/// What the form allows now, computed after this frame's edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent verdicts
+struct Gate {
+    /// "Check" may run.
+    can_check: bool,
+    /// "Apply" may run: `mia` accepted exactly the current draft.
+    can_apply: bool,
+    /// Some field is invalid.
+    invalid: bool,
+    /// The selector differs from the loaded file.
+    off_target: bool,
 }
 
 /// Load the editable configuration: `mia setup --dump --json --editable`,
@@ -140,8 +156,10 @@ impl SetupView {
         }));
     }
 
-    /// Collect finished jobs; `true` after a successful apply.
-    pub(crate) fn poll(&mut self, _ctx: &egui::Context, _shared: &Shared) -> bool {
+    /// Collect finished jobs; `true` after a successful apply. A check
+    /// started by "Check and apply" goes on to apply only when the gate
+    /// (computed from the current values) allows it.
+    pub(crate) fn poll(&mut self, ctx: &egui::Context, shared: &Shared) -> bool {
         if let Some(result) = take(&mut self.load_job) {
             match result {
                 Ok(loaded) => {
@@ -168,6 +186,9 @@ impl SetupView {
                     self.checked = None;
                     self.check_error = Some(m);
                 }
+            }
+            if std::mem::take(&mut self.apply_after_check) && self.gate().can_apply {
+                self.start_apply(ctx, shared);
             }
         }
         if let Some(done) = take(&mut self.apply_job) {
@@ -216,6 +237,34 @@ impl SetupView {
         }
         self.applied = Some(done);
         succeeded
+    }
+
+    /// Whether Check / Apply may run for the current values (the same rule
+    /// for the buttons and for "Check and apply" going on by itself).
+    fn gate(&self) -> Gate {
+        let install_enrollment_key =
+            self.fetch_key || !self.enrollment_public_key.trim().is_empty();
+        let errors = validate_for_apply(&self.values, install_enrollment_key);
+        let public_key_error = validate_enrollment_public_key(&self.enrollment_public_key).is_err()
+            || (!self.enrollment_public_key.trim().is_empty() && self.scope != Scope::System);
+        let fingerprint_error = install_enrollment_key
+            && !self.expected_key_fingerprint.trim().is_empty()
+            && EnrollmentKeyFingerprint::parse(&self.expected_key_fingerprint).is_err();
+        let selected = self.environment().ok().map(|e| (self.scope, e));
+        let on_target = selected.is_some() && selected == self.target;
+        let rendered =
+            render_with_enrollment_public_key(&self.values, Some(&self.enrollment_public_key));
+        let checked_ok = self
+            .checked
+            .as_ref()
+            .is_some_and(|(text, r)| r.ok && *text == rendered);
+        let invalid = !errors.is_empty() || public_key_error || fingerprint_error;
+        Gate {
+            can_check: !invalid && self.check_job.is_none() && on_target,
+            can_apply: !invalid && checked_ok && self.apply_job.is_none() && on_target,
+            invalid,
+            off_target: !on_target,
+        }
     }
 
     fn start_check(&mut self, ctx: &egui::Context, shared: &Shared) {
@@ -314,8 +363,16 @@ impl SetupView {
         }));
     }
 
+    /// The tab: one scrolling page, so it reflows at any window size.
+    pub(crate) fn ui(&mut self, ui: &mut egui::Ui, shared: &Shared, obs: Option<&Observation>) {
+        egui::ScrollArea::vertical()
+            .id_salt("setup-page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.page(ui, shared, obs));
+    }
+
     #[allow(clippy::too_many_lines)] // one linear form; splitting obscures it
-    pub(crate) fn ui(&mut self, ui: &mut egui::Ui, shared: &Shared, _obs: Option<&Observation>) {
+    fn page(&mut self, ui: &mut egui::Ui, shared: &Shared, _obs: Option<&Observation>) {
         let lang = shared.lang;
         let ctx = ui.ctx().clone();
         let red = color32(IconColor::Red);
@@ -326,13 +383,14 @@ impl SetupView {
             ui.radio_value(&mut self.scope, Scope::User, Msg::ScopeUser.text(lang));
         });
         let env = self.environment();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(Msg::LabelEnvironment.text(lang));
+            let width = (ui.available_width() - 120.0).clamp(80.0, 240.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.env_text)
                     .char_limit(mia_status_proto::MAX_ENVIRONMENT_LEN)
                     .hint_text(Msg::DefaultEnvironment.text(lang))
-                    .desired_width(160.0),
+                    .desired_width(width),
             );
             let busy = self.load_job.is_some();
             if ui
@@ -376,7 +434,7 @@ impl SetupView {
                 line.push(' ');
                 line.push_str(Msg::SetupFileAbsent.text(lang));
             }
-            ui.label(RichText::new(line).weak());
+            ui.add(egui::Label::new(RichText::new(line).weak()).wrap());
         }
         if !self.editable {
             return;
@@ -396,28 +454,24 @@ impl SetupView {
             .as_ref()
             .map(|l| l.effective.clone())
             .unwrap_or_default();
-        egui::ScrollArea::vertical()
-            .max_height(ui.available_height() - 140.0)
-            .show(ui, |ui| {
-                for step in Step::ALL {
-                    let focused = matches!(
-                        (self.focus, step),
-                        (Some(WizardStep::Pins | WizardStep::Cmis), Step::Cmis)
-                            | (Some(WizardStep::Attestation), Step::Attestation)
-                    );
-                    egui::CollapsingHeader::new(RichText::new(step.title().text(lang)).strong())
-                        .id_salt(("step", step.title()))
-                        .default_open(self.focus.is_none() || focused)
-                        .show(ui, |ui| {
-                            for f in Field::ALL
-                                .into_iter()
-                                .filter(|f| f.step() == step && f.applies_here())
-                            {
-                                self.field_ui(ui, lang, f, &overridden, &effective, &field_errors);
-                            }
-                        });
-                }
-            });
+        for step in Step::ALL {
+            let focused = matches!(
+                (self.focus, step),
+                (Some(WizardStep::Pins | WizardStep::Cmis), Step::Cmis)
+                    | (Some(WizardStep::Attestation), Step::Attestation)
+            );
+            egui::CollapsingHeader::new(RichText::new(step.title().text(lang)).strong())
+                .id_salt(("step", step.title()))
+                .default_open(self.focus.is_none() || focused)
+                .show(ui, |ui| {
+                    for f in Field::ALL
+                        .into_iter()
+                        .filter(|f| f.step() == step && f.applies_here())
+                    {
+                        self.field_ui(ui, lang, f, &overridden, &effective, &field_errors);
+                    }
+                });
+        }
 
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -426,19 +480,10 @@ impl SetupView {
                 egui::Checkbox::new(&mut self.reload, Msg::SetupReload.text(lang)),
             );
         });
-        // Field edits and the fetch checkbox happen inside the scroll area, so
-        // recompute before enabling Check / Apply in this same frame.
-        let install_enrollment_key =
-            self.fetch_key || !self.enrollment_public_key.trim().is_empty();
-        let errors = validate_for_apply(&self.values, install_enrollment_key);
-        let public_key_error = validate_enrollment_public_key(&self.enrollment_public_key).is_err()
-            || (!self.enrollment_public_key.trim().is_empty() && self.scope != Scope::System);
-        let fingerprint_error = install_enrollment_key
-            && !self.expected_key_fingerprint.trim().is_empty()
-            && EnrollmentKeyFingerprint::parse(&self.expected_key_fingerprint).is_err();
-        let selected = env.clone().ok().map(|e| (self.scope, e));
-        let on_target = selected.is_some() && selected == self.target;
-        if !on_target {
+        // Field edits happen above, so the gate is computed after them, in
+        // this same frame.
+        let gate = self.gate();
+        if gate.off_target {
             ui.colored_label(
                 color32(IconColor::Yellow),
                 Msg::SetupTargetChanged.text(lang),
@@ -446,47 +491,40 @@ impl SetupView {
         }
         let rendered =
             render_with_enrollment_public_key(&self.values, Some(&self.enrollment_public_key));
-        let checked_ok = self
-            .checked
-            .as_ref()
-            .is_some_and(|(text, r)| r.ok && *text == rendered);
-        ui.horizontal(|ui| {
-            let can_check = errors.is_empty()
-                && !public_key_error
-                && !fingerprint_error
-                && self.check_job.is_none()
-                && on_target;
+        ui.horizontal_wrapped(|ui| {
+            // The primary action: check, then apply exactly what passed.
+            let busy = self.check_job.is_some() || self.apply_job.is_some();
+            let mut primary = ui.add_enabled(
+                (gate.can_check || gate.can_apply) && !busy,
+                egui::Button::new(RichText::new(Msg::SetupCheckAndApply.text(lang)).strong()),
+            );
+            if self.scope == Scope::System {
+                primary = primary.on_hover_text(Msg::NoteElevation.text(lang));
+            }
+            if primary.clicked() {
+                if gate.can_apply {
+                    self.start_apply(&ctx, shared);
+                } else {
+                    self.apply_after_check = true;
+                    self.start_check(&ctx, shared);
+                }
+            }
             if ui
-                .add_enabled(can_check, egui::Button::new(Msg::SetupCheck.text(lang)))
+                .add_enabled(
+                    gate.can_check,
+                    egui::Button::new(Msg::SetupCheckOnly.text(lang)),
+                )
                 .clicked()
             {
+                self.apply_after_check = false;
                 self.start_check(&ctx, shared);
             }
-            if self.check_job.is_some() {
-                ui.spinner();
-            }
-            let can_apply = errors.is_empty()
-                && !fingerprint_error
-                && !public_key_error
-                && checked_ok
-                && self.apply_job.is_none()
-                && on_target;
-            let mut apply =
-                ui.add_enabled(can_apply, egui::Button::new(Msg::SetupApply.text(lang)));
-            if self.scope == Scope::System {
-                apply = apply.on_hover_text(Msg::NoteElevation.text(lang));
-            }
-            if apply.clicked() {
-                self.start_apply(&ctx, shared);
-            }
-            if self.apply_job.is_some() {
+            if busy {
                 ui.spinner();
             }
         });
-        if !errors.is_empty() || fingerprint_error || public_key_error {
+        if gate.invalid {
             ui.colored_label(red, Msg::SetupFixErrors.text(lang));
-        } else if !checked_ok && self.apply_job.is_none() && self.applied.is_none() {
-            ui.label(RichText::new(Msg::SetupNeedsCheck.text(lang)).weak());
         }
         if let Some(m) = self.check_error {
             ui.colored_label(red, m.text(lang));
@@ -498,7 +536,12 @@ impl SetupView {
                 } else {
                     ui.colored_label(red, Msg::SetupCheckRejected.text(lang));
                     for (key, message) in &report.errors {
-                        ui.label(RichText::new(format!("  {key}: {message}")).monospace());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("  {key}: {message}")).monospace(),
+                            )
+                            .wrap(),
+                        );
                     }
                 }
             }
@@ -695,6 +738,41 @@ fn apply_result_ui(ui: &mut egui::Ui, lang: Lang, done: &ApplyDone) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Check and apply" may apply only the exact draft `mia` accepted, on
+    /// the loaded target, with every field valid.
+    #[test]
+    fn the_gate_applies_only_the_checked_draft() {
+        let mut view = SetupView {
+            editable: true,
+            target: Some((Scope::System, None)),
+            ..SetupView::default()
+        };
+        let gate = view.gate();
+        assert!(gate.can_check && !gate.can_apply && !gate.off_target);
+        // Accepted for exactly these values: may apply.
+        let rendered = render_with_enrollment_public_key(&view.values, Some(""));
+        view.checked = Some((
+            rendered,
+            CheckReport {
+                ok: true,
+                errors: Vec::new(),
+            },
+        ));
+        assert!(view.gate().can_apply);
+        // Edited afterwards: the check no longer covers it.
+        view.values.set(Field::Log, "mia=debug");
+        assert!(!view.gate().can_apply);
+        // Another target selected: neither.
+        view.env_text = "prod".into();
+        let gate = view.gate();
+        assert!(gate.off_target && !gate.can_check && !gate.can_apply);
+        // An invalid field blocks both.
+        view.env_text.clear();
+        view.values.set(Field::CmisSpkiPin, "not-hex");
+        let gate = view.gate();
+        assert!(gate.invalid && !gate.can_check);
+    }
 
     #[test]
     fn successful_apply_keeps_values_without_a_second_privileged_load() {

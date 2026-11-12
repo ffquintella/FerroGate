@@ -1,13 +1,15 @@
-//! The tray icon, its menu and the actions it dispatches.
+//! The tray icon, its menu and the effects it carries out.
 //!
 //! [`TrayController::tick`] is driven by the platform loop (`tray_loop`)
-//! every few hundred milliseconds: it drains observations from the poller,
-//! finished actions and menu clicks, then updates the icon and menu. All
-//! decisions come from [`crate::model`] / [`crate::alerts`]; this module only
-//! maps [`MenuNode`]s to native items and [`MenuCommand`]s to effects.
+//! every few hundred milliseconds: it drains observations, finished
+//! actions, menu and icon clicks and notification clicks, then updates the
+//! icon and menu. Decisions come from [`crate::model`] (menu, [`plan`]),
+//! [`crate::alerts`] and [`crate::notice`]; this module only executes them.
 
 use std::collections::HashMap;
-use std::process::{Child, Command, Stdio};
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 
 use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
@@ -15,14 +17,16 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use super::{notify, start_poller, Shared};
 use crate::actions::{self, invocation, Action, ActionError, ActionResult, EnvName, Outcome};
-use crate::alerts::{AlertKind, Alerter, Policy};
+use crate::alerts::{Alerter, Policy};
 use crate::client::{Observation, Source};
-use crate::i18n::{fill, Lang, Msg};
+use crate::control::{self, Command as Ctl};
+use crate::i18n::{Lang, Msg};
 use crate::locate::locate_admin_client;
 use crate::model::{
-    menu_model, snapshot_title, title, tray_view, MenuCommand, MenuNode, Presentation, Recovery,
-    TrayView, WindowKind,
+    menu_model, plan, plan_target, snapshot_title, title, tray_view, MenuCommand, MenuNode,
+    Presentation, TrayEffect, TrayView, WindowKind,
 };
+use crate::notice::{Notice, NoticeCenter, Tag, Target};
 use crate::poll::Poller;
 
 /// Whether the loop should keep going.
@@ -31,6 +35,9 @@ pub(crate) enum Flow {
     Continue,
     Quit,
 }
+
+/// Ticks between two looks at the preference file (about 2 s).
+const PREFS_EVERY: u32 = 8;
 
 /// A native menu entry kept so its text can be updated in place.
 enum Handle {
@@ -84,8 +91,37 @@ fn menu_text(text: &str) -> String {
 /// A finished background action.
 struct Done {
     action: Action,
+    env: Option<EnvName>,
     copy_ids: bool,
     result: Result<ActionResult, ActionError>,
+}
+
+/// A child process the tray talks to through its stdin.
+struct Piped {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl Piped {
+    /// Start `cmd` with a piped stdin.
+    fn spawn(mut cmd: Command) -> std::io::Result<Self> {
+        let mut child = cmd.stdin(Stdio::piped()).spawn()?;
+        let stdin = child.stdin.take();
+        Ok(Self { child, stdin })
+    }
+
+    fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Send one command; `false` when the pipe is gone.
+    fn send(&mut self, cmd: &Ctl) -> bool {
+        self.stdin.as_mut().is_some_and(|s| {
+            s.write_all(control::encode(cmd).as_bytes())
+                .and_then(|()| s.flush())
+                .is_ok()
+        })
+    }
 }
 
 pub(crate) struct TrayController {
@@ -94,9 +130,12 @@ pub(crate) struct TrayController {
     obs_rx: mpsc::Receiver<Observation>,
     poller: Poller,
     alerter: Alerter,
+    notices: NoticeCenter,
+    activate_tx: mpsc::Sender<Target>,
+    activate_rx: mpsc::Receiver<Target>,
     view: TrayView,
+    last_obs: Option<Observation>,
     look: Presentation,
-    frame: u32,
     handles: Vec<Handle>,
     model: Vec<MenuNode>,
     commands: HashMap<MenuId, MenuCommand>,
@@ -104,11 +143,13 @@ pub(crate) struct TrayController {
     done_tx: mpsc::Sender<Done>,
     done_rx: mpsc::Receiver<Done>,
     running: Vec<Action>,
-    last_action: Option<String>,
-    windows: HashMap<WindowKind, Child>,
-    admin_client: Option<Child>,
+    main_window: Option<Piped>,
+    admin_client: Option<Piped>,
     clipboard: Option<arboard::Clipboard>,
     logged_state: Option<mia_status_proto::AgentState>,
+    prefs_path: Option<PathBuf>,
+    prefs_stamp: Option<std::time::SystemTime>,
+    ticks: u32,
 }
 
 impl TrayController {
@@ -136,20 +177,29 @@ impl TrayController {
         }
         let tray = TrayIconBuilder::new()
             .with_tooltip(menu_text(&view.headline))
-            .with_icon(icon(look, 0)?)
+            .with_icon(icon(look)?)
             .with_menu(Box::new(menu))
+            // Left click opens the window; the menu stays on right click
+            // (Linux status icons always show the menu).
+            .with_menu_on_left_click(false)
             .build()
             .map_err(|e| e.to_string())?;
         let (done_tx, done_rx) = mpsc::channel();
+        let (activate_tx, activate_rx) = mpsc::channel();
+        let prefs_path = crate::prefs::user_path();
+        let prefs_stamp = prefs_path.as_deref().and_then(crate::prefs::stamp);
         Ok(Self {
             shared,
             tray,
             obs_rx,
             poller,
             alerter: Alerter::new(Policy::default()),
+            notices: NoticeCenter::default(),
+            activate_tx,
+            activate_rx,
             view,
+            last_obs: None,
             look,
-            frame: 0,
             handles,
             model,
             commands,
@@ -157,11 +207,13 @@ impl TrayController {
             done_tx,
             done_rx,
             running: Vec::new(),
-            last_action: None,
-            windows: HashMap::new(),
+            main_window: None,
             admin_client: None,
             clipboard: None,
             logged_state: None,
+            prefs_path,
+            prefs_stamp,
+            ticks: 0,
         })
     }
 
@@ -172,45 +224,76 @@ impl TrayController {
             latest = Some(obs);
         }
         if let Some(obs) = latest {
-            self.on_observation(&obs);
+            self.on_observation(obs);
         }
         while let Ok(done) = self.done_rx.try_recv() {
             self.on_done(done);
         }
+        let mut effects = Vec::new();
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if let Some(cmd) = self.commands.get(&ev.id).cloned() {
-                if self.dispatch(cmd) == Flow::Quit {
-                    return Flow::Quit;
-                }
+            if let Some(cmd) = self.commands.get(&ev.id) {
+                effects.push(plan(cmd));
             }
         }
-        if self.look.animated {
-            self.frame = self.frame.wrapping_add(1);
-            if self.frame.is_multiple_of(2) {
-                self.set_icon();
+        while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            if let tray_icon::TrayIconEvent::Click {
+                button: tray_icon::MouseButton::Left,
+                button_state: tray_icon::MouseButtonState::Up,
+                ..
+            } = ev
+            {
+                effects.push(TrayEffect::ShowWindow(WindowKind::Status));
             }
         }
-        self.windows
-            .retain(|_, child| matches!(child.try_wait(), Ok(None)));
-        if self
-            .admin_client
-            .as_mut()
-            .is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
-        {
+        while let Ok(target) = self.activate_rx.try_recv() {
+            effects.push(plan_target(target));
+        }
+        for effect in effects {
+            if self.execute(effect) == Flow::Quit {
+                return Flow::Quit;
+            }
+        }
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks.is_multiple_of(PREFS_EVERY) {
+            self.watch_language();
+        }
+        if self.main_window.as_mut().is_some_and(|w| !w.alive()) {
+            self.main_window = None;
+        }
+        if self.admin_client.as_mut().is_some_and(|c| !c.alive()) {
             self.admin_client = None;
         }
         Flow::Continue
     }
 
-    fn on_observation(&mut self, obs: &Observation) {
+    /// Follow a language chosen in the window (it writes the preference
+    /// file): rebuild the view, the tooltip and the menu.
+    fn watch_language(&mut self) {
+        let Some(path) = self.prefs_path.as_deref() else {
+            return;
+        };
+        let stamp = crate::prefs::stamp(path);
+        if stamp == self.prefs_stamp {
+            return;
+        }
+        self.prefs_stamp = stamp;
+        let lang = crate::prefs::effective_lang();
+        if lang != self.shared.lang {
+            tracing::info!(lang = lang.code(), "UI language changed");
+            self.shared.lang = lang;
+            let obs = self.last_obs.clone().unwrap_or(Observation {
+                snapshots: Vec::new(),
+                source: Source::Synthesised,
+            });
+            self.view = tray_view(&obs, crate::unix_now(), lang);
+            self.refresh();
+        }
+    }
+
+    fn on_observation(&mut self, obs: Observation) {
         let now = crate::unix_now();
         let lang = self.shared.lang;
         for alert in self.alerter.observe(now, &obs.snapshots) {
-            let heading = match alert.kind {
-                AlertKind::BecameUnhealthy => Msg::NotifyAttentionTitle,
-                AlertKind::SvidExpiring => Msg::NotifySvidExpiringTitle,
-                AlertKind::CrlStale => Msg::NotifyCrlStaleTitle,
-            };
             // A validated name, or the escaped raw one (never markup).
             let env = alert.environment.as_deref().map_or_else(
                 || Msg::DefaultEnvironment.text(lang).to_string(),
@@ -226,38 +309,56 @@ impl TrayController {
                 .iter()
                 .find(|s| s.environment == alert.environment)
                 .map_or_else(|| title(alert.state), snapshot_title);
-            notify::show(
-                heading.text(lang),
-                &fill(
-                    Msg::NotifyBody.text(lang),
-                    &[("env", &env), ("state", state.text(lang))],
-                ),
-            );
+            self.raise_notice(Notice::from_alert(&alert, &env, state, lang, now), true);
         }
-        let view = tray_view(obs, now, lang);
+        let view = tray_view(&obs, now, lang);
         if self.logged_state != Some(view.worst) {
             tracing::info!(state = view.worst.as_str(), source = ?view.source, "agent state");
             self.logged_state = Some(view.worst);
         }
         self.view = view;
+        self.last_obs = Some(obs);
         self.refresh();
+    }
+
+    /// Record a notice, deliver it to the OS when `os` and the rate limit
+    /// allow, and mirror it in the open window.
+    fn raise_notice(&mut self, notice: Notice, os: bool) {
+        if self.notices.push(notice.clone(), os) {
+            notify::deliver(&notice, self.shared.lang, self.activate_tx.clone());
+        }
+        if let Some(w) = self.main_window.as_mut() {
+            w.send(&Ctl::Notice(notice));
+        }
     }
 
     fn refresh(&mut self) {
         if self.view.presentation != self.look {
             self.look = self.view.presentation;
-            self.frame = 0;
-            self.set_icon();
+            match icon(self.look) {
+                Ok(i) => {
+                    if let Err(e) = self.tray.set_icon(Some(i)) {
+                        tracing::warn!(error = %e, "could not update the tray icon");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "could not draw the tray icon"),
+            }
         }
         if let Err(e) = self.tray.set_tooltip(Some(menu_text(&self.view.headline))) {
             tracing::debug!(error = %e, "tooltip not supported here");
         }
+        // The latest action result replaces the old "Last action" line.
+        let line = self
+            .notices
+            .history()
+            .find(|n| n.tag == Tag::Action)
+            .map(Notice::line);
         // Looked up on every refresh, so installing or removing the optional
         // package shows or hides the entry without restarting the tray.
         let model = menu_model(
             &self.view,
             self.shared.lang,
-            self.last_action.as_deref(),
+            line.as_deref(),
             admin_client_path().is_some(),
         );
         if model == self.model {
@@ -282,75 +383,53 @@ impl TrayController {
         self.model = model;
     }
 
-    fn set_icon(&self) {
-        match icon(self.look, self.frame / 2) {
-            Ok(i) => {
-                if let Err(e) = self.tray.set_icon(Some(i)) {
-                    tracing::warn!(error = %e, "could not update the tray icon");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "could not draw the tray icon"),
-        }
-    }
-
-    fn dispatch(&mut self, cmd: MenuCommand) -> Flow {
-        match cmd {
-            MenuCommand::Quit => return Flow::Quit,
-            MenuCommand::Open(kind) => self.open_window(kind),
-            MenuCommand::OpenAdminClient => self.open_admin_client(),
-            MenuCommand::Recover(Recovery::Run(action), env) => self.run_action(action, env, false),
-            MenuCommand::Recover(Recovery::CopyMachineIds, _) => {
-                self.run_action(Action::ShowMachineId, None, true);
-            }
-            MenuCommand::Recover(Recovery::Read(doc), _) => {
-                let opened = self
-                    .shared
-                    .os
-                    .ok_or(ActionError::Unsupported)
-                    .and_then(|os| actions::open_doc_spec(doc, os))
-                    .and_then(|spec| actions::spawn_detached(&spec));
-                if let Err(e) = opened {
-                    tracing::warn!(error = %e, ?doc, "could not open the documentation");
-                }
-            }
-            MenuCommand::Recover(Recovery::OpenWizard(_), _) => {
-                self.open_window(WindowKind::Setup);
-            }
+    fn execute(&mut self, effect: TrayEffect) -> Flow {
+        match effect {
+            TrayEffect::Quit => return Flow::Quit,
+            TrayEffect::ShowWindow(kind) => self.open_window(kind),
+            TrayEffect::OpenAdminClient => self.open_admin_client(),
+            TrayEffect::RunAction {
+                action,
+                env,
+                copy_ids,
+            } => self.run_action(action, env, copy_ids),
+            TrayEffect::OpenDoc(doc) => super::window::open_doc(&self.shared, doc),
         }
         Flow::Continue
     }
 
-    /// Start (at most one of) each window kind as `<this exe> --window <kind>`.
+    /// Show the main window at `kind`: raise the open one through its pipe,
+    /// or start `<this exe> --window <kind>`.
     fn open_window(&mut self, kind: WindowKind) {
-        if let Some(child) = self.windows.get_mut(&kind) {
-            if matches!(child.try_wait(), Ok(None)) {
-                tracing::debug!(?kind, "window already open");
+        if let Some(w) = self.main_window.as_mut() {
+            if w.alive() && w.send(&Ctl::Show(kind)) {
                 return;
             }
         }
         let started = std::env::current_exe().and_then(|exe| {
-            Command::new(exe)
-                .arg("--window")
-                .arg(kind.as_arg())
-                .stdin(Stdio::null())
-                .spawn()
+            let mut cmd = Command::new(exe);
+            cmd.arg("--window").arg(kind.as_arg());
+            Piped::spawn(cmd)
         });
         match started {
-            Ok(child) => {
-                self.windows.insert(kind, child);
+            Ok(mut w) => {
+                // The window shows what happened before it opened.
+                if let Some(n) = self.notices.latest() {
+                    w.send(&Ctl::Notice(n.clone()));
+                }
+                self.main_window = Some(w);
             }
             Err(e) => tracing::error!(error = %e, ?kind, "could not open the window"),
         }
     }
 
-    /// Start the separate administrator client (F22), at most one at a time.
-    /// The trust rule runs again right before the launch (the file may have
-    /// been replaced since the menu was built); the child gets a fixed
-    /// command line, no elevation and no stdin.
+    /// Start the separate administrator client (F22), or raise the open
+    /// one. The trust rule runs again right before a launch (the file may
+    /// have been replaced since the menu was built); the child gets a fixed
+    /// command line and no elevation.
     fn open_admin_client(&mut self) {
-        if let Some(child) = self.admin_client.as_mut() {
-            if matches!(child.try_wait(), Ok(None)) {
-                tracing::debug!("admin client already open");
+        if let Some(c) = self.admin_client.as_mut() {
+            if c.alive() && c.send(&Ctl::Focus) {
                 return;
             }
         }
@@ -359,12 +438,8 @@ impl TrayController {
             self.refresh();
             return;
         };
-        match actions::admin_client_spec(&program)
-            .command()
-            .stdin(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => self.admin_client = Some(child),
+        match Piped::spawn(actions::admin_client_spec(&program).command()) {
+            Ok(c) => self.admin_client = Some(c),
             Err(e) => tracing::error!(error = %e, "could not open the admin client"),
         }
     }
@@ -373,70 +448,76 @@ impl TrayController {
         if self.running.contains(&action) {
             return;
         }
+        let lang = self.shared.lang;
+        let env_label = env.as_ref().map(EnvName::as_str).map(str::to_string);
         let Some(os) = self.shared.os else {
-            self.finish_line(action, Msg::ErrorUnsupported.text(self.shared.lang));
+            let n = Notice::action(
+                action.label().text(lang),
+                Msg::ErrorUnsupported.text(lang),
+                Some(false),
+                env_label.as_deref(),
+                lang,
+                crate::unix_now(),
+            );
+            self.raise_notice(n, true);
+            self.refresh();
             return;
         };
         self.running.push(action);
         let tools = std::sync::Arc::clone(&self.shared.tools);
         let tx = self.done_tx.clone();
+        let for_thread = env.clone();
         std::thread::spawn(move || {
-            let result = actions::run(&invocation(action, env.as_ref(), os), os, &tools);
+            let result = actions::run(&invocation(action, for_thread.as_ref(), os), os, &tools);
             let _ = tx.send(Done {
                 action,
+                env: for_thread,
                 copy_ids,
                 result,
             });
         });
-        let lang = self.shared.lang;
-        self.last_action = Some(fill(
-            Msg::MenuLastAction.text(lang),
-            &[
-                ("action", action.label().text(lang)),
-                ("outcome", Msg::OutcomeRunning.text(lang)),
-            ],
-        ));
-        self.refresh();
-    }
-
-    fn finish_line(&mut self, action: Action, outcome: &str) {
-        let lang = self.shared.lang;
-        let line = fill(
-            Msg::MenuLastAction.text(lang),
-            &[("action", action.label().text(lang)), ("outcome", outcome)],
+        let running = Notice::action(
+            action.label().text(lang),
+            Msg::OutcomeRunning.text(lang),
+            None,
+            env_label.as_deref(),
+            lang,
+            crate::unix_now(),
         );
-        notify::show(Msg::AppName.text(lang), &line);
-        self.last_action = Some(line);
+        self.raise_notice(running, false);
         self.refresh();
     }
 
     fn on_done(&mut self, done: Done) {
         self.running.retain(|a| *a != done.action);
         let lang = self.shared.lang;
-        let outcome_text = match &done.result {
+        let (text, ok) = match &done.result {
             Ok(r) if done.copy_ids && r.outcome == Outcome::Succeeded => {
                 match actions::parse_machine_id(&r.captured.stdout) {
                     Some(id) => {
                         if self.copy(&format!("mia machine-id: {id}")) {
-                            Msg::CopiedIds.text(lang).to_string()
+                            (Msg::CopiedIds.text(lang).to_string(), true)
                         } else {
-                            Msg::OutcomeFailed.text(lang).to_string()
+                            (Msg::OutcomeFailed.text(lang).to_string(), false)
                         }
                     }
-                    None => Msg::ErrorUnexpectedOutput.text(lang).to_string(),
+                    None => (Msg::ErrorUnexpectedOutput.text(lang).to_string(), false),
                 }
             }
-            Ok(r) if r.outcome == Outcome::Succeeded && done.action.applies_on_restart() => {
-                format!(
-                    "{}. {}",
-                    r.outcome.label().text(lang),
-                    Msg::NoteRestartToApply.text(lang)
-                )
-            }
-            Ok(r) => r.outcome.label().text(lang).to_string(),
-            Err(e) => e.message().text(lang).to_string(),
+            Ok(r) => crate::notice::outcome_text(done.action, r.outcome, lang),
+            Err(e) => (e.message().text(lang).to_string(), false),
         };
-        self.finish_line(done.action, &outcome_text);
+        let env_label = done.env.as_ref().map(EnvName::as_str);
+        let n = Notice::action(
+            done.action.label().text(lang),
+            &text,
+            Some(ok),
+            env_label,
+            lang,
+            crate::unix_now(),
+        );
+        self.raise_notice(n, true);
+        self.refresh();
         self.poller.poke();
     }
 
@@ -458,15 +539,15 @@ impl TrayController {
 
 /// The administrator client beside this tray executable, when it passes the
 /// trust rule ([`locate_admin_client`]).
-fn admin_client_path() -> Option<std::path::PathBuf> {
+fn admin_client_path() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|exe| locate_admin_client(&exe))
 }
 
-fn icon(look: Presentation, frame: u32) -> Result<Icon, String> {
+fn icon(look: Presentation) -> Result<Icon, String> {
     Icon::from_rgba(
-        crate::icon::rgba(look, frame),
+        crate::icon::rgba(look),
         crate::icon::SIZE,
         crate::icon::SIZE,
     )
@@ -528,5 +609,26 @@ mod tests {
         assert!(shape(&a) == shape(&b));
         let c = vec![MenuNode::Label("y".into())];
         assert!(shape(&a) != shape(&c));
+    }
+
+    #[test]
+    fn menu_text_is_bounded_and_single_line() {
+        let t = menu_text(&format!("a\nb{}", "c".repeat(500)));
+        assert!(!t.contains('\n'));
+        assert!(t.chars().count() <= 125);
+    }
+
+    /// A piped child receives exactly the encoded control lines.
+    #[cfg(unix)]
+    #[test]
+    fn a_piped_child_receives_control_lines() {
+        let mut cmd = Command::new("cat");
+        cmd.stdout(Stdio::piped());
+        let mut child = Piped::spawn(cmd).unwrap();
+        assert!(child.send(&Ctl::Show(WindowKind::Logs)));
+        assert!(child.send(&Ctl::Focus));
+        drop(child.stdin.take());
+        let out = child.child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "show logs\nfocus\n");
     }
 }

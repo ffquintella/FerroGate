@@ -149,13 +149,13 @@ pub(super) fn panel(
     actions: &mut Vec<Action>,
 ) {
     let free = idle && !v.pending;
-    ui.horizontal(|ui| {
-        for (tab, msg) in [
-            (Tab::Requests, Msg::AdminRequestsOpen),
-            (Tab::Approvals, Msg::AdminApprovalsOpen),
-        ] {
+    ui.horizontal_wrapped(|ui| {
+        for tab in [Tab::Requests, Tab::Approvals] {
             if ui
-                .add_enabled(free, egui::Button::selectable(v.tab == tab, msg.text(lang)))
+                .add_enabled(
+                    free,
+                    egui::Button::selectable(v.tab == tab, tab_label(lang, v, tab)),
+                )
                 .clicked()
             {
                 actions.push(view(ViewAction::Tab(tab)));
@@ -192,14 +192,15 @@ pub(super) fn panel(
     });
     ui.weak(&v.summary);
     if let Some(o) = &v.outcome {
-        ui.group(|ui| {
-            for line in outcome_lines(lang, o) {
-                ui.label(line);
-            }
-            if ui.small_button(Msg::AdminDismiss.text(lang)).clicked() {
-                actions.push(view(ViewAction::DismissOutcome));
-            }
-        });
+        // The result of the last decision, in the page (not a box over it).
+        ui.add_space(4.0);
+        for line in outcome_lines(lang, o) {
+            ui.add(egui::Label::new(egui::RichText::new(line).strong()).wrap());
+        }
+        if ui.small_button(Msg::AdminDismiss.text(lang)).clicked() {
+            actions.push(view(ViewAction::DismissOutcome));
+        }
+        ui.separator();
     }
     if let Some(e) = v.error {
         ui.colored_label(ui.visuals().error_fg_color, refusal_text(lang, e));
@@ -375,6 +376,58 @@ fn list(ui: &mut egui::Ui, lang: Lang, v: &ViewsView, free: bool, actions: &mut 
     if empty {
         ui.weak(Msg::AdminNoRows.text(lang));
     }
+    // Wide tables scroll sideways inside a narrow window.
+    egui::ScrollArea::horizontal()
+        .id_salt(("admin-list-scroll", v.tab == Tab::Requests))
+        .show(ui, |ui| list_grid(ui, lang, v, free, actions));
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(
+                free && v.page > 1,
+                egui::Button::new(Msg::AdminPrevPage.text(lang)),
+            )
+            .clicked()
+        {
+            actions.push(view(ViewAction::PrevPage));
+        }
+        ui.label(fill(
+            Msg::AdminPage.text(lang),
+            &[("n", &v.page.to_string())],
+        ));
+        if ui
+            .add_enabled(
+                free && v.has_next,
+                egui::Button::new(Msg::AdminNextPage.text(lang)),
+            )
+            .clicked()
+        {
+            actions.push(view(ViewAction::NextPage));
+        }
+    });
+}
+
+/// The tab's label; the requests tab counts the pending rows shown.
+fn tab_label(lang: Lang, v: &ViewsView, tab: Tab) -> String {
+    match tab {
+        Tab::Approvals => Msg::AdminApprovalsOpen.text(lang).to_string(),
+        Tab::Requests => {
+            let pending = v.requests.iter().filter(|r| r.state == 1).count();
+            if v.tab == Tab::Requests && v.loaded && pending > 0 {
+                crate::i18n::count(
+                    lang,
+                    u64::try_from(pending).unwrap_or(u64::MAX),
+                    Msg::AdminRequestsPendingOne,
+                    Msg::AdminRequestsPendingOther,
+                )
+            } else {
+                Msg::AdminRequestsOpen.text(lang).to_string()
+            }
+        }
+    }
+}
+
+/// The rows of the list shown.
+fn list_grid(ui: &mut egui::Ui, lang: Lang, v: &ViewsView, free: bool, actions: &mut Vec<Action>) {
     egui::Grid::new(("admin-list", v.tab == Tab::Requests))
         .striped(true)
         .show(ui, |ui| match v.tab {
@@ -414,30 +467,6 @@ fn list(ui: &mut egui::Ui, lang: Lang, v: &ViewsView, free: bool, actions: &mut 
                 }
             }
         });
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                free && v.page > 1,
-                egui::Button::new(Msg::AdminPrevPage.text(lang)),
-            )
-            .clicked()
-        {
-            actions.push(view(ViewAction::PrevPage));
-        }
-        ui.label(fill(
-            Msg::AdminPage.text(lang),
-            &[("n", &v.page.to_string())],
-        ));
-        if ui
-            .add_enabled(
-                free && v.has_next,
-                egui::Button::new(Msg::AdminNextPage.text(lang)),
-            )
-            .clicked()
-        {
-            actions.push(view(ViewAction::NextPage));
-        }
-    });
 }
 
 fn approval_cells(ui: &mut egui::Ui, lang: Lang, a: &ApprovalRow) {
@@ -1090,7 +1119,7 @@ fn text_field(
     }
 }
 
-fn decision_title(lang: Lang, d: &DecisionView) -> String {
+pub(super) fn decision_title(lang: Lang, d: &DecisionView) -> String {
     let msg = match d.kind {
         DecisionKind::Approve => Msg::AdminDecideApprove,
         DecisionKind::Deny => Msg::AdminDecideDeny,
@@ -1194,6 +1223,37 @@ fn review_line(lang: Lang, line: &ReviewLine) -> String {
     }
 }
 
+/// "Step n of total" of the dialog: form, the wide confirmation (only
+/// when the scope is wide), review.
+fn stepper(lang: Lang, d: &DecisionView) -> String {
+    let wide = d.stage == DecisionStage::WideConfirm || (d.any_user || d.path_user_continuity);
+    let total = if wide { 3 } else { 2 };
+    let n = match d.stage {
+        DecisionStage::Form => 1,
+        DecisionStage::WideConfirm => 2,
+        DecisionStage::Review => total,
+    };
+    fill(
+        Msg::AdminStepOf.text(lang),
+        &[("n", &n.to_string()), ("total", &total.to_string())],
+    )
+}
+
+/// One review line, the add's outcome and assertion standing out.
+fn review_label(ui: &mut egui::Ui, lang: Lang, line: &ReviewLine) {
+    let text = review_line(lang, line);
+    match line {
+        ReviewLine::RegisterOutcome(_) | ReviewLine::Assertion => {
+            ui.colored_label(ui.visuals().warn_fg_color, text);
+        }
+        _ => {
+            ui.add(egui::Label::new(text).wrap());
+        }
+    }
+}
+
+/// The decision, as a page of its own (breadcrumb above, stepper here):
+/// the form with a live preview, the wide-scope confirmation, the review.
 #[allow(clippy::too_many_lines)] // one section per stage of the dialog.
 fn decision(
     ui: &mut egui::Ui,
@@ -1202,118 +1262,141 @@ fn decision(
     free: bool,
     actions: &mut Vec<Action>,
 ) {
-    ui.group(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.heading(decision_title(lang, d));
-        if !d.path.is_empty() {
-            let mut line = d.path.clone();
-            for part in [&d.version, &d.host, &d.user] {
-                if !part.is_empty() {
-                    line = format!("{line} · {part}");
+        ui.weak(stepper(lang, d));
+    });
+    if !d.path.is_empty() {
+        let mut line = d.path.clone();
+        for part in [&d.version, &d.host, &d.user] {
+            if !part.is_empty() {
+                line = format!("{line} · {part}");
+            }
+        }
+        ui.add(egui::Label::new(line).wrap());
+    }
+    if !d.warnings.is_empty() {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("⚠ {}", d.warnings.join(" · ")),
+        );
+    }
+    if let Some(changes) = &d.changed_meanwhile {
+        let names: Vec<&str> = changes.iter().map(|c| change_name(lang, *c)).collect();
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            fill(
+                Msg::AdminChangedMeanwhile.text(lang),
+                &[("fields", &names.join(", "))],
+            ),
+        );
+    }
+    ui.separator();
+    match d.stage {
+        DecisionStage::Form => {
+            decision_form(ui, lang, d, actions);
+            if let Some(e) = d.error {
+                let msg = match e {
+                    DecisionError::AnyUserNeedsProtectedPath => Msg::AdminErrAnyUser,
+                    DecisionError::NothingToChange => Msg::AdminErrNothing,
+                    DecisionError::ShortIdMismatch => Msg::AdminErrShortId,
+                    DecisionError::PickFailed => Msg::AdminErrPick,
+                    DecisionError::FieldsInvalid => Msg::AdminErrFields,
+                };
+                ui.colored_label(ui.visuals().error_fg_color, msg.text(lang));
+            }
+            // Approve / deny: exactly what will be sent, live (F23).
+            if !d.preview.is_empty() {
+                ui.add_space(6.0);
+                ui.strong(Msg::AdminPreviewTitle.text(lang));
+                for line in &d.preview {
+                    review_label(ui, lang, line);
+                }
+                if !d.sendable {
+                    ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminPreviewWide.text(lang));
                 }
             }
-            ui.label(line);
-        }
-        if !d.warnings.is_empty() {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                format!("⚠ {}", d.warnings.join(" · ")),
-            );
-        }
-        if let Some(changes) = &d.changed_meanwhile {
-            let names: Vec<&str> = changes.iter().map(|c| change_name(lang, *c)).collect();
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                fill(
-                    Msg::AdminChangedMeanwhile.text(lang),
-                    &[("fields", &names.join(", "))],
-                ),
-            );
-        }
-        ui.add_space(4.0);
-        match d.stage {
-            DecisionStage::Form => {
-                decision_form(ui, lang, d, actions);
-                if let Some(e) = d.error {
-                    let msg = match e {
-                        DecisionError::AnyUserNeedsProtectedPath => Msg::AdminErrAnyUser,
-                        DecisionError::NothingToChange => Msg::AdminErrNothing,
-                        DecisionError::ShortIdMismatch => Msg::AdminErrShortId,
-                        DecisionError::PickFailed => Msg::AdminErrPick,
-                        DecisionError::FieldsInvalid => Msg::AdminErrFields,
-                    };
-                    ui.colored_label(ui.visuals().error_fg_color, msg.text(lang));
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                // The quiet choice comes first; sending needs its own click
+                // (Enter never sends).
+                if ui.button(Msg::AdminCancel.text(lang)).clicked() {
+                    actions.push(view(ViewAction::CancelDecision));
                 }
-                ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        free,
+                        egui::Button::new(Msg::AdminDecisionContinue.text(lang)),
+                    )
+                    .clicked()
+                {
+                    actions.push(view(ViewAction::DecisionNext));
+                }
+                let send = match d.kind {
+                    DecisionKind::Approve => Some(Msg::AdminApproveSend),
+                    DecisionKind::Deny => Some(Msg::AdminDenySend),
+                    _ => None,
+                };
+                if let Some(send) = send {
                     if ui
                         .add_enabled(
-                            free,
-                            egui::Button::new(Msg::AdminDecisionContinue.text(lang)),
+                            free && !d.preview.is_empty(),
+                            egui::Button::new(egui::RichText::new(send.text(lang)).strong()),
                         )
                         .clicked()
                     {
-                        actions.push(view(ViewAction::DecisionNext));
-                    }
-                    if ui.button(Msg::AdminCancel.text(lang)).clicked() {
-                        actions.push(view(ViewAction::CancelDecision));
-                    }
-                });
-            }
-            DecisionStage::WideConfirm => {
-                if d.any_user && matches!(d.kind, DecisionKind::Approve | DecisionKind::Register) {
-                    ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminWideAnyUser.text(lang));
-                }
-                if d.path_user_continuity {
-                    ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminWideLoose.text(lang));
-                }
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(free, egui::Button::new(Msg::AdminAcceptWide.text(lang)))
-                        .clicked()
-                    {
-                        actions.push(view(ViewAction::DecisionNext));
-                    }
-                    if ui.button(Msg::AdminBack.text(lang)).clicked() {
-                        actions.push(view(ViewAction::DecisionBack));
-                    }
-                    if ui.button(Msg::AdminCancel.text(lang)).clicked() {
-                        actions.push(view(ViewAction::CancelDecision));
-                    }
-                });
-            }
-            DecisionStage::Review => {
-                ui.strong(Msg::AdminReviewTitle.text(lang));
-                for line in &d.review {
-                    match line {
-                        // What the add does and what it rests on stand out.
-                        ReviewLine::RegisterOutcome(_) | ReviewLine::Assertion => {
-                            ui.colored_label(ui.visuals().warn_fg_color, review_line(lang, line));
-                        }
-                        _ => {
-                            ui.label(review_line(lang, line));
-                        }
+                        actions.push(view(ViewAction::DecisionSend));
                     }
                 }
-                ui.weak(Msg::AdminReviewSync.text(lang));
-                let confirm = if d.kind == DecisionKind::Register {
-                    Msg::AdminRegConfirm
-                } else {
-                    Msg::AdminDecisionConfirm
-                };
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(free, egui::Button::new(confirm.text(lang)))
-                        .clicked()
-                    {
-                        actions.push(view(ViewAction::DecisionConfirm));
-                    }
-                    if ui.button(Msg::AdminBack.text(lang)).clicked() {
-                        actions.push(view(ViewAction::DecisionBack));
-                    }
-                    if ui.button(Msg::AdminCancel.text(lang)).clicked() {
-                        actions.push(view(ViewAction::CancelDecision));
-                    }
-                });
-            }
+            });
         }
-    });
+        DecisionStage::WideConfirm => {
+            if d.any_user && matches!(d.kind, DecisionKind::Approve | DecisionKind::Register) {
+                ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminWideAnyUser.text(lang));
+            }
+            if d.path_user_continuity {
+                ui.colored_label(ui.visuals().warn_fg_color, Msg::AdminWideLoose.text(lang));
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(Msg::AdminBack.text(lang)).clicked() {
+                    actions.push(view(ViewAction::DecisionBack));
+                }
+                if ui.button(Msg::AdminCancel.text(lang)).clicked() {
+                    actions.push(view(ViewAction::CancelDecision));
+                }
+                if ui
+                    .add_enabled(free, egui::Button::new(Msg::AdminAcceptWide.text(lang)))
+                    .clicked()
+                {
+                    actions.push(view(ViewAction::DecisionNext));
+                }
+            });
+        }
+        DecisionStage::Review => {
+            ui.strong(Msg::AdminReviewTitle.text(lang));
+            for line in &d.review {
+                review_label(ui, lang, line);
+            }
+            ui.weak(Msg::AdminReviewSync.text(lang));
+            let confirm = if d.kind == DecisionKind::Register {
+                Msg::AdminRegConfirm
+            } else {
+                Msg::AdminDecisionConfirm
+            };
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(Msg::AdminBack.text(lang)).clicked() {
+                    actions.push(view(ViewAction::DecisionBack));
+                }
+                if ui.button(Msg::AdminCancel.text(lang)).clicked() {
+                    actions.push(view(ViewAction::CancelDecision));
+                }
+                if ui
+                    .add_enabled(free, egui::Button::new(confirm.text(lang)))
+                    .clicked()
+                {
+                    actions.push(view(ViewAction::DecisionConfirm));
+                }
+            });
+        }
+    }
 }

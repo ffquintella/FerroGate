@@ -365,6 +365,12 @@ pub struct DecisionView {
     pub changed_meanwhile: Option<Vec<ApprovalChange>>,
     /// The review page.
     pub review: Vec<ReviewLine>,
+    /// On the form of an approve or deny (F23): exactly what "send" would
+    /// send now — the review lines, live; empty while the form is invalid.
+    pub preview: Vec<ReviewLine>,
+    /// The form can be sent in one step: an approve or deny whose scope is
+    /// not wide. A wide one still goes through its confirmation and review.
+    pub sendable: bool,
     /// The add dialog's facts, for [`DecisionKind::Register`].
     pub register: Option<RegisterView>,
 }
@@ -835,6 +841,34 @@ impl Decision {
         }
     }
 
+    /// Where the dialog is.
+    #[must_use]
+    pub fn stage(&self) -> DecisionStage {
+        self.stage
+    }
+
+    /// An approve or deny on its form with valid choices: its review lines
+    /// can be shown live (F23 "send from the form").
+    fn previewable(&self) -> bool {
+        self.stage == DecisionStage::Form
+            && matches!(self.ctx, Ctx::Approve { .. } | Ctx::Deny { .. })
+            && self.validate().is_none()
+    }
+
+    /// "Approve and send" / "Deny and send" on the form: move on as
+    /// "Continue" would, and say whether the dialog reached the review (a
+    /// narrow scope) so the caller may confirm at once. A wide scope stops
+    /// at its confirmation; an invalid form stays with its error.
+    pub fn send_from_form(&mut self) -> bool {
+        if self.stage != DecisionStage::Form
+            || !matches!(self.ctx, Ctx::Approve { .. } | Ctx::Deny { .. })
+        {
+            return false;
+        }
+        self.next();
+        self.stage == DecisionStage::Review
+    }
+
     /// "Back": to the form.
     pub fn back(&mut self) {
         self.stage = DecisionStage::Form;
@@ -1057,6 +1091,7 @@ impl Decision {
 
     /// What the window draws at Unix time `now`.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one line per field of the view model.
     pub fn view(&self, now: i64) -> DecisionView {
         let (short, path, version, host, user, flags) = match &self.ctx {
             Ctx::Approve { request, .. } | Ctx::Deny { request } => (
@@ -1155,6 +1190,12 @@ impl Decision {
             } else {
                 Vec::new()
             },
+            preview: if self.previewable() {
+                self.review(now)
+            } else {
+                Vec::new()
+            },
+            sendable: self.previewable() && !self.is_wide(),
             register: self.register_view(),
         }
     }

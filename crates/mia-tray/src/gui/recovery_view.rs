@@ -17,6 +17,7 @@ use crate::actions::{
 use crate::client::Observation;
 use crate::i18n::{Lang, Msg};
 use crate::model::{tray_view, IconColor};
+use crate::notice::Notice;
 use crate::selftest::SelfTest;
 use crate::text::output_text;
 
@@ -32,6 +33,10 @@ struct Finished {
 pub(crate) struct RecoveryView {
     env: Option<EnvName>,
     jobs: HashMap<Action, Job<RunResult>>,
+    /// The environment each running job was started for.
+    job_envs: HashMap<Action, Option<EnvName>>,
+    /// Results not yet turned into notices: action, environment, outcome.
+    fresh: Vec<(Action, Option<EnvName>, Result<Outcome, Msg>)>,
     results: HashMap<Action, Finished>,
     copy_job: Option<Job<RunResult>>,
     copy_notice: Option<Msg>,
@@ -61,6 +66,7 @@ impl RecoveryView {
             return;
         };
         let tools = Arc::clone(&shared.tools);
+        self.job_envs.insert(action, env.clone());
         let job = Job::spawn(Some(ctx.clone()), move || {
             actions::run(&invocation(action, env.as_ref(), os), os, &tools)
         });
@@ -104,6 +110,12 @@ impl RecoveryView {
                         self.last_self_test = Some(st.clone());
                     }
                     changed |= action.privilege() == Privilege::Admin;
+                    let env = self.job_envs.remove(&action).flatten();
+                    let summary = match &result {
+                        Ok(r) => Ok(r.outcome),
+                        Err(e) => Err(e.message()),
+                    };
+                    self.fresh.push((action, env, summary));
                     self.results.insert(action, Finished { result, self_test });
                 }
                 None => {
@@ -129,6 +141,29 @@ impl RecoveryView {
             });
         }
         changed
+    }
+
+    /// The results finished since the last call, as notices for the
+    /// window's status bar (the same format as the tray's).
+    pub(crate) fn take_notices(&mut self, lang: Lang) -> Vec<Notice> {
+        let now = crate::unix_now();
+        self.fresh
+            .drain(..)
+            .map(|(action, env, summary)| {
+                let (text, ok) = match summary {
+                    Ok(outcome) => crate::notice::outcome_text(action, outcome, lang),
+                    Err(m) => (m.text(lang).to_string(), false),
+                };
+                Notice::action(
+                    action.label().text(lang),
+                    &text,
+                    Some(ok),
+                    env.as_ref().map(EnvName::as_str),
+                    lang,
+                    now,
+                )
+            })
+            .collect()
     }
 
     /// The environment selector: the default plus every validated name the

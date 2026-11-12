@@ -20,7 +20,7 @@ use crate::text::{display_safe, human_duration, MAX_FIELD_CHARS};
 pub enum IconColor {
     /// Absent / not configured.
     Grey,
-    /// Attesting (animated).
+    /// Attesting.
     Blue,
     /// Healthy.
     Green,
@@ -30,40 +30,64 @@ pub enum IconColor {
     Red,
 }
 
+/// The glyph drawn over the icon's disc, so the state never rests on
+/// colour alone (F23 §2; WCAG 1.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Glyph {
+    /// ✓ — healthy.
+    Check,
+    /// … — attesting (static: the icon never blinks).
+    Busy,
+    /// ! — degraded, or not configured.
+    Bang,
+    /// × — broken.
+    Cross,
+    /// – — not installed or not running.
+    Dash,
+}
+
+impl Glyph {
+    /// The same glyph as text, for the window's state badge.
+    #[must_use]
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Check => "✔",
+            Self::Busy => "…",
+            Self::Bang => "!",
+            Self::Cross => "✖",
+            Self::Dash => "–",
+        }
+    }
+}
+
 /// How a state looks in the tray.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Presentation {
     /// Icon colour.
     pub color: IconColor,
-    /// The "!" badge (`NotConfigured`).
-    pub badge: bool,
-    /// Pulsing icon (`Attesting`).
-    pub animated: bool,
+    /// The glyph over it.
+    pub glyph: Glyph,
 }
 
 /// The icon for `state`.
 #[must_use]
 pub fn presentation(state: AgentState) -> Presentation {
-    let (color, badge, animated) = match state {
-        AgentState::NotInstalled | AgentState::NotRunning => (IconColor::Grey, false, false),
-        AgentState::NotConfigured => (IconColor::Grey, true, false),
-        AgentState::Attesting => (IconColor::Blue, false, true),
+    let (color, glyph) = match state {
+        AgentState::NotInstalled | AgentState::NotRunning => (IconColor::Grey, Glyph::Dash),
+        AgentState::NotConfigured => (IconColor::Grey, Glyph::Bang),
+        AgentState::Attesting => (IconColor::Blue, Glyph::Busy),
         AgentState::CmisUnreachable
         | AgentState::CrlStale
         | AgentState::AllowlistMissing
         | AgentState::AllowlistInvalid
-        | AgentState::SvidExpiring => (IconColor::Yellow, false, false),
+        | AgentState::SvidExpiring => (IconColor::Yellow, Glyph::Bang),
         AgentState::NotEnrolled
         | AgentState::PinMismatch
         | AgentState::TpmUnavailable
-        | AgentState::ImaDisabled => (IconColor::Red, false, false),
-        AgentState::Healthy => (IconColor::Green, false, false),
+        | AgentState::ImaDisabled => (IconColor::Red, Glyph::Cross),
+        AgentState::Healthy => (IconColor::Green, Glyph::Check),
     };
-    Presentation {
-        color,
-        badge,
-        animated,
-    }
+    Presentation { color, glyph }
 }
 
 /// The state's short title.
@@ -493,8 +517,9 @@ pub fn tray_view(obs: &Observation, now: i64, lang: Lang) -> TrayView {
 
 // ── Menu model ───────────────────────────────────────────────────────────────
 
-/// Which window a menu entry opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Which window a menu entry opens (the main window, at a tab).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum WindowKind {
     /// Status overview.
     Status,
@@ -588,49 +613,33 @@ pub fn recovery_command(r: Recovery, env: Option<EnvName>) -> MenuCommand {
     }
 }
 
-/// The tray menu for `view`. `last_action` is a status line for the most
-/// recent action (already localised). `admin_client` is whether the
-/// administrator client was found beside the tray and passed the trust rule
-/// ([`crate::locate::locate_admin_client`]); only then is "Admin client…"
-/// offered.
+/// The tray menu for `view` (F23 §3): the summary, the latest notice,
+/// the worst environment's recoveries (the primary commands), "Open
+/// FerroGate…", the environments only when there are several, "Review
+/// approvals…" only when `admin_client` (the administrator client was found
+/// beside the tray and passed the trust rule,
+/// [`crate::locate::locate_admin_client`]), then Setup and Quit.
+/// Inapplicable entries are left out, never shown disabled.
 #[must_use]
 pub fn menu_model(
     view: &TrayView,
     lang: Lang,
-    last_action: Option<&str>,
+    notice_line: Option<&str>,
     admin_client: bool,
 ) -> Vec<MenuNode> {
     let t = |m: Msg| m.text(lang).to_string();
-    let mut menu = vec![MenuNode::Label(view.headline.clone()), MenuNode::Separator];
-    for env in &view.envs {
-        let mut children: Vec<MenuNode> =
-            env.details.iter().cloned().map(MenuNode::Label).collect();
-        if !env.recoveries.is_empty() {
-            children.push(MenuNode::Separator);
-            for r in &env.recoveries {
-                children.push(MenuNode::Item(
-                    r.label(lang),
-                    recovery_command(*r, env.env.clone()),
-                ));
-            }
-        }
-        if let Some(r) = env.default_choice {
-            children.push(MenuNode::Separator);
-            children.push(MenuNode::Item(
-                r.label(lang),
-                recovery_command(r, env.env.clone()),
-            ));
-        }
-        menu.push(MenuNode::Submenu(env.headline.clone(), children));
+    let mut menu = vec![MenuNode::Label(view.headline.clone())];
+    if let Some(line) = notice_line {
+        menu.push(MenuNode::Label(line.to_string()));
     }
-    // Recovery for the worst environment directly in the top menu.
+    menu.push(MenuNode::Separator);
+    // The primary commands: the worst environment's recoveries.
     if let Some(env) = view
         .envs
         .iter()
         .filter(|e| e.state == view.worst)
         .find(|e| !e.recoveries.is_empty())
     {
-        menu.push(MenuNode::Separator);
         for r in &env.recoveries {
             let label = if view.envs.len() > 1 {
                 fill(
@@ -642,38 +651,115 @@ pub fn menu_model(
             };
             menu.push(MenuNode::Item(label, recovery_command(*r, env.env.clone())));
         }
+        menu.push(MenuNode::Separator);
     }
-    menu.push(MenuNode::Separator);
     menu.push(MenuNode::Item(
-        t(Msg::MenuOpenStatus),
+        t(Msg::MenuOpenMain),
         MenuCommand::Open(WindowKind::Status),
     ));
+    if view.envs.len() > 1 {
+        let envs = view.envs.iter().map(|env| env_node(env, lang)).collect();
+        menu.push(MenuNode::Submenu(t(Msg::MenuEnvironments), envs));
+    }
+    if admin_client {
+        menu.push(MenuNode::Item(
+            t(Msg::MenuReviewApprovals),
+            MenuCommand::OpenAdminClient,
+        ));
+    }
+    menu.push(MenuNode::Separator);
     menu.push(MenuNode::Item(
         t(Msg::MenuSetup),
         MenuCommand::Open(WindowKind::Setup),
     ));
-    menu.push(MenuNode::Item(
-        t(Msg::MenuLogs),
-        MenuCommand::Open(WindowKind::Logs),
-    ));
-    menu.push(MenuNode::Item(
-        t(Msg::MenuRunSelfTest),
-        MenuCommand::Open(WindowKind::SelfTest),
-    ));
-    if admin_client {
-        menu.push(MenuNode::Separator);
-        menu.push(MenuNode::Item(
-            t(Msg::MenuAdminClient),
-            MenuCommand::OpenAdminClient,
-        ));
-    }
-    if let Some(line) = last_action {
-        menu.push(MenuNode::Separator);
-        menu.push(MenuNode::Label(line.to_string()));
-    }
-    menu.push(MenuNode::Separator);
     menu.push(MenuNode::Item(t(Msg::MenuQuit), MenuCommand::Quit));
     menu
+}
+
+/// One environment in the "Environments" submenu: a submenu of its
+/// actions, or a plain line when it has none.
+fn env_node(env: &EnvView, lang: Lang) -> MenuNode {
+    let mut actions: Vec<MenuNode> = env
+        .recoveries
+        .iter()
+        .map(|r| MenuNode::Item(r.label(lang), recovery_command(*r, env.env.clone())))
+        .collect();
+    if let Some(r) = env.default_choice {
+        if !actions.is_empty() {
+            actions.push(MenuNode::Separator);
+        }
+        actions.push(MenuNode::Item(
+            r.label(lang),
+            recovery_command(r, env.env.clone()),
+        ));
+    }
+    if actions.is_empty() {
+        MenuNode::Label(env.headline.clone())
+    } else {
+        MenuNode::Submenu(env.headline.clone(), actions)
+    }
+}
+
+// ── Dispatch planning ────────────────────────────────────────────────────────
+
+/// What the tray does for a menu command or a notification click, decided
+/// without I/O so it is unit-tested; `gui::tray` carries it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayEffect {
+    /// Leave the loop.
+    Quit,
+    /// Show the main window at this tab (reusing an open one).
+    ShowWindow(WindowKind),
+    /// Start or raise the administrator client.
+    OpenAdminClient,
+    /// Run a fixed action for an environment; `copy_ids` copies the parsed
+    /// machine identifiers afterwards.
+    RunAction {
+        /// The action.
+        action: Action,
+        /// Its environment.
+        env: Option<EnvName>,
+        /// Copy the machine identifiers when it succeeds.
+        copy_ids: bool,
+    },
+    /// Open a document from the fixed table.
+    OpenDoc(Doc),
+}
+
+/// The effect of a menu command.
+#[must_use]
+pub fn plan(cmd: &MenuCommand) -> TrayEffect {
+    match cmd {
+        MenuCommand::Quit => TrayEffect::Quit,
+        MenuCommand::Open(kind) => TrayEffect::ShowWindow(*kind),
+        MenuCommand::OpenAdminClient => TrayEffect::OpenAdminClient,
+        MenuCommand::Recover(Recovery::Run(action), env) => TrayEffect::RunAction {
+            action: *action,
+            env: env.clone(),
+            copy_ids: false,
+        },
+        MenuCommand::Recover(Recovery::CopyMachineIds, _) => TrayEffect::RunAction {
+            action: Action::ShowMachineId,
+            env: None,
+            copy_ids: true,
+        },
+        MenuCommand::Recover(Recovery::Read(doc), _) => TrayEffect::OpenDoc(*doc),
+        // `recovery_command` already maps these to windows; kept total.
+        MenuCommand::Recover(Recovery::OpenWizard(step), _) => TrayEffect::ShowWindow(match step {
+            WizardStep::Cmis => WindowKind::Setup,
+            WizardStep::Pins => WindowKind::SetupPins,
+            WizardStep::Attestation => WindowKind::SetupAttestation,
+        }),
+    }
+}
+
+/// The effect of activating a notification that leads to `target`.
+#[must_use]
+pub fn plan_target(target: crate::notice::Target) -> TrayEffect {
+    match target {
+        crate::notice::Target::Window(kind) => TrayEffect::ShowWindow(kind),
+        crate::notice::Target::Approvals => TrayEffect::OpenAdminClient,
+    }
 }
 
 #[cfg(test)]
@@ -695,50 +781,51 @@ mod tests {
     /// `AgentState`.
     #[test]
     fn every_agent_state_maps_to_the_documented_icon_and_recoveries() {
+        use Glyph::{Bang, Busy, Check, Cross, Dash};
         use IconColor::{Blue, Green, Grey, Red, Yellow};
         use Recovery::{CopyMachineIds, OpenWizard, Read, Run};
-        let table: [(AgentState, IconColor, bool, Vec<Recovery>); 14] = [
+        let table: [(AgentState, IconColor, Glyph, Vec<Recovery>); 14] = [
             (
                 AgentState::NotInstalled,
                 Grey,
-                false,
+                Dash,
                 vec![Read(Doc::Install)],
             ),
             (
                 AgentState::NotRunning,
                 Grey,
-                false,
+                Dash,
                 vec![Run(Action::ServiceStart), Read(Doc::Install)],
             ),
             (
                 AgentState::NotConfigured,
                 Grey,
-                true,
+                Bang,
                 vec![OpenWizard(WizardStep::Cmis)],
             ),
-            (AgentState::Attesting, Blue, false, vec![]),
+            (AgentState::Attesting, Blue, Busy, vec![]),
             (
                 AgentState::CmisUnreachable,
                 Yellow,
-                false,
+                Bang,
                 vec![Run(Action::RunSelfTest), Read(Doc::Networking)],
             ),
             (
                 AgentState::NotEnrolled,
                 Red,
-                false,
+                Cross,
                 vec![CopyMachineIds, Read(Doc::Enrollment)],
             ),
             (
                 AgentState::PinMismatch,
                 Red,
-                false,
+                Cross,
                 vec![OpenWizard(WizardStep::Pins), Read(Doc::Pins)],
             ),
             (
                 AgentState::TpmUnavailable,
                 Red,
-                false,
+                Cross,
                 vec![
                     Run(Action::RunSelfTest),
                     OpenWizard(WizardStep::Attestation),
@@ -748,41 +835,40 @@ mod tests {
             (
                 AgentState::ImaDisabled,
                 Red,
-                false,
+                Cross,
                 vec![Read(Doc::Hardening)],
             ),
             (
                 AgentState::CrlStale,
                 Yellow,
-                false,
+                Bang,
                 vec![Run(Action::RunSelfTest), Read(Doc::CrlStale)],
             ),
             (
                 AgentState::AllowlistMissing,
                 Yellow,
-                false,
+                Bang,
                 vec![Run(Action::ResyncAllowlist), Read(Doc::Allowlist)],
             ),
             (
                 AgentState::AllowlistInvalid,
                 Yellow,
-                false,
+                Bang,
                 vec![Run(Action::ResyncAllowlist), Read(Doc::Allowlist)],
             ),
             (
                 AgentState::SvidExpiring,
                 Yellow,
-                false,
+                Bang,
                 vec![Run(Action::RunSelfTest), Run(Action::ServiceRestart)],
             ),
-            (AgentState::Healthy, Green, false, vec![]),
+            (AgentState::Healthy, Green, Check, vec![]),
         ];
         assert_eq!(table.len(), AgentState::ALL.len());
-        for (state, color, badge, recs) in table {
+        for (state, color, glyph, recs) in table {
             let p = presentation(state);
             assert_eq!(p.color, color, "{state:?}");
-            assert_eq!(p.badge, badge, "{state:?}");
-            assert_eq!(p.animated, state == AgentState::Attesting);
+            assert_eq!(p.glyph, glyph, "{state:?}");
             assert_eq!(recoveries(&snap(state, None, None)), recs, "{state:?}");
             assert_ne!(title(state).text(Lang::Pt), "", "{state:?}");
         }
@@ -825,13 +911,22 @@ mod tests {
         assert_eq!(v.presentation.color, IconColor::Yellow);
         assert!(v.headline.contains("(prod)"));
         let menu = menu_model(&v, Lang::En, Some("Last action: x — done"), false);
-        // One submenu per environment, and the worst one's recoveries on top
-        // with the environment passed along.
+        // One "Environments" submenu holding the three, and the worst one's
+        // recoveries on top with the environment passed along.
+        let subs: Vec<&MenuNode> = menu
+            .iter()
+            .filter(|n| matches!(n, MenuNode::Submenu(..)))
+            .collect();
+        assert!(
+            matches!(subs.as_slice(), [MenuNode::Submenu(t, kids)] if t == "Environments" && kids.len() == 3)
+        );
+        // The primary command comes right after the summary lines.
         assert_eq!(
-            menu.iter()
-                .filter(|n| matches!(n, MenuNode::Submenu(..)))
-                .count(),
-            3
+            menu[3],
+            MenuNode::Item(
+                "Run self-test (prod)".into(),
+                MenuCommand::Open(WindowKind::SelfTest)
+            )
         );
         assert!(menu.contains(&MenuNode::Item(
             "Run self-test (prod)".into(),
@@ -946,8 +1041,15 @@ mod tests {
         // In the menu: inside each environment's submenu, with the name passed
         // along; never among the top-level (worst-state) recoveries.
         let menu = menu_model(&v, Lang::En, None, false);
+        let envs = menu
+            .iter()
+            .find_map(|n| match n {
+                MenuNode::Submenu(h, kids) if h == "Environments" => Some(kids.clone()),
+                _ => None,
+            })
+            .unwrap();
         let submenu = |label: &str| {
-            menu.iter()
+            envs.iter()
                 .find_map(|n| match n {
                     MenuNode::Submenu(h, kids) if h.starts_with(label) => Some(kids.clone()),
                     _ => None,
@@ -962,9 +1064,8 @@ mod tests {
             "Use mia.toml as default".into(),
             MenuCommand::Recover(Recovery::Run(Action::ClearDefaultEnvironment), None)
         )));
-        assert!(!submenu("prod")
-            .iter()
-            .any(|n| matches!(n, MenuNode::Item(..))));
+        // The holder has no action at all: a plain line, not a submenu.
+        assert!(envs.contains(&MenuNode::Label("prod [default address]: Healthy".into())));
         assert!(!menu.iter().any(|n| matches!(
             n,
             MenuNode::Item(_, MenuCommand::Recover(Recovery::Run(a), _))
@@ -1012,7 +1113,7 @@ mod tests {
         for lang in [Lang::En, Lang::Pt] {
             let v = tray_view(&obs, 100, lang);
             let item = MenuNode::Item(
-                Msg::MenuAdminClient.text(lang).to_string(),
+                Msg::MenuReviewApprovals.text(lang).to_string(),
                 MenuCommand::OpenAdminClient,
             );
             let without = menu_model(&v, lang, None, false);
@@ -1022,17 +1123,143 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n, MenuNode::Item(_, MenuCommand::OpenAdminClient))));
             assert!(with.contains(&item));
-            // The item and its separator are the only difference, and Quit
-            // stays last.
-            assert_eq!(with.len(), without.len() + 2);
+            // The item is the only difference, and Quit stays last.
+            assert_eq!(with.len(), without.len() + 1);
             assert!(matches!(
                 with.last(),
                 Some(MenuNode::Item(_, MenuCommand::Quit))
             ));
         }
         assert_ne!(
-            Msg::MenuAdminClient.text(Lang::En),
-            Msg::MenuAdminClient.text(Lang::Pt)
+            Msg::MenuReviewApprovals.text(Lang::En),
+            Msg::MenuReviewApprovals.text(Lang::Pt)
         );
+    }
+
+    /// A healthy single-environment menu is short: summary, the default
+    /// action, Setup, Quit — no detail lines, Logs or self-test.
+    #[test]
+    fn a_healthy_menu_has_only_what_applies() {
+        let obs = Observation {
+            snapshots: vec![snap(AgentState::Healthy, None, None)],
+            source: Source::Endpoint,
+        };
+        for lang in Lang::ALL {
+            let v = tray_view(&obs, 100, lang);
+            let menu = menu_model(&v, lang, None, false);
+            assert_eq!(
+                menu,
+                vec![
+                    MenuNode::Label(v.headline.clone()),
+                    MenuNode::Separator,
+                    MenuNode::Item(
+                        Msg::MenuOpenMain.text(lang).into(),
+                        MenuCommand::Open(WindowKind::Status)
+                    ),
+                    MenuNode::Separator,
+                    MenuNode::Item(
+                        Msg::MenuSetup.text(lang).into(),
+                        MenuCommand::Open(WindowKind::Setup)
+                    ),
+                    MenuNode::Item(Msg::MenuQuit.text(lang).into(), MenuCommand::Quit),
+                ],
+                "{lang:?}"
+            );
+        }
+    }
+
+    /// A stopped agent puts the fix first, before "Open FerroGate…".
+    #[test]
+    fn the_fix_is_the_first_command() {
+        let obs = Observation {
+            snapshots: vec![snap(AgentState::NotRunning, None, Some("not_running"))],
+            source: Source::Synthesised,
+        };
+        let v = tray_view(&obs, 100, Lang::En);
+        let menu = menu_model(&v, Lang::En, Some("Start — running…"), false);
+        let first_item = menu
+            .iter()
+            .find(|n| matches!(n, MenuNode::Item(..)))
+            .unwrap();
+        assert_eq!(
+            first_item,
+            &MenuNode::Item(
+                Action::ServiceStart.label().text(Lang::En).into(),
+                MenuCommand::Recover(Recovery::Run(Action::ServiceStart), None)
+            )
+        );
+        assert_eq!(menu[1], MenuNode::Label("Start — running…".into()));
+    }
+
+    #[test]
+    fn every_menu_command_plans_one_effect() {
+        let prod = Some(EnvName::parse("prod").unwrap());
+        assert_eq!(plan(&MenuCommand::Quit), TrayEffect::Quit);
+        assert_eq!(
+            plan(&MenuCommand::Open(WindowKind::Logs)),
+            TrayEffect::ShowWindow(WindowKind::Logs)
+        );
+        assert_eq!(
+            plan(&MenuCommand::OpenAdminClient),
+            TrayEffect::OpenAdminClient
+        );
+        assert_eq!(
+            plan(&MenuCommand::Recover(
+                Recovery::Run(Action::ServiceRestart),
+                prod.clone()
+            )),
+            TrayEffect::RunAction {
+                action: Action::ServiceRestart,
+                env: prod.clone(),
+                copy_ids: false
+            }
+        );
+        // Copying the identifiers never takes an environment.
+        assert_eq!(
+            plan(&MenuCommand::Recover(
+                Recovery::CopyMachineIds,
+                prod.clone()
+            )),
+            TrayEffect::RunAction {
+                action: Action::ShowMachineId,
+                env: None,
+                copy_ids: true
+            }
+        );
+        assert_eq!(
+            plan(&MenuCommand::Recover(Recovery::Read(Doc::Pins), prod)),
+            TrayEffect::OpenDoc(Doc::Pins)
+        );
+        for (step, kind) in [
+            (WizardStep::Cmis, WindowKind::Setup),
+            (WizardStep::Pins, WindowKind::SetupPins),
+            (WizardStep::Attestation, WindowKind::SetupAttestation),
+        ] {
+            assert_eq!(
+                plan(&MenuCommand::Recover(Recovery::OpenWizard(step), None)),
+                TrayEffect::ShowWindow(kind)
+            );
+            // …and the menu itself already opens the window directly.
+            assert_eq!(
+                recovery_command(Recovery::OpenWizard(step), None),
+                MenuCommand::Open(kind)
+            );
+        }
+        assert_eq!(
+            plan_target(crate::notice::Target::Approvals),
+            TrayEffect::OpenAdminClient
+        );
+        assert_eq!(
+            plan_target(crate::notice::Target::Window(WindowKind::Status)),
+            TrayEffect::ShowWindow(WindowKind::Status)
+        );
+    }
+
+    #[test]
+    fn window_kinds_serialise_as_their_argument() {
+        for k in WindowKind::ALL {
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(json, format!("\"{}\"", k.as_arg()));
+        }
     }
 }

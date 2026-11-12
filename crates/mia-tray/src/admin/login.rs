@@ -1,7 +1,8 @@
 //! The login model (F22 §3): what the administrator has typed and how it is
-//! wiped. Two stages: the user name (sent alone in `BeginLogin`, which says
-//! which second factors the account may use here), then the password with a
-//! TOTP code or a security key, as offered.
+//! wiped. One screen (F23): the user name is always shown; once `BeginLogin`
+//! answered for exactly that name, the password and the TOTP code or the
+//! security key it offers appear below it. Editing the name drops the
+//! answer and whatever secret was typed for it.
 
 //! The window never gives a secret to a text widget: it hands keystrokes to
 //! [`LoginModel::type_text`] / [`LoginModel::backspace`] and draws only the
@@ -81,7 +82,9 @@ pub struct LoginView {
     pub stage: Stage,
     /// Why the last submit was refused.
     pub error: Option<LoginError>,
-    /// Whether "Continue" (the user name stage) can be pressed.
+    /// Whether leaving the user name (`Tab`, `Enter`) would ask the server
+    /// which factors it may use: a name is typed and no answer is shown
+    /// for it.
     pub can_continue: bool,
     /// Whether the form can be submitted with the code.
     pub can_submit_code: bool,
@@ -140,13 +143,52 @@ impl LoginModel {
         }
     }
 
-    /// The fields this stage shows, in `Tab` order.
+    /// The fields shown, in `Tab` order: the user name always, then what
+    /// the server's answer for it calls for (never a guess before it).
     #[must_use]
     pub fn fields(&self) -> Vec<Field> {
         match self.stage {
             Stage::Username => vec![Field::Username],
-            Stage::Secrets(m) if m.totp => vec![Field::Password, Field::Code],
-            Stage::Secrets(_) => vec![Field::Password],
+            Stage::Secrets(m) if m.totp => vec![Field::Username, Field::Password, Field::Code],
+            Stage::Secrets(_) => vec![Field::Username, Field::Password],
+        }
+    }
+
+    /// The focused field.
+    #[must_use]
+    pub fn focused(&self) -> Field {
+        self.focus
+    }
+
+    /// The field after the focused one, `None` on the last.
+    #[must_use]
+    pub fn next_field(&self) -> Option<Field> {
+        let fields = self.fields();
+        let at = fields.iter().position(|f| *f == self.focus)?;
+        fields.get(at + 1).copied()
+    }
+
+    /// The user name as it would be sent (trimmed).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.username.trim()
+    }
+
+    /// The user name to ask the server about: typed, and no answer shown
+    /// for it yet.
+    #[must_use]
+    pub fn name_to_offer(&self) -> Option<String> {
+        let name = self.username.trim();
+        (self.stage == Stage::Username && !name.is_empty()).then(|| name.to_string())
+    }
+
+    /// The name changed: the answer for the old one goes, with the secrets
+    /// typed for it (their fields are hidden until the server answers).
+    fn forget_offer(&mut self) {
+        if matches!(self.stage, Stage::Secrets(_)) {
+            self.password.clear();
+            self.code.clear();
+            self.stage = Stage::Username;
         }
     }
 
@@ -162,30 +204,54 @@ impl LoginModel {
     /// Type or paste `text` into the focused field; characters the field
     /// refuses (controls, anything past its capacity) are dropped. Takes a
     /// borrow so the window never has to copy what the toolkit delivered.
-    pub fn type_text(&mut self, text: &str) {
+    /// `true` when the user name changed (its answer is then dropped).
+    pub fn type_text(&mut self, text: &str) -> bool {
         self.error = None;
         match self.focus {
             Field::Username => {
+                let before = self.username.len();
                 for c in text.chars() {
                     if !c.is_control() && self.username.len() + c.len_utf8() <= MAX_USERNAME {
                         self.username.push(c);
                     }
                 }
+                let changed = self.username.len() != before;
+                if changed {
+                    self.forget_offer();
+                }
+                changed
             }
-            Field::Password => self.password.push_str(text),
-            Field::Code => self.code.push_str(text),
+            Field::Password => {
+                self.password.push_str(text);
+                false
+            }
+            Field::Code => {
+                self.code.push_str(text);
+                false
+            }
         }
     }
 
-    /// Delete the last character of the focused field.
-    pub fn backspace(&mut self) {
+    /// Delete the last character of the focused field; `true` when the
+    /// user name changed.
+    pub fn backspace(&mut self) -> bool {
         self.error = None;
         match self.focus {
             Field::Username => {
-                self.username.pop();
+                let changed = self.username.pop().is_some();
+                if changed {
+                    self.forget_offer();
+                }
+                changed
             }
-            Field::Password => self.password.pop(),
-            Field::Code => self.code.pop(),
+            Field::Password => {
+                self.password.pop();
+                false
+            }
+            Field::Code => {
+                self.code.pop();
+                false
+            }
         }
     }
 
@@ -206,7 +272,8 @@ impl LoginModel {
         *self = Self::new();
     }
 
-    /// "Continue": the user name to ask the server about.
+    /// The user name to ask the server about (recording why not when none
+    /// is typed).
     ///
     /// # Errors
     /// [`LoginError::MissingUsername`].
@@ -219,17 +286,26 @@ impl LoginModel {
         Ok(name.to_string())
     }
 
-    /// The server offered `methods` for `username`: show the secrets stage
-    /// (ignored when the form now holds another user name).
-    pub fn offered(&mut self, username: &str, methods: Methods) {
-        if self.username.trim() == username {
-            // In place: the buffer keeps its capacity, no stray copy.
-            self.username.clear();
-            self.username.push_str(username);
-            self.stage = Stage::Secrets(methods);
-            self.focus = Field::Password;
-            self.error = None;
+    /// The server offered `methods` for `username`: show its fields below
+    /// the name; `false` (nothing changes) when the form now holds another
+    /// name — a stale answer. A repeated answer for the shown name keeps
+    /// what was typed (a code only while a code is still offered).
+    pub fn offered(&mut self, username: &str, methods: Methods) -> bool {
+        if self.username.trim() != username {
+            return false;
         }
+        // In place: the buffer keeps its capacity, no stray copy.
+        self.username.clear();
+        self.username.push_str(username);
+        if !methods.totp {
+            self.code.clear();
+        }
+        if self.stage == Stage::Username || (self.focus == Field::Code && !methods.totp) {
+            self.focus = Field::Password;
+        }
+        self.stage = Stage::Secrets(methods);
+        self.error = None;
+        true
     }
 
     /// "Change user": back to the user name, the secrets wiped.
@@ -262,6 +338,24 @@ impl LoginModel {
         Ok(())
     }
 
+    /// Whether `how` can be submitted now; records why not (generic).
+    ///
+    /// # Errors
+    /// [`LoginError`] when the form is incomplete.
+    pub fn ready(&mut self, how: Submission) -> Result<(), LoginError> {
+        let r = self.check(how);
+        if let Err(e) = r {
+            self.error = Some(e);
+        }
+        r
+    }
+
+    /// Whether `how` could be submitted now (records nothing).
+    #[must_use]
+    pub fn complete(&self, how: Submission) -> bool {
+        self.check(how).is_ok()
+    }
+
     /// Submit: move the credentials out and leave the form empty (the user
     /// name included — the server's answer decides what is shown next). A
     /// key submission wipes any typed code.
@@ -287,7 +381,7 @@ impl LoginModel {
     pub fn retry(&mut self, username: &str, methods: Methods) {
         self.wipe();
         self.username.push_str(username);
-        self.offered(username, methods);
+        let _ = self.offered(username, methods);
     }
 
     /// What the window draws.
@@ -363,9 +457,9 @@ mod tests {
         typed(&mut m, Field::Username, "  alice ");
         assert!(m.view().can_continue);
         assert_eq!(m.continue_with().unwrap(), "alice");
-        m.offered("bob", BOTH);
+        assert!(!m.offered("bob", BOTH));
         assert_eq!(m.view().stage, Stage::Username, "an offer for another name");
-        m.offered("alice", BOTH);
+        assert!(m.offered("alice", BOTH));
         let v = m.view();
         assert_eq!((v.stage, v.focus), (Stage::Secrets(BOTH), Field::Password));
         assert_eq!(v.username, "alice");
@@ -399,7 +493,11 @@ mod tests {
     #[test]
     fn under_the_fido2_policy_only_the_key_is_offered() {
         let mut m = at_secrets(KEY_ONLY);
-        assert_eq!(m.fields(), vec![Field::Password], "no code field");
+        assert_eq!(
+            m.fields(),
+            vec![Field::Username, Field::Password],
+            "no code field"
+        );
         typed(&mut m, Field::Password, PASSWORD);
         let v = m.view();
         assert!(!v.can_submit_code && v.can_submit_key);
@@ -477,16 +575,60 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_the_fields_of_the_stage() {
+    fn tab_cycles_the_fields_shown() {
         let mut m = at_secrets(BOTH);
         m.tab(false);
         assert_eq!(m.view().focus, Field::Code);
+        assert_eq!(m.next_field(), None, "the code is last");
+        m.tab(false);
+        assert_eq!(m.view().focus, Field::Username, "the name stays on screen");
         m.tab(false);
         assert_eq!(m.view().focus, Field::Password);
         m.tab(true);
-        assert_eq!(m.view().focus, Field::Code);
+        assert_eq!(m.view().focus, Field::Username);
         let mut k = at_secrets(KEY_ONLY);
         k.tab(false);
-        assert_eq!(k.view().focus, Field::Password);
+        assert_eq!(k.view().focus, Field::Username);
+        k.tab(false);
+        assert_eq!(k.next_field(), None, "the password is last");
+    }
+
+    /// One screen: editing the name drops its answer and the secrets typed
+    /// for it, so no field outlives the name it was offered for.
+    #[test]
+    fn editing_the_name_drops_its_answer_and_secrets() {
+        let mut m = filled();
+        m.focus(Field::Username);
+        assert!(m.type_text("x"));
+        let v = m.view();
+        assert_eq!((v.stage, v.username.as_str()), (Stage::Username, "alicex"));
+        assert_eq!((v.password_len, v.code_len), (0, 0));
+        assert_eq!(m.fields(), vec![Field::Username]);
+        assert_eq!(m.name_to_offer().as_deref(), Some("alicex"));
+        // Back to the old name: still no answer shown until it is asked.
+        assert!(m.backspace());
+        assert_eq!(m.view().stage, Stage::Username);
+        // Typing in a secret never touches the name.
+        let mut m = filled();
+        assert!(!m.type_text("more"));
+        assert_eq!(m.view().stage, Stage::Secrets(BOTH));
+        // Controls only: nothing changed, nothing dropped.
+        m.focus(Field::Username);
+        assert!(!m.type_text("\n"));
+        assert_eq!(m.view().stage, Stage::Secrets(BOTH));
+    }
+
+    #[test]
+    fn a_repeated_answer_keeps_what_was_typed() {
+        let mut m = filled();
+        assert!(m.offered("alice", BOTH));
+        let v = m.view();
+        assert_eq!((v.password_len, v.code_len), (PASSWORD.chars().count(), 6));
+        // The code is no longer offered: it goes, the password stays.
+        m.focus(Field::Code);
+        assert!(m.offered("alice", KEY_ONLY));
+        let v = m.view();
+        assert_eq!((v.code_len, v.focus), (0, Field::Password));
+        assert_eq!(v.password_len, PASSWORD.chars().count());
     }
 }

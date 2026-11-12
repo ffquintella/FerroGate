@@ -8,6 +8,7 @@ Name=FerroGate MIA
 Name[pt_BR]=FerroGate MIA
 Comment=Status of this machine's FerroGate identity agent
 Comment[pt_BR]=Status do agente de identidade FerroGate desta máquina
+Comment[es]=Estado del agente de identidad FerroGate de esta máquina
 TryExec=/usr/bin/mia-tray
 Exec=systemctl --user start mia-tray.service
 Icon=ferrogate-mia

@@ -1,5 +1,7 @@
-//! The admin window's state machine (F22 §3), headless: sign-in (user name,
-//! then password with a TOTP code or a security key), token enrollment, the
+//! The admin window's state machine (F22 §3), headless: sign-in on one
+//! screen (F23: leaving the user name asks `BeginLogin` which factors it may
+//! use, then the password with a TOTP code or a security key appear below;
+//! the F20 calls and their order are unchanged), token enrollment, the
 //! signed-in summary, second-factor management, the request and approval
 //! views (a decision that asks for a step-up is sent once more after it),
 //! the step-up prompt (which also takes the fresh second factor every
@@ -12,6 +14,8 @@
 //! server string in a view is escaped first (`crate::text::display_safe`).
 
 use std::time::{Duration, Instant};
+
+use zeroize::Zeroizing;
 
 use ferrogate_admin_client::approvals::register::{
     AdminRegisterApplicationRequest, AdminRegisterApplicationResponse,
@@ -40,6 +44,11 @@ pub const IDLE_MARGIN: Duration = Duration::from_secs(30);
 pub const SERVER_IDLE_BOUNDS: (i64, i64) = (60, 15 * 60);
 /// Longest display name or group name shown, in characters.
 pub const MAX_SHOWN: usize = 64;
+/// How long a `BeginLogin` answer is trusted (F20: a login nonce lives
+/// 2 min). An older one is asked again before a submit. The nonce itself
+/// never reaches the window: the worker's sign-in takes a fresh one right
+/// before `Login`.
+pub const OFFER_TTL: Duration = Duration::from_mins(2);
 
 /// Something the window must do.
 pub enum Effect {
@@ -254,6 +263,15 @@ pub struct Flow {
     after_step_up: Option<AfterStepUp>,
     /// The methods last offered for the form's user name.
     offered: Methods,
+    /// When they were offered (`None`: no answer for the name shown).
+    offer_at: Option<Instant>,
+    /// The name of the `BeginLogin` in flight.
+    asking: Option<Zeroizing<String>>,
+    /// The name was left or Enter pressed for another name while a
+    /// `BeginLogin` was in flight: ask again when it lands.
+    want_offer: bool,
+    /// A submit waiting for a fresh answer (the old one was too old).
+    queued_submit: Option<Submission>,
     last_activity: Instant,
     idle_limit: Duration,
     /// Commands sent and replies received: the worker answers each command
@@ -321,6 +339,10 @@ impl Flow {
             adding: None,
             after_step_up: None,
             offered: Methods::default(),
+            offer_at: None,
+            asking: None,
+            want_offer: false,
+            queued_submit: None,
             last_activity: now,
             idle_limit: DEFAULT_IDLE.saturating_sub(IDLE_MARGIN),
             sent: 0,
@@ -355,8 +377,30 @@ impl Flow {
         self.last_activity = now;
     }
 
+    /// Whether the sign-in form takes input now: signed out, no wizard,
+    /// and nothing in flight but a `BeginLogin` (the name may still be
+    /// edited while it runs; its answer is then stale and dropped).
+    fn login_open(&self) -> bool {
+        self.session.is_none()
+            && self.enroll.is_none()
+            && self.step_up.is_none()
+            && matches!(self.busy, None | Some(Busy::Offer))
+    }
+
+    /// The user name changed: its answer, its age and a waiting submit go.
+    fn name_edited(&mut self) {
+        self.offer_at = None;
+        self.queued_submit = None;
+    }
+
     /// Typed or pasted text, for the focused field (or the step-up code).
     pub fn type_text(&mut self, text: &str) {
+        if self.login_open() {
+            if self.login.type_text(text) {
+                self.name_edited();
+            }
+            return;
+        }
         if self.busy.is_some() {
             return;
         }
@@ -371,13 +415,17 @@ impl Flow {
             }
         } else if let Some(w) = &mut self.enroll {
             w.type_text(text);
-        } else {
-            self.login.type_text(text);
         }
     }
 
     /// `Backspace`.
     pub fn backspace(&mut self) {
+        if self.login_open() {
+            if self.login.backspace() {
+                self.name_edited();
+            }
+            return;
+        }
         if self.busy.is_some() {
             return;
         }
@@ -392,15 +440,13 @@ impl Flow {
             }
         } else if let Some(w) = &mut self.enroll {
             w.backspace();
-        } else {
-            self.login.backspace();
         }
     }
 
-    /// `Tab` / `Shift-Tab`.
-    pub fn tab(&mut self, back: bool) {
+    /// `Tab` / `Shift-Tab`; leaving the user name asks the server about it.
+    pub fn tab(&mut self, back: bool) -> Vec<Effect> {
         if self.step_up.is_some() {
-            return;
+            return Vec::new();
         }
         if self.session.is_some() {
             if let Some(p) = &mut self.factors {
@@ -411,8 +457,13 @@ impl Flow {
         } else if let Some(w) = &mut self.enroll {
             w.tab(back);
         } else {
+            let leaving = self.login.focused() == Field::Username;
             self.login.tab(back);
+            if leaving {
+                return self.continue_with();
+            }
         }
+        Vec::new()
     }
 
     /// A click on a field.
@@ -488,33 +539,72 @@ impl Flow {
                 EnrollStage::Details => self.enroll_finish(),
             };
         }
-        match self.login.view().stage {
-            Stage::Username => self.continue_with(),
-            Stage::Secrets(m) if m.totp => self.submit(Submission::Code),
-            Stage::Secrets(_) => self.submit(Submission::SecurityKey),
+        if self.login.focused() == Field::Username
+            && (self.login.name_to_offer().is_some() || self.busy == Some(Busy::Offer))
+        {
+            return self.continue_with();
         }
-    }
-
-    /// "Continue": ask which factors the user name may use.
-    pub fn continue_with(&mut self) -> Vec<Effect> {
-        if self.busy.is_some() || self.session.is_some() || self.throttled() {
+        let how = match self.login.view().stage {
+            Stage::Username => return self.continue_with(),
+            Stage::Secrets(m) if m.totp => Submission::Code,
+            Stage::Secrets(_) => Submission::SecurityKey,
+        };
+        // Enter before the last field moves on, unless the form is complete.
+        if self.login.next_field().is_some() && !self.login.complete(how) {
+            self.login.tab(false);
             return Vec::new();
         }
-        match self.login.continue_with() {
-            Ok(username) => {
-                self.notice = None;
-                self.send(Cmd::Offer { username }, Busy::Offer)
-            }
-            Err(_) => Vec::new(),
-        }
+        self.submit(how)
     }
 
-    /// "Change user".
+    /// The user name was left (`Tab`, `Enter`): ask which factors it may
+    /// use (`BeginLogin`). One call at a time: a repeat for the name in
+    /// flight is dropped; another name is asked when the answer lands. A
+    /// name already answered is not asked again.
+    pub fn continue_with(&mut self) -> Vec<Effect> {
+        if self.session.is_some() || self.enroll.is_some() || self.throttled() {
+            return Vec::new();
+        }
+        if self.busy == Some(Busy::Offer) {
+            let same = self
+                .asking
+                .as_ref()
+                .is_some_and(|a| a.as_str() == self.login.name());
+            self.want_offer |= !same;
+            return Vec::new();
+        }
+        if self.busy.is_some() {
+            return Vec::new();
+        }
+        if self.login.name().is_empty() {
+            let _ = self.login.continue_with(); // records "type a name"
+            return Vec::new();
+        }
+        let Some(username) = self.login.name_to_offer() else {
+            return Vec::new();
+        };
+        self.ask_offer(username)
+    }
+
+    fn ask_offer(&mut self, username: String) -> Vec<Effect> {
+        self.notice = None;
+        self.asking = Some(Zeroizing::new(username.clone()));
+        self.send(Cmd::Offer { username }, Busy::Offer)
+    }
+
+    /// "Change user": the answer and the secrets go, the name stays.
     pub fn change_user(&mut self) {
         if self.busy.is_none() {
             self.login.back();
+            self.name_edited();
             self.notice = None;
         }
+    }
+
+    /// Whether the answer shown is younger than a login nonce lives.
+    fn offer_fresh(&self, now: Instant) -> bool {
+        self.offer_at
+            .is_some_and(|t| now.saturating_duration_since(t) < OFFER_TTL)
     }
 
     fn throttled(&self) -> bool {
@@ -529,6 +619,17 @@ impl Flow {
         if how == Submission::SecurityKey && !self.key_available {
             self.notice = Some(Notice::Problem(Problem::KeyUnavailable));
             return Vec::new();
+        }
+        if self.login.ready(how).is_err() {
+            return Vec::new();
+        }
+        if !self.offer_fresh(Instant::now()) {
+            // The answer shown is older than a nonce lives: ask again (the
+            // secrets stay typed) and sign in when the same name's answer
+            // lands. The worker's sign-in still takes its own fresh nonce.
+            self.queued_submit = Some(how);
+            let username = self.login.name().to_string();
+            return self.ask_offer(username);
         }
         let Ok(creds) = self.login.submit(how) else {
             return Vec::new();
@@ -916,16 +1017,7 @@ impl Flow {
         self.awaiting = None;
         self.busy = None;
         match reply {
-            Reply::Offered { username, result } => {
-                match result {
-                    Ok(methods) => {
-                        self.offered = methods;
-                        self.login.offered(&username, methods);
-                    }
-                    Err(e) => self.fail(&e, now),
-                }
-                Vec::new()
-            }
+            Reply::Offered { username, result } => self.offered_reply(&username, result, now),
             Reply::SignedIn { username, result } => self.signed_in_reply(&username, result, now),
             Reply::SteppedUp(result) => self.stepped_up_reply(result, now),
             Reply::EnrollmentBegun(result) => {
@@ -1147,6 +1239,39 @@ impl Flow {
         }
     }
 
+    /// A `BeginLogin` answer. For the name shown it reveals the fields (and
+    /// sends a submit that waited for it); for an edited name it is stale
+    /// and dropped, and the new name is asked if it was left meanwhile.
+    /// Real and decoy answers are handled alike.
+    fn offered_reply(
+        &mut self,
+        username: &str,
+        result: Result<Methods, ClientError>,
+        now: Instant,
+    ) -> Vec<Effect> {
+        self.asking = None;
+        let ask_again = std::mem::take(&mut self.want_offer);
+        match result {
+            Ok(methods) => {
+                if self.login.offered(username, methods) {
+                    self.offered = methods;
+                    // The same clock as `offer_fresh`.
+                    self.offer_at = Some(Instant::now());
+                    if let Some(how) = self.queued_submit.take() {
+                        return self.submit(how);
+                    }
+                } else if ask_again {
+                    return self.continue_with();
+                }
+            }
+            Err(e) => {
+                self.queued_submit = None;
+                self.fail(&e, now);
+            }
+        }
+        Vec::new()
+    }
+
     fn signed_in_reply(
         &mut self,
         username: &str,
@@ -1160,6 +1285,7 @@ impl Flow {
                 self.fail(&e, now);
                 if let ClientError::FactorNotOffered = e {
                     self.login.back();
+                    self.offer_at = None;
                 } else {
                     self.login.retry(username, self.offered);
                 }
@@ -1296,6 +1422,7 @@ impl Flow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::login::LoginError;
 
     const PASSWORD: &str = "c0rrect-horse-Battery-staple";
     const CODE: &str = "123456";
@@ -1372,6 +1499,228 @@ mod tests {
         );
         assert!(f.signed_in());
         f
+    }
+
+    const KEY_ONLY: Methods = Methods {
+        totp: false,
+        security_key: true,
+    };
+
+    fn offer_reply(f: &mut Flow, name: &str, methods: Methods, now: Instant) -> Vec<Effect> {
+        f.on_reply(
+            Reply::Offered {
+                username: name.into(),
+                result: Ok(methods),
+            },
+            now,
+        )
+    }
+
+    /// F23 single screen: leaving the name (`Tab`) asks `BeginLogin` once;
+    /// a second `Tab` or `Enter` for the same name sends nothing more; the
+    /// answer reveals its fields on the same screen, the name still there.
+    #[test]
+    fn leaving_the_name_asks_once_and_reveals_the_fields_below_it() {
+        let now = Instant::now();
+        let mut f = Flow::new(true, now);
+        assert!(f.tab(false).is_empty(), "no name, nothing asked");
+        assert!(f.enter().is_empty());
+        assert_eq!(f.view(now).login.error, Some(LoginError::MissingUsername));
+        f.type_text("alice");
+        let Cmd::Offer { username } = cmd(f.tab(false)) else {
+            panic!("BeginLogin when the name is left");
+        };
+        assert_eq!(username, "alice");
+        assert!(f.enter().is_empty(), "double Enter: one call");
+        assert!(f.tab(false).is_empty(), "Tab again: one call");
+        let v = f.view(now);
+        assert_eq!(v.busy, Some(Busy::Offer));
+        assert_eq!(v.login.stage, Stage::Username, "no field guessed early");
+        assert!(
+            offer_reply(&mut f, "alice", BOTH, now).is_empty(),
+            "no repeat"
+        );
+        let v = f.view(now);
+        assert_eq!(v.login.stage, Stage::Secrets(BOTH));
+        assert_eq!(
+            (v.login.username.as_str(), v.login.focus),
+            ("alice", Field::Password)
+        );
+        assert_eq!(v.busy, None);
+        // Back on the name, unchanged: Tab moves on, nothing is asked.
+        f.focus(Field::Username);
+        assert!(f.tab(false).is_empty());
+        assert_eq!(f.view(now).login.focus, Field::Password);
+    }
+
+    /// Editing the name after the reveal drops the answer, its age and the
+    /// typed secrets; leaving it asks again for the new name.
+    #[test]
+    fn editing_the_name_drops_the_answer_and_asks_again() {
+        let now = Instant::now();
+        let mut f = Flow::new(true, now);
+        offered(&mut f, now, BOTH);
+        f.type_text(PASSWORD);
+        assert!(f.offer_at.is_some());
+        f.focus(Field::Username);
+        f.backspace();
+        let v = f.view(now);
+        assert_eq!((v.login.stage, v.login.password_len), (Stage::Username, 0));
+        assert!(f.offer_at.is_none(), "the old answer is gone");
+        f.type_text("e");
+        let Cmd::Offer { username } = cmd(f.enter()) else {
+            panic!("asked again");
+        };
+        assert_eq!(username, "alice");
+        // The submit is refused until the new answer: nothing to send.
+        assert!(f.submit(Submission::Code).is_empty());
+    }
+
+    /// The name edited while `BeginLogin` runs: its answer is stale and
+    /// dropped; if the name was left meanwhile, the new one is asked then.
+    #[test]
+    fn a_stale_answer_is_dropped_and_the_new_name_asked() {
+        let now = Instant::now();
+        let mut f = Flow::new(true, now);
+        f.type_text("alice");
+        let _ = cmd(f.enter());
+        f.type_text("2"); // typing goes on while the call runs
+        assert!(offer_reply(&mut f, "alice", BOTH, now).is_empty());
+        let v = f.view(now);
+        assert_eq!(
+            (v.login.stage, v.login.username.as_str()),
+            (Stage::Username, "alice2")
+        );
+        assert!(f.offer_at.is_none());
+        // Left meanwhile: asked as soon as the stale answer lands.
+        let Cmd::Offer { .. } = cmd(f.enter()) else {
+            panic!("asked for alice2");
+        };
+        f.backspace();
+        f.type_text("3");
+        assert!(f.enter().is_empty(), "one call at a time");
+        let Cmd::Offer { username } = cmd(offer_reply(&mut f, "alice2", BOTH, now)) else {
+            panic!("the stale answer brings the next question");
+        };
+        assert_eq!(username, "alice3");
+        assert!(offer_reply(&mut f, "alice3", BOTH, now).is_empty());
+        assert_eq!(f.view(now).login.stage, Stage::Secrets(BOTH));
+    }
+
+    /// An answer older than a login nonce lives is asked again before the
+    /// submit (secrets kept), and the sign-in then goes by itself.
+    #[test]
+    fn an_old_answer_is_refreshed_before_the_submit() {
+        let now = Instant::now();
+        let mut f = Flow::new(true, now);
+        offered(&mut f, now, BOTH);
+        f.type_text(PASSWORD);
+        f.tab(false);
+        f.type_text(CODE);
+        f.offer_at = Instant::now().checked_sub(OFFER_TTL + Duration::from_secs(1));
+        assert!(f.offer_at.is_some(), "the clock is past two minutes");
+        let Cmd::Offer { username } = cmd(f.enter()) else {
+            panic!("BeginLogin again first");
+        };
+        assert_eq!(username, "alice");
+        let v = f.view(now);
+        assert_eq!(
+            (v.login.password_len, v.login.code_len),
+            (PASSWORD.len(), 6)
+        );
+        let Cmd::SignIn {
+            password,
+            factor: FactorChoice::Code(code),
+            ..
+        } = cmd(offer_reply(&mut f, "alice", BOTH, now))
+        else {
+            panic!("the waiting sign-in goes");
+        };
+        assert_eq!((password.expose(), code.expose()), (PASSWORD, CODE));
+        assert_eq!(f.view(now).login.password_len, 0, "wiped at submit");
+        // A failed refresh sends nothing and keeps nothing waiting.
+        let mut g = Flow::new(true, now);
+        offered(&mut g, now, BOTH);
+        g.type_text(PASSWORD);
+        g.tab(false);
+        g.type_text(CODE);
+        g.offer_at = None;
+        let _ = cmd(g.enter());
+        assert!(g
+            .on_reply(
+                Reply::Offered {
+                    username: "alice".into(),
+                    result: Err(ClientError::Connect("down".into())),
+                },
+                now
+            )
+            .is_empty());
+        assert!(g.queued_submit.is_none());
+    }
+
+    /// An unknown name gets the server's plausible decoy answer; the window
+    /// treats it exactly like a real one (same calls, same view).
+    #[test]
+    fn an_unknown_name_looks_exactly_like_a_known_one() {
+        let now = Instant::now();
+        let run = |name: &str| {
+            let mut f = Flow::new(true, now);
+            f.type_text(name);
+            let Cmd::Offer { username } = cmd(f.enter()) else {
+                panic!("BeginLogin");
+            };
+            assert!(offer_reply(&mut f, &username, BOTH, now).is_empty());
+            f.type_text(PASSWORD);
+            f.tab(false);
+            f.type_text(CODE);
+            let mut v = serde_json::to_value(f.view(now)).unwrap();
+            v["login"]["username"] = serde_json::Value::Null;
+            let sent = matches!(cmd(f.enter()), Cmd::SignIn { .. });
+            (v, sent)
+        };
+        assert_eq!(run("alice"), run("nobody-at-all"));
+    }
+
+    /// A WebAuthn-only account: the password and the key button, no code
+    /// field; `Enter` in the password (the last field) uses the key.
+    #[test]
+    fn a_key_only_account_shows_no_code_field() {
+        let now = Instant::now();
+        let mut f = Flow::new(true, now);
+        offered(&mut f, now, KEY_ONLY);
+        let v = f.view(now);
+        assert_eq!(v.login.stage, Stage::Secrets(KEY_ONLY));
+        assert!(!v.login.can_submit_code && !v.login.can_submit_key);
+        f.type_text(PASSWORD);
+        let v = f.view(now);
+        assert!(!v.login.can_submit_code && v.login.can_submit_key);
+        f.tab(false);
+        assert_eq!(f.view(now).login.focus, Field::Username, "no code field");
+        f.tab(false);
+        let Cmd::SignIn {
+            factor: FactorChoice::SecurityKey,
+            ..
+        } = cmd(f.enter())
+        else {
+            panic!("the key");
+        };
+    }
+
+    /// `Enter` in the password with an empty code moves to the code; a
+    /// complete form submits from any field.
+    #[test]
+    fn enter_moves_on_until_the_form_is_complete() {
+        let now = Instant::now();
+        let mut f = Flow::new(true, now);
+        offered(&mut f, now, BOTH);
+        f.type_text(PASSWORD);
+        assert!(f.enter().is_empty());
+        assert_eq!(f.view(now).login.focus, Field::Code);
+        f.type_text(CODE);
+        f.focus(Field::Password);
+        let Cmd::SignIn { .. } = cmd(f.enter()) else {
+            panic!("complete: Enter signs in");
+        };
     }
 
     #[test]

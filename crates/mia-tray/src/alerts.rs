@@ -62,14 +62,70 @@ impl Default for Policy {
     }
 }
 
+/// De-duplication per key plus a global burst budget — the one rate limit
+/// every notification goes through (state alerts here, every other notice
+/// in [`crate::notice::NoticeCenter`]).
+#[derive(Debug, Clone)]
+pub struct RateLimiter<K> {
+    policy: Policy,
+    last_sent: HashMap<K, i64>,
+    recent: VecDeque<i64>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone + std::fmt::Debug> RateLimiter<K> {
+    /// A limiter with `policy`.
+    #[must_use]
+    pub fn new(policy: Policy) -> Self {
+        Self {
+            policy,
+            last_sent: HashMap::new(),
+            recent: VecDeque::new(),
+        }
+    }
+
+    /// Whether `key` may be shown at `now`; when it may, it counts as sent.
+    pub fn allow(&mut self, key: &K, now: i64) -> bool {
+        if self
+            .last_sent
+            .get(key)
+            .is_some_and(|t| now - t < self.policy.dedup_secs)
+        {
+            tracing::debug!(?key, "notification de-duplicated");
+            return false;
+        }
+        while self
+            .recent
+            .front()
+            .is_some_and(|t| now - t >= self.policy.window_secs)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= self.policy.burst {
+            tracing::info!(?key, "notification suppressed by the rate limit");
+            return false;
+        }
+        self.recent.push_back(now);
+        self.last_sent.insert(key.clone(), now);
+        true
+    }
+}
+
+impl<K> Default for RateLimiter<K> {
+    fn default() -> Self {
+        Self {
+            policy: Policy::default(),
+            last_sent: HashMap::new(),
+            recent: VecDeque::new(),
+        }
+    }
+}
+
 /// The stateful filter.
 #[derive(Debug, Clone, Default)]
 pub struct Alerter {
-    policy: Policy,
     /// Last state seen per environment, ignoring `Attesting`.
     settled: HashMap<Option<String>, AgentState>,
-    last_sent: HashMap<(Option<String>, AlertKind), i64>,
-    recent: VecDeque<i64>,
+    limiter: RateLimiter<(Option<String>, AlertKind)>,
 }
 
 impl Alerter {
@@ -77,8 +133,8 @@ impl Alerter {
     #[must_use]
     pub fn new(policy: Policy) -> Self {
         Self {
-            policy,
-            ..Self::default()
+            settled: HashMap::new(),
+            limiter: RateLimiter::new(policy),
         }
     }
 
@@ -122,28 +178,9 @@ impl Alerter {
         let mut out = Vec::new();
         for alert in candidates {
             let key = (alert.environment.clone(), alert.kind);
-            if self
-                .last_sent
-                .get(&key)
-                .is_some_and(|t| now - t < self.policy.dedup_secs)
-            {
-                tracing::debug!(?alert, "notification de-duplicated");
-                continue;
+            if self.limiter.allow(&key, now) {
+                out.push(alert);
             }
-            while self
-                .recent
-                .front()
-                .is_some_and(|t| now - t >= self.policy.window_secs)
-            {
-                self.recent.pop_front();
-            }
-            if self.recent.len() >= self.policy.burst {
-                tracing::info!(?alert, "notification suppressed by the rate limit");
-                continue;
-            }
-            self.recent.push_back(now);
-            self.last_sent.insert(key, now);
-            out.push(alert);
         }
         out
     }
@@ -153,6 +190,21 @@ impl Alerter {
 mod tests {
     use super::*;
     use crate::client::synthesised;
+
+    #[test]
+    fn the_limiter_dedups_per_key_and_caps_bursts() {
+        let mut l = RateLimiter::new(Policy {
+            dedup_secs: 60,
+            burst: 2,
+            window_secs: 100,
+        });
+        assert!(l.allow(&"a", 0));
+        assert!(!l.allow(&"a", 30), "same key inside the dedup window");
+        assert!(l.allow(&"b", 31));
+        assert!(!l.allow(&"c", 32), "burst budget spent");
+        assert!(l.allow(&"c", 101), "the window moved on");
+        assert!(l.allow(&"a", 140), "dedup and burst windows over");
+    }
 
     fn snaps(states: &[(Option<&str>, AgentState)]) -> Vec<StatusSnapshot> {
         states

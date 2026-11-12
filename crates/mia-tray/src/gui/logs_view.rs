@@ -214,7 +214,7 @@ impl LogsView {
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter.text)
                     .char_limit(MAX_SEARCH_LEN)
-                    .desired_width(160.0),
+                    .desired_width((ui.available_width() - 16.0).clamp(80.0, 240.0)),
             );
             let mut follow = !self.paused;
             if ui

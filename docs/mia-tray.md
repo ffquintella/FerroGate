@@ -13,31 +13,46 @@ service-manager) command behind the operating system's own consent prompt.
 
 ## What it shows
 
-The icon colour is the **worst** state across the environments the agent serves
-(the daemon computes the state; the tray only maps it):
+The icon shows the **worst** state across the environments the agent serves
+(the daemon computes the state; the tray only maps it) as a colour *and* a
+glyph, so it never depends on colour alone; it does not blink. The tooltip
+reads `FerroGate MIA — <state>`.
 
-| Colour | States |
+| Icon | States |
 |---|---|
-| grey | `not_installed` (no `mia` found), `not_running` (no status endpoint), `not_configured` (with a `!` badge) |
-| blue (pulsing) | `attesting` |
-| green | `healthy` |
-| yellow | `cmis_unreachable`, `crl_stale`, `allowlist_missing`, `allowlist_invalid`, `svid_expiring` |
-| red | `not_enrolled`, `pin_mismatch`, `tpm_unavailable`, `ima_disabled` |
+| grey – | `not_installed` (no `mia` found), `not_running` (no status endpoint) |
+| grey ! | `not_configured` |
+| blue … | `attesting` |
+| green ✓ | `healthy` |
+| yellow ! | `cmis_unreachable`, `crl_stale`, `allowlist_missing`, `allowlist_invalid`, `svid_expiring` |
+| red × | `not_enrolled`, `pin_mismatch`, `tpm_unavailable`, `ima_disabled` |
 
-The menu has one submenu per environment (state, problem, SPIFFE ID with expiry
-and renewal time, CMIS node, CRL age, allowlist entry count and expiry,
-attestation backend, X.509-SVID store, agent version), the recovery actions for
-the worst state, and **Open status**, **Setup…**, **Logs…**, **Run self-test**
-and **Quit**. A `last_error.code` the tray does not know (a newer daemon) is
-shown generically, with "Run self-test" offered.
+**Left click** (macOS, Windows) opens the window; **right click** opens the
+menu. On Linux the status-icon protocol always shows the menu, whose first
+command opens the window. The menu holds only what applies now (F23):
+
+1. the summary line, and the result of the last action, if any;
+2. the fixes for the worst state (for example **Start the service**), with the
+   environment named when there are several;
+3. **Open FerroGate…**; **Environments ▸** (only with two or more, each with
+   its own fixes and default-environment action); **Review approvals…** (only
+   when the admin client is installed, see below);
+4. **Setup…** and **Quit**.
+
+The details (state, problem, SPIFFE ID with expiry and renewal time, CMIS
+node, CRL age, allowlist, attestation backend, X.509-SVID store, agent
+version), **Logs** and **Run self-test** live in the window. A
+`last_error.code` the tray does not know (a newer daemon) is shown
+generically, with "Run self-test" offered.
 
 **The default environment.** The environment that serves the helper API's
 well-known address — `mia.sock` / `\\.\pipe\ferrogate-mia`, the one local
 applications reach without configuration (see
 [the default environment](mia.md#default-environment-who-serves-the-well-known-address))
-— is marked **[default address]** in its submenu title and in the Status
-window, with a "Helper API: serves the well-known default address" line. Every
-other environment's submenu and Status block offer:
+— is marked **[default address]** in the Environments submenu and in the Status
+tab, with a "Helper API: serves the well-known default address" line. Every
+other environment's card in the Status tab (and its submenu, with two or more
+environments) offers:
 
 - **Set as default environment** (a named environment) —
   `mia default-environment set <env>`;
@@ -53,11 +68,23 @@ already has the address, or for an environment named `default` (reserved). The
 marker comes from the daemon's `default_address` field; an older agent does not
 send it, so nothing is marked.
 
-**Notifications** fire only on transitions that need a human — healthy → any
-degraded/broken/absent state, entering `svid_expiring`, entering `crl_stale` —
-never for the state the tray starts in. Each (environment, kind) is
-de-duplicated for 30 minutes and at most 3 notifications are sent per 10
-minutes.
+**Notifications** use the operating system's own centre (freedesktop
+notifications on Linux, toasts on Windows, Notification Center on macOS) and
+one format for everything: title **FerroGate**, the environment or app as the
+subtitle, one or two short sentences, and a kind — information, done,
+warning, error or approval pending (urgency is critical only for errors and
+pending approvals). They fire on state transitions that need a human —
+healthy → any degraded/broken/absent state, entering `svid_expiring`,
+entering `crl_stale`, never for the state the tray starts in — and for the
+result of an action run from the menu. Clicking one (or **Open**; **Review**
+for approvals) opens the matching view; nothing is ever decided from a
+notification, and none carries a code, secret, token, path or user name.
+Linux and Windows show the buttons; macOS opens on click. A repeat of the
+same kind replaces the previous one on Linux. Each (environment, kind) state
+alert is de-duplicated for 30 minutes and at most 3 are sent per 10 minutes;
+other notices are de-duplicated for a minute, 6 per 10 minutes. The same
+message appears in the menu's second line and in the window's status bar, so
+nothing is lost when no notification service is running.
 
 Where the data comes from, in order: the status endpoint
 (`/run/ferrogate/mia-status.sock`, `/var/run/ferrogate/mia-status.sock`,
@@ -83,13 +110,26 @@ once on Linux so its socket picks the group up.
 
 ## The windows
 
-Every window is a separate process (`mia-tray --window <kind>`, a closed set),
-drawn natively with egui — there is no web view, and every string from the
-daemon or from `mia` is rendered as plain text with control and bidirectional
-characters escaped.
+There is one window, a separate process (`mia-tray --window <kind>`, a closed
+set), drawn natively with egui — there is no web view, and every string from
+the daemon or from `mia` is rendered as plain text with control and
+bidirectional characters escaped. Opening it again from the menu or a
+notification raises the open window at the right tab instead of starting
+another: the tray writes `show <kind>` lines (a closed set, bounded lines) to
+the window's standard input. It is freely resizable down to 380 × 300 points;
+every page scrolls and wraps.
 
-- **Status** — the per-environment detail with the explanation and recovery
-  buttons for each state.
+The **header** shows the state badge (glyph and text), the explanation, when
+the status was last read and from where, the fixes for the worst state as
+buttons, **Refresh**, and the **Language** selector (System default, English,
+Português (Brasil), Español). The choice applies at once, is saved in the
+per-user preference file (`mia-tray.toml` beside `admin.toml`, owner-only,
+the language tag only) and the tray menu follows within two seconds. The
+**status bar** at the bottom mirrors the notifications (newest first, with
+**Dismiss**).
+
+- **Status** — one card per environment: badge, explanation, fix buttons and
+  the details folded under **Details**.
 - **Recovery** — the closed set of actions below, run in the background with
   the outcome shown inline (raw output folded under "Output"; `mia test` is
   shown check by check), **Copy machine identifiers** and documentation links.
@@ -137,6 +177,10 @@ directory as recorded in `HKLM` — never as given by the user-controllable
 return its output, so on Windows elevated actions report only their outcome.
 
 ### Setup wizard
+
+The tab loads the configuration when it opens; **Check and apply** then runs
+the check and, only if `mia` accepted exactly the draft on screen, applies it
+(one click instead of two; **Check only** stays available). In detail:
 
 1. **Load** runs `mia setup --dump --json --editable` (`--user` for the
    per-user file, `-e <env>` for a named environment). On Linux and macOS the
@@ -261,7 +305,8 @@ Linux, macOS and Windows.
 | `FERROGATE_STATUS_SOCKET` | status endpoint address (same override `mia` honours) |
 | `MIA_TRAY_MIA` | absolute path of a development `mia`, used for **unprivileged** actions only — never elevated |
 | `MIA_TRAY_LOG` | the tray's own tracing directive on stderr (default `info`) |
-| `LC_ALL` / `LC_MESSAGES` / `LANG` / `LANGUAGE`, then the OS locale | English or Portuguese |
+| `MIA_TRAY_LANG` | the UI language (`en`, `pt-BR`, `es`), over the preference file |
+| `LC_ALL` / `LC_MESSAGES` / `LANG` / `LANGUAGE`, then the OS locale | English, Portuguese (any `pt-*`) or Spanish (any `es-*`); anything else is English |
 
 ## Admin client (`mia-tray-admin`)
 
@@ -306,14 +351,15 @@ platform it is installed beside `mia-tray`, owned by root and not writable by
 anyone else.
 
 **Menu entry.** Within a few seconds of installing (the tray looks again on every
-status refresh, no restart needed) **Admin client…** appears in the tray menu,
+status refresh, no restart needed) **Review approvals…** appears in the tray menu,
 only when `mia-tray-admin` is found in the same directory as the running `mia-tray` *and* passes the same
 trust rule `mia` must pass to run elevated (Unix: a regular file, not a link,
 owned by root and not group- or world-writable, in a root-owned directory that is
 not group- or world-writable; Windows: under the machine's Program Files). The
 rule is checked again right before each launch. The tray starts it as you, with
-no arguments, no elevation and stdin closed, and nothing flows between the two
-processes; a second click while the window is open does nothing. A copy in a
+no arguments and no elevation; the only thing that ever flows to it is a
+`focus` line on its standard input, so a second click brings the open window
+to the front instead of starting another. A copy in a
 user-writable place (a development build, a Homebrew-owned `/usr/local/bin`) is
 never offered: run such a build directly. The client also works without the tray
 (run it from a terminal by the path above).
@@ -367,16 +413,35 @@ pin fingerprints (no path, nothing secret).
 
 ### Signing in and stepping up
 
-1. Type the user name and press **Continue**. Only the user name is sent
-   (`BeginLogin`, client kind 2); the answer says which second factors the
-   account may use here. Unknown names get the same plausible answer.
-2. Type the password, then either the authenticator code (**Sign in**) or press
-   **Use security key**. Under `CMIS_ADMIN_TRAY_FIDO2_GROUPS` the code field is
-   not shown. A fresh `BeginLogin` runs before `Login`, so a slow typist never
-   meets an expired nonce.
-3. Signed in, the window shows the display name, groups and assurance level
-   (AAL3 for a device-bound key) and **Confirm it is you** (step-up:
-   `BeginStepUp`/`StepUp` with a code or a key; the server rotates the token).
+Sign-in is one screen (F23); the F20 protocol is unchanged — the same
+`BeginLogin` and `Login` calls, in the same order, as before.
+
+1. Type the user name and press **Tab** or **Enter** (the hint under the
+   field says so). Leaving the field sends only the user name
+   (`BeginLogin`, client kind 2), once — a second Tab or Enter for the same
+   name sends nothing, and a "Checking…" spinner shows while it runs. The
+   answer says which second factors the account may use here; unknown
+   names get the same plausible answer from the server, and the window
+   treats both alike (no "user not found", no extra delay of its own).
+2. The fields that answer calls for appear **below the name, on the same
+   screen**: the password and the authenticator code (**Sign in**, or Enter
+   in the code), the password and **Use security key**, or both buttons.
+   Under `CMIS_ADMIN_TRAY_FIDO2_GROUPS` no code field is shown. Nothing is
+   shown before the answer. Editing the name drops the answer and anything
+   typed below it; leaving the field asks again. An answer that lands for a
+   name already edited is ignored. Sign-in itself still runs a fresh
+   `BeginLogin` right before `Login`, so the window never holds a nonce;
+   if the answer on screen is older than a nonce lives (2 min), it is asked
+   again before signing in, with what you typed kept. The password and code
+   are wiped when submitted, nothing is written to disk, and the user name
+   is not remembered between runs.
+3. Signed in, the window opens on the **pending requests** (below). One line
+   shows where you are (**Account › Requests › R-… › Approve R-…**) and the
+   session: display name, assurance level (AAL3 for a device-bound key) and
+   groups, with **Confirm it is you** (step-up: `BeginStepUp`/`StepUp` with a
+   code or a key; the server rotates the token), **Second factors** and
+   **Sign out**. The user name is not remembered between runs (F22 keeps
+   nothing on disk).
 
 Failures are generic ("Sign-in failed"), a throttle shows its countdown, and a
 factor that is not offered or a cancelled key prompt sends no `Login`, so it
@@ -447,7 +512,10 @@ galley holds the seed (tests scan the painted shapes and `egui` memory).
 
 ### Requests and approvals
 
-Signed in, **Requests** and **Approvals** open the administration views
+Signed in, the window opens on **Requests** filtered to pending ones; the
+tab counts them ("Requests · 3 pending") and the status bar says how many
+wait (a count only; an OS notification only when the window is in the
+background). **Requests** and **Approvals** switch between the views
 (F22 §4, the F21 flows). The window first reads the session's permissions
 (`WhoAmI`): they decide which buttons are drawn, as a convenience only, since
 CMIS's `AdminAuthz` checks every call. The lists page through
@@ -474,9 +542,14 @@ approval (terms, expiry, note, row version). From there:
   characters of the id);
 - **Freeze or unfreeze…** stops or resumes auto-updates of the lineage.
 
-"Any user" and "path + user only" need an extra **Accept the wider scope**,
-and auto-update for any user needs a protected path. Every decision ends on a
-review page; only **Confirm and send** sends it, with a fresh idempotency key.
+Approve and deny show, under the form, **What will be sent**: the review
+lines, live. With a narrow scope **Approve and send** / **Deny and send**
+sends it at once (step 1 of 2 saved). "Any user" and "path + user only" are
+never sent from the form: they need an extra **Accept the wider scope** and
+the review page with **Confirm and send** (steps 1–3 of 3), and auto-update
+for any user needs a protected path. Edits, revocations, freezes and adds
+keep the review page. Enter never sends; each send uses a fresh idempotency
+key.
 When the server asks for a step-up, the window opens the step-up prompt and then
 sends the same request once more (same key); a second request for a step-up is
 not looped, and cancelling the prompt sends nothing more. An edit refused as

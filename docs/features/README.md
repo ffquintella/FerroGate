@@ -26,6 +26,7 @@ reviewed in isolation, even though some have ordering dependencies.
 | F20 | [Administrator authentication and authorization](F20-admin-authentication.md) | CMIS, CLI | Specified (Proposed; Phase 0 closes a critical gap and blocks F19/F21/F22) |
 | F21 | [Server administration TUI](F21-admin-tui.md) | CMIS tools | Specified (Proposed) |
 | F22 | [Tray admin client](F22-tray-admin-client.md) | MIA tray | Specified (Proposed) |
+| F23 | [Tray UX redesign](F23-tray-ux-redesign.md) | MIA tray | Implemented (phases 1–4; see §8 for follow-ups) |
 
 The four features above are tied together, with an end-to-end sequence, in
 [../app-approval-and-admin.md](../app-approval-and-admin.md).

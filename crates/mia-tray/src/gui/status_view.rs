@@ -1,18 +1,42 @@
-//! The Status tab: one collapsible block per environment.
+//! The Status tab: one card per environment, plus the state badge and
+//! recovery buttons the window header reuses.
 
 use eframe::egui::{self, RichText};
 
 use super::window::Intent;
 use super::Shared;
 use crate::actions::{EnvName, Privilege};
-use crate::client::{Observation, Source};
+use crate::client::Observation;
 use crate::i18n::Msg;
-use crate::model::{presentation, snapshot_explanation, tray_view, IconColor, Recovery};
+use crate::model::{
+    presentation, snapshot_explanation, tray_view, IconColor, Presentation, Recovery,
+};
 
 /// The egui colour for an icon colour.
 pub(crate) fn color32(c: IconColor) -> egui::Color32 {
     let [r, g, b] = crate::icon::rgb(c);
     egui::Color32::from_rgb(r, g, b)
+}
+
+fn rgb32([r, g, b]: [u8; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// A state badge: glyph and text on the state colour (never colour alone;
+/// text contrast at least 4.5:1, see `icon::badge_rgb`).
+pub(crate) fn badge(ui: &mut egui::Ui, look: Presentation, text: &str) -> egui::Response {
+    egui::Frame::new()
+        .fill(rgb32(crate::icon::badge_rgb(look.color)))
+        .corner_radius(12u8)
+        .inner_margin(egui::Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{} {text}", look.glyph.text()))
+                    .color(rgb32(crate::icon::glyph_rgb(look.color)))
+                    .strong(),
+            )
+        })
+        .response
 }
 
 /// Map a recovery to what the window should do.
@@ -51,57 +75,53 @@ pub(crate) fn ui(ui: &mut egui::Ui, shared: &Shared, obs: Option<&Observation>) 
         return None;
     };
     let view = tray_view(obs, crate::unix_now(), lang);
-    ui.horizontal(|ui| {
-        ui.heading(RichText::new(&view.headline).color(color32(view.presentation.color)));
-        if ui.button(Msg::ButtonRefresh.text(lang)).clicked() {
-            out = Some(Intent::Refresh);
-        }
-    });
-    let source = match view.source {
-        Source::Endpoint => Msg::SourceEndpoint,
-        Source::Cli => Msg::SourceCli,
-        Source::Synthesised => Msg::SourceSynthesised,
-    };
-    ui.label(
-        RichText::new(format!(
-            "{}: {}",
-            Msg::DetailSource.text(lang),
-            source.text(lang)
-        ))
-        .weak(),
-    );
-    ui.separator();
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for (env, snapshot) in view.envs.iter().zip(&obs.snapshots) {
-            let color = color32(presentation(env.state).color);
-            egui::CollapsingHeader::new(RichText::new(&env.headline).color(color).strong())
-                .id_salt(("env", &env.label))
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.label(snapshot_explanation(snapshot).text(lang));
-                    ui.add_space(4.0);
-                    for line in &env.details {
-                        ui.label(RichText::new(line).monospace());
-                    }
-                    if !env.recoveries.is_empty() {
-                        ui.add_space(4.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (env, snapshot) in view.envs.iter().zip(&obs.snapshots) {
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(10))
+                    .corner_radius(8u8)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.horizontal_wrapped(|ui| {
-                            for r in &env.recoveries {
-                                if let Some(i) = recovery_button(ui, shared, *r, env.env.as_ref()) {
-                                    out = Some(i);
-                                }
+                            badge(
+                                ui,
+                                presentation(env.state),
+                                crate::model::snapshot_title(snapshot).text(lang),
+                            );
+                            ui.label(RichText::new(&env.label).strong());
+                            if env.default_address {
+                                ui.weak(Msg::MarkerDefaultAddress.text(lang));
                             }
                         });
-                    }
-                    // Hand this environment the well-known helper address.
-                    if let Some(r) = env.default_choice {
-                        ui.add_space(4.0);
-                        if let Some(i) = recovery_button(ui, shared, r, env.env.as_ref()) {
-                            out = Some(i);
+                        ui.label(snapshot_explanation(snapshot).text(lang));
+                        let mut buttons: Vec<Recovery> = env.recoveries.clone();
+                        buttons.extend(env.default_choice);
+                        if !buttons.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                for r in buttons {
+                                    if let Some(i) =
+                                        recovery_button(ui, shared, r, env.env.as_ref())
+                                    {
+                                        out = Some(i);
+                                    }
+                                }
+                            });
                         }
-                    }
-                });
-        }
-    });
+                        egui::CollapsingHeader::new(Msg::LabelDetails.text(lang))
+                            .id_salt(("env-details", &env.label))
+                            .default_open(view.envs.len() == 1)
+                            .show(ui, |ui| {
+                                for line in &env.details {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(line).monospace()).wrap(),
+                                    );
+                                }
+                            });
+                    });
+                ui.add_space(8.0);
+            }
+        });
     out
 }

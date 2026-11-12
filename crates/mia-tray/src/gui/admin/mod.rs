@@ -15,6 +15,10 @@
 //! Requests, approvals and their decisions: [`views`]. The admin endpoint
 //! and its pin are entered on the "admin server" screen ([`server`]).
 
+//! F23: one navigable page (breadcrumb, no nested boxes), the pending
+//! requests opened after sign-in, a status bar fed by [`crate::notice`],
+//! and the tray's control pipe raising this window instead of a second one.
+
 mod enroll;
 mod factors;
 mod seed;
@@ -22,7 +26,7 @@ mod server;
 mod views;
 
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -36,22 +40,21 @@ use crate::admin::config::{self, Location, SaveError, SaveTarget, SETUP_HELP};
 use crate::admin::enroll::EnrollField;
 use crate::admin::factors::FactorField;
 use crate::admin::flow::{Busy, Effect, Flow, FlowView, Notice, Problem};
-use crate::admin::login::{Field, Stage, Submission};
+use crate::admin::login::{Field, LoginError, Stage, Submission};
 use crate::admin::server::{SavePlan, SaveProblem, ServerField, ServerForm};
 use crate::admin::session::{self, Link, SHUTDOWN_WAIT};
-use crate::admin::views::{Tab, ViewAction};
+use crate::admin::views::{Screen, Tab, ViewAction};
+use crate::control::Command as Ctl;
 use crate::i18n::{fill, Lang, Msg};
+use crate::notice::{Notice as Message, NoticeCenter, Target};
 use crate::text::{display_safe, display_safe_block, human_duration};
 
 /// Run the administrator window until it is closed.
 #[must_use]
 pub fn run(lang: Lang) -> ExitCode {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            // Never the user name or any record data (F22 §3).
-            .with_title(Msg::AdminAppName.text(lang))
-            .with_inner_size([820.0, 700.0])
-            .with_min_inner_size([440.0, 380.0]),
+        // Never the user name or any record data in the title (F22 §3).
+        viewport: super::viewport(Msg::AdminAppName.text(lang), [860.0, 720.0], [380.0, 320.0]),
         persist_window: false,
         ..Default::default()
     };
@@ -127,6 +130,7 @@ impl Setup {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent window switches
 struct AdminApp {
     lang: Lang,
     flow: Flow,
@@ -138,6 +142,42 @@ struct AdminApp {
     server_form: Option<ServerForm>,
     /// A server was just saved (shown until the next input).
     saved: bool,
+    /// Commands from the tray's pipe (the live window only).
+    control_rx: Option<mpsc::Receiver<Ctl>>,
+    /// The status bar's messages (counts only, never record data).
+    notices: NoticeCenter,
+    /// Where a clicked OS notification leads.
+    activate_tx: mpsc::Sender<Target>,
+    activate_rx: mpsc::Receiver<Target>,
+    /// Open the pending requests right after a sign-in (F23).
+    auto_open_requests: bool,
+    /// Whether the previous frame was signed in.
+    was_signed_in: bool,
+    /// The pending count last announced.
+    announced_pending: Option<usize>,
+    /// What the page showed last frame ([`page_key`]).
+    page: String,
+}
+
+/// What the page shows, coarsely. When it changes, egui's keyboard focus
+/// is dropped: widget ids are positional, so a focus left on a button of
+/// the old page would let this frame's `Enter` press a button of the new
+/// one (a "Confirm and send" right after the form, say).
+fn page_key(server_form: bool, view: &FlowView) -> String {
+    format!(
+        "{server_form}|{:?}|{}|{:?}|{}|{}|{:?}",
+        view.login.stage,
+        view.session.is_some(),
+        view.enroll.as_ref().map(|e| e.stage),
+        view.factors.is_some(),
+        view.step_up.is_some(),
+        view.views.as_ref().map(|v| (
+            v.tab,
+            v.screen,
+            v.filters.is_some(),
+            v.decision.as_ref().map(|d| (d.kind, d.stage))
+        )),
+    )
 }
 
 /// Whether `event` is the administrator's own input (a key, typed or pasted
@@ -164,8 +204,14 @@ fn fingerprint(hex: &str) -> String {
 impl AdminApp {
     /// Load `admin.toml` and start the worker; repaint on each reply.
     fn connect(lang: Lang, ctx: &egui::Context) -> Self {
+        super::apply_style(ctx);
         let key_available = crate::admin::webauthn::platform().is_some();
-        Self::open(lang, Setup::system(ctx), key_available)
+        let mut app = Self::open(lang, Setup::system(ctx), key_available);
+        app.auto_open_requests = true;
+        let (tx, rx) = mpsc::channel();
+        super::spawn_control_reader(ctx, tx);
+        app.control_rx = Some(rx);
+        app
     }
 
     /// Load the configuration and start the worker on it; without a usable
@@ -186,6 +232,7 @@ impl AdminApp {
         key_available: bool,
         setup: Setup,
     ) -> Self {
+        let (activate_tx, activate_rx) = mpsc::channel();
         Self {
             lang,
             flow: Flow::new(key_available, Instant::now()),
@@ -195,6 +242,14 @@ impl AdminApp {
             setup,
             server_form: None,
             saved: false,
+            control_rx: None,
+            notices: NoticeCenter::default(),
+            activate_tx,
+            activate_rx,
+            auto_open_requests: false,
+            was_signed_in: false,
+            announced_pending: None,
+            page: String::new(),
         }
     }
 
@@ -337,7 +392,7 @@ impl AdminApp {
                     } => match key {
                         egui::Key::Backspace => flow.backspace(),
                         egui::Key::Escape => flow.escape(),
-                        egui::Key::Tab => flow.tab(modifiers.shift),
+                        egui::Key::Tab => effects.extend(flow.tab(modifiers.shift)),
                         egui::Key::Enter => effects.extend(flow.enter()),
                         _ => {}
                     },
@@ -409,9 +464,16 @@ impl AdminApp {
             Problem::FactorRejected => Msg::AdminFactorRejected.text(lang).to_string(),
             Problem::LastFactor => Msg::AdminLastFactor.text(lang).to_string(),
         };
-        if view.login.error.is_some() && view.session.is_none() && view.enroll.is_none() {
-            // Generic on purpose (F20): never says which part was wrong.
-            return Some(Msg::AdminMissingFields.text(lang).to_string());
+        if view.session.is_none() && view.enroll.is_none() {
+            match view.login.error {
+                // Nothing to ask the server about yet (no account hint).
+                Some(LoginError::MissingUsername) => {
+                    return Some(Msg::AdminNeedUsername.text(lang).to_string());
+                }
+                // Generic on purpose (F20): never says which part was wrong.
+                Some(_) => return Some(Msg::AdminMissingFields.text(lang).to_string()),
+                None => {}
+            }
         }
         let text = match view.notice? {
             Notice::Problem(p) => problem(p),
@@ -549,13 +611,96 @@ impl AdminApp {
         ui.weak(Msg::AdminMemoryOnly.text(lang));
     }
 
+    /// The tray's pipe and clicked notifications: raise the window, and
+    /// open the pending requests when asked to.
+    fn navigation(&mut self, ctx: &egui::Context, view: &FlowView, actions: &mut Vec<Action>) {
+        let mut raise = false;
+        let mut to_requests = false;
+        if let Some(rx) = &self.control_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                raise |= matches!(cmd, Ctl::Focus | Ctl::Show(_));
+            }
+        }
+        while let Ok(target) = self.activate_rx.try_recv() {
+            raise = true;
+            to_requests |= target == Target::Approvals;
+        }
+        if raise {
+            super::raise(ctx);
+        }
+        let signed_in = view.session.as_ref().is_some_and(|s| !s.restricted);
+        let fresh = signed_in && !self.was_signed_in && self.auto_open_requests;
+        self.was_signed_in = signed_in;
+        if signed_in
+            && (fresh || to_requests)
+            && view.views.is_none()
+            && view.factors.is_none()
+            && view.busy.is_none()
+        {
+            actions.push(Action::OpenViews(Tab::Requests));
+        }
+        if !signed_in {
+            self.announced_pending = None;
+        }
+        // Pending requests on screen: one notice per new count (the OS
+        // only when the window is in the background).
+        if let Some(v) = &view.views {
+            if v.tab == Tab::Requests && v.loaded && v.screen == Screen::List {
+                let n = v.requests.iter().filter(|r| r.state == 1).count();
+                if n > 0 && self.announced_pending != Some(n) {
+                    let unfocused = ctx.input(|i| i.viewport().focused) == Some(false);
+                    let notice = Message::pending_approvals(
+                        u64::try_from(n).unwrap_or(u64::MAX),
+                        self.lang,
+                        crate::unix_now(),
+                    );
+                    if self.notices.push(notice.clone(), unfocused) {
+                        super::notify::deliver(&notice, self.lang, self.activate_tx.clone());
+                    }
+                }
+                self.announced_pending = Some(n);
+            }
+        }
+    }
+
+    /// The status bar: the newest notice, Dismiss, the earlier ones folded.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(latest) = self.notices.latest().cloned() else {
+            return;
+        };
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            super::window::notice_label(ui, self.lang, &latest);
+            if ui
+                .small_button(Msg::NoticeDismiss.text(self.lang))
+                .clicked()
+            {
+                self.notices.dismiss_latest();
+            }
+        });
+        ui.add_space(2.0);
+    }
+
     /// Draw one frame at `now`.
     fn show(&mut self, ui: &mut egui::Ui, now: Instant) {
         let ctx = ui.ctx().clone();
         self.read_input(&ctx, now);
         let view = self.flow.view(now);
+        let page = page_key(self.server_form.is_some(), &view);
+        if page != self.page {
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+            self.page = page;
+        }
         let mut clicked: Option<Field> = None;
         let mut actions: Vec<Action> = Vec::new();
+        self.navigation(&ctx, &view, &mut actions);
+        if self.notices.latest().is_some() {
+            egui::Panel::bottom("admin-status").show(ui, |ui| self.status_bar(ui));
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.body(ui, &view, &mut actions, &mut clicked);
@@ -577,11 +722,6 @@ impl AdminApp {
     fn act(&mut self, actions: Vec<Action>) {
         for action in actions {
             let effects = match action {
-                Action::Continue => self.flow.continue_with(),
-                Action::ChangeUser => {
-                    self.flow.change_user();
-                    Vec::new()
-                }
                 Action::Submit(how) => self.flow.submit(how),
                 Action::OpenStepUp => {
                     self.flow.open_step_up();
@@ -690,8 +830,6 @@ impl AdminApp {
 /// A button the administrator pressed this frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
-    Continue,
-    ChangeUser,
     Submit(Submission),
     OpenStepUp,
     StepUp(Submission),
@@ -734,91 +872,77 @@ fn sign_in(
     let idle = view.busy.is_none();
     ui.heading(Msg::AdminSignInTitle.text(lang));
     ui.add_space(8.0);
-    match login.stage {
-        Stage::Username => {
-            ui.label(Msg::AdminUsername.text(lang));
-            if field_box(
-                ui,
-                &display_safe(&login.username, 128),
-                login.focus == Field::Username,
-            )
-            .clicked()
-            {
-                *clicked = Some(Field::Username);
-            }
-            ui.add_space(8.0);
-            if ui
+    // One screen (F23): the name is always here; the fields the server's
+    // answer calls for appear below it, never a guess before the answer.
+    ui.label(Msg::AdminUsername.text(lang));
+    if field_box(
+        ui,
+        &display_safe(&login.username, 128),
+        login.focus == Field::Username,
+    )
+    .clicked()
+    {
+        *clicked = Some(Field::Username);
+    }
+    let checking = view.busy == Some(Busy::Offer);
+    let Stage::Secrets(methods) = login.stage else {
+        ui.add_space(4.0);
+        if checking {
+            ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                ui.weak(Msg::AdminChecking.text(lang));
+            });
+        } else if login.can_continue {
+            ui.weak(Msg::AdminUsernameHint.text(lang));
+        }
+        return;
+    };
+    ui.add_space(4.0);
+    ui.label(Msg::AdminPassword.text(lang));
+    if field_box(
+        ui,
+        &"•".repeat(login.password_len),
+        login.focus == Field::Password,
+    )
+    .clicked()
+    {
+        *clicked = Some(Field::Password);
+    }
+    if methods.totp {
+        ui.add_space(4.0);
+        ui.label(Msg::AdminCode.text(lang));
+        if field_box(ui, &"•".repeat(login.code_len), login.focus == Field::Code).clicked() {
+            *clicked = Some(Field::Code);
+        }
+    }
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        if methods.totp
+            && ui
                 .add_enabled(
-                    login.can_continue && idle,
-                    egui::Button::new(Msg::AdminContinue.text(lang)),
+                    login.can_submit_code && idle,
+                    egui::Button::new(Msg::AdminSignIn.text(lang)),
                 )
                 .clicked()
-            {
-                actions.push(Action::Continue);
-            }
+        {
+            actions.push(Action::Submit(Submission::Code));
         }
-        Stage::Secrets(methods) => {
-            ui.horizontal(|ui| {
-                ui.label(fill(
-                    Msg::AdminUserLine.text(lang),
-                    &[("name", &display_safe(&login.username, 128))],
-                ));
-                if ui
-                    .add_enabled(
-                        idle,
-                        egui::Button::new(Msg::AdminChangeUser.text(lang)).small(),
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::ChangeUser);
-                }
-            });
-            ui.add_space(4.0);
-            ui.label(Msg::AdminPassword.text(lang));
-            if field_box(
-                ui,
-                &"•".repeat(login.password_len),
-                login.focus == Field::Password,
-            )
-            .clicked()
-            {
-                *clicked = Some(Field::Password);
-            }
-            if methods.totp {
-                ui.add_space(4.0);
-                ui.label(Msg::AdminCode.text(lang));
-                if field_box(ui, &"•".repeat(login.code_len), login.focus == Field::Code).clicked()
-                {
-                    *clicked = Some(Field::Code);
-                }
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if methods.totp
-                    && ui
-                        .add_enabled(
-                            login.can_submit_code && idle,
-                            egui::Button::new(Msg::AdminSignIn.text(lang)),
-                        )
-                        .clicked()
-                {
-                    actions.push(Action::Submit(Submission::Code));
-                }
-                if methods.security_key
-                    && ui
-                        .add_enabled(
-                            login.can_submit_key && idle,
-                            egui::Button::new(Msg::AdminUseKey.text(lang)),
-                        )
-                        .clicked()
-                {
-                    actions.push(Action::Submit(Submission::SecurityKey));
-                }
-            });
-            if methods.security_key && !view.key_available {
-                ui.weak(Msg::AdminKeyUnavailable.text(lang));
-            }
+        if methods.security_key
+            && ui
+                .add_enabled(
+                    login.can_submit_key && idle,
+                    egui::Button::new(Msg::AdminUseKey.text(lang)),
+                )
+                .clicked()
+        {
+            actions.push(Action::Submit(Submission::SecurityKey));
         }
+        if checking {
+            ui.spinner();
+        }
+    });
+    if methods.security_key && !view.key_available {
+        ui.weak(Msg::AdminKeyUnavailable.text(lang));
     }
 }
 
@@ -838,18 +962,23 @@ fn signed_in(ui: &mut egui::Ui, lang: Lang, view: &FlowView, actions: &mut Vec<A
         }
         return;
     }
-    ui.heading(fill(
-        Msg::AdminSignedInAs.text(lang),
-        &[("name", &s.display_name)],
-    ));
-    ui.label(fill(
-        Msg::AdminGroups.text(lang),
-        &[("groups", &s.groups.join(", "))],
-    ));
-    ui.label(fill(
-        Msg::AdminAssurance.text(lang),
-        &[("n", &s.aal.to_string())],
-    ));
+    ui.weak(crumbs(lang, view).join("  ›  "));
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(fill(
+            Msg::AdminSignedInAs.text(lang),
+            &[("name", &s.display_name)],
+        ));
+        ui.weak("·");
+        ui.label(fill(
+            Msg::AdminAssurance.text(lang),
+            &[("n", &s.aal.to_string())],
+        ));
+        ui.weak("·");
+        ui.weak(fill(
+            Msg::AdminGroups.text(lang),
+            &[("groups", &s.groups.join(", "))],
+        ));
+    });
     ui.weak(fill(
         Msg::AdminIdleLock.text(lang),
         &[(
@@ -857,63 +986,98 @@ fn signed_in(ui: &mut egui::Ui, lang: Lang, view: &FlowView, actions: &mut Vec<A
             &human_duration(i64::try_from(s.idle_lock_secs).unwrap_or(0)),
         )],
     ));
-    ui.add_space(8.0);
+    ui.add_space(6.0);
     if let Some(su) = &view.step_up {
-        ui.group(|ui| {
-            // The fresh factor of an add is not a step-up (F20 §7 "M").
-            ui.label(if su.for_add {
-                Msg::AdminAddProofTitle.text(lang)
-            } else {
-                Msg::AdminStepUpTitle.text(lang)
-            });
-            if s.methods.totp {
-                ui.label(Msg::AdminCode.text(lang));
-                field_box(ui, &"•".repeat(su.code_len), true);
-            }
-            ui.horizontal(|ui| {
-                if s.methods.totp
-                    && ui
-                        .add_enabled(
-                            su.can_submit_code && idle,
-                            egui::Button::new(Msg::AdminStepUpConfirm.text(lang)),
-                        )
-                        .clicked()
-                {
-                    actions.push(Action::StepUp(Submission::Code));
-                }
-                if s.methods.security_key
-                    && ui
-                        .add_enabled(
-                            su.can_submit_key && idle,
-                            egui::Button::new(Msg::AdminUseKey.text(lang)),
-                        )
-                        .clicked()
-                {
-                    actions.push(Action::StepUp(Submission::SecurityKey));
-                }
-                if ui
-                    .add_enabled(idle, egui::Button::new(Msg::AdminCancel.text(lang)))
+        // Part of the page, not a box over it.
+        ui.separator();
+        ui.heading(if su.for_add {
+            Msg::AdminAddProofTitle.text(lang)
+        } else {
+            Msg::AdminStepUpTitle.text(lang)
+        });
+        if s.methods.totp {
+            ui.label(Msg::AdminCode.text(lang));
+            field_box(ui, &"•".repeat(su.code_len), true);
+        }
+        ui.horizontal_wrapped(|ui| {
+            if s.methods.totp
+                && ui
+                    .add_enabled(
+                        su.can_submit_code && idle,
+                        egui::Button::new(Msg::AdminStepUpConfirm.text(lang)),
+                    )
                     .clicked()
-                {
-                    actions.push(Action::CancelStepUp);
-                }
-            });
-            if s.methods.security_key && !view.key_available {
-                ui.weak(Msg::AdminKeyUnavailable.text(lang));
+            {
+                actions.push(Action::StepUp(Submission::Code));
             }
-            match (su.error, su.for_add) {
-                (None, _) => {}
-                (Some(p), true) => {
-                    ui.colored_label(ui.visuals().error_fg_color, add_problem(lang, view, p));
-                }
-                (Some(_), false) => {
-                    ui.colored_label(ui.visuals().error_fg_color, Msg::AdminRejected.text(lang));
-                }
+            if s.methods.security_key
+                && ui
+                    .add_enabled(
+                        su.can_submit_key && idle,
+                        egui::Button::new(Msg::AdminUseKey.text(lang)),
+                    )
+                    .clicked()
+            {
+                actions.push(Action::StepUp(Submission::SecurityKey));
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new(Msg::AdminCancel.text(lang)))
+                .clicked()
+            {
+                actions.push(Action::CancelStepUp);
             }
         });
+        if s.methods.security_key && !view.key_available {
+            ui.weak(Msg::AdminKeyUnavailable.text(lang));
+        }
+        match (su.error, su.for_add) {
+            (None, _) => {}
+            (Some(p), true) => {
+                ui.colored_label(ui.visuals().error_fg_color, add_problem(lang, view, p));
+            }
+            (Some(_), false) => {
+                ui.colored_label(ui.visuals().error_fg_color, Msg::AdminRejected.text(lang));
+            }
+        }
     } else {
-        ui.horizontal(|ui| session_buttons(ui, lang, view, idle, actions));
+        ui.horizontal_wrapped(|ui| session_buttons(ui, lang, view, idle, actions));
     }
+}
+
+/// Where the page is: Account › Requests › R-… › Approve R-….
+fn crumbs(lang: Lang, view: &FlowView) -> Vec<String> {
+    let mut out = vec![Msg::AdminHome.text(lang).to_string()];
+    if view.factors.is_some() {
+        out.push(Msg::AdminFactorsOpen.text(lang).to_string());
+    }
+    if let Some(v) = &view.views {
+        out.push(
+            match v.tab {
+                Tab::Requests => Msg::AdminRequestsOpen,
+                Tab::Approvals => Msg::AdminApprovalsOpen,
+            }
+            .text(lang)
+            .to_string(),
+        );
+        match (v.screen, &v.request, &v.approval) {
+            (Screen::Request, Some(r), _) => out.push(fill(
+                Msg::AdminRequestTitle.text(lang),
+                &[("id", &r.row.short_id)],
+            )),
+            (Screen::Approval, _, Some(a)) => out.push(fill(
+                Msg::AdminApprovalTitle.text(lang),
+                &[("id", &a.row.short_id)],
+            )),
+            _ => {}
+        }
+        if let Some(d) = &v.decision {
+            out.push(views::decision_title(lang, d));
+        }
+    }
+    if view.step_up.is_some() {
+        out.push(Msg::AdminStepUp.text(lang).to_string());
+    }
+    out
 }
 
 /// Why an add's fresh factor did not go through (nothing was registered).
@@ -1206,6 +1370,98 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// One frame of `size`: the painted texts, and those running past the
+    /// right edge outside any narrower (scrolling) clip.
+    fn frame_sized(
+        ctx: &egui::Context,
+        app: &mut AdminApp,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
+    ) -> (String, Vec<String>) {
+        let input = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.show(ui, Instant::now()));
+        output.textures_delta.clear();
+        let mut texts = Vec::new();
+        let mut overflow = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape {
+                let text = t.galley.text().to_string();
+                let right = clipped.shape.visual_bounding_rect().max.x;
+                if right > size.x + 1.0 && clipped.clip_rect.max.x >= size.x - 1.0 {
+                    overflow.push(text.clone());
+                }
+                texts.push(text);
+            }
+        }
+        (texts.join("\n"), overflow)
+    }
+
+    /// F23: one sign-in screen in every language, at the smallest size: the
+    /// name alone with its hint, then (after the answer) the password and
+    /// code below it on the same screen — no "Continue", nothing past the
+    /// right edge, and nothing guessed before the answer.
+    #[test]
+    fn the_single_sign_in_screen_fits_a_small_window_in_every_language() {
+        let small = egui::vec2(380.0, 300.0);
+        for lang in Lang::ALL {
+            let seen = Rc::new(RefCell::new(Seen::default()));
+            let server = Server::Ready {
+                endpoint: "https://cmis-admin.example.internal:8444".into(),
+                pin: fingerprint(&"ab".repeat(48)),
+            };
+            let link = Some(Box::new(FakeLink(Rc::clone(&seen))) as Box<dyn Link>);
+            let mut app = AdminApp::new(lang, server, link, false, Setup::inert());
+            let ctx = egui::Context::default();
+            frame_sized(
+                &ctx,
+                &mut app,
+                vec![egui::Event::Text("alice".into())],
+                small,
+            );
+            let (painted, overflow) = frame_sized(&ctx, &mut app, Vec::new(), small);
+            assert!(overflow.is_empty(), "{lang:?}: {overflow:?}");
+            assert!(
+                painted.contains(Msg::AdminUsernameHint.text(lang)),
+                "{lang:?}: {painted}"
+            );
+            assert!(
+                !painted.contains(Msg::AdminPassword.text(lang)),
+                "{lang:?}: no guess"
+            );
+            assert!(!painted.contains(Msg::AdminContinue.text(lang)), "{lang:?}");
+            frame_sized(&ctx, &mut app, vec![key(egui::Key::Tab)], small);
+            let (painted, _) = frame_sized(&ctx, &mut app, Vec::new(), small);
+            assert!(
+                painted.contains(Msg::AdminChecking.text(lang)),
+                "{lang:?}: {painted}"
+            );
+            assert_eq!(seen.borrow().cmds, vec!["offer"]);
+            seen.borrow_mut().replies.push_back(Reply::Offered {
+                username: "alice".into(),
+                result: Ok(BOTH),
+            });
+            frame_sized(&ctx, &mut app, Vec::new(), small);
+            let (painted, overflow) = frame_sized(&ctx, &mut app, Vec::new(), small);
+            assert!(overflow.is_empty(), "{lang:?}: {overflow:?}");
+            for want in [
+                Msg::AdminUsername,
+                Msg::AdminPassword,
+                Msg::AdminCode,
+                Msg::AdminSignIn,
+            ] {
+                assert!(
+                    painted.contains(want.text(lang)),
+                    "{lang:?} {want:?}: {painted}"
+                );
+            }
+            assert!(painted.contains("alice"), "the name stays on the screen");
+        }
     }
 
     /// Type the user name and receive the offer.
@@ -1617,6 +1873,67 @@ mod tests {
             })),
         );
         frame(ctx, app, Vec::new()).join("\n")
+    }
+
+    /// F23: after sign-in the pending requests open by themselves, the tab
+    /// counts them, the status bar says how many wait (a count only), the
+    /// breadcrumb shows where the page is, and a narrow approval goes from
+    /// its form with one click; Enter on the form never sends.
+    #[test]
+    fn sign_in_lands_on_pending_requests_and_a_narrow_approval_takes_one_click() {
+        use crate::admin::decide::tests::{detail, request};
+        use crate::admin::decide::DecisionKind;
+        use ferrogate_admin_client::approvals::proto::ListAppRequestsResponse;
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        app.auto_open_requests = true;
+        signed_in_as(&ctx, &mut app, &seen, "Alice");
+        assert_eq!(seen.borrow().cmds.last(), Some(&"permissions"));
+        let perms = vec!["app_request.approve".to_string()];
+        push(&seen, Reply::Permissions(Ok(perms)));
+        frame(&ctx, &mut app, Vec::new());
+        push(
+            &seen,
+            Reply::Requests(Ok(ListAppRequestsResponse {
+                items: vec![request(0)],
+                next_page_token: String::new(),
+            })),
+        );
+        frame(&ctx, &mut app, Vec::new());
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("Requests · 1 pending"), "{painted}");
+        assert!(
+            painted.contains("Administrator client · 1 application request is waiting"),
+            "{painted}"
+        );
+        assert!(painted.contains("Account  ›  Requests"), "{painted}");
+        let notice = app.notices.latest().unwrap().line();
+        assert!(
+            !notice.contains("R-0000A1B2") && !notice.contains('/'),
+            "{notice}"
+        );
+
+        app.act(vec![Action::View(ViewAction::OpenRequest(0))]);
+        push(&seen, Reply::Request(Ok(Box::new(detail(0)))));
+        frame(&ctx, &mut app, Vec::new());
+        app.act(vec![Action::View(ViewAction::Decide(
+            DecisionKind::Approve,
+        ))]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        for text in [
+            "What will be sent",
+            "Approve and send",
+            "Step 1 of 2",
+            "›  Approve",
+        ] {
+            assert!(painted.contains(text), "{text}: {painted}");
+        }
+        let sent = seen.borrow().cmds.len();
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert_eq!(seen.borrow().cmds.len(), sent, "Enter never sends");
+        app.act(vec![Action::View(ViewAction::DecisionBack)]);
+        app.act(vec![Action::View(ViewAction::DecisionSend)]);
+        assert_eq!(seen.borrow().cmds.last(), Some(&"mutate"));
     }
 
     #[test]

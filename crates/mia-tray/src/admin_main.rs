@@ -12,7 +12,6 @@
 use std::process::ExitCode;
 
 use mia_tray::admin::cli::{self, Mode};
-use mia_tray::i18n::Lang;
 
 fn main() -> ExitCode {
     // Diagnostics go to stderr; `MIA_TRAY_LOG` takes a tracing directive.
@@ -31,7 +30,7 @@ fn main() -> ExitCode {
                 environment = environment.as_ref().map(mia_tray::actions::EnvName::as_str),
                 "starting"
             );
-            mia_tray::gui::admin::run(Lang::detect())
+            mia_tray::gui::admin::run(mia_tray::prefs::effective_lang())
         }
         Ok(Mode::Help) => {
             println!("{}", cli::USAGE);

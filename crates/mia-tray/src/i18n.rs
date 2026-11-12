@@ -1,24 +1,62 @@
-//! English / Portuguese strings — a compile-time table.
+//! English / Portuguese (Brazil) / Spanish strings — a compile-time table.
 //!
-//! Every user-facing string the tray itself produces is a [`Msg`]; the table
-//! holds both languages side by side so a missing translation is a compile
-//! error, not a runtime fallback. Placeholders are `{name}` and are filled with
-//! [`fill`]. Text that comes from the daemon or from `mia` output is *not*
-//! translated (it is shown escaped, see [`crate::text`]).
+//! Every user-facing string the tray itself produces is a [`Msg`]. English
+//! and Portuguese sit side by side in the table below; Spanish lives in
+//! [`es`], an exhaustive `match` with no wildcard arm. A missing translation
+//! is therefore a compile error, not a runtime fallback, and
+//! `every_message_has_every_language` checks that no text is empty and that
+//! the placeholders agree. Placeholders are named (`{name}`) and filled with
+//! [`fill`]; counts go through [`plural`] / [`count`] so no sentence is
+//! assembled from fragments. Text that comes from the daemon or from `mia`
+//! output is *not* translated (it is shown escaped, see [`crate::text`]).
+//!
+//! The language is chosen by [`Lang::resolve`]: an explicit override (the
+//! `MIA_TRAY_LANG` variable or the preference file, see [`crate::prefs`]),
+//! then the locale variables, then the OS locale, then English. Region tags
+//! fall back to their language (`pt-PT` → Portuguese, `es-MX` → Spanish).
+
+mod es;
 
 /// A UI language.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Lang {
-    /// English (the default).
+    /// English (the default and the complete source).
     #[default]
     En,
     /// Portuguese (Brazil).
     Pt,
+    /// Spanish.
+    Es,
 }
 
 impl Lang {
-    /// Map a locale tag (`pt_BR.UTF-8`, `pt-BR`, `en_US`, `C`) to a language;
-    /// `None` when the tag names neither.
+    /// Every language, in the order the language selector lists them.
+    pub const ALL: [Self; 3] = [Self::En, Self::Pt, Self::Es];
+
+    /// The BCP 47 tag written to the preference file.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Pt => "pt-BR",
+            Self::Es => "es",
+        }
+    }
+
+    /// The language's own name, for the selector (never translated, so a
+    /// person can find their language whatever is shown now).
+    #[must_use]
+    pub fn native_name(self) -> &'static str {
+        match self {
+            Self::En => "English",
+            Self::Pt => "Português (Brasil)",
+            Self::Es => "Español",
+        }
+    }
+
+    /// Map a locale tag (`pt_BR.UTF-8`, `pt-BR`, `es-MX`, `en_US`, `C`) to a
+    /// language; `None` when the tag names none of them. Any region of a
+    /// supported language falls back to it.
     #[must_use]
     pub fn from_tag(tag: &str) -> Option<Self> {
         let lower = tag.trim().to_ascii_lowercase();
@@ -28,6 +66,7 @@ impl Lang {
             .unwrap_or_default();
         match primary {
             "pt" => Some(Self::Pt),
+            "es" => Some(Self::Es),
             "en" | "c" | "posix" => Some(Self::En),
             _ => None,
         }
@@ -35,7 +74,7 @@ impl Lang {
 
     /// Pick the language from the environment (`LC_ALL`, `LC_MESSAGES`,
     /// `LANG`, `LANGUAGE` in that order) and then the OS locale; English when
-    /// nothing matches.
+    /// nothing matches. Ignores any override; see [`Lang::resolve`].
     #[must_use]
     pub fn detect() -> Self {
         Self::detect_from(|k| std::env::var(k).ok(), sys_locale::get_locale())
@@ -57,6 +96,17 @@ impl Lang {
             .and_then(Self::from_tag)
             .unwrap_or_default()
     }
+
+    /// The language to use: `chosen` (an explicit override) when set, else
+    /// [`Lang::detect_from`] over `env` and `os_locale`.
+    #[must_use]
+    pub fn resolve(
+        chosen: Option<Self>,
+        env: impl Fn(&str) -> Option<String>,
+        os_locale: Option<String>,
+    ) -> Self {
+        chosen.unwrap_or_else(|| Self::detect_from(env, os_locale))
+    }
 }
 
 /// Replace each `{key}` in `template` with its value.
@@ -67,6 +117,41 @@ pub fn fill(template: &str, args: &[(&str, &str)]) -> String {
         out = out.replace(&format!("{{{k}}}"), v);
     }
     out
+}
+
+/// A CLDR plural category (only the two these languages use for whole
+/// numbers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plural {
+    /// "one".
+    One,
+    /// "other".
+    Other,
+}
+
+/// The plural category of the whole number `n` in `lang` (CLDR: English
+/// and Spanish use "one" for 1 only; Brazilian Portuguese for 0 and 1).
+#[must_use]
+pub fn plural(lang: Lang, n: u64) -> Plural {
+    let one = match lang {
+        Lang::En | Lang::Es => n == 1,
+        Lang::Pt => n <= 1,
+    };
+    if one {
+        Plural::One
+    } else {
+        Plural::Other
+    }
+}
+
+/// `one` or `other` (each with an `{n}` placeholder) for `n`, filled.
+#[must_use]
+pub fn count(lang: Lang, n: u64, one: Msg, other: Msg) -> String {
+    let template = match plural(lang, n) {
+        Plural::One => one,
+        Plural::Other => other,
+    };
+    fill(template.text(lang), &[("n", &n.to_string())])
 }
 
 macro_rules! messages {
@@ -85,8 +170,10 @@ macro_rules! messages {
             /// The text in `lang`.
             #[must_use]
             pub fn text(self, lang: Lang) -> &'static str {
-                match (self, lang) {
-                    $( (Msg::$id, Lang::En) => $en, (Msg::$id, Lang::Pt) => $pt, )*
+                match lang {
+                    Lang::En => match self { $( Msg::$id => $en, )* },
+                    Lang::Pt => match self { $( Msg::$id => $pt, )* },
+                    Lang::Es => es::text(self),
                 }
             }
         }
@@ -95,13 +182,8 @@ macro_rules! messages {
 
 messages! {
     AppName => "FerroGate MIA", "FerroGate MIA";
-    MenuOpenStatus => "Open status", "Abrir status";
     MenuSetup => "Setup…", "Configuração…";
-    MenuLogs => "Logs…", "Logs…";
-    MenuRunSelfTest => "Run self-test", "Executar autoteste";
-    MenuAdminClient => "Admin client…", "Cliente de administração…";
     MenuQuit => "Quit", "Sair";
-    MenuLastAction => "Last action: {action} — {outcome}", "Última ação: {action} — {outcome}";
     MenuReadDoc => "Read: {doc}", "Ler: {doc}";
     MenuForEnv => "{action} ({env})", "{action} ({env})";
 
@@ -163,7 +245,6 @@ messages! {
     SourceEndpoint => "from the status endpoint", "do endpoint de status";
     SourceCli => "from `mia status` (fallback)", "de `mia status` (alternativa)";
     SourceSynthesised => "agent not reachable", "agente inacessível";
-    DetailSource => "Source", "Origem";
 
     ActionRunSelfTest => "Run self-test", "Executar autoteste";
     ActionShowMachineId => "Show machine ID", "Mostrar ID da máquina";
@@ -209,10 +290,6 @@ messages! {
     NoteElevation => "This action needs administrator approval; your system will ask for it.", "Esta ação requer aprovação do administrador; o sistema irá solicitá-la.";
     NoteRestartToApply => "Restart the service to apply it: the default address moves only when the agent restarts.", "Reinicie o serviço para aplicar: o endereço padrão só muda quando o agente reinicia.";
 
-    NotifyAttentionTitle => "FerroGate MIA needs attention", "O FerroGate MIA precisa de atenção";
-    NotifySvidExpiringTitle => "Machine identity expiring", "Identidade da máquina expirando";
-    NotifyCrlStaleTitle => "Revocation list stale", "Lista de revogação desatualizada";
-    NotifyBody => "{env}: {state}", "{env}: {state}";
 
     TabStatus => "Status", "Status";
     TabRecovery => "Recovery", "Recuperação";
@@ -227,8 +304,6 @@ messages! {
     AdminMissingFields => "Sign-in failed. Check the fields and try again.", "Falha ao entrar. Verifique os campos e tente novamente.";
     AdminMemoryOnly => "Credentials are kept in memory only and wiped on sign-out, lock and exit.", "As credenciais ficam apenas na memória e são apagadas ao sair, ao bloquear e ao fechar.";
     AdminContinue => "Continue", "Continuar";
-    AdminChangeUser => "Change user", "Trocar usuário";
-    AdminUserLine => "User name: {name}", "Usuário: {name}";
     AdminUseKey => "Use security key", "Usar chave de segurança";
     AdminKeyUnavailable => "This build has no security-key support on this platform yet.", "Esta versão ainda não oferece chave de segurança nesta plataforma.";
     AdminServerLine => "Server: {endpoint} · pin {pin}", "Servidor: {endpoint} · pin {pin}";
@@ -635,30 +710,83 @@ messages! {
     LogsUnavailable => "The log tail is unavailable: the agent is not reachable.", "O log não está disponível: o agente está inacessível.";
     LogsJournalNote => "On Linux the full log is the systemd journal (journalctl -u mia). Reading it needs membership in the systemd-journal or adm group — ask an administrator to add you; the tray does not elevate for this.", "No Linux o log completo é o journal do systemd (journalctl -u mia). Lê-lo requer participação no grupo systemd-journal ou adm — peça a um administrador para incluí-lo; o tray não pede elevação para isso.";
     LogsNoViewer => "No log viewer could be started; run: journalctl -u mia -f", "Não foi possível abrir um visualizador; execute: journalctl -u mia -f";
+
+    MenuOpenMain => "Open FerroGate…", "Abrir o FerroGate…";
+    MenuEnvironments => "Environments", "Ambientes";
+    MenuReviewApprovals => "Review approvals…", "Revisar aprovações…";
+    HeaderUpdated => "Updated {when}", "Atualizado {when}";
+    HeaderLanguage => "Language", "Idioma";
+    HeaderSource => "Read from: {source}", "Lido de: {source}";
+    NoticeKindInfo => "Information", "Informação";
+    NoticeKindSuccess => "Done", "Concluído";
+    NoticeKindWarning => "Warning", "Aviso";
+    NoticeKindError => "Error", "Erro";
+    NoticeKindApproval => "Approval pending", "Aprovação pendente";
+    NoticeUnhealthy => "{state} — open FerroGate for the next step.", "{state} — abra o FerroGate para ver o próximo passo.";
+    NoticeSvidExpiring => "The machine identity is past its renewal point and renewal is failing; the agent keeps retrying.", "A identidade da máquina passou do ponto de renovação e a renovação está falhando; o agente continua tentando.";
+    NoticeCrlStale => "The revocation list is stale, so token minting is paused.", "A lista de revogação está desatualizada, então a emissão de tokens está pausada.";
+    NoticeAction => "{action} — {outcome}", "{action} — {outcome}";
+    NoticePendingOne => "{n} application request is waiting for a decision.", "{n} solicitação de aplicação aguarda decisão.";
+    NoticePendingOther => "{n} application requests are waiting for a decision.", "{n} solicitações de aplicação aguardam decisão.";
+    NoticeOpen => "Open", "Abrir";
+    NoticeReview => "Review", "Revisar";
+    NoticeDismiss => "Dismiss", "Dispensar";
+    NoticeAdminApp => "Administrator client", "Cliente de administração";
+    NoticeHistory => "Earlier messages", "Mensagens anteriores";
+    SetupCheckAndApply => "Check and apply", "Verificar e aplicar";
+    SetupCheckOnly => "Check only", "Somente verificar";
+    AdminRequestsPendingOne => "Requests · {n} pending", "Solicitações · {n} pendente";
+    AdminRequestsPendingOther => "Requests · {n} pending", "Solicitações · {n} pendentes";
+    AdminPreviewTitle => "What will be sent", "O que será enviado";
+    AdminPreviewWide => "This scope is wide: you will be asked to accept it and to review the request before anything is sent.", "Este escopo é amplo: você deverá aceitá-lo e revisar a solicitação antes que algo seja enviado.";
+    AdminApproveSend => "Approve and send", "Aprovar e enviar";
+    AdminDenySend => "Deny and send", "Negar e enviar";
+    AdminHome => "Account", "Conta";
+    AdminStepOf => "Step {n} of {total}", "Etapa {n} de {total}";
+    HeaderLanguageSystem => "System default", "Padrão do sistema";
+    LabelDetails => "Details", "Detalhes";
+    AdminUsernameHint => "Press Enter or Tab to continue.", "Pressione Enter ou Tab para continuar.";
+    AdminNeedUsername => "Type your user name first.", "Digite primeiro o seu usuário.";
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The sorted `{placeholder}` names of `s`.
+    fn holes(s: &str) -> Vec<String> {
+        let mut v: Vec<String> = s
+            .split('{')
+            .skip(1)
+            .filter_map(|p| p.split_once('}').map(|(k, _)| k.to_string()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The completeness check CI relies on: every key has a non-empty text
+    /// in every language, with the same placeholders as the English source.
     #[test]
-    fn every_message_has_both_languages() {
+    fn every_message_has_every_language() {
         for m in Msg::ALL {
-            for lang in [Lang::En, Lang::Pt] {
-                assert!(!m.text(lang).trim().is_empty(), "{m:?} empty in {lang:?}");
+            let en = m.text(Lang::En);
+            for lang in Lang::ALL {
+                let text = m.text(lang);
+                assert!(!text.trim().is_empty(), "{m:?} empty in {lang:?}");
+                assert_eq!(holes(en), holes(text), "{m:?} placeholders in {lang:?}");
             }
-            // Placeholders must match between languages.
-            let holes = |s: &str| {
-                let mut v: Vec<String> = s
-                    .split('{')
-                    .skip(1)
-                    .filter_map(|p| p.split_once('}').map(|(k, _)| k.to_string()))
-                    .collect();
-                v.sort();
-                v
-            };
-            assert_eq!(holes(m.text(Lang::En)), holes(m.text(Lang::Pt)), "{m:?}");
         }
+    }
+
+    /// Spanish is a real table, not English passed through.
+    #[test]
+    fn spanish_is_translated() {
+        let differs = Msg::ALL
+            .iter()
+            .filter(|m| m.text(Lang::Es) != m.text(Lang::En))
+            .count();
+        assert!(differs * 10 > Msg::ALL.len() * 8, "{differs}");
+        assert_eq!(Msg::MenuQuit.text(Lang::Es), "Salir");
     }
 
     #[test]
@@ -701,6 +829,57 @@ mod tests {
         assert_eq!(Lang::detect_from(env(&[]), Some("pt-BR".into())), Lang::Pt);
         assert_eq!(Lang::detect_from(env(&[]), Some("de-DE".into())), Lang::En);
         assert_eq!(Lang::detect_from(env(&[("LANG", "")]), None), Lang::En);
+        // Spanish, any region; Portuguese of any region falls back to pt-BR.
+        assert_eq!(
+            Lang::detect_from(env(&[("LANG", "es_MX.UTF-8")]), None),
+            Lang::Es
+        );
+        assert_eq!(Lang::detect_from(env(&[]), Some("es-419".into())), Lang::Es);
+        assert_eq!(
+            Lang::detect_from(env(&[("LANG", "pt_PT.UTF-8")]), None),
+            Lang::Pt
+        );
+        // An unsupported first preference falls through to the next one.
+        assert_eq!(
+            Lang::detect_from(env(&[("LANGUAGE", "fr:es:en")]), None),
+            Lang::Es
+        );
+    }
+
+    #[test]
+    fn an_explicit_choice_wins_over_the_locale() {
+        let pt = |k: &str| (k == "LANG").then(|| "pt_BR.UTF-8".to_string());
+        assert_eq!(Lang::resolve(Some(Lang::Es), pt, None), Lang::Es);
+        assert_eq!(Lang::resolve(None, pt, None), Lang::Pt);
+        assert_eq!(Lang::resolve(None, |_| None, None), Lang::En);
+    }
+
+    #[test]
+    fn codes_round_trip_and_names_are_native() {
+        for lang in Lang::ALL {
+            assert_eq!(Lang::from_tag(lang.code()), Some(lang));
+        }
+        assert_eq!(Lang::Pt.native_name(), "Português (Brasil)");
+        assert_eq!(Lang::from_tag("de"), None);
+    }
+
+    #[test]
+    fn plurals_follow_cldr() {
+        assert_eq!(plural(Lang::En, 0), Plural::Other);
+        assert_eq!(plural(Lang::En, 1), Plural::One);
+        assert_eq!(plural(Lang::Es, 0), Plural::Other);
+        assert_eq!(plural(Lang::Es, 1), Plural::One);
+        // pt-BR: 0 and 1 are "one".
+        assert_eq!(plural(Lang::Pt, 0), Plural::One);
+        assert_eq!(plural(Lang::Pt, 2), Plural::Other);
+        assert_eq!(
+            count(Lang::En, 1, Msg::NoticePendingOne, Msg::NoticePendingOther),
+            "1 application request is waiting for a decision."
+        );
+        assert_eq!(
+            count(Lang::En, 3, Msg::NoticePendingOne, Msg::NoticePendingOther),
+            "3 application requests are waiting for a decision."
+        );
     }
 
     #[test]
