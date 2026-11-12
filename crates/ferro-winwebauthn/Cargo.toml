@@ -1,0 +1,33 @@
+[package]
+name        = "ferro-winwebauthn"
+description = "FerroGate — the Windows WebAuthn API (webauthn.dll) FFI for the tray admin client's security keys"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish                = false
+
+[lib]
+name = "ferro_winwebauthn"
+path = "src/lib.rs"
+
+# The FFI boundary of the admin client's Windows security-key backend (F22).
+# `mia-tray` is `#![forbid(unsafe_code)]`; the `unsafe` lives in `src/dll.rs`,
+# compiled on Windows only. The rest (bounds, UTF-16 strings, the cancel
+# watcher) is plain Rust, built and tested on every host. A `cfg(windows)`
+# dependency of `mia-tray`'s `fido2-windows` feature only.
+[lints]
+workspace = true
+
+# `webauthn.dll` is loaded at run time from System32 (LoadLibraryExW +
+# GetProcAddress), never imported: a Windows without it simply has no key
+# backend.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }

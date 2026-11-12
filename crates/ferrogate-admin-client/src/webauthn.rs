@@ -1,9 +1,10 @@
 //! FIDO2 / WebAuthn on the client side (F20 §5, F22 §3a): the
-//! [`Authenticator`] trait each front end implements over its platform
-//! (Windows `webauthn.dll`, macOS AuthenticationServices, CTAP2 over USB HID)
-//! or a test double, and the requests this client builds for it — an
-//! assertion (sign-in, step-up, per-operation proof) or a new credential
-//! (enrollment, adding a key).
+//! [`Authenticator`] trait each front end implements over its platform (the
+//! tray admin client: CTAP2 over USB HID on macOS and Linux, `webauthn.dll`
+//! on Windows) or a test double, and the requests this client builds for it
+//! — an assertion
+//! (sign-in, step-up, per-operation proof) or a new credential (enrollment,
+//! adding a key).
 
 //! The client writes the `clientDataJSON` itself, with origin
 //! `https://<RP ID>` (CMIS's default origin), and refuses any RP ID outside
@@ -97,8 +98,10 @@ pub struct AssertionRequest {
     pub client_data_hash: [u8; 32],
     /// Credentials the server accepts (empty: any discoverable one).
     pub allow_credential_ids: Vec<Vec<u8>>,
-    /// Always `true`: CMIS requires user verification (PIN or biometric,
-    /// entered in the key's or the OS's own prompt, never in this client).
+    /// Always `true`: CMIS requires user verification (the key's PIN or
+    /// biometric). The PIN goes to the key only: entered in the OS's own
+    /// prompt where the platform API has one, or, for USB HID keys on macOS
+    /// and Linux, in the front end's masked, wiped PIN prompt. Never to CMIS.
     pub user_verification_required: bool,
     /// How long to wait for a touch.
     pub timeout: Duration,
@@ -143,7 +146,8 @@ pub struct CreationRequest {
     pub algorithms: Vec<i32>,
     /// Credentials the account already holds (the key must not add another).
     pub exclude_credential_ids: Vec<Vec<u8>>,
-    /// Always `true`: a PIN or biometric in the key's or the OS's prompt.
+    /// Always `true`: the key's PIN or biometric (the PIN as for
+    /// [`AssertionRequest::user_verification_required`]).
     pub user_verification_required: bool,
     /// How long to wait for a touch.
     pub timeout: Duration,

@@ -179,7 +179,11 @@ client refuses to connect without a pin.
   crash dumps.
 - The FIDO2 prompt is the operating system's or the authenticator's own dialog. PIN
   and biometric entry happen there. The client never sees them, and no private key
-  leaves the authenticator.
+  leaves the authenticator. **Exception (macOS and Linux, USB HID keys):** raw
+  CTAP2 over HID has no system PIN dialog, so the admin window asks for the key's
+  PIN in a masked, fixed-capacity `Zeroizing` buffer, hands it to the key only
+  (never to CMIS, logs, files or the clipboard) and wipes it on submit, cancel,
+  sign-out, idle lock and close (`docs/mia-tray.md`, "Security keys").
 - Errors show F20's generic messages ("Sign-in failed", or "Too many attempts, try
   again in mm:ss").
 - The idle lock follows the server idle timeout minus 30 s. On lock the client
@@ -216,11 +220,12 @@ Both factors are enrolled here (decision D3). The flows call the F20 §5 and §1
 4. **Secret handling.** The TOTP secret and QR are held in `Zeroizing` buffers, never
    copied to the clipboard automatically, never persisted, and cleared when the
    wizard closes.
-5. **Platform notes.** Windows uses `webauthn.dll` and needs the window handle; macOS
-   uses AuthenticationServices; Linux talks CTAP2 over USB HID and needs a udev rule
-   for the key (documented in `docs/mia-tray.md`). When the platform offers no
-   authenticator API, the key button is disabled with an explanation, and TOTP is
-   used unless the server policy requires FIDO2.
+5. **Platform notes.** Windows uses `webauthn.dll` (loaded from System32, its own
+   PIN dialog parented to the admin window; FFI isolated in `ferro-winwebauthn`);
+   macOS and Linux talk CTAP2 over USB HID (Mozilla's `authenticator` crate; Linux
+   needs access to the key's hidraw node, documented in `docs/mia-tray.md`). When
+   the platform offers no authenticator API, the key button is disabled with an
+   explanation, and TOTP is used unless the server policy requires FIDO2.
 
 ### 4. Views
 

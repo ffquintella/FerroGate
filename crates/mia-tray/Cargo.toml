@@ -61,10 +61,22 @@ admin-core = [
     "dep:ferro-svid",
     "dep:sha2",
 ]
+# FIDO2 security keys over USB HID (CTAP2) for the administrator client on
+# macOS and Linux, through Mozilla's `authenticator` crate with its pure-Rust
+# crypto back end (no NSS, no OpenSSL). The PIN is typed in the admin window
+# (`admin::keyprompt`). Elsewhere (Windows) it adds nothing: `platform()`
+# stays `None` there. On Linux it links libudev (`libudev-dev` to build).
+fido2-hid = ["admin-core", "dep:authenticator", "dep:ciborium"]
+# FIDO2 security keys on Windows through the system's WebAuthn API
+# (`webauthn.dll`, loaded from System32 at run time) via the
+# `ferro-winwebauthn` FFI crate, which holds the backend's only `unsafe`.
+# Windows shows its own PIN/biometric dialog. Elsewhere it adds no
+# dependency (its checks are compiled for the tests).
+fido2-windows = ["admin-core", "dep:ferro-winwebauthn", "dep:ciborium"]
 # The administrator client `mia-tray-admin` (F22): a separate binary with its
 # own link graph. `cargo tree -p mia-tray --bin mia-tray -e normal` must stay
 # free of everything this feature adds (`make check-tray-isolation`).
-admin = ["gui", "admin-core"]
+admin = ["gui", "admin-core", "fido2-hid", "fido2-windows"]
 # The desktop front end. See the note above.
 gui = [
     "dep:eframe",
@@ -104,6 +116,9 @@ qrcode                 = { version = "0.14", optional = true, default-features =
 ferro-machineid        = { path = "../ferro-machineid", optional = true }
 ferro-svid             = { path = "../ferro-svid", optional = true }
 sha2                   = { workspace = true, optional = true }
+# The CBOR of a new key's attestation object, rewritten as `none` (features
+# `fido2-hid`, `fido2-windows`).
+ciborium               = { workspace = true, optional = true }
 
 # ── GUI (feature `gui`) ──────────────────────────────────────────────────────
 # Native rendering only — no embedded web view, so log text and config values
@@ -124,6 +139,13 @@ winit = { version = "0.30", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
 
+# Administrator client, feature `fido2-hid`: CTAP2 over USB HID (IOKit on
+# macOS, hidraw + libudev on Linux). Never in the `mia-tray` graph
+# (`make check-tray-isolation`). Not built on Windows, where raw FIDO HID
+# access needs an elevated process (`fido2-windows` uses `webauthn.dll`).
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+authenticator = { version = "0.5", optional = true, default-features = false, features = ["crypto_rust"] }
+
 # Windows: the Program Files and Windows directories for the elevation trust
 # rule come from HKLM, not from environment variables the user controls.
 [target.'cfg(unix)'.dependencies]
@@ -131,6 +153,8 @@ rustix = { workspace = true, features = ["std", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+# Administrator client, feature `fido2-windows`: the `webauthn.dll` FFI.
+ferro-winwebauthn = { path = "../ferro-winwebauthn", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -178,7 +202,7 @@ opened from the tray menu, to sign in to CMIS with a second factor and approve \
 application requests. Install it only on managed approver devices. Runs as the \
 logged-in user, needs no group membership or privilege, keeps credentials in \
 memory only."""
-depends = "ferrogate-mia-tray, libgtk-3-0, libxdo3, libayatana-appindicator3-1"
+depends = "ferrogate-mia-tray, libgtk-3-0, libxdo3, libayatana-appindicator3-1, libudev1"
 maintainer-scripts = "dist/debian-admin"
 assets = [
     ["../../target/release/mia-tray-admin", "usr/bin/", "755"],
@@ -219,6 +243,8 @@ ferrogate-mia-tray = "*"
 gtk3 = "*"
 libxdo = "*"
 libayatana-appindicator-gtk3 = "*"
+# libudev, for USB security keys (feature `fido2-hid`).
+systemd-libs = "*"
 
 [package.metadata.generate-rpm.requires]
 ferrogate-mia = "*"

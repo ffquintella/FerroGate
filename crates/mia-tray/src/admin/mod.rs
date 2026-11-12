@@ -16,15 +16,27 @@
 //! - [`session`] — the worker thread that talks to CMIS for the window;
 //! - [`config`] — `admin.toml` (endpoint and SPKI pin, no secrets);
 //! - [`server`] — the "admin server" screen that writes it;
-//! - [`webauthn`] — the platform's security-key backend (none built yet);
+//! - [`webauthn`] — the platform's security-key backend: USB HID on macOS
+//!   and Linux (`ctap`), `webauthn.dll` on Windows (`winkey`), both after
+//!   the same request checks (`keycheck`);
+//! - [`keyprompt`] — arming and cancelling key ceremonies, and the touch and
+//!   PIN prompts the window shows for USB HID keys;
 //! - [`cli`] — the binary's own (tiny) argument parser.
 
 pub mod cli;
 pub mod config;
+#[cfg(all(feature = "fido2-hid", any(target_os = "macos", target_os = "linux")))]
+mod ctap;
 pub mod decide;
 pub mod enroll;
 pub mod factors;
 pub mod flow;
+#[cfg(any(
+    all(feature = "fido2-hid", any(target_os = "macos", target_os = "linux")),
+    feature = "fido2-windows"
+))]
+mod keycheck;
+pub mod keyprompt;
 pub mod local;
 pub mod login;
 pub mod secret;
@@ -33,3 +45,5 @@ pub mod server;
 pub mod session;
 pub mod views;
 pub mod webauthn;
+#[cfg(feature = "fido2-windows")]
+mod winkey;

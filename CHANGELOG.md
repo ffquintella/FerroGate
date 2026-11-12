@@ -25,6 +25,14 @@ record them.
 
 ## [Unreleased]
 
+## [0.30.16] - 2026-11-12
+
+### Added
+
+- Use FIDO2 security keys (YubiKey and the like) in `mia-tray-admin` on macOS, Linux and Windows. macOS and Linux: CTAP2 over USB HID through Mozilla's `authenticator` crate (pure-Rust crypto, new `fido2-hid` feature), with the key's touch, key-choice and PIN prompts in the admin window; raw HID has no system PIN dialog, so the PIN is typed there into a masked, fixed-capacity wiped buffer, handed to the key only and wiped on submit, cancel, sign-out, idle lock and close. Windows: the system's WebAuthn API (`webauthn.dll`, loaded from System32 only, new `fido2-windows` feature and `ferro-winwebauthn` FFI crate holding the only `unsafe`), whose own Windows Security dialog takes the PIN, parented to the admin window and cancelled on lock, sign-out and close; ES256 only, roaming keys only, and no backend on a Windows without `webauthn.dll`. Everywhere: user verification stays required, requests are re-checked against the RP ID, origin and bounds before any key or API is touched, new keys register with `none` attestation, failures are worded generically and the HID library's own log is dropped. Not yet verified with a real key or a real Windows; the Linux build needs `libudev-dev` (S53, S51, M40, T297)
+
+## [0.30.15] - 2026-11-12
+
 ### Added
 
 - Add Spanish to the tray and the admin client, with a language selector in the window (System default, English, Português (Brasil), Español) saved per user in `mia-tray.toml`, the `MIA_TRAY_LANG` override, region fallback (`pt-*` → Portuguese, `es-*` → Spanish, else English), CLDR plurals, and a test that every message exists with the same placeholders in all three languages (F23, S18)

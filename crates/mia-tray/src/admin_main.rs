@@ -12,15 +12,23 @@
 use std::process::ExitCode;
 
 use mia_tray::admin::cli::{self, Mode};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::Layer as _;
 
 fn main() -> ExitCode {
     // Diagnostics go to stderr; `MIA_TRAY_LOG` takes a tracing directive.
-    // Nothing logged is a credential: the client never formats one.
+    // Nothing logged is a credential: the client never formats one, and the
+    // security-key library's own log (credential ids, PIN hashes, HID
+    // frames at debug/trace) is dropped whatever the directive says.
     let filter = tracing_subscriber::EnvFilter::try_from_env("MIA_TRAY_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(mia_tray::admin::webauthn::log_filter(filter)),
+        )
         .init();
 
     match cli::parse(std::env::args().skip(1)) {

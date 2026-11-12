@@ -146,6 +146,12 @@ spanish! {
     AdminChecking => "Verificando la cuenta…";
     AdminSigningIn => "Iniciando sesión…";
     AdminTouchKey => "Toque su llave de seguridad cuando parpadee…";
+    AdminFollowSystemKeyPrompt => "Siga el aviso de Seguridad de Windows para usar su llave de seguridad…";
+    AdminChooseKey =>"Hay varias llaves de seguridad conectadas. Toque la que quiera usar.";
+    AdminKeyPin => "PIN de la llave de seguridad";
+    AdminKeyPinHint => "El PIN va solo a la llave. Nunca se guarda ni se envía al servidor.";
+    AdminKeyPinWrong => "PIN incorrecto. Inténtelo de nuevo: la llave bloquea el PIN tras demasiados intentos fallidos.";
+    AdminKeyPinLast => "PIN incorrecto. Queda un intento antes de que la llave bloquee el PIN.";
     AdminConfirming => "Confirmando…";
     AdminRejected => "No se pudo iniciar sesión. Inténtelo de nuevo.";
     AdminThrottled => "Demasiados intentos. Inténtelo de nuevo en {time}.";

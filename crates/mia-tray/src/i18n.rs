@@ -311,6 +311,12 @@ messages! {
     AdminChecking => "Checking the account…", "Verificando a conta…";
     AdminSigningIn => "Signing in…", "Entrando…";
     AdminTouchKey => "Touch your security key when it blinks…", "Toque na sua chave de segurança quando ela piscar…";
+    AdminFollowSystemKeyPrompt => "Follow the Windows Security prompt to use your security key…", "Siga o pedido da Segurança do Windows para usar sua chave de segurança…";
+    AdminChooseKey =>"Several security keys are connected. Touch the one you want to use.", "Há várias chaves de segurança conectadas. Toque na que você quer usar.";
+    AdminKeyPin => "Security key PIN", "PIN da chave de segurança";
+    AdminKeyPinHint => "The PIN goes only to the key. It is never stored or sent to the server.", "O PIN vai apenas para a chave. Ele nunca é guardado nem enviado ao servidor.";
+    AdminKeyPinWrong => "Wrong PIN. Try again: the key locks its PIN after too many wrong attempts.", "PIN incorreto. Tente novamente: a chave bloqueia o PIN após tentativas erradas demais.";
+    AdminKeyPinLast => "Wrong PIN. One attempt is left before the key locks its PIN.", "PIN incorreto. Resta uma tentativa antes de a chave bloquear o PIN.";
     AdminConfirming => "Confirming…", "Confirmando…";
     AdminRejected => "Sign-in failed. Try again.", "Falha ao entrar. Tente novamente.";
     AdminThrottled => "Too many attempts. Try again in {time}.", "Muitas tentativas. Tente novamente em {time}.";

@@ -155,6 +155,33 @@ pub enum Cmd {
 
 static_assertions::assert_not_impl_any!(Cmd: std::fmt::Debug, std::fmt::Display, Clone);
 
+impl Cmd {
+    /// Whether carrying out this command asks the platform's security key
+    /// (the window arms its key prompt for it).
+    #[must_use]
+    pub fn uses_key(&self) -> bool {
+        let key = |f: &FactorChoice| matches!(f, FactorChoice::SecurityKey);
+        match self {
+            Cmd::SignIn { factor, .. } | Cmd::StepUp { factor } => key(factor),
+            Cmd::CompleteAddTotp { proof, .. }
+            | Cmd::RemoveFactor { proof, .. }
+            | Cmd::Register { proof, .. } => key(proof),
+            Cmd::EnrollKey { .. } | Cmd::CompleteAddKey { .. } => true,
+            Cmd::Offer { .. }
+            | Cmd::BeginEnrollment { .. }
+            | Cmd::CompleteEnrollment { .. }
+            | Cmd::ListFactors
+            | Cmd::BeginAddFactor { .. }
+            | Cmd::Permissions
+            | Cmd::ListRequests(_)
+            | Cmd::GetRequest(_)
+            | Cmd::ListApprovals(_)
+            | Cmd::GetApproval(_)
+            | Cmd::Mutate(_) => false,
+        }
+    }
+}
+
 /// A [`Cmd`] and the session epoch the window saw when it queued it: one
 /// queued before a lock, sign-out or close is answered but never sent.
 struct Queued {
@@ -782,6 +809,42 @@ mod tests {
             user_verification: 1,
             attestation: 1,
         }
+    }
+
+    #[test]
+    fn only_commands_that_ask_the_key_arm_its_prompt() {
+        let key = || FactorChoice::SecurityKey;
+        let code = || FactorChoice::Code(secret("123456"));
+        let sign_in = |factor| Cmd::SignIn {
+            username: "alice".into(),
+            password: secret("pw"),
+            factor,
+        };
+        assert!(sign_in(key()).uses_key());
+        assert!(!sign_in(code()).uses_key());
+        assert!(Cmd::StepUp { factor: key() }.uses_key());
+        assert!(!Cmd::StepUp { factor: code() }.uses_key());
+        assert!(Cmd::Register {
+            req: Box::default(),
+            proof: key(),
+        }
+        .uses_key());
+        assert!(!Cmd::RemoveFactor {
+            factor_id: "totp".into(),
+            proof: code(),
+        }
+        .uses_key());
+        let request = ferrogate_admin_client::webauthn::creation_request(&ferro_like_options());
+        assert!(Cmd::EnrollKey {
+            request: Box::new(request.unwrap()),
+            label: String::new(),
+        }
+        .uses_key());
+        assert!(!Cmd::ListFactors.uses_key());
+        assert!(!Cmd::Offer {
+            username: "alice".into()
+        }
+        .uses_key());
     }
 
     #[test]

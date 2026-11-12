@@ -55,6 +55,7 @@ lint: ## Run clippy with warnings denied
 # builders, wizard drafts, log follower), which is where its logic lives. These
 # targets cover the GUI build. On Linux they need GTK 3 headers:
 #   sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+# and the admin build (security keys over USB HID) also needs `libudev-dev`.
 TRAY := -p mia-tray --features mia-tray/gui
 # The administrator client (F22) is a separate binary behind the `admin`
 # feature, which the unprivileged tray never enables.
@@ -67,8 +68,10 @@ tray-admin: ## Build the mia-tray-admin administrator client (release)
 	cargo build --release $(TRAY_ADMIN) --bin mia-tray-admin
 
 # The admin build legitimately links the shared admin client (T281: tonic,
-# tokio, rustls, ferro-transport); the plain tray must link none of it.
-TRAY_FORBIDDEN := tonic|ferro-transport|ferrogate-admin-client|zeroize|tokio|hyper|h2|rustls|prost|ferro-proto|ferro-crypto
+# tokio, rustls, ferro-transport) and the security-key backends (`fido2-hid`:
+# authenticator, libudev on Linux; `fido2-windows`: ferro-winwebauthn); the
+# plain tray must link none of it.
+TRAY_FORBIDDEN := tonic|ferro-transport|ferrogate-admin-client|zeroize|tokio|hyper|h2|rustls|prost|ferro-proto|ferro-crypto|authenticator|serde_cbor|runloop|libudev|libudev-sys|ferro-winwebauthn
 
 check-tray-isolation: ## Assert the mia-tray binary links no admin or network crate (F22)
 	@deps="$$(cargo tree -p mia-tray --features mia-tray/gui -e normal --prefix none)" || exit 1; \

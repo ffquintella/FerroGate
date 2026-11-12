@@ -296,7 +296,8 @@ $ make deny-tray   # cargo-deny over the GUI dependency graph
 ```
 
 On Linux these need `libgtk-3-dev libxdo-dev libayatana-appindicator3-dev`
-(runtime: `libgtk-3-0 libxdo3 libayatana-appindicator3-1`). The
+(runtime: `libgtk-3-0 libxdo3 libayatana-appindicator3-1`), and the admin
+client (security keys over USB HID) also `libudev-dev` (runtime: `libudev1`). The
 `.github/workflows/mia-tray.yml` workflow builds, lints and tests the GUI on
 Linux, macOS and Windows.
 
@@ -461,13 +462,38 @@ never shown.
 origin `https://<RP ID>` (CMIS's default origin; if `CMIS_ADMIN_WEBAUTHN_ORIGINS`
 is set it must include it) and refuses any RP ID that is not
 `ferrogate-admin.<trust domain>`, so a server cannot use the key for another
-site; user verification is always required (the PIN or biometric is entered in
-the key's or the system's own prompt, never in this window). The authenticator
-is reached through the `ferrogate_admin_client::webauthn::Authenticator` trait.
-**No platform backend ships yet** (Windows `webauthn.dll`, macOS
-AuthenticationServices, Linux CTAP2 over USB HID): the key button is disabled
-with an explanation, and TOTP works unless the FIDO2 policy requires a key.
-The flows are tested with a software authenticator against an in-process CMIS.
+site; user verification is always required. The authenticator is reached
+through the `ferrogate_admin_client::webauthn::Authenticator` trait.
+
+- **macOS and Linux:** FIDO2 keys (YubiKey and the like) over USB, CTAP2
+  through Mozilla's `authenticator` crate. The window says when to touch the
+  key, or which of several keys to touch. **The PIN is typed in this window**:
+  raw USB HID has no system PIN prompt, so this is the one secret the client
+  handles that is not for CMIS. It goes into a masked field (dots only, fed
+  from the key events, never a text widget, at most 63 bytes, at least 4
+  characters), is handed to the key and nowhere else (never to CMIS, a file,
+  the clipboard or the log), and is wiped on submit, **Cancel**/`Esc`,
+  sign-out, the idle lock and close. A wrong PIN is asked again, with a warning on the last attempt.
+  Keys with a built-in fingerprint reader use it instead of the PIN. The
+  library's own log (credential ids, PIN hashes, HID frames) is dropped
+  whatever `MIA_TRAY_LOG` says. A new key is registered with `none`
+  attestation. On Linux the logged-in user needs access to the key's
+  `/dev/hidraw*` node (systemd's `uaccess` rule for FIDO devices grants it on
+  current distributions).
+- **Windows:** the system's WebAuthn API (`webauthn.dll`, loaded from
+  System32 only). **Windows Security shows its own dialog** for the touch,
+  the PIN or the fingerprint: the PIN never passes through this client, and
+  the window only says to follow that prompt. The dialog is parented to the
+  admin window; the idle lock, sign-out and close cancel it. A new key is
+  registered as ES256 with `none` attestation (a server that accepts only
+  EdDSA keys is refused with a logged reason); roaming keys only, no Windows
+  Hello. Without `webauthn.dll` (Windows older than 10 1903) the key button
+  is disabled with an explanation, and TOTP works unless the FIDO2 policy
+  requires a key.
+
+The flows are tested with a software authenticator against an in-process CMIS,
+the USB HID backend with a scripted key and the Windows backend with a
+scripted API; no real key and no real `webauthn.dll` were used in tests.
 
 ### Enrolling and managing second factors
 

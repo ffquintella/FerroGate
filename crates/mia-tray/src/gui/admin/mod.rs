@@ -35,11 +35,13 @@ use ferrogate_admin_client::config::ConfigError;
 use ferrogate_admin_client::display::inert;
 use ferrogate_admin_client::factors::FactorMethod;
 use ferrogate_admin_client::files::WriteError;
+use ferrogate_admin_client::webauthn::Authenticator;
 
 use crate::admin::config::{self, Location, SaveError, SaveTarget, SETUP_HELP};
 use crate::admin::enroll::EnrollField;
 use crate::admin::factors::FactorField;
-use crate::admin::flow::{Busy, Effect, Flow, FlowView, Notice, Problem};
+use crate::admin::flow::{Busy, Effect, Flow, FlowView, KeyPromptView, Notice, Problem};
+use crate::admin::keyprompt::{KeyAsk, KeyPrompt};
 use crate::admin::login::{Field, LoginError, Stage, Submission};
 use crate::admin::server::{SavePlan, SaveProblem, ServerField, ServerForm};
 use crate::admin::session::{self, Link, SHUTDOWN_WAIT};
@@ -63,7 +65,7 @@ pub fn run(lang: Lang) -> ExitCode {
         options,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
-            Ok(Box::new(AdminApp::connect(lang, &ctx)))
+            Ok(Box::new(AdminApp::connect(lang, &ctx, native_window(cc))))
         }),
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -72,6 +74,23 @@ pub fn run(lang: Lang) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// This window's Windows `HWND` as an address (0 elsewhere, or when the
+/// handle is unavailable), for the system's security-key dialog.
+#[cfg(not(target_os = "linux"))]
+fn native_window(cc: &eframe::CreationContext<'_>) -> usize {
+    use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    match cc.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(w)) => w.hwnd.get().cast_unsigned(),
+        _ => 0,
+    }
+}
+
+/// No native dialog to parent on Linux.
+#[cfg(target_os = "linux")]
+fn native_window(_: &eframe::CreationContext<'_>) -> usize {
+    0
 }
 
 /// Where the window signs in.
@@ -98,8 +117,9 @@ struct Setup {
 }
 
 impl Setup {
-    /// This user's files and environment; the worker repaints `ctx`.
-    fn system(ctx: &egui::Context) -> Self {
+    /// This user's files and environment; the worker (with the platform's
+    /// security key, if any) repaints `ctx`.
+    fn system(ctx: &egui::Context, key: Option<Arc<dyn Authenticator>>) -> Self {
         let env = |k: &str| std::env::var(k).ok();
         let os = std::env::consts::OS;
         let ctx = ctx.clone();
@@ -110,7 +130,7 @@ impl Setup {
             start: Box::new(move |cfg| {
                 let ctx = ctx.clone();
                 let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-                match session::spawn(cfg, crate::admin::webauthn::platform(), wake) {
+                match session::spawn(cfg, key.clone(), wake) {
                     Ok(worker) => Some(Box::new(worker) as Box<dyn Link>),
                     Err(e) => {
                         tracing::error!(error = %e, "the admin client worker could not start");
@@ -137,6 +157,8 @@ struct AdminApp {
     link: Option<Box<dyn Link>>,
     server: Server,
     key_available: bool,
+    /// The key's touch and PIN prompts, for a backend that shows them here.
+    key_prompt: Option<Arc<KeyPrompt>>,
     setup: Setup,
     /// The "admin server" screen, when shown (it replaces the sign-in).
     server_form: Option<ServerForm>,
@@ -165,12 +187,13 @@ struct AdminApp {
 /// one (a "Confirm and send" right after the form, say).
 fn page_key(server_form: bool, view: &FlowView) -> String {
     format!(
-        "{server_form}|{:?}|{}|{:?}|{}|{}|{:?}",
+        "{server_form}|{:?}|{}|{:?}|{}|{}|{:?}|{:?}",
         view.login.stage,
         view.session.is_some(),
         view.enroll.as_ref().map(|e| e.stage),
         view.factors.is_some(),
         view.step_up.is_some(),
+        view.key_prompt.map(|k| k.ask.is_pin()),
         view.views.as_ref().map(|v| (
             v.tab,
             v.screen,
@@ -203,10 +226,24 @@ fn fingerprint(hex: &str) -> String {
 
 impl AdminApp {
     /// Load `admin.toml` and start the worker; repaint on each reply.
-    fn connect(lang: Lang, ctx: &egui::Context) -> Self {
+    /// `window` is this window's native handle (Windows `HWND`, else 0), the
+    /// parent of the system's security-key dialog.
+    fn connect(lang: Lang, ctx: &egui::Context, window: usize) -> Self {
         super::apply_style(ctx);
-        let key_available = crate::admin::webauthn::platform().is_some();
-        let mut app = Self::open(lang, Setup::system(ctx), key_available);
+        // One backend for the window's lifetime: every worker started on a
+        // (re)loaded configuration uses it, and the window answers its prompts.
+        let platform = crate::admin::webauthn::platform();
+        if let Some(p) = &platform {
+            p.set_parent_window(window);
+        }
+        let key_prompt = platform.as_ref().and_then(|p| p.prompt.clone());
+        if let Some(p) = &key_prompt {
+            let ctx = ctx.clone();
+            p.set_wake(Arc::new(move || ctx.request_repaint()));
+        }
+        let key = platform.as_ref().map(|p| Arc::clone(&p.authenticator));
+        let setup = Setup::system(ctx, key);
+        let mut app = Self::open(lang, setup, platform.is_some(), key_prompt);
         app.auto_open_requests = true;
         let (tx, rx) = mpsc::channel();
         super::spawn_control_reader(ctx, tx);
@@ -216,9 +253,16 @@ impl AdminApp {
 
     /// Load the configuration and start the worker on it; without a usable
     /// one, the "admin server" screen.
-    fn open(lang: Lang, setup: Setup, key_available: bool) -> Self {
+    fn open(
+        lang: Lang,
+        setup: Setup,
+        key_available: bool,
+        key_prompt: Option<Arc<KeyPrompt>>,
+    ) -> Self {
         let missing = Server::Missing(String::new());
         let mut app = Self::new(lang, missing, None, key_available, setup);
+        app.key_prompt = key_prompt;
+        app.flow.set_key_prompt(app.key_prompt.clone());
         if !app.reload() {
             app.open_server();
         }
@@ -239,6 +283,7 @@ impl AdminApp {
             link,
             server,
             key_available,
+            key_prompt: None,
             setup,
             server_form: None,
             saved: false,
@@ -330,6 +375,7 @@ impl AdminApp {
         self.apply(effects);
         let usable = self.reload();
         self.flow = Flow::new(self.key_available, Instant::now());
+        self.flow.set_key_prompt(self.key_prompt.clone());
         if usable {
             self.server_form = None;
             self.saved = true;
@@ -588,21 +634,10 @@ impl AdminApp {
             }
         }
         ui.add_space(8.0);
-        if let Some(busy) = view.busy {
-            let msg = match busy {
-                Busy::Offer => Msg::AdminChecking,
-                Busy::SignIn { key: true }
-                | Busy::StepUp { key: true }
-                | Busy::Enroll { key: true }
-                | Busy::Factors { key: true }
-                | Busy::Register { key: true } => Msg::AdminTouchKey,
-                Busy::Register { key: false } => Msg::AdminRegistering,
-                Busy::SignIn { key: false } => Msg::AdminSigningIn,
-                Busy::StepUp { key: false } => Msg::AdminConfirming,
-                Busy::Enroll { key: false } | Busy::Factors { key: false } | Busy::Views => {
-                    Msg::AdminWorking
-                }
-            };
+        if let Some(k) = &view.key_prompt {
+            key_prompt(ui, lang, k, actions);
+        } else if let Some(busy) = view.busy {
+            let msg = busy_message(busy);
             ui.label(msg.text(lang));
         } else if let Some(text) = self.notice_text(view) {
             ui.label(text);
@@ -777,6 +812,14 @@ impl AdminApp {
                     Vec::new()
                 }
                 Action::View(action) => self.flow.views_action(action),
+                Action::KeyPin => {
+                    self.flow.submit_key_pin();
+                    Vec::new()
+                }
+                Action::KeyCancel => {
+                    self.flow.cancel_key();
+                    Vec::new()
+                }
                 Action::OpenServer
                 | Action::FocusServer(_)
                 | Action::ServerSave
@@ -859,6 +902,75 @@ enum Action {
     ServerEnter,
     ServerBack,
     ServerCancel,
+    KeyPin,
+    KeyCancel,
+}
+
+/// What the window says while the worker is busy.
+fn busy_message(busy: Busy) -> Msg {
+    match busy {
+        Busy::Offer => Msg::AdminChecking,
+        Busy::SignIn { key: true }
+        | Busy::StepUp { key: true }
+        | Busy::Enroll { key: true }
+        | Busy::Factors { key: true }
+        | Busy::Register { key: true } => {
+            // Windows shows its own dialog (touch, PIN, biometric).
+            if cfg!(windows) {
+                Msg::AdminFollowSystemKeyPrompt
+            } else {
+                Msg::AdminTouchKey
+            }
+        }
+        Busy::Register { key: false } => Msg::AdminRegistering,
+        Busy::SignIn { key: false } => Msg::AdminSigningIn,
+        Busy::StepUp { key: false } => Msg::AdminConfirming,
+        Busy::Enroll { key: false } | Busy::Factors { key: false } | Busy::Views => {
+            Msg::AdminWorking
+        }
+    }
+}
+
+/// The security key's prompt (USB HID keys): touch it, pick one of several,
+/// or type its PIN — a masked box fed from the input events, never an `egui`
+/// text widget, like the password.
+fn key_prompt(ui: &mut egui::Ui, lang: Lang, k: &KeyPromptView, actions: &mut Vec<Action>) {
+    match k.ask {
+        KeyAsk::Touch => {
+            ui.label(Msg::AdminTouchKey.text(lang));
+        }
+        KeyAsk::ChooseKey => {
+            ui.label(Msg::AdminChooseKey.text(lang));
+        }
+        KeyAsk::Pin { again, retries } => {
+            ui.label(Msg::AdminKeyPin.text(lang));
+            ui.weak(Msg::AdminKeyPinHint.text(lang));
+            if again {
+                let msg = if retries == Some(1) {
+                    Msg::AdminKeyPinLast
+                } else {
+                    Msg::AdminKeyPinWrong
+                };
+                ui.colored_label(ui.visuals().warn_fg_color, msg.text(lang));
+            }
+            field_box(ui, &"•".repeat(k.pin_len), true);
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
+        if k.ask.is_pin()
+            && ui
+                .add_enabled(
+                    k.can_submit_pin,
+                    egui::Button::new(Msg::AdminContinue.text(lang)),
+                )
+                .clicked()
+        {
+            actions.push(Action::KeyPin);
+        }
+        if ui.button(Msg::AdminCancel.text(lang)).clicked() {
+            actions.push(Action::KeyCancel);
+        }
+    });
 }
 
 fn sign_in(
@@ -1512,6 +1624,57 @@ mod tests {
         assert!(!memory.contains(PASSWORD));
     }
 
+    /// USB HID keys (macOS, Linux): the key's PIN is typed in the window,
+    /// painted as dots only, never kept by egui, and `Esc` stops the key.
+    #[test]
+    fn the_keys_pin_is_painted_as_dots_and_esc_stops_the_key() {
+        use crate::admin::keyprompt::PinAnswer;
+        const PIN: &str = "4711";
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        let prompt = KeyPrompt::new();
+        app.key_available = true;
+        app.key_prompt = Some(Arc::clone(&prompt));
+        app.flow = Flow::new(true, Instant::now());
+        app.flow.set_key_prompt(app.key_prompt.clone());
+        to_secrets(&ctx, &mut app, &seen);
+        frame(&ctx, &mut app, vec![egui::Event::Text(PASSWORD.into())]);
+        app.act(vec![Action::Submit(Submission::SecurityKey)]);
+        assert_eq!(seen.borrow().cmds, vec!["offer", "sign_in"]);
+        // The backend asks for the PIN on its own thread.
+        let ceremony = prompt.begin().expect("armed by the key sign-in");
+        let backend = Arc::clone(&prompt);
+        let waiter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            matches!(
+                backend.wait_pin(&ceremony, true, Some(1), deadline),
+                PinAnswer::Cancelled
+            )
+        });
+        for _ in 0..500 {
+            if prompt.asking().is_some_and(KeyAsk::is_pin) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut painted = frame(&ctx, &mut app, vec![egui::Event::Text(PIN.into())]);
+        painted.extend(frame(&ctx, &mut app, Vec::new()));
+        let memory = ctx.memory(|m| format!("{m:?}"));
+        assert!(painted.iter().all(|t| !t.contains(PIN)), "{painted:?}");
+        assert!(!memory.contains(PIN));
+        assert!(
+            painted.iter().any(|t| t.contains("••••")),
+            "the mask is drawn"
+        );
+        assert!(
+            painted.iter().any(|t| t.contains("One attempt is left")),
+            "the last attempt is called out: {painted:?}"
+        );
+        frame(&ctx, &mut app, vec![key(egui::Key::Escape)]);
+        assert!(waiter.join().unwrap(), "Esc cancelled the key");
+        assert_eq!(app.flow.view(Instant::now()).key_prompt, None);
+    }
+
     /// Sign in as `display_name`; return what the signed-in frame painted.
     fn signed_in_as(
         ctx: &egui::Context,
@@ -2157,7 +2320,7 @@ mod tests {
     fn without_a_server_the_window_opens_the_server_screen_and_a_save_goes_to_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let seen = Rc::new(RefCell::new(Seen::default()));
-        let mut app = AdminApp::open(Lang::En, Setup::temp(dir.path(), &[], &seen), false);
+        let mut app = AdminApp::open(Lang::En, Setup::temp(dir.path(), &[], &seen), false, None);
         let ctx = egui::Context::default();
         let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
         for want in [
@@ -2213,7 +2376,7 @@ mod tests {
         )
         .unwrap();
         let seen = Rc::new(RefCell::new(Seen::default()));
-        let mut app = AdminApp::open(Lang::En, Setup::temp(dir.path(), &[], &seen), false);
+        let mut app = AdminApp::open(Lang::En, Setup::temp(dir.path(), &[], &seen), false, None);
         assert!(
             app.server_form.is_none(),
             "a usable server: the sign-in form"
@@ -2278,7 +2441,7 @@ mod tests {
             ("FERROGATE_ADMIN_ENDPOINT", "https://env.test:8444"),
             ("FERROGATE_ADMIN_SPKI_PIN", PIN),
         ];
-        let mut app = AdminApp::open(Lang::Pt, Setup::temp(dir.path(), env, &seen), false);
+        let mut app = AdminApp::open(Lang::Pt, Setup::temp(dir.path(), env, &seen), false, None);
         assert!(app.server_form.is_none(), "the environment alone is usable");
         app.act(vec![Action::OpenServer]);
         let ctx = egui::Context::default();

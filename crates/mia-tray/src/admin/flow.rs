@@ -13,6 +13,7 @@
 //! lengths) and never the session token, which only the worker has. Every
 //! server string in a view is escaped first (`crate::text::display_safe`).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -28,6 +29,7 @@ use serde::Serialize;
 
 use super::enroll::{EnrollField, EnrollStage, EnrollView, EnrollWizard};
 use super::factors::{FactorField, FactorsPanel, FactorsView};
+use super::keyprompt::{KeyAsk, KeyPrompt, PinEntry};
 use super::login::{Field, LoginModel, LoginView, Stage, Submission};
 use super::secret::Secret;
 use super::seed::SeedDisplay;
@@ -196,6 +198,17 @@ pub struct StepUpView {
     pub for_add: bool,
 }
 
+/// The security key's prompt, when the window shows it (USB HID keys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct KeyPromptView {
+    /// What the key asks for.
+    pub ask: KeyAsk,
+    /// Characters of the PIN typed so far (mask).
+    pub pin_len: usize,
+    /// Whether the PIN is long enough to send.
+    pub can_submit_pin: bool,
+}
+
 /// Everything the window draws. Holds no secret and no token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FlowView {
@@ -203,6 +216,8 @@ pub struct FlowView {
     pub login: LoginView,
     /// What the worker is doing.
     pub busy: Option<Busy>,
+    /// The key's prompt, while the key asks for something here.
+    pub key_prompt: Option<KeyPromptView>,
     /// Whether this build has a security-key backend here.
     pub key_available: bool,
     /// The message to show.
@@ -250,6 +265,11 @@ enum AfterStepUp {
 pub struct Flow {
     login: LoginModel,
     key_available: bool,
+    /// The key's touch and PIN prompts, for a backend that shows them in
+    /// the window (USB HID).
+    key_prompt: Option<Arc<KeyPrompt>>,
+    /// The key's PIN as typed (masked; wiped on submit, `Esc`, lock, close).
+    pin: PinEntry,
     busy: Option<Busy>,
     notice: Option<Notice>,
     throttled_until: Option<Instant>,
@@ -328,6 +348,8 @@ impl Flow {
         Self {
             login: LoginModel::new(),
             key_available,
+            key_prompt: None,
+            pin: PinEntry::new(),
             busy: None,
             notice: None,
             throttled_until: None,
@@ -357,7 +379,18 @@ impl Flow {
         self.session.is_some()
     }
 
+    /// Show the key's touch and PIN prompts in the window (a USB HID
+    /// backend's [`KeyPrompt`]; `None` when the OS shows its own).
+    pub fn set_key_prompt(&mut self, prompt: Option<Arc<KeyPrompt>>) {
+        self.key_prompt = prompt;
+    }
+
     fn send(&mut self, cmd: Cmd, busy: Busy) -> Vec<Effect> {
+        if cmd.uses_key() {
+            if let Some(p) = &self.key_prompt {
+                p.arm();
+            }
+        }
         self.sent += 1;
         self.awaiting = Some(self.sent);
         self.busy = Some(busy);
@@ -366,10 +399,49 @@ impl Flow {
 
     /// The window could not queue the last command (dropped and wiped).
     pub fn send_failed(&mut self) {
+        self.key_done();
         self.sent = self.sent.saturating_sub(1);
         self.awaiting = None;
         self.busy = None;
         self.notice = Some(Notice::Problem(Problem::NotSent));
+    }
+
+    /// What the key asks for now, when its prompts are the window's.
+    fn key_ask(&self) -> Option<KeyAsk> {
+        self.key_prompt.as_ref().and_then(|p| p.asking())
+    }
+
+    /// Whether the key waits for its PIN, typed here.
+    fn pin_asked(&self) -> bool {
+        self.key_ask().is_some_and(KeyAsk::is_pin)
+    }
+
+    /// The key command was answered: no ceremony starts for it any more and
+    /// a PIN typed for it is wiped.
+    fn key_done(&mut self) {
+        self.pin.clear();
+        if let Some(p) = &self.key_prompt {
+            p.disarm();
+        }
+    }
+
+    /// Send the typed PIN to the key (moved out of the form, which is left
+    /// empty); `false` when no PIN is asked or it is too short.
+    pub fn submit_key_pin(&mut self) -> bool {
+        if !self.pin_asked() || !self.pin.is_complete() {
+            return false;
+        }
+        let pin = self.pin.take();
+        self.key_prompt.as_ref().is_some_and(|p| p.answer(pin))
+    }
+
+    /// Cancel the key prompt (`Esc`, the Cancel button): the key stops, the
+    /// typed PIN is wiped, and the command fails with nothing sent.
+    pub fn cancel_key(&mut self) {
+        self.pin.clear();
+        if let Some(p) = &self.key_prompt {
+            p.cancel();
+        }
     }
 
     /// Any input: the idle clock restarts.
@@ -393,8 +465,13 @@ impl Flow {
         self.queued_submit = None;
     }
 
-    /// Typed or pasted text, for the focused field (or the step-up code).
+    /// Typed or pasted text, for the focused field (or the step-up code, or
+    /// the key's PIN while the key asks for it).
     pub fn type_text(&mut self, text: &str) {
+        if self.pin_asked() {
+            self.pin.type_text(text);
+            return;
+        }
         if self.login_open() {
             if self.login.type_text(text) {
                 self.name_edited();
@@ -420,6 +497,10 @@ impl Flow {
 
     /// `Backspace`.
     pub fn backspace(&mut self) {
+        if self.pin_asked() {
+            self.pin.backspace();
+            return;
+        }
         if self.login_open() {
             if self.login.backspace() {
                 self.name_edited();
@@ -445,7 +526,7 @@ impl Flow {
 
     /// `Tab` / `Shift-Tab`; leaving the user name asks the server about it.
     pub fn tab(&mut self, back: bool) -> Vec<Effect> {
-        if self.step_up.is_some() {
+        if self.step_up.is_some() || self.pin_asked() {
             return Vec::new();
         }
         if self.session.is_some() {
@@ -487,9 +568,13 @@ impl Flow {
         }
     }
 
-    /// `Esc`: close the step-up prompt or a factor form, or wipe the typed
-    /// secrets.
+    /// `Esc`: cancel the key's prompt, close the step-up prompt or a factor
+    /// form, or wipe the typed secrets.
     pub fn escape(&mut self) {
+        if self.key_ask().is_some() {
+            self.cancel_key();
+            return;
+        }
         if self.busy.is_some() {
             return;
         }
@@ -512,6 +597,10 @@ impl Flow {
 
     /// `Enter`: the default action of what is shown.
     pub fn enter(&mut self) -> Vec<Effect> {
+        if self.pin_asked() {
+            self.submit_key_pin();
+            return Vec::new();
+        }
         if let Some(session) = &self.session {
             if self.step_up.is_some() {
                 let how = if session.info.methods.totp {
@@ -955,6 +1044,9 @@ impl Flow {
 
     /// Wipe everything the window holds and end the session.
     fn end(&mut self, notice: Option<Notice>) -> Vec<Effect> {
+        // The key stops asking (a ceremony in flight is cancelled and can
+        // never ask again) and a half-typed PIN is wiped.
+        self.cancel_key();
         self.login.wipe();
         self.session = None;
         self.step_up = None;
@@ -982,6 +1074,11 @@ impl Flow {
 
     /// Time passes: lock after the idle limit (also on a half-typed form).
     pub fn tick(&mut self, now: Instant) -> Vec<Effect> {
+        // A PIN typed for a prompt that went away (the key moved on, the
+        // ceremony ended) does not wait for the next one.
+        if !self.pin_asked() {
+            self.pin.clear();
+        }
         if now.saturating_duration_since(self.last_activity) < self.idle_limit {
             return Vec::new();
         }
@@ -990,6 +1087,7 @@ impl Flow {
         let typed = !view.username.is_empty()
             || view.password_len > 0
             || view.code_len > 0
+            || self.pin.char_count() > 0
             || self
                 .enroll
                 .as_ref()
@@ -1016,6 +1114,7 @@ impl Flow {
         }
         self.awaiting = None;
         self.busy = None;
+        self.key_done();
         match reply {
             Reply::Offered { username, result } => self.offered_reply(&username, result, now),
             Reply::SignedIn { username, result } => self.signed_in_reply(&username, result, now),
@@ -1392,9 +1491,19 @@ impl Flow {
             _ => None,
         };
         let signed_in = self.session.is_some();
+        let key_prompt = self.busy.and(self.key_ask()).map(|ask| KeyPromptView {
+            ask,
+            pin_len: if ask.is_pin() {
+                self.pin.char_count()
+            } else {
+                0
+            },
+            can_submit_pin: ask.is_pin() && self.pin.is_complete(),
+        });
         FlowView {
             login,
             busy: self.busy,
+            key_prompt,
             key_available: self.key_available,
             notice: self.notice,
             throttle_secs_left,
@@ -1422,6 +1531,7 @@ impl Flow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::keyprompt::PinAnswer;
     use crate::admin::login::LoginError;
 
     const PASSWORD: &str = "c0rrect-horse-Battery-staple";
@@ -1790,6 +1900,129 @@ mod tests {
         };
         assert_eq!(with.view(now).busy, Some(Busy::SignIn { key: true }));
         assert_eq!(with.view(now).login.code_len, 0, "the typed code is wiped");
+    }
+
+    /// A flow whose key shows its prompts in the window (USB HID), sent a
+    /// key sign-in for `alice`.
+    fn key_sign_in(now: Instant) -> (Flow, Arc<KeyPrompt>) {
+        let prompt = KeyPrompt::new();
+        let mut f = Flow::new(true, now);
+        f.set_key_prompt(Some(Arc::clone(&prompt)));
+        offered(&mut f, now, KEY_ONLY);
+        f.type_text(PASSWORD);
+        let sent = cmd(f.enter());
+        assert!(sent.uses_key());
+        (f, prompt)
+    }
+
+    /// The backend's side, on its own thread: wait for the PIN.
+    fn backend_waits_for_pin(prompt: &Arc<KeyPrompt>) -> std::thread::JoinHandle<Option<String>> {
+        let ceremony = prompt.begin().expect("the key command armed the prompt");
+        let backend = Arc::clone(prompt);
+        let waiter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            match backend.wait_pin(&ceremony, false, None, deadline) {
+                PinAnswer::Pin(pin) => Some(pin.expose().to_string()),
+                PinAnswer::Cancelled | PinAnswer::TimedOut => None,
+            }
+        });
+        for _ in 0..500 {
+            if prompt.asking().is_some_and(KeyAsk::is_pin) {
+                return waiter;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the PIN was never asked");
+    }
+
+    #[test]
+    fn the_keys_pin_is_typed_masked_and_handed_over_by_move() {
+        let now = Instant::now();
+        let (mut f, prompt) = key_sign_in(now);
+        let waiter = backend_waits_for_pin(&prompt);
+        // Typing now goes to the PIN, never to the sign-in form.
+        f.type_text("47");
+        let v = f.view(now);
+        assert_eq!(
+            v.key_prompt,
+            Some(KeyPromptView {
+                ask: KeyAsk::Pin {
+                    again: false,
+                    retries: None
+                },
+                pin_len: 2,
+                can_submit_pin: false,
+            })
+        );
+        assert_eq!(v.login.password_len, 0);
+        assert!(!f.submit_key_pin(), "CTAP2 needs four characters");
+        f.type_text("11");
+        let json = serde_json::to_string(&f.view(now)).unwrap();
+        assert!(
+            !json.contains("4711") && json.contains("\"pin_len\":4"),
+            "{json}"
+        );
+        assert!(
+            f.enter().is_empty(),
+            "Enter sends the PIN to the key, not to CMIS"
+        );
+        assert_eq!(waiter.join().unwrap().as_deref(), Some("4711"));
+        assert_eq!(f.pin.char_count(), 0, "moved out, nothing left");
+        assert_eq!(f.view(now).key_prompt, None);
+        // The worker's answer ends the command: no ceremony starts for it.
+        f.on_reply(
+            Reply::SignedIn {
+                username: "alice".into(),
+                result: Err(ClientError::Rejected),
+            },
+            now,
+        );
+        assert!(prompt.begin().is_none());
+    }
+
+    #[test]
+    fn esc_or_the_idle_lock_stops_the_key_and_wipes_the_pin() {
+        let now = Instant::now();
+        let (mut f, prompt) = key_sign_in(now);
+        let touch = prompt.begin().unwrap();
+        prompt.show(&touch, KeyAsk::Touch);
+        assert_eq!(f.view(now).key_prompt.map(|k| k.ask), Some(KeyAsk::Touch));
+        f.escape();
+        assert!(prompt.cancelled(&touch), "Esc stops the key");
+        f.on_reply(
+            Reply::SignedIn {
+                username: "alice".into(),
+                result: Err(ClientError::Authenticator(AuthenticatorError::Cancelled)),
+            },
+            now,
+        );
+        assert_eq!(
+            f.view(now).notice,
+            Some(Notice::Problem(Problem::KeyCancelled))
+        );
+
+        let (mut f, prompt) = key_sign_in(now);
+        let waiter = backend_waits_for_pin(&prompt);
+        f.type_text("12");
+        let effects = f.tick(now + Duration::from_secs(3600));
+        assert!(ends(&effects), "the lock ends the session");
+        assert_eq!(waiter.join().unwrap(), None, "the key was cancelled");
+        assert_eq!(f.pin.char_count(), 0, "the half-typed PIN is wiped");
+        assert_eq!(f.view(now).key_prompt, None);
+        assert!(prompt.begin().is_none(), "nothing can ask any more");
+    }
+
+    #[test]
+    fn a_pin_left_behind_by_a_prompt_that_went_away_is_wiped() {
+        let now = Instant::now();
+        let (mut f, prompt) = key_sign_in(now);
+        let waiter = backend_waits_for_pin(&prompt);
+        f.type_text("12");
+        // The key gave up (its own timeout): the prompt goes away.
+        prompt.cancel();
+        assert_eq!(waiter.join().unwrap(), None);
+        let _ = f.tick(now);
+        assert_eq!(f.pin.char_count(), 0);
     }
 
     #[test]
