@@ -1117,6 +1117,13 @@ fn stage_with(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("inspecting {}", target.display())),
     };
+    #[cfg(target_os = "linux")]
+    let previous_acl = previous
+        .as_ref()
+        .filter(|_| ownership == Ownership::Previous)
+        .map(|_| read_access_acl(target))
+        .transpose()?
+        .flatten();
     let name = target
         .file_name()
         .context("the configuration path has no file name")?
@@ -1176,6 +1183,16 @@ fn stage_with(
                 )?;
             }
         }
+        #[cfg(target_os = "linux")]
+        if let Some(acl) = previous_acl {
+            rustix::fs::fsetxattr(
+                &file,
+                "system.posix_acl_access",
+                &acl,
+                rustix::fs::XattrFlags::empty(),
+            )
+            .with_context(|| format!("keeping the access ACL of {}", target.display()))?;
+        }
     }
     #[cfg(not(unix))]
     let _ = (&previous, ownership);
@@ -1189,6 +1206,25 @@ fn stage_with(
     crate::system_dir::claim(&tmp)
         .with_context(|| format!("writing {} ({ELEVATION_HINT})", target.display()))?;
     Ok(staged)
+}
+
+/// Read the Linux POSIX access ACL that an atomic configuration replacement
+/// must carry to its new inode. A missing ACL (or a filesystem without ACL
+/// support) is the ordinary mode-bit-only case.
+#[cfg(target_os = "linux")]
+fn read_access_acl(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    const ACCESS_ACL: &str = "system.posix_acl_access";
+    const XATTR_MAX: usize = 64 * 1024;
+    let mut acl = vec![0_u8; XATTR_MAX];
+    match rustix::fs::lgetxattr(path, ACCESS_ACL, &mut acl) {
+        Ok(len) => {
+            acl.truncate(len);
+            Ok(Some(acl))
+        }
+        Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => Ok(None),
+        Err(e) => Err(std::io::Error::from_raw_os_error(e.raw_os_error()))
+            .with_context(|| format!("reading the access ACL of {}", path.display())),
+    }
 }
 
 impl Staged {
@@ -1474,6 +1510,60 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         p
+    }
+
+    #[cfg(target_os = "linux")]
+    fn named_reader_acl(uid: u32) -> Vec<u8> {
+        const VERSION: u32 = 2;
+        const USER_OBJ: u16 = 0x01;
+        const USER: u16 = 0x02;
+        const GROUP_OBJ: u16 = 0x04;
+        const MASK: u16 = 0x10;
+        const OTHER: u16 = 0x20;
+        const UNDEFINED_ID: u32 = u32::MAX;
+        let mut acl = VERSION.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (USER_OBJ, 0o6_u16, UNDEFINED_ID),
+            (USER, 0o4, uid),
+            (GROUP_OBJ, 0o4, UNDEFINED_ID),
+            (MASK, 0o4, UNDEFINED_ID),
+            (OTHER, 0o0, UNDEFINED_ID),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        acl
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_config_rewrite_preserves_the_service_account_acl() {
+        let dir = scratch("preserve-acl");
+        let target = dir.join("mia.toml");
+        let before = "log = 'info'\n";
+        std::fs::write(&target, before).unwrap();
+        let acl = named_reader_acl(424_242);
+        rustix::fs::setxattr(
+            &target,
+            "system.posix_acl_access",
+            &acl,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+
+        write_config(
+            &target,
+            "log = 'debug'\n",
+            &Config::from_toml(before).unwrap(),
+        )
+        .unwrap();
+
+        let mut actual = vec![0_u8; 64 * 1024];
+        let len = rustix::fs::lgetxattr(&target, "system.posix_acl_access", &mut actual).unwrap();
+        actual.truncate(len);
+        assert_eq!(actual, acl);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn invoker_for_test(elevated: bool) -> Invoker {

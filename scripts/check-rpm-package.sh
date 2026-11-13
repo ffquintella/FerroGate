@@ -45,6 +45,7 @@ fi
 scripts="$work_dir/scripts"
 rpm -qp --scripts "$rpm_package" >"$scripts"
 grep -F 'setfacl --modify "user:$SERVICE_USER:rw-"' "$scripts" >/dev/null
+grep -F 'setfacl --modify "user:$SERVICE_USER:r--"' "$scripts" >/dev/null
 grep -F 'udevadm control --reload-rules' "$scripts" >/dev/null
 grep -F 'setfacl --remove "user:$SERVICE_USER"' "$scripts" >/dev/null
 grep -F 'if [ "${1:-0}" -ne 0 ]' "$scripts" >/dev/null || {

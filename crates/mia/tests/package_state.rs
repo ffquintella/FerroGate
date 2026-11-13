@@ -159,8 +159,14 @@ mod linux_installer_groups {
             "usermod",
             "#!/bin/sh\nprintf 'usermod %s\\n' \"$*\" >>\"$FERROGATE_TEST_RECORD\"\n",
         );
+        stub(
+            &bin,
+            "setfacl",
+            "#!/bin/sh\nprintf 'setfacl %s\\n' \"$*\" >>\"$FERROGATE_TEST_RECORD\"\n",
+        );
         stub(&bin, "groupadd", "#!/bin/sh\nexit 0\n");
         stub(&bin, "useradd", "#!/bin/sh\nexit 0\n");
+        stub(&bin, "stat", "#!/bin/sh\nprintf 'root\\n'\n");
         // Prevent the hook from discovering real desktop sessions on the host.
         stub(&bin, "loginctl", "#!/bin/sh\nexit 0\n");
 
@@ -201,7 +207,7 @@ mod linux_installer_groups {
     }
 
     #[test]
-    fn linux_installers_enroll_the_service_account_in_the_status_group_on_upgrade() {
+    fn linux_installers_keep_the_hardened_service_account_able_to_reload_config() {
         for (script, args, tag) in [
             ("dist/debian/postinst", vec!["configure"], "deb"),
             ("dist/rpm/postinstall", Vec::new(), "rpm"),
@@ -212,6 +218,14 @@ mod linux_installer_groups {
                     .lines()
                     .any(|line| line == "usermod -aG ferrogate-status -- _ferrogate"),
                 "{script} did not enroll _ferrogate in ferrogate-status: {calls:?}"
+            );
+            assert!(
+                calls.lines().any(|line| {
+                    line.starts_with("setfacl --modify user:_ferrogate:r-- -- ")
+                        && line.ends_with("/etc/ferrogate/mia.toml")
+                }),
+                "{script} did not grant the hardened _ferrogate process read-only config access: \
+                 {calls:?}"
             );
         }
     }

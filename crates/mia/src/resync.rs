@@ -25,7 +25,7 @@
 //! no TPM, plain terminal output (no tracing).
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use ferro_crypto::composite::CompositePublicKey;
@@ -35,6 +35,120 @@ use crate::config::Config;
 const USAGE_RESYNC: &str =
     "usage: mia resync-allowlist [--config <path> | --environment <env>] [--reload]";
 const USAGE_RELOAD: &str = "usage: mia --reload";
+
+fn validate_sync_resync(config: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.allowlist_key().is_some(),
+        "allowlist.key is not configured, so the agent cannot verify or load a synced allowlist; \
+         install and pin the CMIS enrollment key first with `sudo mia allowlist-key fetch \
+         --expect-fingerprint <hex> --reload`"
+    );
+    Ok(())
+}
+
+fn completed_sync(
+    before: &mia_status_proto::AllowlistSyncSummary,
+    after: &mia_status_proto::AllowlistSyncSummary,
+    allowlist: mia_status_proto::AllowlistState,
+) -> Option<anyhow::Result<()>> {
+    if after == before {
+        return None;
+    }
+    if after.failing {
+        let reason = after.last_reason.as_deref().unwrap_or("unknown");
+        let effect = match allowlist {
+            mia_status_proto::AllowlistState::Loaded { .. } => {
+                "the previously verified allowlist remains loaded"
+            }
+            mia_status_proto::AllowlistState::Missing
+            | mia_status_proto::AllowlistState::Invalid => "no allowlist was loaded",
+        };
+        return Some(Err(anyhow::anyhow!(
+            "the agent completed the allowlist sync but refused or failed it ({reason}); {effect}"
+        )));
+    }
+    Some(match allowlist {
+        mia_status_proto::AllowlistState::Loaded { .. } => Ok(()),
+        mia_status_proto::AllowlistState::Missing | mia_status_proto::AllowlistState::Invalid => {
+            Err(anyhow::anyhow!(
+                "the agent completed the allowlist sync but no verified allowlist was loaded"
+            ))
+        }
+    })
+}
+
+fn current_sync(
+    config: &Config,
+) -> anyhow::Result<(
+    mia_status_proto::AllowlistSyncSummary,
+    mia_status_proto::AllowlistState,
+)> {
+    let environment = config
+        .environment()
+        .unwrap_or(crate::status::DEFAULT_ENVIRONMENT_LABEL)
+        .to_owned();
+    let request = mia_status_proto::StatusRequest::Status(mia_status_proto::StatusReq {
+        environment: Some(environment),
+    });
+    let response = crate::status_cli::query(&config.status_socket(), &request)
+        .map_err(|e| anyhow::anyhow!("querying the running agent's status: {e:?}"))?;
+    let mia_status_proto::StatusResponse::Status(mut snapshots) = response else {
+        anyhow::bail!("the running agent did not return status for the selected environment");
+    };
+    anyhow::ensure!(
+        snapshots.len() == 1,
+        "the running agent returned {} status records for one environment",
+        snapshots.len()
+    );
+    let snapshot = snapshots.pop().expect("length checked");
+    let sync = snapshot
+        .sync
+        .context("the running agent does not expose allowlist-sync status")?;
+    Ok((sync, snapshot.allowlist))
+}
+
+async fn wait_for_completed_sync(
+    config: &Config,
+    before: &mia_status_proto::AllowlistSyncSummary,
+) -> anyhow::Result<()> {
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const POLL: Duration = Duration::from_millis(200);
+    wait_for_completed_sync_with(before, TIMEOUT, POLL, || current_sync(config)).await
+}
+
+async fn wait_for_completed_sync_with(
+    before: &mia_status_proto::AllowlistSyncSummary,
+    timeout: Duration,
+    poll: Duration,
+    mut query: impl FnMut() -> anyhow::Result<(
+        mia_status_proto::AllowlistSyncSummary,
+        mia_status_proto::AllowlistState,
+    )>,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_query_error: Option<anyhow::Error>;
+    loop {
+        tokio::time::sleep(poll).await;
+        match query() {
+            Ok((after, allowlist)) => {
+                last_query_error = None;
+                if let Some(result) = completed_sync(before, &after, allowlist) {
+                    return result;
+                }
+            }
+            Err(e) => last_query_error = Some(e),
+        }
+        if Instant::now() >= deadline {
+            let detail =
+                last_query_error.map_or_else(String::new, |e| format!("; last error: {e:#}"));
+            anyhow::bail!(
+                "the reload signal was delivered, but the agent did not confirm a completed \
+                 allowlist sync within {} seconds{detail}",
+                timeout.as_secs_f64()
+            );
+        }
+    }
+}
 
 /// Run the top-level `mia --reload` command: signal the running agent (SIGHUP)
 /// to re-read its configuration and signed allowlist live, without a restart, so
@@ -59,10 +173,8 @@ pub fn run_reload(args: &[String]) -> anyhow::Result<()> {
     };
     println!("Signaling the running agent to reload its configuration and allowlist (SIGHUP) …");
     let tool = outcome?;
-    println!(
-        "✓ done via {tool} — the agent re-read its configuration and signed allowlist live; the \
-         helper socket stayed up."
-    );
+    println!("✓ reload signal delivered via {tool}; the agent processes it asynchronously.");
+    println!("  Run `mia status` to confirm the configuration and allowlist now in force.");
     Ok(())
 }
 
@@ -164,6 +276,8 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
         .flatten()
         .is_some();
     if config.allowlist_sync_enabled() && cmis_configured {
+        validate_sync_resync(config)?;
+        let (before, _) = current_sync(config)?;
         println!(
             "allowlist.sync is on: the agent syncs this host's signed allowlist from CMIS every \
              {} s (SyncAllowlist).",
@@ -171,7 +285,12 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
         );
         if reload {
             if signal_reload() {
-                println!("  The agent syncs now; `mia status` shows the generation it holds.");
+                wait_for_completed_sync(config, &before).await?;
+                println!("✓ the agent completed the sync and loaded a verified allowlist.");
+            } else {
+                anyhow::bail!(
+                    "the running agent could not be reached to request an allowlist sync"
+                );
             }
         } else {
             println!("  {}", sync_now_hint(LIVE_RELOAD));
@@ -275,8 +394,8 @@ pub(crate) fn signal_reload() -> bool {
         print!("\nSignaling the running agent to reload (SIGHUP) … ");
         return match outcome {
             Ok(tool) => {
-                println!("done via {tool}.");
-                println!("  The agent reloaded live — no restart, the helper socket stayed up.");
+                println!("reload signal delivered via {tool}.");
+                println!("  The agent reloads asynchronously; `mia status` confirms its result.");
                 true
             }
             Err(e) => {
@@ -460,6 +579,100 @@ fn print_help_reload() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_resync_refuses_to_claim_success_without_a_verification_key() {
+        let config = Config::from_toml(
+            r#"
+            [cmis]
+            endpoint = "https://cmis.example.invalid:8443"
+
+            [allowlist]
+            sync = true
+            "#,
+        )
+        .unwrap();
+
+        let error = validate_sync_resync(&config).unwrap_err().to_string();
+        assert!(error.contains("allowlist.key"), "{error}");
+        assert!(error.contains("allowlist-key fetch"), "{error}");
+    }
+
+    #[test]
+    fn sync_resync_reports_the_daemons_failed_attempt_instead_of_signal_delivery() {
+        let before = mia_status_proto::AllowlistSyncSummary::default();
+        let mut after = before.clone();
+        after.last_attempt_at = Some(1_700_000_000);
+        after.rejected = 1;
+        after.consecutive_failures = 1;
+        after.failing = true;
+        after.last_reason = Some("bad_signature".to_owned());
+
+        let error = completed_sync(&before, &after, mia_status_proto::AllowlistState::Missing)
+            .expect("the completed attempt must be observed")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bad_signature"), "{error}");
+        assert!(error.contains("no allowlist was loaded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sync_resync_waits_for_status_to_confirm_a_loaded_allowlist() {
+        let before = mia_status_proto::AllowlistSyncSummary::default();
+        let mut after = before.clone();
+        after.last_attempt_at = Some(1_700_000_000);
+        after.last_ok_at = after.last_attempt_at;
+        after.applied = 1;
+        after.generation = 7;
+
+        wait_for_completed_sync_with(&before, Duration::from_millis(20), Duration::ZERO, || {
+            Ok((
+                after.clone(),
+                mia_status_proto::AllowlistState::Loaded {
+                    entries: 2,
+                    not_after: 1_700_086_400,
+                },
+            ))
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_resync_returns_the_status_failure() {
+        let before = mia_status_proto::AllowlistSyncSummary::default();
+        let mut after = before.clone();
+        after.last_attempt_at = Some(1_700_000_000);
+        after.rejected = 1;
+        after.failing = true;
+        after.last_reason = Some("wrong_host".to_owned());
+
+        let error = wait_for_completed_sync_with(
+            &before,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            || Ok((after.clone(), mia_status_proto::AllowlistState::Missing)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("wrong_host"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sync_resync_times_out_when_signal_delivery_produces_no_status_change() {
+        let before = mia_status_proto::AllowlistSyncSummary::default();
+        let error = wait_for_completed_sync_with(
+            &before,
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            || Ok((before.clone(), mia_status_proto::AllowlistState::Missing)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not confirm"), "{error}");
+    }
 
     #[test]
     fn sync_now_hint_says_when_reload_means_a_restart() {

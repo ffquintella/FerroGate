@@ -110,6 +110,7 @@ grep -F 'action.lookup("unit") === "mia.service"' "$work_dir/root/usr/share/polk
 grep -F 'subject.isInGroup("ferrogate-operators")' "$work_dir/root/usr/share/polkit-1/rules.d/50-ferrogate-operators.rules" >/dev/null
 grep -F '_ferrogate' "$work_dir/control/postinst" >/dev/null
 grep -F 'setfacl --modify "user:$SERVICE_USER:rw-"' "$work_dir/control/postinst" >/dev/null
+grep -F 'setfacl --modify "user:$SERVICE_USER:r--"' "$work_dir/control/postinst" >/dev/null
 grep -F 'udevadm control --reload-rules' "$work_dir/control/postinst" >/dev/null
 grep -F 'setfacl --remove "user:$SERVICE_USER"' "$work_dir/control/postrm" >/dev/null
 grep -F 'systemctl --user restart mia-tray.service' "$work_dir/control/postinst" >/dev/null

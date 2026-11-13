@@ -27,7 +27,7 @@ record them.
 
 ### Fixed
 
-- Enroll the Linux MIA service account in `ferrogate-status` during Debian and RPM installation and upgrades. The daemon currently clears supplementary groups when dropping privileges, so this membership alone does not allow it to reload a configuration file readable only by that group.
+- Keep Linux MIA live reloads able to read root-owned configuration after the daemon drops to `_ferrogate` and clears supplementary groups. Debian and RPM installation now grant that account a read-only POSIX ACL on each system TOML, and the audited atomic configuration writer preserves the ACL when `allowlist-key fetch` or setup replaces the file. `resync-allowlist --reload` also refuses to report success without `allowlist.key` and, with sync enabled, waits for the status endpoint to confirm a new sync attempt loaded a verified allowlist; plain `--reload` now accurately reports signal delivery as asynchronous rather than claiming the reload already succeeded.
 
 - Give the privilege-dropped Linux MIA access to TPM resource-manager devices after package installation. Debian and RPM packages now install a udev rule that preserves the distribution's TPM owner, group and mode while granting only `_ferrogate` an `rw` ACL on `/dev/tpmrm[0-9]*`; install and upgrade apply it immediately, device recreation reapplies it, and final package removal removes the live ACL. The packages depend explicitly on `acl` and udev, and their archive checks pin the rule, dependencies and lifecycle scripts.
 

@@ -24,8 +24,19 @@ if ! getent group "$STATUS_GROUP" >/dev/null 2>&1; then
     groupadd --system "$STATUS_GROUP"
 fi
 # Keep the service account enrolled for account-management tooling. The
-# hardened daemon deliberately clears supplementary groups before it runs.
+# hardened daemon deliberately clears supplementary groups before it runs,
+# so the file ACL below is what lets a live SIGHUP reload read the config.
 usermod -aG "$STATUS_GROUP" -- "$SERVICE_USER"
+
+# The daemon reads configuration as root at startup, then drops to the service
+# account and clears supplementary groups. Grant that UID read-only access so a
+# SIGHUP can re-read root-owned configuration without weakening its group mode.
+for config_file in /etc/ferrogate/mia*.toml /etc/ferrogate/environments.toml; do
+    [ -f "$config_file" ] && [ ! -L "$config_file" ] || continue
+    if [ "$(stat -c %U "$config_file" 2>/dev/null || true)" = root ]; then
+        setfacl --modify "user:$SERVICE_USER:r--" -- "$config_file"
+    fi
+done
 
 if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules >/dev/null 2>&1 ||
