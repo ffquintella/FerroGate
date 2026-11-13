@@ -261,8 +261,10 @@ recorded in [features/F11-revocation.md](features/F11-revocation.md) §"Status".
       stays seccomp-blocked). (`drop_privileges` + `restrict_capabilities`;
       `harden()` verifies the post-drop effective set is exactly
       `{CAP_IPC_LOCK, CAP_SYS_PTRACE}`.)
-- [x] Fail-closed IMA-enforcement check. (`mia::hardening` refuses to start
-      unless `/proc/cmdline` requests `ima_appraise=enforce`.)
+- [x] Opt-in, fail-closed IMA-enforcement check. (`FERROGATE_REQUIRE_IMA=1`
+      makes `mia::hardening` refuse to start unless `/proc/cmdline` requests
+      `ima_appraise=enforce`; stock workstation kernels use loaded-image hashing
+      plus the signed caller allowlist without the measurement-log cross-check.)
 - [x] Reproducible build job in CI (byte-identical re-builds).
       (`scripts/reproducible-build.sh` + the `reproducible-build` CI job.)
 - [x] `#![forbid(unsafe_code)]` on all MIA modules. (All FFI isolated in the new

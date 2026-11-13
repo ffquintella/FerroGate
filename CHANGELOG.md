@@ -49,6 +49,8 @@ record them.
 
 ### Changed
 
+- Make Linux IMA appraisal opt-in with `FERROGATE_REQUIRE_IMA=1`, so MIA starts on stock workstation kernels that do not enforce appraisal. The daemon still identifies helper callers by hashing the image loaded through `/proc/<pid>/exe` and checking the signed allowlist, and all other process hardening remains enabled. Deployments that set the variable keep the former fail-closed startup check and IMA measurement-log cross-check; invalid explicit values also fail closed.
+
 - Build the Windows MSI and NuGet package natively on a Windows host, without Docker: `make pkg-win` on Windows now runs `scripts/build-msi-windows.sh`, which compiles `mia.exe`, `mia-tray.exe` and `mia-tray-admin.exe` with cargo and MSVC, builds the MSI from the same `crates/mia/wix/mia.wxs` with the WiX Toolset (v4+ through a converted temporary copy, or v3), signs with `signtool` or `osslsigncode` when `WIN_SIGN_PFX` is set, and packs the `.nupkg` with Windows' bundled `tar`. Other hosts keep the containerised `scripts/build-msi-amd64.sh`
 
 ### Fixed

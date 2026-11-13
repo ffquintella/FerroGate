@@ -38,7 +38,7 @@ pub struct IdentifyConfig {
     pub max_file_size: u64,
     /// Version sources consulted.
     pub sources: VersionSources,
-    /// Linux: callers are IMA-verified (`FERROGATE_REQUIRE_IMA`); otherwise
+    /// Linux: callers are IMA-verified when `FERROGATE_REQUIRE_IMA=1`; otherwise
     /// `RegisterSelf` requests carry `ima_unverified`.
     pub ima_enforced: bool,
 }

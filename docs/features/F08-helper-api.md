@@ -156,6 +156,9 @@ file, also driven by `mia-tray`. See
 
 ## Risks
 
-- **IMA disabled.** A host without IMA cannot prove caller binary integrity.
-  Mitigation: MIA refuses to start unless IMA is enforced.
+- **IMA disabled.** Without IMA, MIA cannot cross-check a caller's loaded-image
+  hash against a kernel measurement. Mitigation: the hash is still read through
+  `/proc/<pid>/exe` and checked against the signed allowlist; deployments that
+  need kernel appraisal set `FERROGATE_REQUIRE_IMA=1` and fail closed if it is
+  unavailable.
 - **Allowlist staleness.** Mitigation: max age enforced; refresh on a timer.

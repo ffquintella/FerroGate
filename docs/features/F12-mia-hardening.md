@@ -5,7 +5,7 @@
 The MIA is a static-PIE Rust binary that applies a defence-in-depth profile
 at startup before any TPM or network I/O: no-new-privs, dumpable-off,
 mlockall, seccomp-bpf allowlist, drop to a dedicated UID with minimal
-capabilities, and a kernel-cmdline requirement for enforced IMA.
+capabilities. IMA appraisal remains available as an opt-in deployment policy.
 
 ## Scope
 
@@ -17,7 +17,7 @@ In:
 - Drop to `_ferrogate` UID retaining `CAP_IPC_LOCK` + `CAP_SYS_PTRACE` (the
   latter so the non-root daemon can read a helper caller's `/proc/<pid>/exe`;
   the `ptrace` syscall stays seccomp-blocked).
-- IMA-enforcement check: refuse to start if not active.
+- Optional IMA-enforcement check: when enabled, refuse to start if not active.
 - Static-PIE build with reproducible-build flags.
 - `unsafe` forbidden in MIA crates (CI gate).
 
@@ -41,10 +41,10 @@ See [../mia.md](../mia.md) §"Hardening profile".
 
 ## Acceptance criteria
 
-- [x] `mia` binary refuses to start when IMA is not enforced.
-      (`mia::hardening::harden` fails closed unless `/proc/cmdline` carries
-      `ima_appraise=enforce`; the parser `ima_cmdline_enforced` is unit-tested.
-      `FERROGATE_REQUIRE_IMA=0` is a documented dev-only override.)
+- [x] `mia` binary refuses to start when IMA is required but not enforced.
+      (`FERROGATE_REQUIRE_IMA=1` opts in; `mia::hardening::harden` then fails
+      closed unless `/proc/cmdline` carries `ima_appraise=enforce`; the policy
+      default and cmdline parser are unit-tested.)
 - [x] seccomp violation in a fuzzed handler kills the process; verified by
       a unit test that triggers a forbidden syscall.
       (`ferro_harden::linux::tests::seccomp_enforce_kills_forbidden_syscall`
@@ -81,9 +81,9 @@ capability restriction, seccomp-bpf via `seccompiler`) live in the new
 before the tokio runtime spawns workers (so the filter is inherited and
 `MCL_FUTURE` covers their allocations) and before any TPM/network I/O. Env
 toggles (`FERROGATE_SECCOMP=enforce|audit|off`, `FERROGATE_SKIP_HARDENING`,
-`FERROGATE_REQUIRE_IMA`, `FERROGATE_RUN_AS_UID/GID`) cover staged rollout and
-the dev "audit" mode. The Linux paths are verified by `cargo test -p
-ferro-harden` (including the live `SIGSYS` self-test) run in CI / the
+`FERROGATE_REQUIRE_IMA=1`, `FERROGATE_RUN_AS_UID/GID`) cover deployments that
+provision IMA and the dev "audit" mode. The Linux paths are verified by `cargo
+test -p ferro-harden` (including the live `SIGSYS` self-test) run in CI / the
 `rust:1.95-bookworm` container. A static-PIE musl build that statically links
 TSS2 is left as deployment packaging; the reproducibility gate runs on the
 default glibc build, which is PIE by default.

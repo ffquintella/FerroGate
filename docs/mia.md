@@ -24,9 +24,10 @@ defences applied at startup, before any network or TPM I/O:
   helper-API caller's `/proc/<pid>/exe` to authenticate it — a non-root daemon
   needs this to identify callers under other UIDs; the `ptrace` **syscall**
   itself stays blocked by the seccomp allowlist, so this is read-access only).
-- Linux kernel command line is expected to include
-  `ima_appraise=enforce ima_policy=appraise_tcb` so IMA-measured binary hashes
-  are kernel-enforced.
+- Helper callers are identified from the SHA-384 of the image loaded through
+  `/proc/<pid>/exe` and a signed allowlist. Deployments that enable IMA also
+  cross-check that hash against the kernel measurement log and require
+  `ima_appraise=enforce` on the kernel command line.
 
 The profile is applied by `mia::hardening::harden` on the startup thread,
 *before* the tokio runtime spawns workers (so the seccomp filter is inherited
@@ -34,13 +35,15 @@ and `mlockall(MCL_FUTURE)` covers their allocations) and before any TPM or
 network I/O. Every privileged syscall lives in the `ferro-harden` crate (the
 Linux analogue of `ferro-winauth`); `mia` itself is `#![forbid(unsafe_code)]`.
 
-Environment toggles for staged rollout and development:
+Environment toggles for deployment policy and development:
 
 - `FERROGATE_SECCOMP=enforce|audit|off` — seccomp mode. `audit` logs violations
   instead of killing, to discover allow-list drift before enforcing (default
   `enforce`).
-- `FERROGATE_REQUIRE_IMA=0` — do not require enforced IMA (dev/CI only; default
-  is to require it and refuse to start otherwise).
+- `FERROGATE_REQUIRE_IMA=1` — require kernel-enforced IMA appraisal. The
+  default is off so MIA runs on stock workstation kernels; the loaded-binary
+  hash and signed allowlist remain mandatory. When enabled, MIA refuses to
+  start unless the kernel command line requests `ima_appraise=enforce`.
 - `FERROGATE_RUN_AS_UID` / `FERROGATE_RUN_AS_GID` — drop to these instead of
   resolving the `_ferrogate` user.
 - `FERROGATE_SKIP_HARDENING=1` — disable the whole profile (development only).
@@ -1361,8 +1364,8 @@ $ mia status
 names `mia.toml`). `--json` prints the snapshot array. Exit status: `0` every
 reported environment is healthy, `1` not all healthy (or the environment is not
 served), `2` usage/config/protocol error, `3` the endpoint is absent (agent not
-running — the JSON still lists `not_running` snapshots, or `ima_disabled` on a
-Linux host whose kernel does not enforce IMA appraisal), `4` permission denied
+running — the JSON still lists `not_running` snapshots, or `ima_disabled` when
+a Linux host explicitly requires but does not enforce IMA appraisal), `4` permission denied
 (not a member of the status group).
 
 ### `mia-tray` — desktop companion

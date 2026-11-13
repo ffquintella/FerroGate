@@ -399,28 +399,60 @@ pub fn not_running_snapshots(environment: Option<&str>) -> Vec<StatusSnapshot> {
         .collect()
 }
 
-/// Linux: the kernel does not enforce IMA appraisal and nothing visible to
-/// this process turns the requirement off (`FERROGATE_REQUIRE_IMA=0` /
-/// `FERROGATE_SKIP_HARDENING=1` in this environment or the packaged
-/// `/etc/ferrogate/mia.env`). A heuristic: the daemon's own environment is
-/// authoritative and may differ.
+/// Read the last assignment to `key` in a systemd-style environment file.
+#[cfg(target_os = "linux")]
+fn env_file_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().rev().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return None;
+        }
+        let (name, value) = line.split_once('=')?;
+        (name.trim() == key).then(|| value.trim())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn env_value_is(value: &str, expected: &str) -> bool {
+    value == expected
+        || value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .is_some_and(|v| v == expected)
+        || value
+            .strip_prefix('\'')
+            .and_then(|v| v.strip_suffix('\''))
+            .is_some_and(|v| v == expected)
+}
+
+/// Whether a packaged service environment explicitly requires IMA.
+#[cfg(target_os = "linux")]
+fn ima_required_in_env_file(text: &str) -> bool {
+    env_file_value(text, "FERROGATE_REQUIRE_IMA").is_some_and(|value| !env_value_is(value, "0"))
+}
+
+/// Linux: the kernel does not enforce IMA appraisal while this process or the
+/// packaged `/etc/ferrogate/mia.env` explicitly requires it. A heuristic: the
+/// daemon's own environment is authoritative and may differ.
 #[cfg(target_os = "linux")]
 fn ima_blocks_startup() -> bool {
-    let opted_out = |text: &str| {
-        text.lines().any(|l| {
-            let l = l.trim();
-            l == "FERROGATE_REQUIRE_IMA=0" || l == "FERROGATE_SKIP_HARDENING=1"
-        })
-    };
-    if std::env::var("FERROGATE_REQUIRE_IMA").is_ok_and(|v| v == "0")
-        || std::env::var("FERROGATE_SKIP_HARDENING").is_ok_and(|v| v == "1")
+    if std::env::var("FERROGATE_SKIP_HARDENING").is_ok_and(|v| v == "1") {
+        return false;
+    }
+
+    let env_file = std::fs::read_to_string("/etc/ferrogate/mia.env").unwrap_or_default();
+    if env_file_value(&env_file, "FERROGATE_SKIP_HARDENING")
+        .is_some_and(|value| env_value_is(value, "1"))
     {
         return false;
     }
-    if std::fs::read_to_string("/etc/ferrogate/mia.env").is_ok_and(|t| opted_out(&t)) {
-        return false;
-    }
-    !crate::hardening::ima_enforced()
+
+    let required = if std::env::var_os("FERROGATE_REQUIRE_IMA").is_some() {
+        crate::hardening::ima_required()
+    } else {
+        ima_required_in_env_file(&env_file)
+    };
+    required && !crate::hardening::ima_enforced()
 }
 
 /// IMA is a Linux concept.
@@ -665,6 +697,19 @@ mod tests {
         ));
         let s = not_running_snapshots(Some("prod"));
         assert_eq!(s[0].environment.as_deref(), Some("prod"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn env_file_ima_requirement_is_opt_in() {
+        assert!(!ima_required_in_env_file("RUST_LOG=info\n"));
+        assert!(!ima_required_in_env_file("FERROGATE_REQUIRE_IMA=0\n"));
+        assert!(ima_required_in_env_file("FERROGATE_REQUIRE_IMA=1\n"));
+        assert!(ima_required_in_env_file("FERROGATE_REQUIRE_IMA=invalid\n"));
+        assert!(!ima_required_in_env_file(
+            "FERROGATE_REQUIRE_IMA=1\nFERROGATE_REQUIRE_IMA=0\n"
+        ));
+        assert!(!ima_required_in_env_file("#FERROGATE_REQUIRE_IMA=1\n"));
     }
 
     #[test]

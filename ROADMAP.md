@@ -369,7 +369,7 @@ T223.)
   - note: `SignedCrl::verify` in `ferro-svid`, the MIA-side `crl::ingest`, and the reference verifier's `verify_unrevoked` all reject unknown-kid / wrong-key / tampered CRLs without yielding the body.
 
 ## [M14] MIA process hardening (F12)
-> outcome: `mia` locks memory, drops to `_ferrogate` with a minimal capability set under an enforcing seccomp allow-list, refuses to run without IMA enforcement, and builds reproducibly with no `unsafe` code.
+> outcome: `mia` locks memory, drops to `_ferrogate` with a minimal capability set under an enforcing seccomp allow-list, can require IMA enforcement as an opt-in policy, and builds reproducibly with no `unsafe` code.
 > version: 0.8.0
 > phase: P6
 > spec: S12, S29
@@ -388,8 +388,8 @@ gate runs on the PIE-by-default glibc build.
   - note: ~70-name explicit allow-list via `seccompiler`; `FERROGATE_SECCOMP=enforce|audit|off`. The enforcing filter is proven to `SIGSYS`-kill a forbidden syscall by a unit test. Allow-list completed for the real runtime and aarch64 in 0.21.0–0.21.1.
 - [x] T88 Drop to the `_ferrogate` UID keeping `CAP_IPC_LOCK` and `CAP_SYS_PTRACE` (S12)
   - note: `CAP_SYS_PTRACE` (added in 0.21.0) lets the daemon read a helper caller's `/proc/<pid>/exe`; the `ptrace` syscall stays seccomp-blocked. `drop_privileges` + `restrict_capabilities`; `harden()` verifies the post-drop effective set is exactly `{CAP_IPC_LOCK, CAP_SYS_PTRACE}`.
-- [x] T89 Refuse to start unless IMA enforcement is on (S12)
-  - note: `mia::hardening` refuses to start unless `/proc/cmdline` requests `ima_appraise=enforce`.
+- [x] T89 Support fail-closed IMA enforcement as an opt-in policy (S12)
+  - note: `FERROGATE_REQUIRE_IMA=1` makes `mia::hardening` refuse to start unless `/proc/cmdline` requests `ima_appraise=enforce`; by default caller identity uses the loaded-image SHA-384 plus the signed allowlist without the measurement-log cross-check.
 - [x] T90 Add a reproducible-build CI job with byte-identical rebuilds (S12)
   - note: `scripts/reproducible-build.sh` + the `reproducible-build` CI job. The job went with `ci.yml` in 0.13.2; restoring it is T222.
 - [x] T91 Forbid `unsafe` in all MIA modules (S12)

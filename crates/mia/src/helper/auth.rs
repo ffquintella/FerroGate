@@ -556,11 +556,11 @@ mod linux {
     /// The Linux caller authenticator: `SO_PEERCRED` + a SHA-384 of the caller's
     /// `/proc/<pid>/exe`.
     ///
-    /// When `require_ima` is set (the production default) that hash is
+    /// When `require_ima` is set that hash is
     /// cross-checked against the kernel IMA measurement log, so a caller whose
     /// binary was not IMA-measured — or whose on-disk bytes no longer match its
     /// measurement — is rejected. When it is clear (the daemon started with
-    /// `FERROGATE_REQUIRE_IMA=0`, i.e. IMA is not enforced on this host) the IMA
+    /// `FERROGATE_REQUIRE_IMA` is unset or `0`) the IMA
     /// cross-check is skipped and identity rests on the hash of the loaded binary
     /// alone — mirroring how [`WindowsCallerAuth`](super::WindowsCallerAuth) drops
     /// the Authenticode check when it is not required. The hash is always read
@@ -591,7 +591,7 @@ mod linux {
         }
 
         /// Authenticate by the loaded-binary hash alone, without the IMA
-        /// cross-check. For hosts that do not enforce IMA (`FERROGATE_REQUIRE_IMA=0`),
+        /// cross-check. For hosts that do not require IMA,
         /// where there is no measurement log to check against.
         #[must_use]
         pub fn without_ima(mut self) -> Self {

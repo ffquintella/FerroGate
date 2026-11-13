@@ -1,8 +1,8 @@
 //! MIA process-hardening orchestration (feature F12).
 //!
 //! [`harden`] applies the defence-in-depth profile from `docs/mia.md`
-//! §"Hardening profile" at startup, **before** any TPM or network I/O: it
-//! refuses to start unless IMA appraisal is kernel-enforced, then drives the
+//! §"Hardening profile" at startup, **before** any TPM or network I/O. It
+//! optionally verifies kernel-enforced IMA appraisal, then drives the
 //! syscall-level steps in `ferro_harden` (mlockall, no-dumpable, drop to
 //! `_ferrogate` retaining `CAP_IPC_LOCK` + `CAP_SYS_PTRACE`, no-new-privs,
 //! seccomp allow-list).
@@ -16,8 +16,9 @@
 //!
 //! - `FERROGATE_SKIP_HARDENING=1` — **dev only.** Skip the whole profile and
 //!   log a loud warning. Never set this in production.
-//! - `FERROGATE_REQUIRE_IMA=0` — do not require enforced IMA (dev/CI). Default
-//!   is to require it and fail closed.
+//! - `FERROGATE_REQUIRE_IMA=1` — require enforced IMA appraisal. It is off by
+//!   default so MIA runs on stock workstation kernels; when enabled it fails
+//!   closed if the kernel does not enforce appraisal.
 //! - `FERROGATE_SECCOMP=enforce|audit|off` — seccomp mode (default `enforce`).
 //!   `audit` logs violations instead of killing — used to discover allow-list
 //!   drift before rollout.
@@ -28,6 +29,20 @@
 
 /// The kernel-cmdline token that signals enforced IMA appraisal.
 const IMA_ENFORCE_KEY: &str = "ima_appraise";
+
+/// Whether Linux startup and caller authentication require IMA appraisal.
+///
+/// The requirement is opt-in because stock workstation kernels commonly do
+/// not enforce appraisal. An explicitly set value keeps the former fail-closed
+/// semantics: only `0` disables it; `1` (and invalid values) require IMA.
+#[must_use]
+pub fn ima_required() -> bool {
+    ima_required_from(std::env::var_os("FERROGATE_REQUIRE_IMA").as_deref())
+}
+
+fn ima_required_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v != "0")
+}
 
 /// The dedicated service account the MIA drops to.
 pub const SERVICE_USER: &str = "_ferrogate";
@@ -137,7 +152,7 @@ mod linux {
     use anyhow::{bail, Context as _};
     use ferro_harden::{HardenProfile, RunAs, SeccompMode};
 
-    use super::{hand_over_dir, ima_cmdline_enforced, RuntimeDir, SERVICE_USER};
+    use super::{hand_over_dir, ima_cmdline_enforced, ima_required, RuntimeDir, SERVICE_USER};
 
     /// Default path to the kernel command line.
     const DEFAULT_CMDLINE: &str = "/proc/cmdline";
@@ -265,19 +280,21 @@ mod linux {
             return Ok(());
         }
 
-        // 1. IMA enforcement — refuse to start unless the kernel enforces
-        //    measured-binary appraisal (fail closed).
-        let require_ima = std::env::var("FERROGATE_REQUIRE_IMA").map_or(true, |v| v != "0");
-        if require_ima {
+        // 1. Optional IMA enforcement. Hardened deployments opt in and fail
+        //    closed; stock workstation kernels continue with the remaining
+        //    process-hardening controls.
+        if ima_required() {
             if !ima_enforced() {
                 bail!(
                     "IMA appraisal is not enforced (kernel cmdline lacks `ima_appraise=enforce`); \
-                     refusing to start. Set FERROGATE_REQUIRE_IMA=0 only for development."
+                     refusing to start because FERROGATE_REQUIRE_IMA is set."
                 );
             }
             tracing::info!("IMA enforcement confirmed");
         } else {
-            tracing::warn!("FERROGATE_REQUIRE_IMA=0 set; IMA enforcement NOT required (dev only)");
+            tracing::info!(
+                "IMA appraisal is not required; set FERROGATE_REQUIRE_IMA=1 to enforce it"
+            );
         }
 
         // 2. Decide the privilege-drop target. Only meaningful when started as
@@ -353,6 +370,15 @@ mod tests {
         // A substring that merely contains the value must not match.
         assert!(!ima_cmdline_enforced("xima_appraise=enforce"));
         assert!(!ima_cmdline_enforced("not_ima_appraise=enforce"));
+    }
+
+    #[test]
+    fn ima_requirement_is_opt_in() {
+        assert!(!ima_required_from(None));
+        assert!(!ima_required_from(Some(std::ffi::OsStr::new("0"))));
+        assert!(ima_required_from(Some(std::ffi::OsStr::new("1"))));
+        // Preserve fail-closed handling for an explicitly set, invalid value.
+        assert!(ima_required_from(Some(std::ffi::OsStr::new("invalid"))));
     }
 
     #[test]
