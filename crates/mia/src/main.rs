@@ -2337,7 +2337,7 @@ where
         socket_mode: config.socket_mode()?,
         socket_gid: socket_dir.gid,
         own_socket_dir: socket_dir.own_dir,
-        windows_group: config.helper.windows_group.clone(),
+        windows_group: config.helper_windows_group().map(str::to_owned),
         max_concurrent: 64,
         read_timeout: Duration::from_secs(5),
     };

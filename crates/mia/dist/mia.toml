@@ -66,8 +66,10 @@
 # (ferrogate-status after a package install). A group *name* is not accepted
 # (the daemon is unsafe-free and won't call getgrnam); use the numeric gid.
 #socket_gid = "555"
-# Windows only. Local group whose members may open the pipe (blank => default
-# pipe DACL).
+# Windows only. Local group whose members may open the pipe. Default:
+# "FerroGateClients" (created by the installer). Set it blank ("") to fall back
+# to the default pipe DACL, which lets non-administrators open the pipe
+# read-only, so their helper requests fail with "Access is denied".
 #windows_group = "FerroGateClients"
 # Windows only. Require a valid Authenticode signature on every caller's image
 # (the Code-Integrity analogue of the Linux IMA check). Default: true. Set false

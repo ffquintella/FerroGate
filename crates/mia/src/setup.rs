@@ -448,9 +448,17 @@ fn prompt_all(
         {
             s.helper_socket_mode
                 .clone_from(&existing.helper.socket_mode);
-            let group = Text::new("Windows group allowed to open the pipe (blank ⇒ default DACL):")
-                .with_default(existing.helper.windows_group.as_deref().unwrap_or_default())
-                .with_help_message("e.g. FerroGateClients")
+            let group = Text::new("Windows group allowed to open the pipe:")
+                .with_default(
+                    existing
+                        .helper
+                        .windows_group
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|g| !g.is_empty())
+                        .unwrap_or(crate::config::DEFAULT_HELPER_GROUP),
+                )
+                .with_help_message("blank ⇒ FerroGateClients, the group the installer creates")
                 .with_validator(literal_validator)
                 .prompt()?;
             s.helper_windows_group = non_empty(group);
@@ -1173,7 +1181,10 @@ pub(crate) fn render(
         "socket_mode",
         "660",
     ));
-    out.push_str("# Windows only. Local group allowed to open the pipe (blank ⇒ default DACL).\n");
+    out.push_str(
+        "# Windows only. Local group allowed to open the pipe. Default: FerroGateClients.\n\
+         # An explicit '' falls back to the default DACL (read-only for non-administrators).\n",
+    );
     out.push_str(&str_line(
         s.helper_windows_group.as_deref(),
         "windows_group",

@@ -529,8 +529,10 @@ pub struct HelperConfig {
     /// so the installer resolves the FerroGate group name to its gid and passes
     /// the number (see `make mia-install`).
     pub socket_gid: Option<String>,
-    /// **Windows only.** Local group whose members may open the pipe (e.g.
-    /// `FerroGateClients`). `None` ⇒ the pipe's default DACL applies.
+    /// **Windows only.** Local group whose members may open the pipe. `None`
+    /// ⇒ [`DEFAULT_HELPER_GROUP`]; blank ⇒ no group, so the pipe's default DACL
+    /// applies (read-only for non-administrators). Resolve it through
+    /// [`Config::helper_windows_group`].
     pub windows_group: Option<String>,
     /// **Windows only.** Require a valid Authenticode signature on every caller's
     /// image (the Code-Integrity analogue of the Linux IMA cross-check). `None`
@@ -703,6 +705,10 @@ pub const DEFAULT_STATUS_GROUP: &str = "FerroGateStatus";
 /// Default group allowed to read the status endpoint (Unix group name).
 #[cfg(not(windows))]
 pub const DEFAULT_STATUS_GROUP: &str = "ferrogate-status";
+
+/// Default local group allowed to open the Windows helper pipe
+/// (`helper.windows_group` when unset). The installers create it.
+pub const DEFAULT_HELPER_GROUP: &str = "FerroGateClients";
 
 /// Default per-uid status request budget, requests per second.
 pub const DEFAULT_STATUS_RATE_LIMIT: u32 = 10;
@@ -1350,6 +1356,21 @@ impl Config {
         }
     }
 
+    /// The local group the Windows helper pipe's DACL grants access to.
+    ///
+    /// Unset ⇒ [`DEFAULT_HELPER_GROUP`]; an explicit blank value ⇒ `None`, so
+    /// the pipe keeps the default DACL. Without a group, non-administrators
+    /// can only open the pipe read-only and every helper request fails with
+    /// `ERROR_ACCESS_DENIED`, which is why unset does not mean "no group".
+    #[must_use]
+    pub fn helper_windows_group(&self) -> Option<&str> {
+        match self.helper.windows_group.as_deref().map(str::trim) {
+            None => Some(DEFAULT_HELPER_GROUP),
+            Some("") => None,
+            Some(group) => Some(group),
+        }
+    }
+
     /// The group allowed to read status; default [`DEFAULT_STATUS_GROUP`].
     #[must_use]
     pub fn status_group(&self) -> &str {
@@ -1743,6 +1764,24 @@ mod tests {
     fn windows_group_round_trips() {
         let c = Config::from_toml("[helper]\nwindows_group = \"FerroGateClients\"").unwrap();
         assert_eq!(c.helper.windows_group.as_deref(), Some("FerroGateClients"));
+    }
+
+    #[test]
+    fn helper_windows_group_defaults_to_the_installer_group() {
+        let unset = Config::from_toml("").unwrap();
+        assert_eq!(unset.helper_windows_group(), Some(DEFAULT_HELPER_GROUP));
+        let custom = Config::from_toml(
+            "[helper]
+windows_group = \" AppClients \"",
+        )
+        .unwrap();
+        assert_eq!(custom.helper_windows_group(), Some("AppClients"));
+        let blank = Config::from_toml(
+            "[helper]
+windows_group = \"  \"",
+        )
+        .unwrap();
+        assert_eq!(blank.helper_windows_group(), None);
     }
 
     #[test]

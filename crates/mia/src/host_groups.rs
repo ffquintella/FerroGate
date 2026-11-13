@@ -2,8 +2,8 @@
 //! when they are missing.
 //!
 //! The status pipe grants read access to `status.group` (default
-//! `FerroGateStatus`) and the helper pipe, when `helper.windows_group` is set,
-//! to that group (conventionally `FerroGateClients`). A DACL naming a group
+//! `FerroGateStatus`) and the helper pipe to `helper.windows_group` (default
+//! `FerroGateClients`; blank opts out). A DACL naming a group
 //! that does not resolve cannot be built, so the pipe is never created: the
 //! service keeps running but `mia status` and the tray see no agent. The
 //! Chocolatey package used to be the only thing creating these groups; a host
@@ -21,7 +21,7 @@ use crate::config::{Config, DEFAULT_STATUS_GROUP};
 
 /// The conventional helper-pipe group (`helper.windows_group`), created by
 /// the installers so an administrator only has to add client accounts.
-pub const DEFAULT_HELPER_GROUP: &str = "FerroGateClients";
+pub use crate::config::DEFAULT_HELPER_GROUP;
 
 /// One local group the agent needs, with the comment it is created with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +61,7 @@ pub fn required_groups<'a>(
         push_unique(&mut out, DEFAULT_STATUS_GROUP, STATUS_COMMENT);
     }
     for config in configs {
-        if let Some(group) = config.helper.windows_group.as_deref() {
+        if let Some(group) = config.helper_windows_group() {
             push_unique(&mut out, group, HELPER_COMMENT);
         }
         if config.status_enabled() {
@@ -114,8 +114,22 @@ mod tests {
     }
 
     #[test]
-    fn a_default_config_needs_only_the_status_group() {
+    fn a_default_config_needs_the_default_helper_and_status_groups() {
         let c = Config::from_toml("").unwrap();
+        assert_eq!(
+            names(&required_groups([&c], false)),
+            [DEFAULT_HELPER_GROUP, DEFAULT_STATUS_GROUP]
+        );
+    }
+
+    #[test]
+    fn a_blank_helper_group_needs_no_helper_group() {
+        let c = Config::from_toml(
+            "[helper]
+windows_group = \"\"
+",
+        )
+        .unwrap();
         assert_eq!(names(&required_groups([&c], false)), [DEFAULT_STATUS_GROUP]);
     }
 
@@ -146,8 +160,8 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_status_endpoint_needs_no_group() {
+    fn a_disabled_status_endpoint_needs_no_status_group() {
         let c = Config::from_toml("[status]\nenable = false\ngroup = \"Ops\"\n").unwrap();
-        assert!(required_groups([&c], false).is_empty());
+        assert_eq!(names(&required_groups([&c], false)), [DEFAULT_HELPER_GROUP]);
     }
 }

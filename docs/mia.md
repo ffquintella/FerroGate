@@ -325,8 +325,11 @@ The pipe's DACL restricts access to the local group named by
 group; **add the accounts of vetted client applications to it** so they may
 request tokens (`net localgroup FerroGateClients <account> /add`). If the group
 does not exist, the daemon cannot resolve its SID and fails to bind the pipe
-(`ERROR_NONE_MAPPED`); set `helper.windows_group` blank to fall back to the
-default DACL. On a manual `mia service install` (no installer), create the group
+(`ERROR_NONE_MAPPED`); set `helper.windows_group = ""` to fall back to the
+default DACL, but note that the default DACL lets non-administrators open the
+pipe read-only, so their requests fail with `Access is denied` (os error 5).
+Leaving the key unset (or commented out, as in the shipped `mia.toml`) uses
+`FerroGateClients`. On a manual `mia service install` (no installer), create the group
 yourself first.
 
 Past the pipe DACL, the daemon also authenticates each caller's *image*: by
