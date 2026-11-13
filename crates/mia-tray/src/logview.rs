@@ -109,7 +109,7 @@ impl LogBuffer {
     }
 
     /// Everything kept, oldest first.
-    #[must_use]
+    #[must_use = "iterators are lazy"]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Entry> + ExactSizeIterator {
         self.entries.iter()
     }

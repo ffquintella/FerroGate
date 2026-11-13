@@ -52,7 +52,7 @@ use crate::notice::{Notice as Message, NoticeCenter, Target};
 use crate::text::{display_safe, display_safe_block, human_duration};
 
 /// Run the administrator window until it is closed.
-#[must_use]
+#[must_use = "the exit code must be returned from main"]
 pub fn run(lang: Lang) -> ExitCode {
     let options = eframe::NativeOptions {
         // Never the user name or any record data in the title (F22 §3).

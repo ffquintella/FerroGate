@@ -39,13 +39,13 @@ use crate::model::WindowKind;
 use crate::poll::Poller;
 
 /// Run the tray icon until "Quit".
-#[must_use]
+#[must_use = "the exit code must be returned from main"]
 pub fn run_tray() -> ExitCode {
     tray_loop::run(crate::prefs::effective_lang())
 }
 
 /// Run the main window until it is closed.
-#[must_use]
+#[must_use = "the exit code must be returned from main"]
 pub fn run_window(kind: WindowKind) -> ExitCode {
     window::run(kind, crate::prefs::effective_lang())
 }
