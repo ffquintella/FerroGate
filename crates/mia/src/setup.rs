@@ -949,6 +949,21 @@ pub(crate) fn perform_reload() -> Option<anyhow::Result<&'static str>> {
     None
 }
 
+/// Restart the agent's service so it loads a new configuration, on platforms
+/// with no live reload ([`perform_reload`] returns `None`). Windows restarts
+/// the `mia` service through the SCM (needs an elevated process); `None`
+/// elsewhere.
+#[cfg(windows)]
+pub(crate) fn perform_restart() -> Option<anyhow::Result<()>> {
+    Some(ferro_winauth::service::restart())
+}
+
+/// Restart fallback (non-Windows): none — these platforms reload live.
+#[cfg(not(windows))]
+pub(crate) fn perform_restart() -> Option<anyhow::Result<()>> {
+    None
+}
+
 // ── Field validators ────────────────────────────────────────────────────────
 //
 // One implementation per field, shared by the interactive prompts (wrapped as

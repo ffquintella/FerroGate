@@ -268,18 +268,27 @@ pub(crate) fn signal_reload() {
     }
 }
 
-/// Signal the running agent to reload (SIGHUP via the service manager)
-/// without printing anything — for `mia setup --apply --json`, whose stdout
-/// must stay one JSON document. Errors when the platform has no live reload
-/// or the service manager command fails.
+/// Load a freshly applied configuration into the running agent without
+/// printing anything — for `mia setup --apply [--json]`, whose stdout must
+/// stay one JSON document. Signals a live reload (SIGHUP via the service
+/// manager) where the platform has one; otherwise (Windows) restarts the
+/// service. Errors when neither is available or the service manager fails.
 pub(crate) fn send_reload() -> anyhow::Result<()> {
-    let outcome = crate::setup::perform_reload().with_context(|| {
+    if let Some(outcome) = crate::setup::perform_reload() {
+        return outcome.map(|_| ());
+    }
+    let restarted = crate::setup::perform_restart().with_context(|| {
         format!(
             "live reload is not supported on this platform; restart the agent:  {}",
             crate::setup::restart_hint()
         )
     })?;
-    outcome.map(|_| ())
+    restarted.with_context(|| {
+        format!(
+            "restarting the agent to load the configuration; restart it by hand:  {}",
+            crate::setup::restart_hint()
+        )
+    })
 }
 
 /// Verify the freshly fetched allowlist against the locally pinned enrollment

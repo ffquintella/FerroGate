@@ -677,14 +677,8 @@ fn apply_validated_draft(
             Ok(plan.path().to_path_buf())
         })
     };
-    let reloaded = opts.reload.then(|| {
-        if opts.json {
-            crate::resync::send_reload()
-        } else {
-            crate::resync::signal_reload();
-            Ok(())
-        }
-    });
+    // A live reload where the platform has one, a service restart on Windows.
+    let reloaded = opts.reload.then(crate::resync::send_reload);
     report_apply_result(
         opts,
         &target,
@@ -745,6 +739,8 @@ fn report_apply_result(
                 "  (Re)start or reload the agent to apply it:  {}",
                 setup::restart_hint()
             );
+        } else if matches!(reloaded, Some(Ok(()))) {
+            println!("✓ The running agent loaded the new configuration");
         }
     }
     match error {

@@ -238,6 +238,79 @@ pub fn stop() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How often [`restart`] polls the SCM while the service stops.
+const RESTART_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How many polls [`restart`] waits for the service to stop (30 s in all).
+const RESTART_POLL_ATTEMPTS: u32 = 120;
+
+/// Poll `query` until it reports [`ServiceState::Stopped`], at most
+/// `attempts` times, sleeping `interval` between polls. Errors when the query
+/// fails or the service is still not stopped after the last poll.
+fn wait_until_stopped<F>(mut query: F, attempts: u32, interval: Duration) -> anyhow::Result<()>
+where
+    F: FnMut() -> anyhow::Result<ServiceState>,
+{
+    let mut last = None;
+    for i in 0..attempts {
+        let state = query()?;
+        if state == ServiceState::Stopped {
+            return Ok(());
+        }
+        last = Some(state);
+        if i + 1 < attempts {
+            std::thread::sleep(interval);
+        }
+    }
+    anyhow::bail!(
+        "the mia service did not stop in time (last state: {})",
+        last.map_or_else(|| "unknown".to_string(), |s| format!("{s:?}"))
+    )
+}
+
+/// Restart the `mia` service so it loads its configuration again: stop it
+/// when it is not already stopped, wait for the SCM to report it stopped,
+/// then start it. A stopped service is simply started. Requires
+/// Administrator rights.
+///
+/// This is the Windows counterpart of the SIGHUP reload used on Unix (there
+/// is no live reload here), so the helper pipe is briefly unavailable while
+/// the service restarts.
+pub fn restart() -> anyhow::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("opening the service control manager (run as Administrator)")?;
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+        )
+        .context("opening the mia service (is it installed?)")?;
+    let state = service
+        .query_status()
+        .context("querying the mia service")?
+        .current_state;
+    if state != ServiceState::Stopped {
+        if state != ServiceState::StopPending {
+            service.stop().context("stopping the mia service")?;
+        }
+        wait_until_stopped(
+            || {
+                Ok(service
+                    .query_status()
+                    .context("querying the mia service")?
+                    .current_state)
+            },
+            RESTART_POLL_ATTEMPTS,
+            RESTART_POLL_INTERVAL,
+        )?;
+    }
+    let no_args: [&OsStr; 0] = [];
+    service
+        .start(&no_args)
+        .context("starting the mia service")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +333,48 @@ mod tests {
         assert!(!is_already_running(
             &windows_service::Error::LaunchArgumentsNotSupported
         ));
+    }
+
+    #[test]
+    fn waits_until_the_service_reports_stopped() {
+        let mut states = vec![
+            ServiceState::Stopped,
+            ServiceState::StopPending,
+            ServiceState::Running,
+        ];
+        let mut polls = 0;
+        wait_until_stopped(
+            || {
+                polls += 1;
+                Ok(states.pop().unwrap())
+            },
+            5,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn gives_up_when_the_service_never_stops() {
+        let mut polls = 0;
+        let err = wait_until_stopped(
+            || {
+                polls += 1;
+                Ok(ServiceState::StopPending)
+            },
+            4,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(polls, 4);
+        assert!(err.to_string().contains("did not stop"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_query_is_reported() {
+        let err =
+            wait_until_stopped(|| anyhow::bail!("scm refused"), 3, Duration::ZERO).unwrap_err();
+        assert!(err.to_string().contains("scm refused"), "{err}");
     }
 }

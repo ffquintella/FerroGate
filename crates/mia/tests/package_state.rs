@@ -283,7 +283,8 @@ fn the_windows_msi_sets_path_auto_start_and_icon() {
     }
     let custom = element("Custom");
     assert!(
-        custom.contains(r#"Action="MiaSecureConfig""#) && custom.contains(r#"Before="StartServices""#),
+        custom.contains(r#"Action="MiaSecureConfig""#)
+            && custom.contains(r#"Before="StartServices""#),
         "{custom}"
     );
 
