@@ -108,6 +108,116 @@ fn no_install_or_upgrade_script_deletes_identity_material() {
 }
 
 #[cfg(unix)]
+mod linux_installer_groups {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::read;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("mia-installer-groups-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn stub(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn run_installer(script: &str, args: &[&str], tag: &str) -> String {
+        let root = TempDir::new(tag);
+        let bin = root.0.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let record = root.0.join("calls");
+
+        // The hooks query only these account records in this controlled run.
+        // They must see the service account and the three package groups as
+        // already present, just as on an upgrade.
+        stub(
+            &bin,
+            "getent",
+            "#!/bin/sh\ncase \"$1:$2\" in\ngroup:ferrogate-clients) echo 'ferrogate-clients:x:4101:';;\ngroup:ferrogate-status) echo 'ferrogate-status:x:4102:';;\ngroup:ferrogate-operators) echo 'ferrogate-operators:x:4103:';;\npasswd:_ferrogate) exit 0;;\n*) exit 2;;\nesac\n",
+        );
+        stub(
+            &bin,
+            "usermod",
+            "#!/bin/sh\nprintf 'usermod %s\\n' \"$*\" >>\"$FERROGATE_TEST_RECORD\"\n",
+        );
+        stub(&bin, "groupadd", "#!/bin/sh\nexit 0\n");
+        stub(&bin, "useradd", "#!/bin/sh\nexit 0\n");
+        // Prevent the hook from discovering real desktop sessions on the host.
+        stub(&bin, "loginctl", "#!/bin/sh\nexit 0\n");
+
+        let config_dir = root.0.join("etc/ferrogate");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("mia.toml"), "log = 'info'\n").unwrap();
+        let dropin_dir = root.0.join("etc/systemd/system/mia.service.d");
+
+        let copy = root.0.join("installer.sh");
+        let source = read(script)
+            .replace("/etc/ferrogate", &config_dir.display().to_string())
+            .replace(
+                "/etc/systemd/system/mia.service.d",
+                &dropin_dir.display().to_string(),
+            )
+            .replace(
+                "/run/systemd/system",
+                &root.0.join("no-systemd").display().to_string(),
+            );
+        fs::write(&copy, source).unwrap();
+
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let output = Command::new("sh")
+            .arg(&copy)
+            .args(args)
+            .env("PATH", path)
+            .env("FERROGATE_TEST_RECORD", &record)
+            .output()
+            .unwrap_or_else(|e| panic!("run {}: {e}", copy.display()));
+        assert!(
+            output.status.success(),
+            "{} failed:\nstdout: {}\nstderr: {}",
+            script,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(record).unwrap_or_default()
+    }
+
+    #[test]
+    fn linux_installers_enroll_the_service_account_in_the_status_group_on_upgrade() {
+        for (script, args, tag) in [
+            ("dist/debian/postinst", vec!["configure"], "deb"),
+            ("dist/rpm/postinstall", Vec::new(), "rpm"),
+        ] {
+            let calls = run_installer(script, &args, tag);
+            assert!(
+                calls
+                    .lines()
+                    .any(|line| line == "usermod -aG ferrogate-status -- _ferrogate"),
+                "{script} did not enroll _ferrogate in ferrogate-status: {calls:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
 mod uninstall {
     use super::*;
 

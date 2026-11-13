@@ -135,6 +135,9 @@ if [ "${1:-}" = configure ]; then
     create_system_group "$CLIENT_GROUP"
     create_system_group "$STATUS_GROUP"
     create_system_group "$OPERATORS_GROUP"
+    # Keep the service account enrolled for account-management tooling. The
+    # hardened daemon deliberately clears supplementary groups before it runs.
+    usermod -aG "$STATUS_GROUP" -- "$SERVICE_USER"
     grant_tpm_access
 
     # The tray's read-only diagnostics (`mia test`, `mia status`) resolve the

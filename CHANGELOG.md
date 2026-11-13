@@ -27,6 +27,8 @@ record them.
 
 ### Fixed
 
+- Enroll the Linux MIA service account in `ferrogate-status` during Debian and RPM installation and upgrades. The daemon currently clears supplementary groups when dropping privileges, so this membership alone does not allow it to reload a configuration file readable only by that group.
+
 - Give the privilege-dropped Linux MIA access to TPM resource-manager devices after package installation. Debian and RPM packages now install a udev rule that preserves the distribution's TPM owner, group and mode while granting only `_ferrogate` an `rw` ACL on `/dev/tpmrm[0-9]*`; install and upgrade apply it immediately, device recreation reapplies it, and final package removal removes the live ACL. The packages depend explicitly on `acl` and udev, and their archive checks pin the rule, dependencies and lifecycle scripts.
 
 - Show MIA on Linux desktops after installing the workstation package: Debian and RPM packages now install a visible **FerroGate MIA** application entry that opens the status window without starting another tray, while the background tray uses the KSNI backend and publishes its state disc as `IconPixmap`. The former package installed only a hidden XDG autostart entry, and the libappindicator backend registered an absolute-path `IconName` without a pixmap, which Pantheon Wingpanel accepted but did not render. `/usr/bin/mia-tray` was already installed and remains directly available on `PATH`.

@@ -2,6 +2,7 @@
 set -eu
 
 SERVICE_USER=_ferrogate
+STATUS_GROUP=ferrogate-status
 
 if ! getent group "$SERVICE_USER" >/dev/null 2>&1; then
     groupadd --system "$SERVICE_USER"
@@ -19,6 +20,12 @@ if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
         --comment "FerroGate MIA service account" \
         "$SERVICE_USER"
 fi
+if ! getent group "$STATUS_GROUP" >/dev/null 2>&1; then
+    groupadd --system "$STATUS_GROUP"
+fi
+# Keep the service account enrolled for account-management tooling. The
+# hardened daemon deliberately clears supplementary groups before it runs.
+usermod -aG "$STATUS_GROUP" -- "$SERVICE_USER"
 
 if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules >/dev/null 2>&1 ||
