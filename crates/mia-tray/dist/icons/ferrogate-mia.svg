@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
 <!--
   FerroGate MIA application icon (master). A steel shield (the identity the
   agent guards) carrying a machine chip whose keyhole glows in the tray's
   "healthy" accent. Raster sizes, the macOS .icns and the Windows .ico are
   generated from this file by scripts/gen-mia-icons.sh; edit only this file.
 -->
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#22364b"/>

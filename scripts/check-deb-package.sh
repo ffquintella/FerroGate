@@ -55,6 +55,15 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$launcher"
 fi
 
+# GdkPixbuf chooses an SVG loader from a short content prefix rather than the
+# file extension. Keep the root element in that prefix so GTK desktops can
+# decode the launcher icon instead of showing their missing-image fallback.
+launcher_svg="$work_dir/root/usr/share/icons/hicolor/scalable/apps/ferrogate-mia.svg"
+head -c 100 "$launcher_svg" | grep -F '<svg' >/dev/null || {
+    echo "ERROR: FerroGate MIA SVG root must appear in its first 100 bytes" >&2
+    exit 1
+}
+
 tpm_rule="$work_dir/root/usr/lib/udev/rules.d/70-ferrogate-mia-tpm.rules"
 grep -F 'ACTION=="add|change"' "$tpm_rule" >/dev/null || {
     echo "ERROR: TPM rule must run only when a device is added or changed" >&2
