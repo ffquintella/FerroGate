@@ -61,6 +61,12 @@ name  = "clipboard-win"
 allow = ["BSL-1.0"]
 name  = "error-code"
 
+# mia-tray GUI: ksni, the Linux StatusNotifierItem tray backend pulled in by
+# tray-icon (Unlicense, a public-domain dedication; OSI approved, permissive).
+[[licenses.exceptions]]
+allow = ["Unlicense"]
+name  = "ksni"
+
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
