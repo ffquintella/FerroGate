@@ -505,6 +505,9 @@ spanish! {
     HelpHelperSocketMode => "Modo de archivo octal del socket del helper, por ejemplo 660.";
     FieldHelperWindowsGroup => "Grupo del pipe (Windows)";
     HelpHelperWindowsGroup => "Grupo local autorizado para abrir el pipe del helper, por ejemplo FerroGateClients.";
+    FieldHelperRequireAuthenticode => "Exigir aplicaciones firmadas (Windows)";
+    HelpHelperRequireAuthenticode => "Rechaza las aplicaciones locales cuyo ejecutable no supera la verificación Authenticode (rechazadas como untrusted-binary). Activado por defecto; se aplica tras reiniciar el servicio mia.";
+    WarnHelperUnsignedCallers => "Se aceptarán aplicaciones no firmadas. La identidad del llamador dependerá solo del proceso, el hash del ejecutable y el usuario; úselo solo en hosts cuyas aplicaciones no estén firmadas.";
     FieldAllowlistPath => "Archivo de la lista de permitidos";
     HelpAllowlistPath => "Ruta de la lista de permitidos de llamadores firmada; déjela en blanco para usar el valor predeterminado de la plataforma.";
     FieldAllowlistKey => "Archivo de la clave pública de inscripción (destino)";

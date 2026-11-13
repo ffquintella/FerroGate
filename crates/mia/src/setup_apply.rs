@@ -218,6 +218,10 @@ struct DraftHelper {
     socket: Option<String>,
     socket_mode: Option<String>,
     windows_group: Option<String>,
+    /// `helper.require_authenticode` (Windows). Absent ⇒ keep the target
+    /// file's current value, so a draft from a front end that predates the
+    /// key never changes how callers are authenticated.
+    require_authenticode: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -392,6 +396,7 @@ fn validate(draft: Draft) -> Result<(Settings, Option<Vec<u8>>), Vec<DraftError>
             check_literal,
             &mut e,
         ),
+        helper_require_authenticode: draft.helper.require_authenticode,
         allowlist: answer(
             "allowlist.path",
             draft.allowlist.path,
@@ -503,10 +508,14 @@ fn validate_enrollment_public_key(
 
 /// A draft that does not mention `helper.enable` keeps the target file's
 /// value: the switch is fail-safe in the "off" direction, so it is never
-/// flipped back on by omission.
+/// flipped back on by omission. Likewise `helper.require_authenticode`: an
+/// older front end that omits it never changes caller authentication.
 fn keep_helper_switch(settings: &mut Settings, existing: &Config) {
     if settings.helper_enable.is_none() {
         settings.helper_enable = existing.helper.enable;
+    }
+    if settings.helper_require_authenticode.is_none() {
+        settings.helper_require_authenticode = existing.helper.require_authenticode;
     }
 }
 
@@ -1342,6 +1351,7 @@ fn editable_values(config: &Config) -> serde_json::Value {
             "socket": config.helper.socket,
             "socket_mode": config.helper.socket_mode,
             "windows_group": config.helper.windows_group,
+            "require_authenticode": config.helper.require_authenticode,
         },
         "allowlist": {
             "path": config.allowlist.path,
@@ -1367,6 +1377,7 @@ fn editable_key(key: &str) -> bool {
             | "helper.socket"
             | "helper.socket_mode"
             | "helper.windows_group"
+            | "helper.require_authenticode"
             | "allowlist.path"
             | "allowlist.key"
             | "allowlist.max_age_secs"
@@ -1900,6 +1911,37 @@ mod tests {
         let draft = write_draft(&dir, "[helper]\nenable = false\n");
         apply(&draft, &apply_opts(&target)).unwrap();
         assert!(!setup::load_existing(&target).helper_enabled());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_keeps_or_sets_the_authenticode_switch() {
+        let dir = scratch("authenticode-switch");
+        let target = dir.join("mia.toml");
+        let require = |t: &Path| setup::load_existing(t).helper.require_authenticode;
+
+        // Unset stays unset (the daemon default, on).
+        let draft = write_draft(&dir, "log = 'info'\n");
+        apply(&draft, &apply_opts(&target)).unwrap();
+        assert_eq!(require(&target), None);
+
+        // An explicit false is written.
+        let draft = write_draft(&dir, "[helper]\nrequire_authenticode = false\n");
+        apply(&draft, &apply_opts(&target)).unwrap();
+        assert_eq!(require(&target), Some(false));
+
+        // A draft that omits the key keeps the file's value.
+        let draft = write_draft(&dir, "log = 'info'\n");
+        apply(&draft, &apply_opts(&target)).unwrap();
+        assert_eq!(require(&target), Some(false));
+
+        // And an explicit true turns the check back on.
+        let draft = write_draft(&dir, "[helper]\nrequire_authenticode = true\n");
+        apply(&draft, &apply_opts(&target)).unwrap();
+        assert_eq!(require(&target), Some(true));
+
+        // `--dump` exposes it to the graphical wizard.
+        assert!(editable_key("helper.require_authenticode"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

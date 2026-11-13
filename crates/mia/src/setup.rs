@@ -217,6 +217,9 @@ pub(crate) struct Settings {
     pub(crate) helper_socket: Option<String>,
     pub(crate) helper_socket_mode: Option<String>,
     pub(crate) helper_windows_group: Option<String>,
+    /// `helper.require_authenticode` (Windows): `None` leaves the default
+    /// (on) as a commented placeholder; `Some(b)` writes `b` explicitly.
+    pub(crate) helper_require_authenticode: Option<bool>,
     pub(crate) allowlist: Option<String>,
     pub(crate) allowlist_key: Option<String>,
     pub(crate) allowlist_max_age: Option<String>,
@@ -236,7 +239,6 @@ pub(crate) struct Settings {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Carried {
     helper_socket_gid: Option<String>,
-    helper_require_authenticode: Option<bool>,
     allowlist_propose_interval_secs: Option<u64>,
     allowlist_sync: Option<bool>,
     allowlist_sync_interval_secs: Option<u64>,
@@ -254,7 +256,6 @@ impl Carried {
         let path = |p: &Path| p.display().to_string();
         Self {
             helper_socket_gid: existing.helper.socket_gid.clone(),
-            helper_require_authenticode: existing.helper.require_authenticode,
             allowlist_propose_interval_secs: existing.allowlist.propose_interval_secs,
             allowlist_sync: existing.allowlist.sync,
             allowlist_sync_interval_secs: existing.allowlist.sync_interval_secs,
@@ -441,6 +442,7 @@ fn prompt_all(
             // a non-Windows host, so cross-editing a shared file is lossless.
             s.helper_windows_group
                 .clone_from(&existing.helper.windows_group);
+            s.helper_require_authenticode = existing.helper.require_authenticode;
         }
 
         // The pipe-access group is Windows-only.
@@ -462,6 +464,17 @@ fn prompt_all(
                 .with_validator(literal_validator)
                 .prompt()?;
             s.helper_windows_group = non_empty(group);
+
+            let current = existing.helper.require_authenticode;
+            let require = Confirm::new("Require Authenticode-signed callers?")
+                .with_default(current.unwrap_or(true))
+                .with_help_message(
+                    "on by default: unsigned apps are refused as 'untrusted-binary'. \
+                     No accepts unsigned apps; caller identity then rests on \
+                     PID + image SHA-384 + RID only",
+                )
+                .prompt()?;
+            s.helper_require_authenticode = authenticode_setting(require, current);
         }
     } else {
         // An unset socket no longer disables the helper API; say so explicitly.
@@ -472,6 +485,7 @@ fn prompt_all(
             .clone_from(&existing.helper.socket_mode);
         s.helper_windows_group
             .clone_from(&existing.helper.windows_group);
+        s.helper_require_authenticode = existing.helper.require_authenticode;
     }
 
     // ── Allowlist ────────────────────────────────────────────────────────────
@@ -766,6 +780,19 @@ fn dist_sibling(name: &str) -> String {
 /// Choose a prompt default: the existing path if set, else `fallback`.
 fn path_default(existing: Option<&Path>, fallback: String) -> String {
     existing.map_or(fallback, |p| p.display().to_string())
+}
+
+/// The `helper.require_authenticode` value to write for the wizard's
+/// `answer`, given the file's `current` value: an unchanged answer keeps
+/// `current` (so an unset key stays a placeholder), a changed one is written
+/// explicitly.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows prompt calls it
+pub(crate) fn authenticode_setting(answer: bool, current: Option<bool>) -> Option<bool> {
+    if answer == current.unwrap_or(true) {
+        current
+    } else {
+        Some(answer)
+    }
 }
 
 /// The `allowlist.path` value to write for `answer`: `None` when it is just
@@ -1190,15 +1217,21 @@ pub(crate) fn render(
         "windows_group",
         "FerroGateClients",
     ));
-    let c = &s.carried;
-    if c.helper_socket_gid.is_some() || c.helper_require_authenticode.is_some() {
-        out.push_str("# Kept from the previous file (not edited by `mia setup`).\n");
-        if let Some(gid) = &c.helper_socket_gid {
-            let _ = writeln!(out, "socket_gid = {}", basic_str(gid));
-        }
-        if let Some(b) = c.helper_require_authenticode {
+    out.push_str(
+        "# Windows only. Refuse local callers whose executable does not pass\n\
+         # Authenticode verification. Default: true. false accepts unsigned apps;\n\
+         # caller identity then rests on PID + image SHA-384 + RID only.\n",
+    );
+    match s.helper_require_authenticode {
+        Some(b) => {
             let _ = writeln!(out, "require_authenticode = {b}");
         }
+        None => out.push_str("#require_authenticode = true\n"),
+    }
+    let c = &s.carried;
+    if let Some(gid) = &c.helper_socket_gid {
+        out.push_str("# Kept from the previous file (not edited by `mia setup`).\n");
+        let _ = writeln!(out, "socket_gid = {}", basic_str(gid));
     }
     out.push('\n');
 
@@ -1763,6 +1796,43 @@ mod tests {
     }
 
     #[test]
+    fn render_writes_the_authenticode_switch() {
+        // Unset: a commented placeholder; the daemon keeps the default (on).
+        let plain = render(&Settings::default(), None, None);
+        assert!(
+            plain.contains("\n#require_authenticode = true\n"),
+            "{plain}"
+        );
+        assert_eq!(
+            Config::from_toml(&plain)
+                .unwrap()
+                .helper
+                .require_authenticode,
+            None
+        );
+        // Off: an active key that parses back as false.
+        let s = Settings {
+            helper_require_authenticode: Some(false),
+            ..Settings::default()
+        };
+        let off = render(&s, None, None);
+        assert!(off.contains("\nrequire_authenticode = false\n"), "{off}");
+        assert_eq!(
+            Config::from_toml(&off).unwrap().helper.require_authenticode,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn authenticode_answer_only_writes_a_change() {
+        assert_eq!(authenticode_setting(true, None), None);
+        assert_eq!(authenticode_setting(false, None), Some(false));
+        assert_eq!(authenticode_setting(false, Some(false)), Some(false));
+        assert_eq!(authenticode_setting(true, Some(false)), Some(true));
+        assert_eq!(authenticode_setting(true, Some(true)), Some(true));
+    }
+
+    #[test]
     fn render_carries_keys_the_wizard_does_not_edit() {
         // A rewrite must not drop keys the wizard never asks about — in
         // particular the [status] section (feature F18) — and must quote
@@ -1782,7 +1852,8 @@ mod tests {
         let out = render(&s, None, None);
         let back = Config::from_toml(&out).expect("rendered TOML parses");
         assert_eq!(back.helper.socket_gid.as_deref(), Some("991"));
-        assert_eq!(back.helper.require_authenticode, Some(false));
+        // Wizard-managed now: not carried, so it follows `Settings`.
+        assert_eq!(back.helper.require_authenticode, None);
         assert_eq!(back.allowlist.propose_interval_secs, Some(60));
         assert_eq!(back.attestation.tpm, existing.attestation.tpm);
         assert_eq!(back.status, existing.status);

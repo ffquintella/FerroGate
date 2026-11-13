@@ -621,6 +621,19 @@ impl SetupView {
             ui.label(RichText::new(fill(Msg::SetupReadOnly.text(lang), &[("var", var)])).weak());
         }
         ui.label(RichText::new(help.text(lang)).small().weak());
+        if f == Field::HelperRequireAuthenticode {
+            let source = if read_only.is_some() {
+                effective
+            } else {
+                &self.values
+            };
+            if !source.flag(f) {
+                ui.colored_label(
+                    color32(IconColor::Yellow),
+                    Msg::WarnHelperUnsignedCallers.text(lang),
+                );
+            }
+        }
         if f == Field::AllowlistKey {
             self.allowlist_key_ui(ui, lang, read_only.is_some());
         }

@@ -670,6 +670,9 @@ messages! {
     HelpHelperSocketMode => "Octal file mode of the helper socket, e.g. 660.", "Modo octal do socket do helper, por exemplo 660.";
     FieldHelperWindowsGroup => "Pipe group (Windows)", "Grupo do pipe (Windows)";
     HelpHelperWindowsGroup => "Local group allowed to open the helper pipe, e.g. FerroGateClients.", "Grupo local autorizado a abrir o pipe do helper, por exemplo FerroGateClients.";
+    FieldHelperRequireAuthenticode => "Require signed applications (Windows)", "Exigir aplicações assinadas (Windows)";
+    HelpHelperRequireAuthenticode => "Refuse local applications whose executable does not pass Authenticode verification (refused as untrusted-binary). On by default; takes effect after the mia service restarts.", "Recusa aplicações locais cujo executável não passa na verificação Authenticode (recusadas como untrusted-binary). Ativado por padrão; vale após reiniciar o serviço mia.";
+    WarnHelperUnsignedCallers => "Unsigned applications will be accepted. Caller identity then rests only on process, executable hash and user; use this only on hosts whose applications are not code-signed.", "Aplicações não assinadas serão aceitas. A identidade do chamador passa a depender apenas do processo, do hash do executável e do usuário; use somente em hosts cujas aplicações não são assinadas.";
     FieldAllowlistPath => "Allowlist file", "Arquivo da lista de permissões";
     HelpAllowlistPath => "Path of the signed caller allowlist; leave blank for the platform default.", "Caminho da lista de permissões assinada; deixe em branco para usar o padrão da plataforma.";
     FieldAllowlistKey => "Enrollment public key file (destination)", "Arquivo da chave pública de registro (destino)";

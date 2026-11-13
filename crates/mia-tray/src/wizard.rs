@@ -84,6 +84,8 @@ pub enum Field {
     HelperSocketMode,
     /// `helper.windows_group` (Windows).
     HelperWindowsGroup,
+    /// `helper.require_authenticode` (Windows, boolean; unset ⇒ on).
+    HelperRequireAuthenticode,
     /// `allowlist.path`.
     AllowlistPath,
     /// `allowlist.key`.
@@ -104,13 +106,14 @@ pub enum Field {
 
 impl Field {
     /// Every field, in wizard order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::CmisEndpoint,
         Self::CmisSrv,
         Self::CmisSpkiPin,
         Self::HelperSocket,
         Self::HelperSocketMode,
         Self::HelperWindowsGroup,
+        Self::HelperRequireAuthenticode,
         Self::AllowlistPath,
         Self::AllowlistKey,
         Self::AllowlistMaxAge,
@@ -131,6 +134,7 @@ impl Field {
             Self::HelperSocket => "helper.socket",
             Self::HelperSocketMode => "helper.socket_mode",
             Self::HelperWindowsGroup => "helper.windows_group",
+            Self::HelperRequireAuthenticode => "helper.require_authenticode",
             Self::AllowlistPath => "allowlist.path",
             Self::AllowlistKey => "allowlist.key",
             Self::AllowlistMaxAge => "allowlist.max_age_secs",
@@ -151,7 +155,17 @@ impl Field {
     /// A checkbox rather than a text field.
     #[must_use]
     pub fn is_bool(self) -> bool {
-        matches!(self, Self::AllowlistFetch | Self::AllowlistPropose)
+        matches!(
+            self,
+            Self::AllowlistFetch | Self::AllowlistPropose | Self::HelperRequireAuthenticode
+        )
+    }
+
+    /// A boolean's value when the configuration leaves it unset: `true` for
+    /// the switches whose daemon default is on.
+    #[must_use]
+    pub fn default_on(self) -> bool {
+        matches!(self, Self::HelperRequireAuthenticode)
     }
 
     /// The step it belongs to.
@@ -159,7 +173,10 @@ impl Field {
     pub fn step(self) -> Step {
         match self {
             Self::CmisEndpoint | Self::CmisSrv | Self::CmisSpkiPin => Step::Cmis,
-            Self::HelperSocket | Self::HelperSocketMode | Self::HelperWindowsGroup => Step::Helper,
+            Self::HelperSocket
+            | Self::HelperSocketMode
+            | Self::HelperWindowsGroup
+            | Self::HelperRequireAuthenticode => Step::Helper,
             Self::AllowlistPath
             | Self::AllowlistKey
             | Self::AllowlistMaxAge
@@ -175,7 +192,7 @@ impl Field {
     pub fn applies_here(self) -> bool {
         match self {
             Self::HelperSocketMode => cfg!(unix),
-            Self::HelperWindowsGroup => cfg!(windows),
+            Self::HelperWindowsGroup | Self::HelperRequireAuthenticode => cfg!(windows),
             Self::ImaLog => cfg!(target_os = "linux"),
             _ => true,
         }
@@ -191,6 +208,10 @@ impl Field {
             Self::HelperSocket => (Msg::FieldHelperSocket, Msg::HelpHelperSocket),
             Self::HelperSocketMode => (Msg::FieldHelperSocketMode, Msg::HelpHelperSocketMode),
             Self::HelperWindowsGroup => (Msg::FieldHelperWindowsGroup, Msg::HelpHelperWindowsGroup),
+            Self::HelperRequireAuthenticode => (
+                Msg::FieldHelperRequireAuthenticode,
+                Msg::HelpHelperRequireAuthenticode,
+            ),
             Self::AllowlistPath => (Msg::FieldAllowlistPath, Msg::HelpAllowlistPath),
             Self::AllowlistKey => (Msg::FieldAllowlistKey, Msg::HelpAllowlistKey),
             Self::AllowlistMaxAge => (Msg::FieldAllowlistMaxAge, Msg::HelpAllowlistMaxAge),
@@ -235,10 +256,13 @@ impl Values {
         true
     }
 
-    /// A boolean field.
+    /// A boolean field (blank ⇒ the field's default, see [`Field::default_on`]).
     #[must_use]
     pub fn flag(&self, f: Field) -> bool {
-        self.get(f) == "true"
+        match self.get(f) {
+            "" => f.default_on(),
+            v => v == "true",
+        }
     }
 
     fn opt(&self, f: Field) -> Option<String> {
@@ -312,7 +336,9 @@ pub fn parse_dump(out: &Captured) -> Result<Dump, LoadError> {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Bool(b) => b.to_string(),
             serde_json::Value::Number(n) => n.to_string(),
-            _ if f.is_bool() => "false".to_string(),
+            // Unset stays blank for a default-on switch, so applying the
+            // draft never pins the default into the file.
+            _ if f.is_bool() && !f.default_on() => "false".to_string(),
             _ => String::new(),
         };
         values.set(f, text);
@@ -409,7 +435,9 @@ pub fn validate_field(f: Field, raw: &str) -> Result<(), Msg> {
             Err(Msg::ValUint)
         }
         Field::AttestationBackend if !BACKEND_CHOICES.contains(&v) => Err(Msg::ValBackend),
-        Field::AllowlistFetch | Field::AllowlistPropose if v != "true" && v != "false" => {
+        Field::AllowlistFetch | Field::AllowlistPropose | Field::HelperRequireAuthenticode
+            if v != "true" && v != "false" =>
+        {
             Err(Msg::ValLiteral)
         }
         Field::Log if tracing_subscriber::EnvFilter::try_new(v).is_err() => {
@@ -528,6 +556,9 @@ struct DraftHelper {
     socket_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     windows_group: Option<String>,
+    /// Omitted while unset, so `--apply` keeps the file's value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    require_authenticode: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -580,6 +611,9 @@ pub fn render_with_enrollment_public_key(
             socket: values.opt(Field::HelperSocket),
             socket_mode: values.opt(Field::HelperSocketMode),
             windows_group: values.opt(Field::HelperWindowsGroup),
+            require_authenticode: values
+                .opt(Field::HelperRequireAuthenticode)
+                .map(|_| values.flag(Field::HelperRequireAuthenticode)),
         },
         allowlist: DraftAllowlist {
             path: values.opt(Field::AllowlistPath),
@@ -805,6 +839,46 @@ mod tests {
         assert_eq!(d.values.get(Field::AttestationBackend), "host-key");
         assert_eq!(d.values.get(Field::CmisSrv), "");
         assert_eq!(validate(&d.values), [] as [(Field, Msg); 0]);
+    }
+
+    #[test]
+    fn the_authenticode_switch_defaults_on_and_is_written_only_when_set() {
+        let d = parse_dump(&captured(&dump_json("https://cmis:8443", ""), 0)).unwrap();
+        // Unset in the file: shown checked, left out of the draft.
+        assert_eq!(d.values.get(Field::HelperRequireAuthenticode), "");
+        assert!(d.values.flag(Field::HelperRequireAuthenticode));
+        assert!(!render(&d.values).contains("require_authenticode"));
+
+        // Unchecked: written as false, and the draft parses back.
+        let mut v = d.values.clone();
+        v.set(Field::HelperRequireAuthenticode, "false");
+        assert!(!v.flag(Field::HelperRequireAuthenticode));
+        let out = render(&v);
+        let doc: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            doc["helper"]["require_authenticode"].as_bool(),
+            Some(false),
+            "{out}"
+        );
+
+        // Checked again: written as an explicit true.
+        v.set(Field::HelperRequireAuthenticode, "true");
+        let doc: toml::Value = toml::from_str(&render(&v)).unwrap();
+        assert_eq!(doc["helper"]["require_authenticode"].as_bool(), Some(true));
+
+        // A file value is loaded as such.
+        let json = dump_json("https://cmis:8443", "").replace(
+            r#""require_authenticode": null"#,
+            r#""require_authenticode": false"#,
+        );
+        let d = parse_dump(&captured(&json, 0)).unwrap();
+        assert!(!d.values.flag(Field::HelperRequireAuthenticode));
+        assert_eq!(
+            validate_field(Field::HelperRequireAuthenticode, "maybe"),
+            Err(Msg::ValLiteral)
+        );
+        assert_eq!(Field::HelperRequireAuthenticode.step(), Step::Helper);
+        assert!(Field::HelperRequireAuthenticode.is_bool());
     }
 
     #[test]
