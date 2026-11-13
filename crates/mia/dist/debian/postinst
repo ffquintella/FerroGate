@@ -12,6 +12,27 @@ OPERATORS_GROUP=ferrogate-operators
 DROPIN_DIR=/etc/systemd/system/mia.service.d
 DROPIN_FILE="$DROPIN_DIR/10-ferrogate-groups.conf"
 
+grant_tpm_access() {
+    # The udev rule handles nodes created at boot and after device recreation.
+    # Reload it for this installation, then apply the same narrow ACL directly
+    # so chroots and systems without a running udev daemon still converge.
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 ||
+            echo "ferrogate-mia: warning: could not reload udev rules" >&2
+        udevadm trigger --action=change --subsystem-match=tpmrm >/dev/null 2>&1 ||
+            echo "ferrogate-mia: warning: could not retrigger TPM resource-manager devices" >&2
+    fi
+
+    for tpm_device in /dev/tpmrm[0-9]*; do
+        [ -c "$tpm_device" ] || continue
+        if setfacl --modify "user:$SERVICE_USER:rw-" -- "$tpm_device"; then
+            echo "ferrogate-mia: granted $SERVICE_USER access to $tpm_device"
+        else
+            echo "ferrogate-mia: warning: could not grant $SERVICE_USER access to $tpm_device" >&2
+        fi
+    done
+}
+
 create_system_group() {
     group_name=$1
     if ! getent group "$group_name" >/dev/null 2>&1; then
@@ -114,6 +135,7 @@ if [ "${1:-}" = configure ]; then
     create_system_group "$CLIENT_GROUP"
     create_system_group "$STATUS_GROUP"
     create_system_group "$OPERATORS_GROUP"
+    grant_tpm_access
 
     # The tray's read-only diagnostics (`mia test`, `mia status`) resolve the
     # system config before the user's config. Keep system TOMLs root-owned and

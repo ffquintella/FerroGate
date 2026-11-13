@@ -178,7 +178,7 @@ priority = "optional"
 # desktop dependencies belong here because the Debian package is the complete
 # workstation installer: it ships and starts mia-tray as well as the daemon.
 # The tray publishes its icon through KSNI and does not need libappindicator.
-depends = "libc6 (>= 2.31), libtss2-esys-3.0.2-0, libssl3, libgtk-3-0, libxdo3, policykit-1 | polkitd, pkexec | policykit-1, systemd, passwd, util-linux"
+depends = "acl, udev, libc6 (>= 2.31), libtss2-esys-3.0.2-0, libssl3, libgtk-3-0, libxdo3, policykit-1 | polkitd, pkexec | policykit-1, systemd, passwd, util-linux"
 conflicts = "ferrogate-mia-tray"
 replaces = "ferrogate-mia-tray"
 provides = "ferrogate-mia-tray"
@@ -193,6 +193,7 @@ assets = [
     ["../mia-tray/dist/mia-tray.service", "usr/lib/systemd/user/mia-tray.service", "644"],
     ["../mia-tray/dist/br.fgv.ferrogate.mia.setup.policy", "usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy", "644"],
     ["dist/50-ferrogate-operators.rules", "usr/share/polkit-1/rules.d/50-ferrogate-operators.rules", "644"],
+    ["dist/70-ferrogate-mia-tpm.rules", "usr/lib/udev/rules.d/70-ferrogate-mia-tpm.rules", "644"],
     ["dist/mia.env", "etc/ferrogate/mia.env", "640"],
     ["dist/mia.toml", "etc/ferrogate/mia.toml", "640"],
     ["../../docs/mia.md", "usr/share/doc/ferrogate-mia/mia.md", "644"],
@@ -216,13 +217,20 @@ assets = [
     { source = "crates/mia/dist/mia.env", dest = "/etc/ferrogate/mia.env", mode = "640", config = true },
     { source = "crates/mia/dist/mia.toml", dest = "/etc/ferrogate/mia.toml", mode = "640", config = true },
     { source = "crates/mia/dist/mia.service", dest = "/usr/lib/systemd/system/mia.service", mode = "644" },
+    { source = "crates/mia/dist/70-ferrogate-mia-tpm.rules", dest = "/usr/lib/udev/rules.d/70-ferrogate-mia-tpm.rules", mode = "644" },
     { source = "docs/mia.md", dest = "/usr/share/doc/ferrogate-mia/mia.md", mode = "644", doc = true },
 ]
 auto-req = "no"
+post_install_script = "dist/rpm/postinstall"
+post_uninstall_script = "dist/rpm/postuninstall"
 
 [package.metadata.generate-rpm.requires]
 # TPM 2.0 ESAPI runtime stack (Fedora/RHEL package name).
 tpm2-tss = "*"
+acl = "*"
+systemd = "*"
+systemd-udev = "*"
+shadow-utils = "*"
 
 # The Windows MSI is built with msitools (wixl) from crates/mia/wix/mia.wxs and
 # wrapped in a Chocolatey/NuGet package — see `make pkg-win`.

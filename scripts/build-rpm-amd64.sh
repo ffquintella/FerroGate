@@ -16,10 +16,11 @@ docker run --rm --platform linux/amd64 \
   -e MIA_FEATURES="$MIA_FEATURES" \
   rust:bookworm bash -euo pipefail -c '
     apt-get update -qq
-    apt-get install -y -qq libtss2-dev pkg-config protobuf-compiler >/dev/null
+    apt-get install -y -qq cpio libtss2-dev pkg-config protobuf-compiler rpm >/dev/null
     cargo install cargo-generate-rpm --locked --quiet
     cargo build --release -p mia --bin mia ${MIA_FEATURES:+--features "$MIA_FEATURES"}
     strip target/release/mia
     cargo generate-rpm -p crates/mia -a x86_64
+    ./scripts/check-rpm-package.sh target/generate-rpm/ferrogate-mia-$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' Cargo.toml | head -1)-1.x86_64.rpm
   '
 echo "==> amd64 .rpm written under target/generate-rpm/"

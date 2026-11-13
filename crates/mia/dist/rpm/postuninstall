@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+# RPM passes 0 only after the final erase. Upgrades leave the new package's
+# rule and ACL in place.
+if [ "${1:-0}" -ne 0 ]; then
+    exit 0
+fi
+
+SERVICE_USER=_ferrogate
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+fi
+if command -v setfacl >/dev/null 2>&1 &&
+   getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
+    for tpm_device in /dev/tpmrm[0-9]*; do
+        [ -c "$tpm_device" ] || continue
+        setfacl --remove "user:$SERVICE_USER" -- "$tpm_device" 2>/dev/null || true
+    done
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

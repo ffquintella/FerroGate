@@ -537,6 +537,7 @@ ifeq ($(UNAME_S)/$(HOST_ARCH),Linux/x86_64)
 	cargo build --release -p $(PKG_CRATE) --bin $(PKG_CRATE) $(CARGO_FEATURE_FLAG)
 	strip target/release/$(PKG_CRATE)
 	cargo generate-rpm -p crates/$(PKG_CRATE) -a $(RPM_ARCH)
+	./scripts/check-rpm-package.sh target/generate-rpm/ferrogate-mia-$(CARGO_VERSION)-1.$(RPM_ARCH).rpm
 	@echo "==> $(RPM_ARCH) .rpm written under target/generate-rpm/"
 else
 	@echo "==> host is $(UNAME_S)/$(HOST_ARCH), not Linux/x86_64; building the amd64 .rpm in a linux/amd64 container"

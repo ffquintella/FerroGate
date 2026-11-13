@@ -1,0 +1,4 @@
+# Preserve the distribution's TPM ownership and mode. MIA drops supplementary
+# groups before attestation, so membership in the usual `tss` group is not
+# sufficient; grant only its service account access to resource-manager nodes.
+ACTION=="add|change", SUBSYSTEM=="tpmrm", KERNEL=="tpmrm[0-9]*", ENV{DEVNAME}!="", RUN+="/usr/bin/setfacl --modify user:_ferrogate:rw- -- $env{DEVNAME}"

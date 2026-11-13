@@ -294,6 +294,15 @@ authentication differ per OS:
 The TPM attestation loop is Linux-only; on macOS/Windows MIA runs as the
 helper-API surface. The startup hardening profile applies on Linux only.
 
+On Linux, MIA opens the resource-manager device (`/dev/tpmrm0`) after dropping
+to the `_ferrogate` service account. The Debian and RPM installers add an ACL
+that grants only this account `rw` access, while preserving the owner, group and
+mode chosen by the distribution's TPM rule. The udev rule reapplies the ACL if
+the device node is recreated; upgrades also apply it to an existing node before
+restarting an active service, and final package removal removes the live ACL.
+This deliberately targets `tpmrm` devices only: the raw `/dev/tpm0` device is
+not granted to MIA because using it can evict other consumers' TPM objects.
+
 ### Running as a Windows service
 
 On Windows the daemon runs under the Service Control Manager as the **`mia`**

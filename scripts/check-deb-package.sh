@@ -37,7 +37,8 @@ for path in \
     /usr/share/icons/hicolor/scalable/apps/ferrogate-mia.svg \
     /usr/share/icons/hicolor/256x256/apps/ferrogate-mia.png \
     /usr/share/polkit-1/actions/br.fgv.ferrogate.mia.setup.policy \
-    /usr/share/polkit-1/rules.d/50-ferrogate-operators.rules; do
+    /usr/share/polkit-1/rules.d/50-ferrogate-operators.rules \
+    /usr/lib/udev/rules.d/70-ferrogate-mia-tpm.rules; do
     require_file "$path"
 done
 
@@ -54,6 +55,28 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$launcher"
 fi
 
+tpm_rule="$work_dir/root/usr/lib/udev/rules.d/70-ferrogate-mia-tpm.rules"
+grep -F 'ACTION=="add|change"' "$tpm_rule" >/dev/null || {
+    echo "ERROR: TPM rule must run only when a device is added or changed" >&2
+    exit 1
+}
+grep -F 'SUBSYSTEM=="tpmrm"' "$tpm_rule" >/dev/null || {
+    echo "ERROR: TPM rule must match only resource-manager devices" >&2
+    exit 1
+}
+grep -F 'KERNEL=="tpmrm[0-9]*"' "$tpm_rule" >/dev/null || {
+    echo "ERROR: TPM rule must match only numbered tpmrm device nodes" >&2
+    exit 1
+}
+grep -F 'RUN+="/usr/bin/setfacl --modify user:_ferrogate:rw- -- $env{DEVNAME}"' "$tpm_rule" >/dev/null || {
+    echo "ERROR: TPM rule must grant only _ferrogate rw access through an ACL" >&2
+    exit 1
+}
+if grep -E '(^|, )[A-Z]*(OWNER|GROUP|MODE)[:+]?=' "$tpm_rule" >/dev/null; then
+    echo "ERROR: TPM rule must preserve the distribution's TPM owner, group and mode" >&2
+    exit 1
+fi
+
 # The administrator client (F22) is the separate, optional
 # ferrogate-mia-tray-admin package; every workstation gets this one.
 if grep -Fx "./usr/bin/mia-tray-admin" "$work_dir/files" >/dev/null; then
@@ -62,7 +85,7 @@ if grep -Fx "./usr/bin/mia-tray-admin" "$work_dir/files" >/dev/null; then
 fi
 
 depends=$(dpkg-deb --field "$deb" Depends)
-for dependency in libgtk-3-0 policykit-1 systemd passwd; do
+for dependency in acl udev libgtk-3-0 policykit-1 systemd passwd; do
     printf '%s\n' "$depends" | grep -F "$dependency" >/dev/null || {
         echo "ERROR: missing Debian dependency $dependency" >&2
         exit 1
@@ -86,6 +109,9 @@ grep -F '[ ! -L "$config_file" ]' "$work_dir/control/postinst" >/dev/null
 grep -F 'action.lookup("unit") === "mia.service"' "$work_dir/root/usr/share/polkit-1/rules.d/50-ferrogate-operators.rules" >/dev/null
 grep -F 'subject.isInGroup("ferrogate-operators")' "$work_dir/root/usr/share/polkit-1/rules.d/50-ferrogate-operators.rules" >/dev/null
 grep -F '_ferrogate' "$work_dir/control/postinst" >/dev/null
+grep -F 'setfacl --modify "user:$SERVICE_USER:rw-"' "$work_dir/control/postinst" >/dev/null
+grep -F 'udevadm control --reload-rules' "$work_dir/control/postinst" >/dev/null
+grep -F 'setfacl --remove "user:$SERVICE_USER"' "$work_dir/control/postrm" >/dev/null
 grep -F 'systemctl --user restart mia-tray.service' "$work_dir/control/postinst" >/dev/null
 if grep -F '#DEBHELPER#' "$work_dir/control/postinst" >/dev/null; then
     echo "ERROR: cargo-deb did not expand #DEBHELPER# in postinst" >&2
