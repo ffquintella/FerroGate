@@ -342,6 +342,13 @@ async fn run_checks(
     // would verify. Never a failure — step 5 is the authority on minting.
     report_allowlist(config);
 
+    // Informational (Windows): whether the daemon will accept this binary as a
+    // caller at all. An unsigned build under the default
+    // `helper.require_authenticode` is refused before any other mint check,
+    // so say so here instead of leaving step 5 with a generic refusal.
+    #[cfg(windows)]
+    report_caller_signing(config);
+
     // 2. CMIS connection / 3. CRL publishing ------------------------------
     let mut server_crl = ServerCrl::Unknown;
     if let Some(resolver) = &resolver {
@@ -861,7 +868,11 @@ where
             if code == ErrorCode::NoHostSvid {
                 explain_no_host_svid(config, config_path);
             } else {
-                hints(&mint_failure_advice(code, server_crl));
+                let mut advice = mint_failure_advice(code, server_crl, caller_signing(config));
+                if code == ErrorCode::PermissionDenied && !cmis_configured(config) {
+                    advice.push(NO_CMIS_AFTER_DENIAL_HINT.to_string());
+                }
+                hints(&advice);
             }
             false
         }
@@ -1053,8 +1064,24 @@ async fn check_mint(
 // Only the unix `check_mint` calls this; `test` keeps it compiled for the
 // platform-independent advice-text tests below.
 #[cfg(any(unix, windows, test))]
-fn mint_failure_advice(code: ErrorCode, server_crl: ServerCrl) -> Vec<String> {
+fn mint_failure_advice(
+    code: ErrorCode,
+    server_crl: ServerCrl,
+    signing: CallerSigning,
+) -> Vec<String> {
     match code {
+        ErrorCode::PermissionDenied if signing == CallerSigning::Unsigned => vec![
+            "Most likely 'untrusted-binary': this mia binary does not pass Authenticode \
+             verification (see the 'caller signing' line above) and helper.require_authenticode \
+             is on (the default), so the daemon refuses it before checking anything else. \
+             Self-trust covers only the allowlist, not caller authentication."
+                .to_string(),
+            SIGN_OR_DISABLE_HINT.to_string(),
+            "If the daemon log's LocalDenied event names another reason, that one wins: \
+             'ima-mismatch' (the binary changed after the daemon started), 'svid-revoked', or \
+             'not-allowlisted' for a caller other than mia."
+                .to_string(),
+        ],
         ErrorCode::CrlStale => {
             let mut lines = vec![
                 "The daemon refuses to mint because its cached CRL is missing or older than 5 \
@@ -1595,6 +1622,112 @@ fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<Str
     }
 }
 
+/// Whether the daemon checks this binary's Authenticode signature when it
+/// calls the helper API, and whether the binary passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallerSigning {
+    /// No signature check applies (`helper.require_authenticode = false`, or
+    /// not Windows).
+    NotChecked,
+    /// The check applies and this binary passes it.
+    Signed,
+    /// The check applies and this binary fails it (unsigned, untrusted, or
+    /// unverifiable): the daemon refuses it as 'untrusted-binary'.
+    Unsigned,
+}
+
+/// How to get past an 'untrusted-binary' refusal.
+const SIGN_OR_DISABLE_HINT: &str = "Sign mia.exe and the client binaries (see WIN_SIGN_PFX in \
+     scripts/build-msi-amd64.sh), or, for hosts whose clients are not code-signed, set \
+     `helper.require_authenticode = false` under [helper] in mia.toml and restart the mia \
+     service. Without the check, caller identity rests on PID + image SHA-384 + RID only.";
+
+/// Appended to a step-5 refusal when no CMIS is configured: fixing the
+/// refusal alone will not make the mint pass.
+const NO_CMIS_AFTER_DENIAL_HINT: &str = "Even once this refusal is fixed, the mint needs a host \
+     SVID, which needs CMIS: no cmis.endpoint / cmis.srv is set (step 1), so the next run \
+     would fail with NoHostSvid. Run `mia setup` to point the agent at CMIS.";
+
+/// Whether `cmis.endpoint` or `cmis.srv` is set (not blank).
+fn cmis_configured(config: &Config) -> bool {
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
+    set(&config.cmis.endpoint) || set(&config.cmis.srv)
+}
+
+/// [`CallerSigning`] for this process's own image under `config`. Mirrors the
+/// daemon's caller check: `helper.require_authenticode` defaults to on, and
+/// only an `Ok(true)` from the OS trust provider counts as signed.
+fn caller_signing(config: &Config) -> CallerSigning {
+    #[cfg(windows)]
+    {
+        if !config.helper.require_authenticode.unwrap_or(true) {
+            return CallerSigning::NotChecked;
+        }
+        let verified =
+            std::env::current_exe().and_then(|exe| ferro_winauth::verify_authenticode(&exe));
+        signing_from(verified)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config;
+        CallerSigning::NotChecked
+    }
+}
+
+/// Map an Authenticode verification result (with the check required) to
+/// [`CallerSigning`]: anything but `Ok(true)` fails closed, as in the daemon.
+#[cfg(any(windows, test))]
+fn signing_from(verified: std::io::Result<bool>) -> CallerSigning {
+    if matches!(verified, Ok(true)) {
+        CallerSigning::Signed
+    } else {
+        CallerSigning::Unsigned
+    }
+}
+
+/// The "caller signing" line: status, detail and hints for `signing` of the
+/// binary at `image`.
+#[cfg(any(windows, test))]
+fn caller_signing_detail(
+    signing: CallerSigning,
+    image: &str,
+) -> (&'static str, String, Vec<String>) {
+    match signing {
+        CallerSigning::NotChecked => (
+            "info",
+            "helper.require_authenticode = false — the daemon does not check caller signatures"
+                .to_string(),
+            Vec::new(),
+        ),
+        CallerSigning::Signed => (
+            "ok",
+            format!("{image} passes Authenticode verification"),
+            Vec::new(),
+        ),
+        CallerSigning::Unsigned => (
+            "warn",
+            format!(
+                "{image} does not pass Authenticode verification and \
+                 helper.require_authenticode is on (the default) — the daemon refuses unsigned \
+                 callers ('untrusted-binary'), including this self-test, so step 5 cannot pass"
+            ),
+            vec![SIGN_OR_DISABLE_HINT.to_string()],
+        ),
+    }
+}
+
+/// Report the "caller signing" line for this binary (Windows).
+#[cfg(windows)]
+fn report_caller_signing(config: &Config) {
+    let image =
+        std::env::current_exe().map_or_else(|_| "mia.exe".to_string(), |p| p.display().to_string());
+    let (status, detail, advice) = caller_signing_detail(caller_signing(config), &image);
+    report("caller signing", status, &detail);
+    if !advice.is_empty() {
+        hints(&advice);
+    }
+}
+
 /// Print one aligned check line (or, with `--json`, record it).
 fn report(step: &str, status: &str, detail: &str) {
     let recorded = JSON_SINK.with(|sink| {
@@ -1927,19 +2060,96 @@ mod tests {
 
     #[test]
     fn crl_stale_advice_names_the_failing_side() {
-        let fresh = mint_failure_advice(ErrorCode::CrlStale, ServerCrl::Fresh).join("\n");
+        let fresh = mint_failure_advice(
+            ErrorCode::CrlStale,
+            ServerCrl::Fresh,
+            CallerSigning::NotChecked,
+        )
+        .join("\n");
         assert!(fresh.contains("spawn_puller"));
 
-        let broken = mint_failure_advice(ErrorCode::CrlStale, ServerCrl::Broken).join("\n");
+        let broken = mint_failure_advice(
+            ErrorCode::CrlStale,
+            ServerCrl::Broken,
+            CallerSigning::NotChecked,
+        )
+        .join("\n");
         assert!(broken.contains("crl-stale.md"));
 
-        let unknown = mint_failure_advice(ErrorCode::CrlStale, ServerCrl::Unknown).join("\n");
+        let unknown = mint_failure_advice(
+            ErrorCode::CrlStale,
+            ServerCrl::Unknown,
+            CallerSigning::NotChecked,
+        )
+        .join("\n");
         assert!(unknown.contains("connectivity"));
     }
 
     #[test]
+    fn unsigned_caller_narrows_permission_denied_to_untrusted_binary() {
+        let advice = mint_failure_advice(
+            ErrorCode::PermissionDenied,
+            ServerCrl::Unknown,
+            CallerSigning::Unsigned,
+        );
+        assert!(advice[0].starts_with("Most likely 'untrusted-binary'"));
+        let text = advice.join("\n");
+        assert!(text.contains("helper.require_authenticode = false"));
+        assert!(text.contains("WIN_SIGN_PFX"));
+        // The broad self-trust / version-skew explanation is not repeated.
+        assert!(!text.contains("predates the self-trust change"));
+    }
+
+    #[test]
+    fn caller_signing_line_warns_only_for_an_unsigned_image_under_the_check() {
+        let (status, detail, hints) = caller_signing_detail(CallerSigning::Unsigned, r"C:\mia.exe");
+        assert_eq!(status, "warn");
+        assert!(detail.contains(r"C:\mia.exe") && detail.contains("untrusted-binary"));
+        assert_eq!(hints, [SIGN_OR_DISABLE_HINT]);
+
+        let (status, _, hints) = caller_signing_detail(CallerSigning::Signed, "mia.exe");
+        assert_eq!(status, "ok");
+        assert!(hints.is_empty());
+
+        let (status, _, _) = caller_signing_detail(CallerSigning::NotChecked, "mia.exe");
+        assert_eq!(status, "info");
+    }
+
+    #[test]
+    fn only_a_verified_signature_counts_as_signed() {
+        assert_eq!(signing_from(Ok(true)), CallerSigning::Signed);
+        assert_eq!(signing_from(Ok(false)), CallerSigning::Unsigned);
+        assert_eq!(
+            signing_from(Err(std::io::Error::other("trust provider failed"))),
+            CallerSigning::Unsigned
+        );
+    }
+
+    #[test]
+    fn disabled_authenticode_check_is_not_checked() {
+        let c = Config::from_toml("[helper]\nrequire_authenticode = false\n").unwrap();
+        assert_eq!(caller_signing(&c), CallerSigning::NotChecked);
+    }
+
+    #[test]
+    fn cmis_counts_as_configured_only_when_set_and_not_blank() {
+        assert!(!cmis_configured(&Config::from_toml("").unwrap()));
+        assert!(!cmis_configured(
+            &Config::from_toml("[cmis]\nendpoint = \" \"\n").unwrap()
+        ));
+        assert!(cmis_configured(
+            &Config::from_toml("[cmis]\nsrv = \"_cmis._tcp.example.com\"\n").unwrap()
+        ));
+    }
+
+    #[test]
     fn permission_denied_advice_points_at_the_allowlist() {
-        let advice = mint_failure_advice(ErrorCode::PermissionDenied, ServerCrl::Fresh).join("\n");
+        let advice = mint_failure_advice(
+            ErrorCode::PermissionDenied,
+            ServerCrl::Fresh,
+            CallerSigning::Signed,
+        )
+        .join("\n");
         assert!(advice.contains("allowlist"));
         assert!(advice.contains("LocalDenied"));
         // The Windows Authenticode refusal is named, with both remediations.
@@ -2062,7 +2272,11 @@ mod tests {
             vec![GENERIC_NO_HOST_SVID_HINT.to_string()]
         );
         assert_eq!(
-            mint_failure_advice(ErrorCode::NoHostSvid, ServerCrl::Unknown),
+            mint_failure_advice(
+                ErrorCode::NoHostSvid,
+                ServerCrl::Unknown,
+                CallerSigning::NotChecked
+            ),
             vec![GENERIC_NO_HOST_SVID_HINT.to_string()]
         );
     }
