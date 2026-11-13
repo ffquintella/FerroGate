@@ -970,6 +970,25 @@ impl Config {
         Ok((Self::default(), None))
     }
 
+    /// The system configuration file [`Config::load`] would look for with
+    /// these arguments but could not even probe — typically a
+    /// `C:\ProgramData\FerroGate` that refuses a non-elevated process — with
+    /// the probe error. Discovery treats such a file as absent and falls back
+    /// to the per-user file or the defaults, so client commands (`mia test`)
+    /// call this to say so instead of silently reporting on a configuration
+    /// other than the service's. `None` when the file was probed (present or
+    /// absent), or when `explicit` / `$FERROGATE_CONFIG` bypass discovery.
+    #[must_use]
+    pub fn unreadable_system_config(
+        explicit: Option<&Path>,
+        environment: Option<&str>,
+    ) -> Option<(PathBuf, std::io::Error)> {
+        if environment.is_none() && (explicit.is_some() || std::env::var_os(ENV_CONFIG).is_some()) {
+            return None;
+        }
+        probe_failure(system_config_path_for(environment), Path::try_exists)
+    }
+
     /// Parse a TOML configuration file from `path`. A file in the system
     /// configuration directory that a non-administrator could have written is
     /// refused ([`crate::system_dir::check_trusted_file`]; Windows only).
@@ -1622,6 +1641,18 @@ fn parse_bool_env(name: &str, raw: &str) -> anyhow::Result<bool> {
     }
 }
 
+/// `path` with the error `probe` returned for it, or `None` when the probe
+/// answered (present or absent). Split out so the error branch is testable.
+fn probe_failure(
+    path: PathBuf,
+    probe: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> Option<(PathBuf, std::io::Error)> {
+    match probe(&path) {
+        Ok(_) => None,
+        Err(e) => Some((path, e)),
+    }
+}
+
 /// A configured path, unless it is blank (empty or whitespace only): a blank
 /// value counts as unset, so the key's default (or absence) applies.
 fn non_blank_path(path: Option<&Path>) -> Option<&Path> {
@@ -1673,6 +1704,22 @@ mod tests {
         assert!(staging.ends_with("mia-staging.toml"));
         // The plain accessor is the default-environment path.
         assert_eq!(system_config_path(), default);
+    }
+
+    #[test]
+    fn an_unprobeable_system_config_is_reported_not_treated_as_absent() {
+        let path = PathBuf::from("mia.toml");
+        let denied = probe_failure(path.clone(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        let (p, e) = denied.expect("a probe error must be reported");
+        assert_eq!(p, path);
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        // Present or absent are both answers, not failures.
+        assert!(probe_failure(path.clone(), |_| Ok(false)).is_none());
+        assert!(probe_failure(path, |_| Ok(true)).is_none());
+        // An explicit --config bypasses discovery, so there is nothing to report.
+        assert!(Config::unreadable_system_config(Some(Path::new("x.toml")), None).is_none());
     }
 
     #[test]

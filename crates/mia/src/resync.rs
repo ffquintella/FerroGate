@@ -17,7 +17,8 @@
 //! then `resync-allowlist` re-establishes both halves of the allowlist trust
 //! chain. `resync-allowlist --reload` (or `mia --reload`) signals the running
 //! daemon (SIGHUP) to re-read the key and the body live — no restart, no
-//! helper-socket downtime. Without `--reload`, the command prints the platform
+//! helper-socket downtime; Windows has no SIGHUP, so there it restarts the
+//! service instead. Without `--reload`, the command prints the platform
 //! restart hint.
 //!
 //! Like `mia setup`/`mia test`, these are client commands: no hardening profile,
@@ -169,10 +170,11 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
             config.allowlist_sync_interval().as_secs()
         );
         if reload {
-            signal_reload();
-            println!("  The agent syncs now; `mia status` shows the generation it holds.");
+            if signal_reload() {
+                println!("  The agent syncs now; `mia status` shows the generation it holds.");
+            }
         } else {
-            println!("  Run `mia resync-allowlist --reload` (or `mia --resync`) to sync now.");
+            println!("  {}", sync_now_hint(LIVE_RELOAD));
         }
         return Ok(());
     }
@@ -234,36 +236,77 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
 
     if reload {
         signal_reload();
-    } else {
+    } else if LIVE_RELOAD {
         println!(
             "\nLoad it live (no restart, keeps the helper socket up):  mia resync-allowlist --reload"
         );
         println!("  or restart the agent:  {}", crate::setup::restart_hint());
+    } else {
+        println!(
+            "\nLoad it by restarting the agent:  mia resync-allowlist --reload  (or: {})",
+            crate::setup::restart_hint()
+        );
     }
     Ok(())
 }
 
-/// Signal the running agent to reload the freshly written allowlist via SIGHUP,
-/// printing the outcome. Falls back to the manual restart hint when the signal
-/// can't be sent (no signal-reload path on this platform, or the service
-/// manager command fails — e.g. the agent isn't running as a managed service).
-pub(crate) fn signal_reload() {
-    let Some(outcome) = crate::setup::perform_reload() else {
+/// Whether this platform reloads the running agent live (SIGHUP through the
+/// service manager). Elsewhere (Windows) `--reload` restarts the service.
+const LIVE_RELOAD: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+/// How to make the agent sync its allowlist now, with `allowlist.sync` on.
+fn sync_now_hint(live_reload: bool) -> &'static str {
+    if live_reload {
+        "Run `mia resync-allowlist --reload` (or `mia --resync`) to sync now."
+    } else {
+        "Run `mia resync-allowlist --reload` (or `mia --resync`) to sync now; on this platform \
+         that restarts the agent (no live reload), which syncs as it starts."
+    }
+}
+
+/// Make the running agent load what was just written — or, with
+/// `allowlist.sync` on, sync now — printing the outcome. Signals a live
+/// reload (SIGHUP via the service manager) where the platform has one;
+/// otherwise (Windows) restarts the service, as `mia setup --apply --reload`
+/// does. Returns whether the agent was reached; on `false` the manual
+/// restart hint has been printed.
+pub(crate) fn signal_reload() -> bool {
+    if let Some(outcome) = crate::setup::perform_reload() {
+        print!("\nSignaling the running agent to reload (SIGHUP) … ");
+        return match outcome {
+            Ok(tool) => {
+                println!("done via {tool}.");
+                println!("  The agent reloaded live — no restart, the helper socket stayed up.");
+                true
+            }
+            Err(e) => {
+                println!("failed.");
+                println!("  {e:#}");
+                false
+            }
+        };
+    }
+    let Some(restarted) = crate::setup::perform_restart() else {
         println!(
-            "\n--reload is not supported on this platform; restart the agent to load it:  {}",
+            "\nThis platform has no live reload; restart the agent to load it:  {}",
             crate::setup::restart_hint()
         );
-        return;
+        return false;
     };
-    print!("\nSignaling the running agent to reload (SIGHUP) … ");
-    match outcome {
-        Ok(tool) => {
-            println!("done via {tool}.");
-            println!("  The new allowlist is now live — no restart, the helper socket stayed up.");
+    print!(
+        "\nRestarting the agent (no live reload on this platform; the helper pipe drops \
+         briefly) … "
+    );
+    match restarted {
+        Ok(()) => {
+            println!("done.");
+            true
         }
         Err(e) => {
             println!("failed.");
             println!("  {e:#}");
+            println!("  Restart it by hand:  {}", crate::setup::restart_hint());
+            false
         }
     }
 }
@@ -375,7 +418,10 @@ fn print_help_resync() {
          \n\
          With --reload, the running agent is signalled (SIGHUP) to swap in the\n\
          new body immediately — no restart, so the helper socket never drops.\n\
-         Without it, restart the agent to load the refreshed body.\n\
+         Windows has no live reload: there --reload restarts the mia service\n\
+         (the helper pipe drops briefly). Without it, restart the agent to load\n\
+         the refreshed body. With allowlist.sync on, nothing is written: --reload\n\
+         makes the agent sync from CMIS now.\n\
          \n\
          options:\n\
          \x20 -c, --config <path>   TOML config file (default: the system config;\n\
@@ -383,7 +429,7 @@ fn print_help_resync() {
          \x20 -e, --environment <env>  select mia-<env>.toml from the standard config\n\
          \x20                       locations instead of mia.toml; excludes --config\n\
          \x20     --reload          signal the running agent to reload the allowlist\n\
-         \x20                       live (SIGHUP) instead of requiring a restart\n\
+         \x20                       live (SIGHUP; Windows: restart the service)\n\
          \x20 -h, --help            show this help"
     );
 }
@@ -409,4 +455,22 @@ fn print_help_reload() {
          options:\n\
          \x20 -h, --help   show this help"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_now_hint_says_when_reload_means_a_restart() {
+        let live = sync_now_hint(true);
+        assert!(live.contains("mia resync-allowlist --reload"), "{live}");
+        assert!(!live.contains("restart"), "{live}");
+        let restart = sync_now_hint(false);
+        assert!(
+            restart.contains("mia resync-allowlist --reload"),
+            "{restart}"
+        );
+        assert!(restart.contains("restarts the agent"), "{restart}");
+    }
 }

@@ -89,10 +89,24 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         println!();
     }
 
+    // A system config this process cannot even probe (not elevated) is
+    // skipped by discovery, so everything below would describe some other
+    // configuration than the service's: fail loudly instead.
+    let unreadable =
+        Config::unreadable_system_config(opts.config.as_deref(), opts.environment.as_deref());
+    if let Some((path, err)) = &unreadable {
+        let (detail, advice) = unreadable_config_detail(path, err, source.as_deref());
+        report("config file", "FAIL", &detail);
+        hints(&advice);
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let failures = runtime.block_on(run_checks(&config, source.as_deref(), &opts.audience));
+    let mut failures = runtime.block_on(run_checks(&config, source.as_deref(), &opts.audience));
+    if unreadable.is_some() {
+        failures.insert(0, "config file");
+    }
 
     if opts.json {
         let report = JSON_SINK
@@ -121,6 +135,33 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("self-test failed: {}", failures.join(", "));
     }
+}
+
+/// The "config file" FAIL line for a system config at `path` that could not
+/// be probed (`err`), naming what this run used instead (`used`).
+fn unreadable_config_detail(
+    path: &Path,
+    err: &std::io::Error,
+    used: Option<&Path>,
+) -> (String, Vec<String>) {
+    let instead = used.map_or_else(
+        || "the environment and built-in defaults".to_string(),
+        |p| p.display().to_string(),
+    );
+    let rerun = if cfg!(windows) {
+        "Re-run from an elevated prompt (Run as administrator): the mia service reads it as \
+         LocalSystem."
+    } else {
+        "Re-run as root (`sudo mia test`): the mia service reads it as root."
+    };
+    (
+        format!(
+            "{} could not be read ({err}) — this run used {instead} instead, so the checks \
+             below may not match the configuration the mia service runs with",
+            path.display()
+        ),
+        vec![rerun.to_string()],
+    )
 }
 
 /// One check's outcome in `--json` mode.
@@ -1553,9 +1594,25 @@ fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<Str
     } else {
         path.display().to_string()
     };
-    let resync = "Pull this host's allowlist from CMIS with `mia resync-allowlist` (add -e <env> \
-                  for a named environment), or enable allowlist.fetch."
-        .to_string();
+    // With the F19 sync on, the agent keeps the body it pulls from CMIS beside
+    // allowlist.state, not at allowlist.path.
+    let sync_on = config.allowlist_sync_enabled() && cmis_configured(config);
+    let resync = if sync_on {
+        format!(
+            "allowlist.sync is on: the agent pulls it from CMIS itself every {} s (`mia status` \
+             shows what it holds). To sync now: `mia resync-allowlist --reload`{}.",
+            config.allowlist_sync_interval().as_secs(),
+            if cfg!(windows) {
+                " (on Windows this restarts the mia service)"
+            } else {
+                ""
+            }
+        )
+    } else {
+        "Pull this host's allowlist from CMIS with `mia resync-allowlist` (add -e <env> for a \
+         named environment), or enable allowlist.fetch."
+            .to_string()
+    };
     let Some(key) = config.allowlist_key() else {
         return (
             "warn",
@@ -1576,6 +1633,12 @@ fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<Str
             ],
         );
     };
+    if let Some(synced) = sync_on
+        .then(|| synced_allowlist_detail(config, key, now))
+        .flatten()
+    {
+        return ("info", synced, Vec::new());
+    }
     match load_classified(&path, key, now, config.allowlist_max_age()) {
         Ok((_, AllowlistLoad::Loaded { entries, not_after })) => (
             "info",
@@ -1620,6 +1683,27 @@ fn allowlist_detail(config: &Config, now: i64) -> (&'static str, String, Vec<Str
             Vec::new(),
         ),
     }
+}
+
+/// The "allowlist" detail for the body the F19 sync keeps beside
+/// `allowlist.state`, when it verifies against `key` (the daemon prefers it
+/// over `allowlist.path`); `None` when it is absent or does not verify.
+/// Admission against the held generation is the agent's — `mia status`.
+fn synced_allowlist_detail(config: &Config, key: &Path, now: i64) -> Option<String> {
+    use crate::helper::allowlist::{load_classified, AllowlistLoad};
+    let synced = crate::allowlist_sync::synced_body_path(&config.allowlist_state_path());
+    let Ok((_, AllowlistLoad::Loaded { entries, not_after })) =
+        load_classified(&synced, key, now, config.allowlist_max_age())
+    else {
+        return None;
+    };
+    Some(format!(
+        "{} (synced from CMIS, allowlist.sync on) — verified with {}: {entries} entries, valid \
+         for {}s; `mia status` shows the generation the agent holds",
+        synced.display(),
+        key.display(),
+        (not_after - now).max(0)
+    ))
 }
 
 /// Whether the daemon checks this binary's Authenticode signature when it
@@ -1922,7 +2006,70 @@ mod tests {
         assert_eq!(status, "warn");
         assert!(detail.contains("not found"), "{detail}");
         assert!(advice.iter().any(|h| h.contains("resync-allowlist")));
+
+        // With allowlist.sync on (and CMIS set), the agent keeps the body it
+        // syncs beside allowlist.state: that one is verified and reported,
+        // not the missing allowlist.path.
+        let state = dir.join("al.state");
+        let synced = crate::allowlist_sync::synced_body_path(&state);
+        let sync_config = |extra: &str| {
+            Config::from_toml(&format!(
+                "[cmis]\nendpoint = 'https://cmis.test:8443'\n\n[allowlist]\npath = '{}'\n\
+                 key = '{}'\nstate_path = '{}'\n{extra}",
+                body.display(),
+                key.display(),
+                state.display()
+            ))
+            .unwrap()
+        };
+        // No synced body yet: still deny-all, but the hint points at the sync.
+        let (status, detail, advice) = allowlist_detail(&sync_config(""), 1000);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(
+            advice.iter().any(|h| h.contains("allowlist.sync is on")
+                && h.contains("mia resync-allowlist --reload")),
+            "{advice:?}"
+        );
+        std::fs::write(&synced, encode(&sign(&doc, &sk).unwrap()).unwrap()).unwrap();
+        let (status, detail, advice) = allowlist_detail(&sync_config(""), 1000);
+        assert_eq!(status, "info", "{detail}");
+        assert!(
+            detail.starts_with(&synced.display().to_string()),
+            "{detail}"
+        );
+        assert!(detail.contains("synced from CMIS"), "{detail}");
+        assert!(detail.contains("1 entries"), "{detail}");
+        assert!(advice.is_empty(), "{advice:?}");
+        // allowlist.sync = false: back to the allowlist.path body.
+        let (status, detail, _) = allowlist_detail(&sync_config("sync = false\n"), 1000);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(detail.contains("not found"), "{detail}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_system_config_names_what_was_used_instead() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let path = Path::new("C:/ProgramData/FerroGate/mia.toml");
+        let (detail, advice) = unreadable_config_detail(path, &err, None);
+        assert!(detail.starts_with(&path.display().to_string()), "{detail}");
+        assert!(detail.contains("could not be read"), "{detail}");
+        assert!(
+            detail.contains("the environment and built-in defaults"),
+            "{detail}"
+        );
+        assert_eq!(advice.len(), 1);
+        assert!(
+            advice[0].contains(if cfg!(windows) {
+                "administrator"
+            } else {
+                "sudo"
+            }),
+            "{advice:?}"
+        );
+        let user = Path::new("/home/u/.config/ferrogate/mia.toml");
+        let (detail, _) = unreadable_config_detail(path, &err, Some(user));
+        assert!(detail.contains(&user.display().to_string()), "{detail}");
     }
 
     #[test]
