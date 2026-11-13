@@ -1630,6 +1630,7 @@ enum CallerSigning {
     /// not Windows).
     NotChecked,
     /// The check applies and this binary passes it.
+    #[cfg(any(windows, test))]
     Signed,
     /// The check applies and this binary fails it (unsigned, untrusted, or
     /// unverifiable): the daemon refuses it as 'untrusted-binary'.
@@ -2109,7 +2110,7 @@ mod tests {
 
         let (status, _, hints) = caller_signing_detail(CallerSigning::Signed, "mia.exe");
         assert_eq!(status, "ok");
-        assert!(hints.is_empty());
+        assert_eq!(hints, Vec::<String>::new());
 
         let (status, _, _) = caller_signing_detail(CallerSigning::NotChecked, "mia.exe");
         assert_eq!(status, "info");

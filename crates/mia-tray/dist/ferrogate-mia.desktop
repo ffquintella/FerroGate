@@ -1,0 +1,20 @@
+[Desktop Entry]
+# Application-menu launcher. The tray itself is started by the separate XDG
+# autostart entry and systemd user unit; this opens a useful window without
+# starting a second tray process.
+Type=Application
+Name=FerroGate MIA
+GenericName=Machine identity status
+GenericName[pt_BR]=Status da identidade da máquina
+GenericName[es]=Estado de identidad del equipo
+Comment=View this machine's FerroGate identity status
+Comment[pt_BR]=Veja o status da identidade FerroGate desta máquina
+Comment[es]=Vea el estado de identidad FerroGate de este equipo
+TryExec=/usr/bin/mia-tray
+Exec=/usr/bin/mia-tray --window status
+Icon=ferrogate-mia
+Terminal=false
+Categories=System;Monitor;
+Keywords=identity;security;status;
+Keywords[pt_BR]=identidade;segurança;status;
+Keywords[es]=identidad;seguridad;estado;

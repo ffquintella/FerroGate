@@ -18,10 +18,11 @@ publish                = false
 #   ordinary `make lint` / `make test` on every host;
 # - the **GUI** (`gui` feature, off by default): tray icon + menu (`tray-icon`
 #   / `muda`), windows (`eframe` / `egui`), notifications, clipboard and file
-#   dialogs. On Linux it links GTK 3 (`libgtk-3-dev`, `libxdo-dev`, and
-#   `libayatana-appindicator3` at runtime), which servers and CI images often
-#   lack. The `mia-tray` binary requires it; build it with `make tray`, lint it
-#   with `make lint-tray`, test it with `make test-tray`.
+#   dialogs. On Linux it links GTK 3 (`libgtk-3-dev` and `libxdo-dev`), which
+#   servers and CI images often lack, and publishes its icon through KSNI so
+#   StatusNotifier hosts receive the state disc as `IconPixmap`. The `mia-tray`
+#   binary requires it; build it with `make tray`, lint it with `make lint-tray`,
+#   test it with `make test-tray`.
 #
 # The tray never depends on the `mia` crate (no TPM stack, gRPC client or key
 # handling): it talks to the daemon through `mia-status-proto` and by running
@@ -124,7 +125,10 @@ ciborium               = { workspace = true, optional = true }
 # Native rendering only — no embedded web view, so log text and config values
 # have no HTML/JS injection surface.
 eframe      = { version = "0.37", optional = true }
-tray-icon   = { version = "0.26", optional = true }
+# The default libappindicator backend exports custom images as an absolute
+# IconName without IconPixmap. Pantheon Wingpanel registers that item but cannot
+# render it. KSNI exports the same bounded RGBA state disc as IconPixmap.
+tray-icon   = { version = "0.26", optional = true, default-features = false, features = ["ksni"] }
 notify-rust = { version = "4.17", optional = true }
 arboard     = { version = "3.6", optional = true }
 # GTK 3 file dialog on Linux (the tray already needs GTK there), native
@@ -184,11 +188,12 @@ redacted log viewer. Unprivileged; holds no private key material."""
 section = "admin"
 priority = "optional"
 features = ["gui"]
-depends = "ferrogate-mia, libgtk-3-0, libxdo3, libayatana-appindicator3-1, policykit-1 | polkitd, pkexec | policykit-1"
+depends = "ferrogate-mia, libgtk-3-0, libxdo3, policykit-1 | polkitd, pkexec | policykit-1"
 maintainer-scripts = "dist/debian"
 assets = [
     ["../../target/release/mia-tray", "usr/bin/", "755"],
     ["dist/mia-tray.desktop", "etc/xdg/autostart/mia-tray.desktop", "644"],
+    ["dist/ferrogate-mia.desktop", "usr/share/applications/ferrogate-mia.desktop", "644"],
     ["dist/icons/ferrogate-mia.svg", "usr/share/icons/hicolor/scalable/apps/ferrogate-mia.svg", "644"],
     ["dist/icons/ferrogate-mia.png", "usr/share/icons/hicolor/256x256/apps/ferrogate-mia.png", "644"],
     ["dist/mia-tray.service", "usr/lib/systemd/user/mia-tray.service", "644"],
@@ -209,7 +214,7 @@ opened from the tray menu, to sign in to CMIS with a second factor and approve \
 application requests. Install it only on managed approver devices. Runs as the \
 logged-in user, needs no group membership or privilege, keeps credentials in \
 memory only."""
-depends = "ferrogate-mia-tray, libgtk-3-0, libxdo3, libayatana-appindicator3-1, libudev1"
+depends = "ferrogate-mia-tray, libgtk-3-0, libxdo3, libudev1"
 maintainer-scripts = "dist/debian-admin"
 assets = [
     ["../../target/release/mia-tray-admin", "usr/bin/", "755"],
@@ -223,6 +228,7 @@ license = "Apache-2.0"
 assets = [
     { source = "target/release/mia-tray", dest = "/usr/bin/mia-tray", mode = "755" },
     { source = "crates/mia-tray/dist/mia-tray.desktop", dest = "/etc/xdg/autostart/mia-tray.desktop", mode = "644" },
+    { source = "crates/mia-tray/dist/ferrogate-mia.desktop", dest = "/usr/share/applications/ferrogate-mia.desktop", mode = "644" },
     { source = "crates/mia-tray/dist/icons/ferrogate-mia.svg", dest = "/usr/share/icons/hicolor/scalable/apps/ferrogate-mia.svg", mode = "644" },
     { source = "crates/mia-tray/dist/icons/ferrogate-mia.png", dest = "/usr/share/icons/hicolor/256x256/apps/ferrogate-mia.png", mode = "644" },
     { source = "crates/mia-tray/dist/mia-tray.service", dest = "/usr/lib/systemd/user/mia-tray.service", mode = "644" },
@@ -249,7 +255,6 @@ post_install_script = "crates/mia-tray/dist/debian-admin/postinst"
 ferrogate-mia-tray = "*"
 gtk3 = "*"
 libxdo = "*"
-libayatana-appindicator-gtk3 = "*"
 # libudev, for USB security keys (feature `fido2-hid`).
 systemd-libs = "*"
 
@@ -257,5 +262,4 @@ systemd-libs = "*"
 ferrogate-mia = "*"
 gtk3 = "*"
 libxdo = "*"
-libayatana-appindicator-gtk3 = "*"
 polkit = "*"

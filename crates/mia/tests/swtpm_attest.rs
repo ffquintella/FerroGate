@@ -218,7 +218,7 @@ fn swtpm_quote_is_accepted_end_to_end() {
     // Phase 4: the restricted AIK signs a payload (bound to hardware).
     let payload = b"composite-public-key-bytes";
     let aik_sig = engine.sign_aik(&aik, payload).expect("AIK sign");
-    assert!(!aik_sig.is_empty());
+    assert_ne!(aik_sig, Vec::<u8>::new());
 
     // Phase 3: credential activation round-trips and compares constant-time.
     credential_activation_roundtrips(&mut engine, &ek, &aik);
@@ -242,7 +242,7 @@ fn tpm_evidence_adapter_quote_is_accepted() {
 
     // The adapter surfaces exactly the EK cert it was constructed with.
     assert_eq!(evidence.ek_cert(), leaf_der);
-    assert!(evidence.ek_intermediates().is_empty());
+    assert_eq!(evidence.ek_intermediates(), Vec::<Vec<u8>>::new());
 
     let nonce = [0x11u8; 32];
     let quote = evidence.quote(&nonce).expect("adapter quote");
@@ -281,7 +281,7 @@ fn tpm_evidence_adapter_quote_is_accepted() {
     let sig = evidence
         .sign_aik(b"composite-public-key-bytes")
         .expect("adapter sign");
-    assert!(!sig.is_empty());
+    assert_ne!(sig, Vec::<u8>::new());
 }
 
 /// Rebuild a `QuoteVerification` borrowing the same evidence (the struct holds

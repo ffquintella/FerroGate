@@ -85,7 +85,7 @@ lint: ## Run clippy with warnings denied
 # and test the tray's headless core (endpoint client, state mapping, command
 # builders, wizard drafts, log follower), which is where its logic lives. These
 # targets cover the GUI build. On Linux they need GTK 3 headers:
-#   sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+#   sudo apt-get install -y libgtk-3-dev libxdo-dev
 # and the admin build (security keys over USB HID) also needs `libudev-dev`.
 TRAY := -p mia-tray --features mia-tray/gui
 # The administrator client (F22) is a separate binary behind the `admin`
@@ -108,6 +108,12 @@ check-tray-isolation: ## Assert the mia-tray binary links no admin or network cr
 	@deps="$$(cargo tree -p mia-tray --features mia-tray/gui -e normal --prefix none)" || exit 1; \
 	if echo "$$deps" | grep -E '^($(TRAY_FORBIDDEN)) v'; then \
 	  echo "ERROR: the mia-tray binary links admin or network code (see above)"; exit 1; fi; \
+	if [ "$(UNAME_S)" = Linux ]; then \
+	  if echo "$$deps" | grep -E '^libappindicator(-sys)? v'; then \
+	    echo "ERROR: the Linux tray uses libappindicator, whose absolute IconName is invisible in Pantheon Wingpanel"; exit 1; fi; \
+	  if ! echo "$$deps" | grep -qE '^ksni v'; then \
+	    echo "ERROR: the Linux tray must use the KSNI backend so hosts receive IconPixmap"; exit 1; fi; \
+	fi; \
 	admin="$$(cargo tree -p mia-tray --features mia-tray/admin -e normal --prefix none)" || exit 1; \
 	if ! echo "$$admin" | grep -qE '^ferrogate-admin-client v'; then \
 	  echo "ERROR: the admin build no longer shows ferrogate-admin-client: this check is blind"; exit 1; fi; \

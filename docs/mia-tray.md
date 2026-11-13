@@ -257,14 +257,19 @@ are held and counted).
 |---|---|---|
 | macOS | inside `make pkg-macos` (`/Applications/FerroGate MIA.app`, symlinked as `/usr/local/bin/mia-tray`) | LaunchAgent `/Library/LaunchAgents/com.ferrogate.mia-tray.plist` (login item; started for the console user at install) |
 | Windows | inside `make pkg-win` (`%ProgramFiles%\FerroGate\MIA\mia-tray.exe`) | `HKLM\…\CurrentVersion\Run\FerroGateMiaTray` |
-| Linux (Debian/Ubuntu) | inside `ferrogate-mia` (`make pkg-deb`) | started for active graphical users during install; XDG autostart `/etc/xdg/autostart/mia-tray.desktop` on later logins |
-| Linux (RPM) | separate, opt-in `ferrogate-mia-tray` package (`make pkg-rpm-tray`) | XDG autostart `/etc/xdg/autostart/mia-tray.desktop` |
+| Linux (Debian/Ubuntu) | inside `ferrogate-mia` (`make pkg-deb`) | started for active graphical users during install; XDG autostart `/etc/xdg/autostart/mia-tray.desktop` on later logins; **FerroGate MIA** application launcher opens the status window |
+| Linux (RPM) | separate, opt-in `ferrogate-mia-tray` package (`make pkg-rpm-tray`) | XDG autostart `/etc/xdg/autostart/mia-tray.desktop`; **FerroGate MIA** application launcher opens the status window |
 
 The application icon is mastered as `crates/mia-tray/dist/icons/ferrogate-mia.svg`.
 After editing it, run `make icons` (`scripts/gen-mia-icons.sh`) to regenerate
 the committed PNG, `.icns` (app bundle) and `.ico` (MSI). The packages install
-it as `ferrogate-mia` in the hicolor icon theme on Linux. The menu-bar icon
-itself is the state disc drawn in `src/icon.rs`.
+it as `ferrogate-mia` in the hicolor icon theme on Linux. The Linux application
+launcher lives at `/usr/share/applications/ferrogate-mia.desktop` and runs
+`mia-tray --window status`; the background tray remains owned by the systemd
+user service. The menu-bar icon itself is the state disc drawn in `src/icon.rs`.
+On Linux that disc is published as a StatusNotifier `IconPixmap`, which works
+with hosts such as Pantheon Wingpanel as well as KDE, Xfce and GNOME's
+AppIndicator extension.
 
 The optional administrator client (`mia-tray-admin`, see [Admin client](#admin-client-mia-tray-admin))
 is **not** part of the workstation `ferrogate-mia` `.deb`, and it is off by

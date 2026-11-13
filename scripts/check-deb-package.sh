@@ -32,6 +32,7 @@ for path in \
     /usr/bin/mia \
     /usr/bin/mia-tray \
     /etc/xdg/autostart/mia-tray.desktop \
+    /usr/share/applications/ferrogate-mia.desktop \
     /usr/lib/systemd/user/mia-tray.service \
     /usr/share/icons/hicolor/scalable/apps/ferrogate-mia.svg \
     /usr/share/icons/hicolor/256x256/apps/ferrogate-mia.png \
@@ -39,6 +40,19 @@ for path in \
     /usr/share/polkit-1/rules.d/50-ferrogate-operators.rules; do
     require_file "$path"
 done
+
+launcher="$work_dir/root/usr/share/applications/ferrogate-mia.desktop"
+grep -Fx 'Exec=/usr/bin/mia-tray --window status' "$launcher" >/dev/null || {
+    echo "ERROR: FerroGate MIA launcher must open the status window" >&2
+    exit 1
+}
+if grep -Fx 'NoDisplay=true' "$launcher" >/dev/null; then
+    echo "ERROR: FerroGate MIA launcher is hidden from application menus" >&2
+    exit 1
+fi
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$launcher"
+fi
 
 # The administrator client (F22) is the separate, optional
 # ferrogate-mia-tray-admin package; every workstation gets this one.
@@ -48,7 +62,7 @@ if grep -Fx "./usr/bin/mia-tray-admin" "$work_dir/files" >/dev/null; then
 fi
 
 depends=$(dpkg-deb --field "$deb" Depends)
-for dependency in libgtk-3-0 libayatana-appindicator3-1 policykit-1 systemd passwd; do
+for dependency in libgtk-3-0 policykit-1 systemd passwd; do
     printf '%s\n' "$depends" | grep -F "$dependency" >/dev/null || {
         echo "ERROR: missing Debian dependency $dependency" >&2
         exit 1
@@ -78,4 +92,4 @@ if grep -F '#DEBHELPER#' "$work_dir/control/postinst" >/dev/null; then
     exit 1
 fi
 
-echo "OK: $deb contains MIA, tray, autostart, access groups, and lifecycle hooks"
+echo "OK: $deb contains MIA, tray, launcher, autostart, access groups, and lifecycle hooks"
