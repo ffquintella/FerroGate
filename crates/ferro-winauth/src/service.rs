@@ -190,18 +190,41 @@ pub fn is_running() -> Option<bool> {
     Some(status.current_state == ServiceState::Running)
 }
 
+/// `ERROR_SERVICE_ALREADY_RUNNING`: `StartService` on a running service.
+const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
+
+/// What [`start`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// The SCM accepted the start request.
+    Started,
+    /// The service was already running; nothing was changed.
+    AlreadyRunning,
+}
+
+/// Whether `err` is the SCM refusing a start because the service already runs.
+fn is_already_running(err: &windows_service::Error) -> bool {
+    matches!(err, windows_service::Error::Winapi(io)
+        if io.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING))
+}
+
 /// Start the installed `mia` service. Requires Administrator rights.
-pub fn start() -> anyhow::Result<()> {
+///
+/// Idempotent: a service that is already running is reported as
+/// [`StartOutcome::AlreadyRunning`] rather than an error, so the tray's
+/// "Start the service" action does not fail when the agent is up.
+pub fn start() -> anyhow::Result<StartOutcome> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("opening the service control manager (run as Administrator)")?;
     let service = manager
         .open_service(SERVICE_NAME, ServiceAccess::START)
         .context("opening the mia service (is it installed?)")?;
     let no_args: [&OsStr; 0] = [];
-    service
-        .start(&no_args)
-        .context("starting the mia service")?;
-    Ok(())
+    match service.start(&no_args) {
+        Ok(()) => Ok(StartOutcome::Started),
+        Err(e) if is_already_running(&e) => Ok(StartOutcome::AlreadyRunning),
+        Err(e) => Err(anyhow::Error::new(e).context("starting the mia service")),
+    }
 }
 
 /// Stop the running `mia` service. Requires Administrator rights.
@@ -213,4 +236,29 @@ pub fn stop() -> anyhow::Result<()> {
         .context("opening the mia service (is it installed?)")?;
     service.stop().context("stopping the mia service")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn winapi(code: i32) -> windows_service::Error {
+        windows_service::Error::Winapi(std::io::Error::from_raw_os_error(code))
+    }
+
+    #[test]
+    fn already_running_is_recognised() {
+        assert!(is_already_running(&winapi(ERROR_SERVICE_ALREADY_RUNNING)));
+    }
+
+    #[test]
+    fn other_start_errors_are_not_swallowed() {
+        // ERROR_ACCESS_DENIED, ERROR_SERVICE_DISABLED, ERROR_SERVICE_DOES_NOT_EXIST.
+        for code in [5, 1058, 1060] {
+            assert!(!is_already_running(&winapi(code)), "code {code}");
+        }
+        assert!(!is_already_running(
+            &windows_service::Error::LaunchArgumentsNotSupported
+        ));
+    }
 }

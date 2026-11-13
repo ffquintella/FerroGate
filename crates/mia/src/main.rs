@@ -544,8 +544,14 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         Some("start") => {
-            ferro_winauth::service::start()?;
-            println!("started the 'mia' service.");
+            match ferro_winauth::service::start()? {
+                ferro_winauth::service::StartOutcome::Started => {
+                    println!("started the 'mia' service.");
+                }
+                ferro_winauth::service::StartOutcome::AlreadyRunning => {
+                    println!("the 'mia' service is already running.");
+                }
+            }
             Ok(())
         }
         // Make %ProgramData%\FerroGate administrator-only, exactly as the
