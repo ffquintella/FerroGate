@@ -182,7 +182,7 @@ toml = "1.1"
 
 # macOS caller authentication: resolve a peer PID to its executable path
 # (proc_pidpath). FFI is confined to this crate, keeping mia unsafe-free.
-libproc = "0.14"
+libproc = "0.15"
 
 # test helpers
 proptest = "1"
