@@ -1950,31 +1950,13 @@ fn maybe_spawn_crl_puller(
         return;
     };
 
-    tokio::spawn(async move {
-        loop {
-            // Resolve + dial with fail-over each cycle, so a CRL puller whose node
-            // went down re-selects a live one (re-resolving SRV on the way).
-            match resolver.connect().await {
-                Ok((_, client)) => {
-                    // The channel redials on demand after transient drops, so
-                    // one successful connect is enough to hand the pull loop;
-                    // it only resolves if the puller task itself dies.
-                    let puller =
-                        mia::helper::crl::spawn_puller(client, cache.clone(), CRL_PULL_INTERVAL);
-                    let _ = puller.await;
-                    tracing::warn!("CRL puller stopped unexpectedly; restarting");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e, cmis = %resolver.describe(),
-                        "cannot connect to CMIS for CRL pulls; retrying (minting stays \
-                         fail-closed until the first verified pull)"
-                    );
-                }
-            }
-            tokio::time::sleep(CRL_PULL_INTERVAL).await;
-        }
-    });
+    // Every pull resolves + dials with fail-over (and a per-RPC timeout), so a
+    // CMIS node that dies or hangs is replaced by the next live one.
+    drop(mia::helper::crl::spawn_failover_puller(
+        resolver,
+        cache,
+        CRL_PULL_INTERVAL,
+    ));
 }
 
 /// The owned configuration the renewal hooks need to refresh what depends

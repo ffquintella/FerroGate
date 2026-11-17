@@ -25,6 +25,10 @@ record them.
 
 ## [Unreleased]
 
+### Added
+
+- MIA's SRV fail-over now detects a CMIS node that is down, too slow or silent, not only one that refuses the dial: `CmisResolver::call` bounds every RPC (10 s) and fails over to the next SRV candidate on a timeout or transport-class error, `connect`/`call` remember failed nodes for a 30 s cool-down so later requests try healthy nodes first instead of paying the timeout again (a recovered preferred node takes traffic back once the cool-down lapses), and the CRL puller now pulls through `call`, so it no longer stays glued to the node it first dialled. The per-candidate connect timeout drops from 10 s to 5 s. Covered by fast in-process tests (`crates/mia/tests/srv_failover.rs`) and by Docker behaviour tests that run a 3-node CMIS cluster behind a DNS SRV record and kill/pause real containers (`crates/mia/tests/docker_failover.rs`, `docker/failover-test/`). The Docker tests are `#[ignore]`d: they run only via `make test-failover` or the `SRV fail-over (Docker)` workflow, which fires on release tags and manual dispatch.
+
 ### Fixed
 
 - Keep Linux MIA live reloads able to read root-owned configuration after the daemon drops to `_ferrogate` and clears supplementary groups. Debian and RPM installation now grant that account a read-only POSIX ACL on each system TOML, and the audited atomic configuration writer preserves the ACL when `allowlist-key fetch` or setup replaces the file. `resync-allowlist --reload` also refuses to report success without `allowlist.key` and, with sync enabled, waits for the status endpoint to confirm a new sync attempt loaded a verified allowlist; plain `--reload` now accurately reports signal delivery as asynchronous rather than claiming the reload already succeeded.

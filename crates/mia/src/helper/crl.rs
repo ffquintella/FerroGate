@@ -176,6 +176,39 @@ pub fn spawn_puller(
     })
 }
 
+/// Like [`spawn_puller`], but every pull goes through
+/// [`crate::endpoint::CmisResolver::call`], so a CMIS node that dies, hangs or
+/// slows down is abandoned for the next live one (re-resolving SRV) instead of
+/// the puller staying glued to the node it first dialled.
+#[must_use = "the puller stops when the join handle is dropped"]
+pub fn spawn_failover_puller(
+    resolver: crate::endpoint::CmisResolver,
+    cache: Arc<CrlCache>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let pulled = resolver
+                .call(|mut client| {
+                    let cache = cache.clone();
+                    async move {
+                        refresh_once(&mut client, &cache)
+                            .await
+                            .map_err(anyhow::Error::from)
+                    }
+                })
+                .await;
+            match pulled {
+                Ok((endpoint, number)) => {
+                    tracing::debug!(crl_number = number, %endpoint, "CRL refreshed");
+                }
+                Err(e) => tracing::warn!(error = %e, "CRL refresh failed; cache left stale"),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

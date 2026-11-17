@@ -20,8 +20,25 @@
 //!
 //! The SPKI pin authenticates *every* candidate: a CMIS HA cluster shares one
 //! pinned identity, so a single pin covers all nodes.
+//!
+//! # Detecting a down, slow or silent node
+//!
+//! - **Down / refusing / black-holed:** the dial fails or exceeds the connect
+//!   timeout, and the node is skipped.
+//! - **Slow or hung after connecting** (accepts the connection but stops
+//!   answering — a paused process, a saturated host): [`CmisResolver::call`]
+//!   bounds every RPC by an RPC timeout, and a timeout or transport-class error
+//!   fails the call over to the next candidate.
+//! - **Memory:** a node that failed is *penalised* for a cool-down, so later
+//!   connects try the healthy nodes first instead of paying the timeout on the
+//!   dead one every time. A penalised node is still tried last, as a last
+//!   resort, and a success clears its penalty — so a recovered preferred node
+//!   takes traffic back once the cool-down lapses.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use ferro_crypto::pin::SpkiPin;
@@ -30,9 +47,16 @@ use tonic::transport::Channel;
 
 use crate::config::CmisConfig;
 
-/// Per-candidate connect timeout, so one black-holed node cannot stall the whole
-/// fail-over sweep.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default per-candidate connect timeout, so one black-holed node cannot stall
+/// the whole fail-over sweep.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default bound on one RPC made through [`CmisResolver::call`]; a node that
+/// accepts the connection but does not answer in time is failed over.
+const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default time a failed node is deprioritised before it is tried first again.
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Timeout for the SRV DNS lookup itself.
 const SRV_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,6 +68,44 @@ enum Source {
     Static(String),
     /// A DNS SRV owner name (e.g. `_cmis._tcp.example.com`).
     Srv(String),
+    /// A fixed, ordered candidate list (embedding and tests; no DNS).
+    Fixed(Vec<String>),
+}
+
+/// Timeouts and penalty window of a [`CmisResolver`].
+#[derive(Debug, Clone, Copy)]
+struct Tuning {
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
+    cooldown: Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            connect_timeout: CONNECT_TIMEOUT,
+            rpc_timeout: RPC_TIMEOUT,
+            cooldown: FAILURE_COOLDOWN,
+        }
+    }
+}
+
+/// Whether `err` says the *node* (not the request) is at fault: a timeout, a
+/// transport/IO failure, or a gRPC status meaning the server is unavailable.
+/// Application errors (permission, not-found, invalid argument…) are the
+/// answer of a healthy node and must not trigger fail-over.
+fn is_node_failure(err: &anyhow::Error) -> bool {
+    use tonic::Code;
+    err.chain().any(|cause| {
+        if let Some(status) = cause.downcast_ref::<tonic::Status>() {
+            matches!(
+                status.code(),
+                Code::Unavailable | Code::DeadlineExceeded | Code::Unknown | Code::Cancelled
+            )
+        } else {
+            cause.is::<tonic::transport::Error>() || cause.is::<std::io::Error>()
+        }
+    })
 }
 
 /// Resolves the configured CMIS source to live, pinned connections, with
@@ -53,6 +115,9 @@ enum Source {
 pub struct CmisResolver {
     source: Source,
     pins: Vec<SpkiPin>,
+    tuning: Tuning,
+    /// Endpoint → instant until which it is deprioritised. Shared by clones.
+    penalties: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl CmisResolver {
@@ -80,7 +145,37 @@ impl CmisResolver {
         Ok(Some(Self {
             source,
             pins: vec![pin],
+            tuning: Tuning::default(),
+            penalties: Arc::default(),
         }))
+    }
+
+    /// A resolver over a fixed, ordered list of `https://host:port` candidates
+    /// (most-preferred first), with no DNS involved. For embedding and tests.
+    #[must_use]
+    pub fn with_candidates(candidates: Vec<String>, pins: Vec<SpkiPin>) -> Self {
+        Self {
+            source: Source::Fixed(candidates),
+            pins,
+            tuning: Tuning::default(),
+            penalties: Arc::default(),
+        }
+    }
+
+    /// Override the connect timeout, RPC timeout and failure cool-down.
+    #[must_use]
+    pub fn with_timeouts(
+        mut self,
+        connect_timeout: Duration,
+        rpc_timeout: Duration,
+        cooldown: Duration,
+    ) -> Self {
+        self.tuning = Tuning {
+            connect_timeout,
+            rpc_timeout,
+            cooldown,
+        };
+        self
     }
 
     /// A short human label for logs and diagnostics: the static endpoint, or the
@@ -90,6 +185,7 @@ impl CmisResolver {
         match &self.source {
             Source::Static(e) => e,
             Source::Srv(n) => n,
+            Source::Fixed(c) => c.first().map_or("(no candidates)", String::as_str),
         }
     }
 
@@ -114,7 +210,108 @@ impl CmisResolver {
         match &self.source {
             Source::Static(ep) => Ok(vec![ep.clone()]),
             Source::Srv(name) => resolve_srv(name).await,
+            Source::Fixed(c) => Ok(c.clone()),
         }
+    }
+
+    /// Record that `endpoint` failed: it is tried after the healthy nodes for the
+    /// cool-down. Callers that hold a long-lived connection use this when an RPC
+    /// on it fails.
+    pub fn mark_failed(&self, endpoint: &str) {
+        let until = Instant::now() + self.tuning.cooldown;
+        if let Ok(mut p) = self.penalties.lock() {
+            p.insert(endpoint.to_string(), until);
+        }
+    }
+
+    /// Record that `endpoint` served successfully, clearing any penalty.
+    pub fn mark_ok(&self, endpoint: &str) {
+        if let Ok(mut p) = self.penalties.lock() {
+            p.remove(endpoint);
+        }
+    }
+
+    /// Stable-reorder `candidates`: nodes not under penalty first (keeping their
+    /// preference order), then penalised ones (also in preference order). Expired
+    /// penalties are dropped.
+    fn order_by_health(&self, candidates: Vec<String>) -> Vec<String> {
+        let now = Instant::now();
+        let Ok(mut p) = self.penalties.lock() else {
+            return candidates;
+        };
+        p.retain(|_, until| *until > now);
+        let (healthy, penalised): (Vec<_>, Vec<_>) =
+            candidates.into_iter().partition(|c| !p.contains_key(c));
+        healthy.into_iter().chain(penalised).collect()
+    }
+
+    /// Dial one candidate under the connect timeout, updating its health.
+    async fn dial(&self, ep: &str) -> anyhow::Result<MachineIdentityClient<Channel>> {
+        let res = match tokio::time::timeout(
+            self.tuning.connect_timeout,
+            crate::client::connect_pinned(ep, self.pins.clone()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => Ok(client),
+            Ok(Err(e)) => Err(e.context(format!("dialing {ep}"))),
+            Err(_) => Err(anyhow::anyhow!(
+                "dialing {ep}: timed out after {:?}",
+                self.tuning.connect_timeout
+            )),
+        };
+        match &res {
+            Ok(_) => self.mark_ok(ep),
+            Err(_) => self.mark_failed(ep),
+        }
+        res
+    }
+
+    /// Run one RPC against a live node, failing over to the next candidate when
+    /// the node is down, too slow, or erroring at the transport level.
+    ///
+    /// `op` receives a connected client (cheap to clone) and returns the RPC's
+    /// result; it may be invoked once per candidate tried, so it must be safe to
+    /// repeat (all the read-only MIA→CMIS calls are). Each attempt is bounded by
+    /// the RPC timeout. An *application* error from a healthy node (permission,
+    /// not-found…) is returned at once without trying another node. On success
+    /// returns the serving endpoint and the value.
+    pub async fn call<T, F, Fut>(&self, mut op: F) -> anyhow::Result<(String, T)>
+    where
+        F: FnMut(MachineIdentityClient<Channel>) -> Fut,
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
+        let candidates = self.order_by_health(self.candidates().await?);
+        let mut last_err: Option<anyhow::Error> = None;
+        for ep in candidates {
+            let client = match self.dial(&ep).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(endpoint = %ep, error = %e, "CMIS candidate unreachable; trying next");
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            match tokio::time::timeout(self.tuning.rpc_timeout, op(client)).await {
+                Ok(Ok(v)) => return Ok((ep, v)),
+                Ok(Err(e)) if is_node_failure(&e) => {
+                    tracing::warn!(endpoint = %ep, error = %e, "CMIS node failed mid-call; trying next");
+                    self.mark_failed(&ep);
+                    last_err = Some(e.context(format!("calling {ep}")));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    tracing::warn!(endpoint = %ep, timeout = ?self.tuning.rpc_timeout, "CMIS node too slow; trying next");
+                    self.mark_failed(&ep);
+                    last_err = Some(anyhow::anyhow!(
+                        "calling {ep}: no answer within {:?}",
+                        self.tuning.rpc_timeout
+                    ));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no CMIS candidates to call")))
+            .with_context(|| format!("no responsive CMIS endpoint via {}", self.describe()))
     }
 
     /// Dial CMIS with fail-over: resolve candidates, then try each in preference
@@ -123,38 +320,25 @@ impl CmisResolver {
     ///
     /// The successful handshake is the health check — an unreachable, non-hybrid,
     /// or wrong-identity node is skipped. Per-candidate dials are bounded by
-    /// [`CONNECT_TIMEOUT`] so a black-holed node cannot stall the sweep.
+    /// the connect timeout so a black-holed node cannot stall the sweep; failed
+    /// nodes are deprioritised for the cool-down.
     pub async fn connect(&self) -> anyhow::Result<(String, MachineIdentityClient<Channel>)> {
-        let candidates = self.candidates().await?;
+        let candidates = self.order_by_health(self.candidates().await?);
         let multi = candidates.len() > 1;
         let mut last_err: Option<anyhow::Error> = None;
         for ep in candidates {
-            match tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                crate::client::connect_pinned(&ep, self.pins.clone()),
-            )
-            .await
-            {
-                Ok(Ok(client)) => {
+            match self.dial(&ep).await {
+                Ok(client) => {
                     if multi {
                         tracing::debug!(endpoint = %ep, "selected live CMIS endpoint");
                     }
                     return Ok((ep, client));
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if multi {
                         tracing::warn!(endpoint = %ep, error = %e, "CMIS candidate unreachable; trying next");
                     }
-                    last_err = Some(e.context(format!("dialing {ep}")));
-                }
-                Err(_) => {
-                    if multi {
-                        tracing::warn!(endpoint = %ep, timeout_secs = CONNECT_TIMEOUT.as_secs(), "CMIS candidate timed out; trying next");
-                    }
-                    last_err = Some(anyhow::anyhow!(
-                        "dialing {ep}: timed out after {}s",
-                        CONNECT_TIMEOUT.as_secs()
-                    ));
+                    last_err = Some(e);
                 }
             }
         }
@@ -313,5 +497,78 @@ mod tests {
         let r = CmisResolver::from_config(&cfg).unwrap().unwrap();
         assert!(r.is_srv());
         assert_eq!(r.describe(), "_cmis._tcp.example.com");
+    }
+
+    fn fixed(c: &[&str]) -> CmisResolver {
+        CmisResolver::with_candidates(
+            c.iter().map(|s| (*s).to_string()).collect(),
+            vec![SpkiPin::from_hex(&pin_hex()).unwrap()],
+        )
+    }
+
+    #[test]
+    fn failed_node_is_tried_last_then_recovers() {
+        let r = fixed(&["https://a:1", "https://b:1", "https://c:1"]).with_timeouts(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        );
+        let all = || {
+            vec![
+                "https://a:1".into(),
+                "https://b:1".into(),
+                "https://c:1".into(),
+            ]
+        };
+        assert_eq!(r.order_by_health(all()), all());
+        r.mark_failed("https://a:1");
+        assert_eq!(
+            r.order_by_health(all()),
+            vec!["https://b:1", "https://c:1", "https://a:1"]
+        );
+        // Cool-down lapses → the preferred node is first again.
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(r.order_by_health(all()), all());
+        // An explicit success clears the penalty immediately.
+        r.mark_failed("https://b:1");
+        r.mark_ok("https://b:1");
+        assert_eq!(r.order_by_health(all()), all());
+    }
+
+    #[test]
+    fn penalties_are_shared_by_clones() {
+        let r = fixed(&["https://a:1", "https://b:1"]);
+        let c = r.clone();
+        c.mark_failed("https://a:1");
+        assert_eq!(
+            r.order_by_health(vec!["https://a:1".into(), "https://b:1".into()]),
+            vec!["https://b:1", "https://a:1"]
+        );
+    }
+
+    #[test]
+    fn only_node_level_errors_trigger_failover() {
+        use tonic::{Code, Status};
+        for code in [Code::Unavailable, Code::DeadlineExceeded, Code::Unknown] {
+            assert!(is_node_failure(&anyhow::Error::from(Status::new(
+                code, "x"
+            ))));
+        }
+        for code in [
+            Code::PermissionDenied,
+            Code::NotFound,
+            Code::InvalidArgument,
+        ] {
+            assert!(!is_node_failure(&anyhow::Error::from(Status::new(
+                code, "x"
+            ))));
+        }
+        assert!(is_node_failure(&anyhow::Error::from(
+            std::io::Error::other("reset")
+        )));
+        assert!(!is_node_failure(&anyhow::anyhow!("empty enrollment key")));
+        // The status is found through added context.
+        let wrapped = anyhow::Error::from(Status::unavailable("down")).context("calling");
+        assert!(is_node_failure(&wrapped));
     }
 }

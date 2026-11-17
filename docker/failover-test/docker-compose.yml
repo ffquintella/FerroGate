@@ -1,0 +1,102 @@
+# SRV fail-over behaviour test bed: a 3-node CMIS cluster sharing ONE TLS
+# identity (one SPKI pin covers every node), a DNS server publishing the SRV
+# record `_cmis._tcp.fg.test`, and the MIA probe resolving it. The Rust harness
+# (crates/mia/tests/docker_failover.rs) stops / pauses nodes and asserts the
+# probe keeps being served by a live one. Never run by default: see
+# `make test-failover`.
+#
+# Required env: TLS_DIR (cmis.crt + cmis.key), PIN (SPKI pin hex);
+# optional: IMAGE (CMIS image), PROBE_IMAGE.
+
+services:
+  dns:
+    build:
+      context: .
+      dockerfile: dns.Dockerfile
+    container_name: fgfo-dns
+    networks:
+      fg:
+        ipv4_address: 10.77.0.2
+    volumes:
+      - ./dnsmasq.conf:/etc/dnsmasq.conf:ro
+
+  cmis1:
+    image: ${IMAGE:-ferrogate:latest}
+    container_name: fgfo-cmis1
+    hostname: cmis1
+    networks:
+      fg:
+        ipv4_address: 10.77.0.11
+    volumes:
+      - ${TLS_DIR:?set TLS_DIR to the dir holding cmis.crt + cmis.key}:/tls:ro
+    environment:
+      RUST_LOG: "info,hiqlite=warn"
+      CMIS_LISTEN: "0.0.0.0:8443"
+      CMIS_TLS_CERT: /tls/cmis.crt
+      CMIS_TLS_KEY: /tls/cmis.key
+      CMIS_NODE_ID: "1"
+      CMIS_CLUSTER_PEERS: "1=cmis1:9601,cmis1:9602;2=cmis2:9601,cmis2:9602;3=cmis3:9601,cmis3:9602"
+      CMIS_RAFT_LISTEN: "0.0.0.0"
+      CMIS_PEER_TLS: "1"
+      CMIS_RAFT_SECRET: "ferrogate-failover-raft-secret-1"
+      CMIS_API_SECRET: "ferrogate-failover-api-secret-01"
+      CMIS_RAFT_DIR: "/var/lib/ferrogate/raft"
+
+  cmis2:
+    image: ${IMAGE:-ferrogate:latest}
+    container_name: fgfo-cmis2
+    hostname: cmis2
+    networks:
+      fg:
+        ipv4_address: 10.77.0.12
+    volumes:
+      - ${TLS_DIR:?set TLS_DIR to the dir holding cmis.crt + cmis.key}:/tls:ro
+    environment:
+      RUST_LOG: "info,hiqlite=warn"
+      CMIS_LISTEN: "0.0.0.0:8443"
+      CMIS_TLS_CERT: /tls/cmis.crt
+      CMIS_TLS_KEY: /tls/cmis.key
+      CMIS_NODE_ID: "2"
+      CMIS_CLUSTER_PEERS: "1=cmis1:9601,cmis1:9602;2=cmis2:9601,cmis2:9602;3=cmis3:9601,cmis3:9602"
+      CMIS_RAFT_LISTEN: "0.0.0.0"
+      CMIS_PEER_TLS: "1"
+      CMIS_RAFT_SECRET: "ferrogate-failover-raft-secret-1"
+      CMIS_API_SECRET: "ferrogate-failover-api-secret-01"
+      CMIS_RAFT_DIR: "/var/lib/ferrogate/raft"
+
+  cmis3:
+    image: ${IMAGE:-ferrogate:latest}
+    container_name: fgfo-cmis3
+    hostname: cmis3
+    networks:
+      fg:
+        ipv4_address: 10.77.0.13
+    volumes:
+      - ${TLS_DIR:?set TLS_DIR to the dir holding cmis.crt + cmis.key}:/tls:ro
+    environment:
+      RUST_LOG: "info,hiqlite=warn"
+      CMIS_LISTEN: "0.0.0.0:8443"
+      CMIS_TLS_CERT: /tls/cmis.crt
+      CMIS_TLS_KEY: /tls/cmis.key
+      CMIS_NODE_ID: "3"
+      CMIS_CLUSTER_PEERS: "1=cmis1:9601,cmis1:9602;2=cmis2:9601,cmis2:9602;3=cmis3:9601,cmis3:9602"
+      CMIS_RAFT_LISTEN: "0.0.0.0"
+      CMIS_PEER_TLS: "1"
+      CMIS_RAFT_SECRET: "ferrogate-failover-raft-secret-1"
+      CMIS_API_SECRET: "ferrogate-failover-api-secret-01"
+      CMIS_RAFT_DIR: "/var/lib/ferrogate/raft"
+
+  probe:
+    image: ${PROBE_IMAGE:-ferrogate-failover-probe:latest}
+    container_name: fgfo-probe
+    networks: [fg]
+    dns: [10.77.0.2]
+    depends_on: [dns]
+    command: ["_cmis._tcp.fg.test", "${PIN:?set PIN to the SPKI pin hex}", "500"]
+
+networks:
+  fg:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24

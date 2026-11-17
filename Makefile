@@ -1,4 +1,4 @@
-.PHONY: help build test test-macos run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
+.PHONY: help build test test-failover test-macos run run-cmis run-mia fmt fmt-check lint check audit deny coverage clean \
         formal formal-tamarin formal-cryptoverif docs container-image container-image-push \
         docker-repo-setup docker-repo-show mia-install mia-uninstall \
         pkg pkg-deb pkg-rpm pkg-win pkg-macos pkg-tools pkg-sdk \
@@ -52,6 +52,10 @@ build: ## Build the entire workspace
 
 test: ## Run all workspace tests
 	cargo test --workspace --all-targets
+
+test-failover: ## Docker behaviour tests: SRV fail-over when CMIS nodes die/hang (slow; release/on demand only)
+	@command -v docker >/dev/null || { echo "ERROR: docker is required"; exit 1; }
+	cargo test -p mia --test docker_failover -- --ignored --nocapture --test-threads=1
 
 test-macos: ## Run the macOS Secure Enclave tests (needs a Mac with a Secure Enclave)
 	@[ "$(UNAME_S)" = "Darwin" ] || { echo "ERROR: test-macos must run on macOS (host is $(UNAME_S))"; exit 1; }
