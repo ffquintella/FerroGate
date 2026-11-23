@@ -66,7 +66,12 @@ jobs:
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        run: choco install protoc --no-progress -y
+        # Not `choco install`: the Chocolatey feed is flaky and a failed
+        # install left `protoc` off PATH (build.rs: "Could not find protoc").
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Lint (GUI build, warnings denied)
         run: cargo clippy -p mia-tray --features mia-tray/gui -p mia-status-proto --all-targets -- -D warnings

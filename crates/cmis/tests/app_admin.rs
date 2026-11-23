@@ -633,7 +633,14 @@ async fn revoke_update_and_freeze_are_audited_and_change_the_served_allowlist() 
     let before = app_events(&w.h).len();
 
     // Edit the expiry (and the note).
-    let new_expiry = w.h.clock_now() + 30 * 86_400;
+    // The admin plane runs on the manual test clock but request intake uses the
+    // wall clock, so anchor on whichever is later; otherwise the approval would
+    // already be expired for intake once real time passes `clock + 30 days`.
+    let wall_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let new_expiry = w.h.clock_now().max(wall_now) + 30 * 86_400;
     let updated =
         w.h.call(
             &w.token,
