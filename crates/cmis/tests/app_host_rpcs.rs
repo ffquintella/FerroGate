@@ -708,7 +708,9 @@ async fn sync_serves_signed_v2_bodies_with_monotonic_generations() {
         generation: g2,
         signed,
         ..
-    } = serve(&h.cmis, &a.uuid, g1, now_unix()).await.unwrap()
+    } = serve(&h.cmis, &a.uuid, g1, false, now_unix())
+        .await
+        .unwrap()
     else {
         panic!("expected a body");
     };
@@ -736,13 +738,16 @@ async fn sync_serves_signed_v2_bodies_with_monotonic_generations() {
 
     // Unchanged: not modified. Another host gets its own (empty) body.
     assert_eq!(
-        serve(&h.cmis, &a.uuid, g2, now_unix()).await.unwrap(),
+        serve(&h.cmis, &a.uuid, g2, false, now_unix())
+            .await
+            .unwrap(),
         Served::NotModified {
             generation: g2,
             not_after: doc.not_after
         }
     );
-    let Served::Body { signed: other, .. } = serve(&h.cmis, &b.uuid, 0, now_unix()).await.unwrap()
+    let Served::Body { signed: other, .. } =
+        serve(&h.cmis, &b.uuid, 0, false, now_unix()).await.unwrap()
     else {
         panic!("expected a body");
     };
@@ -768,7 +773,9 @@ async fn sync_serves_signed_v2_bodies_with_monotonic_generations() {
         generation: g3,
         signed,
         ..
-    } = serve(&h.cmis, &a.uuid, g2, now_unix()).await.unwrap()
+    } = serve(&h.cmis, &a.uuid, g2, false, now_unix())
+        .await
+        .unwrap()
     else {
         panic!("expected a body");
     };
@@ -878,7 +885,7 @@ async fn v2_body_projects_manual_auto_and_auto_update_approvals() {
         generation: g1,
         signed,
         ..
-    } = serve(&h.cmis, &a.uuid, 0, now_unix()).await.unwrap()
+    } = serve(&h.cmis, &a.uuid, 0, false, now_unix()).await.unwrap()
     else {
         panic!("expected a body");
     };
@@ -907,7 +914,9 @@ async fn v2_body_projects_manual_auto_and_auto_update_approvals() {
         generation: g2,
         signed,
         ..
-    } = serve(&h.cmis, &a.uuid, g1, now_unix()).await.unwrap()
+    } = serve(&h.cmis, &a.uuid, g1, false, now_unix())
+        .await
+        .unwrap()
     else {
         panic!("expected a new body after the auto-update");
     };
@@ -968,7 +977,7 @@ async fn legacy_mode_sync_serves_the_legacy_entries() {
         generation: g1,
         signed,
         ..
-    } = serve(&h.cmis, &a.uuid, 0, now_unix()).await.unwrap()
+    } = serve(&h.cmis, &a.uuid, 0, false, now_unix()).await.unwrap()
     else {
         panic!("expected a body");
     };
@@ -987,7 +996,9 @@ async fn legacy_mode_sync_serves_the_legacy_entries() {
         generation: g2,
         signed,
         ..
-    } = serve(&h.cmis, &a.uuid, g1, now_unix()).await.unwrap()
+    } = serve(&h.cmis, &a.uuid, g1, false, now_unix())
+        .await
+        .unwrap()
     else {
         panic!("expected a body");
     };

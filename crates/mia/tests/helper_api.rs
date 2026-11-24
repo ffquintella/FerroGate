@@ -798,3 +798,245 @@ async fn minted_token_verifies_against_published_jwks_key() {
     )
     .expect("child token must verify under the host JWKS key");
 }
+
+// --- trusted publishers (ADR-0006) ------------------------------------------
+
+mod trusted_publishers {
+    use super::*;
+    use ferro_codesign::testing::{FakeVerifier, TestChain};
+    use ferro_codesign::{cert_facts, PinKind, SignatureKind, SignatureVerifier, VerifyError};
+    use ferro_svid::allowlist_v2::{
+        sign_v2, AllowlistDocV2, TrustedPublisherV3, ALLOWLIST_V2_FORMAT, ALLOWLIST_V3_FORMAT,
+    };
+
+    const HOST: &str = "8d5e0000-0000-4000-8000-0000000000aa";
+    /// 2026-01-01: inside the test chain's validity window.
+    const NOW: i64 = 1_767_225_600;
+    const SIGNED_APP: [u8; 48] = [0x5A; 48];
+
+    fn publisher(chain: &TestChain, id: u8) -> TrustedPublisherV3 {
+        let leaf = cert_facts(&chain.leaf_der).unwrap();
+        TrustedPublisherV3 {
+            publisher_id: [id; 16],
+            kind: SignatureKind::Apple.code(),
+            anchor_sha256: cert_facts(&chain.ca_der).unwrap().cert_sha256,
+            pin_kind: PinKind::LeafSpkiSha256.code(),
+            pin: leaf.spki_sha256,
+            require_timestamp: true,
+            expires_at: None,
+        }
+    }
+
+    /// A signed format-3 body (format 2 when `publishers` is empty) that
+    /// admits `(APP_UID, APP_BIN)` only.
+    fn allowlist(publishers: Vec<TrustedPublisherV3>) -> Allowlist {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let doc = AllowlistDocV2 {
+            format: if publishers.is_empty() {
+                ALLOWLIST_V2_FORMAT
+            } else {
+                ALLOWLIST_V3_FORMAT
+            },
+            trust_domain: "ferrogate.test".into(),
+            host_uuid: HOST.into(),
+            generation: 1,
+            issued_at: NOW,
+            not_after: NOW + 3600,
+            entries: vec![ferro_svid::allowlist_v2::AllowEntryV2 {
+                approval_id: [1; 16],
+                bin_sha: hex::encode(APP_BIN),
+                uid: Some(APP_UID),
+                user_sid_hash: None,
+                path_hash: None,
+                expires_at: None,
+            }],
+            publishers,
+        };
+        let bytes = allowlist::encode(&sign_v2(&doc, &sk).unwrap()).unwrap();
+        Allowlist::load_v2(&bytes, &pk, NOW, 86_400).unwrap()
+    }
+
+    fn spawn(
+        bin: [u8; 48],
+        allowlist: Allowlist,
+        verifier: Arc<FakeVerifier>,
+    ) -> (
+        PathBuf,
+        mpsc::Receiver<AuditEvent>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let path = unique_socket_path();
+        let (audit_tx, audit_rx) = mpsc::channel(64);
+        let cfg = HelperServerConfig {
+            socket_path: path.clone(),
+            socket_mode: 0o660,
+            socket_gid: None,
+            own_socket_dir: false,
+            windows_group: None,
+            max_concurrent: 16,
+            read_timeout: Duration::from_millis(300),
+        };
+        let server = HelperServer::bind(
+            cfg,
+            FixedAuth(Ok(
+                id(APP_UID, bin).with_exe_path("/Applications/Signed.app/x")
+            )),
+            Some(minter()),
+            Some(allowlist),
+            fresh_crl_cache(NOW),
+            audit_tx,
+            fixed_clock(NOW),
+        )
+        .unwrap();
+        server.set_signature_verifier(verifier as Arc<dyn SignatureVerifier>);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            server
+                .serve_with_shutdown(async {
+                    let _ = stop_rx.await;
+                })
+                .await;
+        });
+        (path, audit_rx, stop_tx)
+    }
+
+    async fn only_event(rx: &mut mpsc::Receiver<AuditEvent>) -> AuditEvent {
+        let ev = rx.recv().await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one audit event per request"
+        );
+        ev
+    }
+
+    /// The approval path end to end: a caller no entry admits, signed by a
+    /// trusted publisher, gets a token with no request sent anywhere, and the
+    /// grant is audited with the publisher, the leaf thumbprint, the binary
+    /// hash and the caller.
+    #[tokio::test]
+    async fn a_trusted_publishers_binary_is_auto_approved_and_audited() {
+        let chain = TestChain::new("ACME Corp");
+        let fake = Arc::new(FakeVerifier::new(Ok(
+            chain.signature(SignatureKind::Apple, true)
+        )));
+        let (path, mut rx, _stop) = spawn(
+            SIGNED_APP,
+            allowlist(vec![publisher(&chain, 7)]),
+            Arc::clone(&fake),
+        );
+        let resp = round_trip(&path, &good_req()).await;
+        assert!(matches!(resp, HelperResp::Token(_)), "{resp:?}");
+        assert_eq!(fake.calls(), 1);
+        match only_event(&mut rx).await {
+            AuditEvent::LocalGrantByPublisher {
+                pid,
+                uid,
+                bin_sha,
+                publisher_id,
+                leaf_cert_sha256,
+                ..
+            } => {
+                assert_eq!((pid, uid), (4321, APP_UID));
+                assert_eq!(bin_sha.0, SIGNED_APP);
+                assert_eq!(publisher_id.0, [7; 16]);
+                assert_eq!(
+                    leaf_cert_sha256.0,
+                    cert_facts(&chain.leaf_der).unwrap().cert_sha256
+                );
+            }
+            other => panic!("expected LocalGrantByPublisher, got {other:?}"),
+        }
+    }
+
+    async fn assert_denied(path: &PathBuf, rx: &mut mpsc::Receiver<AuditEvent>) {
+        let resp = round_trip(path, &good_req()).await;
+        assert!(
+            matches!(
+                resp,
+                HelperResp::Error {
+                    code: ErrorCode::PermissionDenied,
+                    ..
+                }
+            ),
+            "{resp:?}"
+        );
+        match only_event(rx).await {
+            AuditEvent::LocalDenied { reason, .. } => assert_eq!(reason, "not-allowlisted"),
+            other => panic!("expected LocalDenied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_errors_fail_closed() {
+        let chain = TestChain::new("ACME Corp");
+        for e in [
+            VerifyError::Unsigned,
+            VerifyError::Untrusted,
+            VerifyError::Revoked,
+            VerifyError::ImageChanged,
+            VerifyError::Unsupported,
+        ] {
+            let fake = Arc::new(FakeVerifier::new(Err(e)));
+            let (path, mut rx, _stop) = spawn(
+                SIGNED_APP,
+                allowlist(vec![publisher(&chain, 7)]),
+                Arc::clone(&fake),
+            );
+            assert_denied(&path, &mut rx).await;
+            assert_eq!(fake.calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn another_publisher_or_a_missing_timestamp_is_denied() {
+        let trusted = TestChain::new("ACME Corp");
+        let other = TestChain::new("Evil Corp");
+        let fake = Arc::new(FakeVerifier::new(Ok(
+            other.signature(SignatureKind::Apple, true)
+        )));
+        let (path, mut rx, _stop) = spawn(
+            SIGNED_APP,
+            allowlist(vec![publisher(&trusted, 7)]),
+            Arc::clone(&fake),
+        );
+        assert_denied(&path, &mut rx).await;
+
+        let untimed = Arc::new(FakeVerifier::new(Ok(
+            trusted.signature(SignatureKind::Apple, false)
+        )));
+        let (path, mut rx, _stop) =
+            spawn(SIGNED_APP, allowlist(vec![publisher(&trusted, 7)]), untimed);
+        assert_denied(&path, &mut rx).await;
+    }
+
+    /// Without publishers nothing is verified: the old behaviour.
+    #[tokio::test]
+    async fn no_publishers_means_no_verification() {
+        let chain = TestChain::new("ACME Corp");
+        let fake = Arc::new(FakeVerifier::new(Ok(
+            chain.signature(SignatureKind::Apple, true)
+        )));
+        let (path, mut rx, _stop) = spawn(SIGNED_APP, allowlist(Vec::new()), Arc::clone(&fake));
+        assert_denied(&path, &mut rx).await;
+        assert_eq!(fake.calls(), 0);
+    }
+
+    /// An allowlisted caller is granted as before, without a verification.
+    #[tokio::test]
+    async fn an_allowlisted_caller_skips_the_publisher_check() {
+        let chain = TestChain::new("ACME Corp");
+        let fake = Arc::new(FakeVerifier::new(Err(VerifyError::Unsigned)));
+        let (path, mut rx, _stop) = spawn(
+            APP_BIN,
+            allowlist(vec![publisher(&chain, 7)]),
+            Arc::clone(&fake),
+        );
+        let resp = round_trip(&path, &good_req()).await;
+        assert!(matches!(resp, HelperResp::Token(_)), "{resp:?}");
+        assert!(matches!(
+            only_event(&mut rx).await,
+            AuditEvent::LocalGrant { .. }
+        ));
+        assert_eq!(fake.calls(), 0);
+    }
+}

@@ -89,6 +89,13 @@ impl<A: CallerAuth> HelperServer<A> {
         }
     }
 
+    /// Install the code-signature verifier the trusted publishers use
+    /// (ADR-0006), once, before serving. Without one, this platform's
+    /// verifier is used (none on Linux: publishers never admit there).
+    pub fn set_signature_verifier(&self, verifier: Arc<dyn ferro_codesign::SignatureVerifier>) {
+        self.shared.set_verifier(verifier);
+    }
+
     /// A handle to the observed-caller ledger, for the allowlist-propose task.
     #[must_use]
     pub fn ledger(&self) -> crate::helper::ledger::CallerLedger {

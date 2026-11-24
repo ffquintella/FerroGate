@@ -22,7 +22,7 @@
 //! approve, deny, edit, revoke, the lineage freeze and the single-step
 //! direct registration, all behind the same table and guard; and the
 //! allowlist migration ([`migration`]): the legacy import and the mode
-//! switch.
+//! switch. ADR-0006 adds the trusted publishers ([`publishers`]).
 
 pub(crate) mod codec;
 
@@ -36,6 +36,7 @@ pub mod keys;
 pub mod layer;
 pub mod migration;
 pub mod password;
+pub mod publishers;
 pub mod service;
 pub mod session;
 pub mod state;

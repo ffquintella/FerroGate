@@ -2574,6 +2574,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-codesign"
+version = "0.30.31"
+dependencies = [
+ "core-foundation 0.10.1",
+ "ferro-winauth",
+ "rcgen",
+ "security-framework",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "x509-parser",
+]
+
+[[package]]
 name = "ferro-crypto"
 version = "0.30.31"
 dependencies = [
@@ -2771,6 +2784,7 @@ dependencies = [
  "ferro-appid",
  "ferro-attest",
  "ferro-audit",
+ "ferro-codesign",
  "ferro-crypto",
  "ferro-proto",
  "ferro-raft",
@@ -2808,6 +2822,7 @@ dependencies = [
  "ferro-raft",
  "ferro-svid",
  "ferro-transport",
+ "ferrogate-admin-client",
  "hex",
  "inquire",
  "rcgen",
@@ -4743,6 +4758,7 @@ dependencies = [
  "ferro-attest",
  "ferro-audit",
  "ferro-child-verify",
+ "ferro-codesign",
  "ferro-crypto",
  "ferro-harden",
  "ferro-machineid",
@@ -4817,6 +4833,7 @@ dependencies = [
  "authenticator",
  "ciborium",
  "eframe",
+ "ferro-codesign",
  "ferro-machineid",
  "ferro-svid",
  "ferro-winauth",

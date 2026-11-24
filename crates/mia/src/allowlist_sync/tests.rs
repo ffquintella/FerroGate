@@ -193,6 +193,7 @@ fn body(
         issued_at: NOW,
         not_after: NOW + 86_400,
         entries,
+        publishers: Vec::new(),
     };
     encode(&sign_v2(&doc, sk).unwrap()).unwrap()
 }
@@ -244,7 +245,8 @@ async fn a_newer_body_is_applied_persisted_and_audited() {
         }
     );
     assert_eq!(r.cmis.last_doc().have_generation, 0);
-    assert_eq!(r.cmis.last_doc().accept_formats, vec![2]);
+    // Format 3 carries trusted publishers (ADR-0006).
+    assert_eq!(r.cmis.last_doc().accept_formats, vec![2, 3]);
     assert_eq!(r.sink.generations(), vec![Some(10)]);
     assert!(matches!(
         r.audit.try_recv().unwrap(),

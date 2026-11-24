@@ -3,7 +3,8 @@
 //! `mia-tray-admin` (F22). Entry point: [`client::AdminSession`] (sign-in and
 //! step-up with a TOTP code or a FIDO2 key, logout, `WhoAmI`), with token
 //! enrollment in [`enroll`], second-factor management in [`factors`], and
-//! request and approval administration in [`approvals`].
+//! request and approval administration in [`approvals`], and trusted
+//! publishers (ADR-0006) in [`publishers`].
 
 //! Secrets never implement `Debug`, `Display` or `Clone`, nothing here logs,
 //! and `unsafe` is forbidden.
@@ -20,6 +21,7 @@ pub mod error;
 pub mod factors;
 pub mod files;
 pub mod perm;
+pub mod publishers;
 pub mod secret;
 pub mod session;
 pub mod timefmt;

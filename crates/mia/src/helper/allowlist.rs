@@ -15,7 +15,8 @@
 //!   view of the host's approvals, with a generation and per-entry uid,
 //!   Windows SID, path and expiry constraints. Served by the authenticated
 //!   `SyncAllowlist` and kept current by [`crate::allowlist_sync`], which also
-//!   enforces the host binding and the generation (rollback) rules.
+//!   enforces the host binding and the generation (rollback) rules. Its
+//!   format 3 adds the fleet's trusted publishers (ADR-0006).
 //!
 //! The wire model ([`AllowlistDoc`], [`SignedAllowlist`], `sign`/`encode`) lives
 //! in `ferro-svid` so CMIS and the MIA share one definition; it is re-exported
@@ -79,6 +80,8 @@ struct V2Index {
     any_bin: Vec<Constraint>,
     /// The verified entries, for listing (`mia app list`).
     entries: Vec<AllowEntryV2>,
+    /// Trusted publishers (format 3, ADR-0006); empty for format 2.
+    publishers: Vec<ferro_codesign::PublisherRule>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +110,20 @@ pub struct Allowlist {
     issued_at: i64,
     not_after: i64,
     body: Body,
+}
+
+/// The enforced form of a signed trusted publisher; `None` for a code the
+/// body validation should already have refused.
+fn publisher_rule(p: &allowlist_v2::TrustedPublisherV3) -> Option<ferro_codesign::PublisherRule> {
+    Some(ferro_codesign::PublisherRule {
+        publisher_id: p.publisher_id,
+        kind: ferro_codesign::SignatureKind::from_code(p.kind)?,
+        anchor_sha256: p.anchor_sha256,
+        pin_kind: ferro_codesign::PinKind::from_code(p.pin_kind)?,
+        pin: p.pin,
+        require_timestamp: p.require_timestamp,
+        expires_at: p.expires_at,
+    })
 }
 
 /// A caller as the helper API authenticated it, for [`Allowlist::permits_caller`].
@@ -368,7 +385,16 @@ impl Allowlist {
 
     fn from_v2(doc: AllowlistDocV2, now: i64, max_age_secs: i64) -> Result<Self, AllowlistError> {
         check_window(doc.issued_at, doc.not_after, now, max_age_secs)?;
-        let entries_digest = allowlist_v2::entries_digest(&doc.entries).map_err(v2_error)?;
+        // The digest CMIS records per generation: the v2 entries digest when
+        // there are no publishers, else it also covers them (ADR-0006).
+        let entries_digest =
+            allowlist_v2::compiled_digest(&doc.entries, &doc.publishers).map_err(v2_error)?;
+        let publishers = doc
+            .publishers
+            .iter()
+            .map(publisher_rule)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(AllowlistError::Cbor("trusted publisher".into()))?;
         let mut by_sha: HashMap<[u8; 48], Vec<Constraint>> =
             HashMap::with_capacity(doc.entries.len());
         let mut any_bin = Vec::new();
@@ -396,6 +422,7 @@ impl Allowlist {
                 by_sha,
                 any_bin,
                 entries: doc.entries,
+                publishers,
             }),
         })
     }
@@ -515,6 +542,17 @@ impl Allowlist {
         match &self.body {
             Body::V1 { .. } => None,
             Body::V2(ix) => Some(ix.entries_digest),
+        }
+    }
+
+    /// The trusted publishers in force at `now` (ADR-0006): none for a v1 or
+    /// format-2 body, and none once the body is past `not_after` (fail
+    /// closed, like the entries).
+    #[must_use]
+    pub fn publishers_at(&self, now: i64) -> &[ferro_codesign::PublisherRule] {
+        match &self.body {
+            Body::V2(ix) if now <= self.not_after => &ix.publishers,
+            _ => &[],
         }
     }
 
@@ -1328,8 +1366,49 @@ mod tests {
             issued_at: now,
             not_after: now + 3600,
             entries,
+            publishers: Vec::new(),
         };
         encode(&allowlist_v2::sign_v2(&doc, sk).unwrap()).unwrap()
+    }
+
+    /// A format-3 body carries its trusted publishers until `not_after`, and
+    /// its digest covers them (ADR-0006).
+    #[test]
+    fn format_3_publishers_are_in_force_until_the_hard_expiry() {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let now = 1_000;
+        let publisher = allowlist_v2::TrustedPublisherV3 {
+            publisher_id: [3; 16],
+            kind: 2,
+            anchor_sha256: [4; 32],
+            pin_kind: 1,
+            pin: [5; 32],
+            require_timestamp: false,
+            expires_at: None,
+        };
+        let doc = AllowlistDocV2 {
+            format: allowlist_v2::ALLOWLIST_V3_FORMAT,
+            trust_domain: "ferrogate.test".into(),
+            host_uuid: HOST.into(),
+            generation: 7,
+            issued_at: now,
+            not_after: now + 3600,
+            entries: Vec::new(),
+            publishers: vec![publisher.clone()],
+        };
+        let bytes = encode(&allowlist_v2::sign_v2(&doc, &sk).unwrap()).unwrap();
+        let al = Allowlist::load_v2(&bytes, &pk, now, 86_400).unwrap();
+        let rules = al.publishers_at(now);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].publisher_id, [3; 16]);
+        assert_eq!(rules[0].kind, ferro_codesign::SignatureKind::Apple);
+        assert_eq!(al.publishers_at(now + 3601).len(), 0, "past not_after");
+        assert_eq!(
+            al.entries_digest(),
+            Some(allowlist_v2::compiled_digest(&[], &[publisher]).unwrap())
+        );
+        let plain = Allowlist::load_v2(&v2_bytes(Vec::new(), now, &sk), &pk, now, 86_400).unwrap();
+        assert_eq!(plain.publishers_at(now).len(), 0);
     }
 
     fn path_hash_of(path: &str) -> [u8; 32] {

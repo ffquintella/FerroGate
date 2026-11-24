@@ -24,6 +24,9 @@ use ferrogate_admin_client::approvals::register::{
 use ferrogate_admin_client::client::{LoginInfo, Methods};
 use ferrogate_admin_client::error::{ClientError, Code};
 use ferrogate_admin_client::factors::{AddNonce, AddOffer, FactorInfo, FactorMethod};
+use ferrogate_admin_client::perm;
+use ferrogate_admin_client::publishers::inspect::Candidate;
+use ferrogate_admin_client::publishers::proto::{AddTrustedPublisherRequest, TrustedPublisherInfo};
 use ferrogate_admin_client::webauthn::AuthenticatorError;
 use serde::Serialize;
 
@@ -31,6 +34,9 @@ use super::enroll::{EnrollField, EnrollStage, EnrollView, EnrollWizard};
 use super::factors::{FactorField, FactorsPanel, FactorsView};
 use super::keyprompt::{KeyAsk, KeyPrompt, PinEntry};
 use super::login::{Field, LoginModel, LoginView, Stage, Submission};
+use super::publishers::{
+    InspectFailure, InspectJob, PubAction, PubEvent, PublishersPanel, PublishersView,
+};
 use super::secret::Secret;
 use super::seed::SeedDisplay;
 use super::session::{Cmd, FactorChoice, Reply};
@@ -93,6 +99,13 @@ pub enum Busy {
     Views,
     /// Adding an application (`key`: waiting for a key touch first).
     Register {
+        /// A security key was chosen.
+        key: bool,
+    },
+    /// Loading trusted publishers, or removing one.
+    Publishers,
+    /// Adding a trusted publisher (`key`: waiting for a key touch first).
+    AddPublisher {
         /// A security key was chosen.
         key: bool,
     },
@@ -181,6 +194,9 @@ pub struct SessionView {
     pub methods: Methods,
     /// The FIDO2 policy holds this session to registering a key.
     pub restricted: bool,
+    /// "Trusted publishers" is offered: the account may list them, or its
+    /// permissions are not known yet (the server decides either way).
+    pub can_list_publishers: bool,
 }
 
 /// The step-up prompt.
@@ -194,7 +210,8 @@ pub struct StepUpView {
     pub can_submit_code: bool,
     /// Whether a key can be used.
     pub can_submit_key: bool,
-    /// The fresh second factor of an "add application", not a step-up.
+    /// The fresh second factor of an add (an application or a trusted
+    /// publisher), not a step-up.
     pub for_add: bool,
 }
 
@@ -234,6 +251,8 @@ pub struct FlowView {
     pub factors: Option<FactorsView>,
     /// The request and approval views, when open (signed in).
     pub views: Option<ViewsView>,
+    /// The trusted publishers, when open (signed in).
+    pub publishers: Option<PublishersView>,
 }
 
 struct Session {
@@ -243,6 +262,8 @@ struct Session {
     restricted: bool,
     /// Whether sign-in offered a code (the policy may forbid one).
     signin_totp: bool,
+    /// What `WhoAmI` said the account may do (once asked).
+    permissions: Option<Vec<String>>,
 }
 
 struct StepUpForm {
@@ -250,6 +271,8 @@ struct StepUpForm {
     error: Option<Problem>,
     /// The add this factor proves (sent with it, never a step-up).
     register: Option<Box<AdminRegisterApplicationRequest>>,
+    /// The trusted-publisher add this factor proves (same rule).
+    publisher: Option<Box<AddTrustedPublisherRequest>>,
 }
 
 /// What goes on after a successful step-up.
@@ -259,6 +282,9 @@ enum AfterStepUp {
     AddFactor(FactorMethod),
     /// The decision that asked for it, once more with the same key.
     Resend,
+    /// The trusted-publisher removal that asked for it, once more with the
+    /// same key.
+    ResendRemoval,
 }
 
 /// The window's state.
@@ -278,6 +304,7 @@ pub struct Flow {
     enroll: Option<EnrollWizard>,
     factors: Option<FactorsPanel>,
     views: Option<AdminViews>,
+    publishers: Option<PublishersPanel>,
     /// The factor being added (resent after a required step-up).
     adding: Option<FactorMethod>,
     after_step_up: Option<AfterStepUp>,
@@ -305,6 +332,21 @@ pub struct Flow {
 fn idle_limit(server_secs: i64) -> Duration {
     let secs = server_secs.clamp(SERVER_IDLE_BOUNDS.0, SERVER_IDLE_BOUNDS.1);
     Duration::from_secs(u64::try_from(secs).unwrap_or(900)).saturating_sub(IDLE_MARGIN)
+}
+
+/// Whether a failed add leaves its second-factor prompt open for a retry
+/// with the same request: nothing was changed (a wrong or missing factor,
+/// a throttle, or no answer at all).
+fn keeps_add_prompt(e: &ClientError) -> bool {
+    match e {
+        ClientError::Rejected
+        | ClientError::Throttled(_)
+        | ClientError::FactorNotOffered
+        | ClientError::Authenticator(_)
+        | ClientError::Connect(_) => true,
+        ClientError::Other(e) => matches!(e.code, Code::DeadlineExceeded | Code::Unavailable),
+        ClientError::SessionEnded => false,
+    }
 }
 
 fn problem(e: &ClientError) -> Problem {
@@ -358,6 +400,7 @@ impl Flow {
             enroll: None,
             factors: None,
             views: None,
+            publishers: None,
             adding: None,
             after_step_up: None,
             offered: Methods::default(),
@@ -489,6 +532,8 @@ impl Flow {
                 p.type_text(text);
             } else if let Some(v) = &mut self.views {
                 v.type_text(text);
+            } else if let Some(p) = &mut self.publishers {
+                p.type_text(text);
             }
         } else if let Some(w) = &mut self.enroll {
             w.type_text(text);
@@ -518,6 +563,8 @@ impl Flow {
                 p.backspace();
             } else if let Some(v) = &mut self.views {
                 v.backspace();
+            } else if let Some(p) = &mut self.publishers {
+                p.backspace();
             }
         } else if let Some(w) = &mut self.enroll {
             w.backspace();
@@ -585,6 +632,8 @@ impl Flow {
                 p.cancel();
             } else if let Some(v) = &mut self.views {
                 v.escape();
+            } else if let Some(p) = &mut self.publishers {
+                p.back();
             }
         } else if let Some(w) = &mut self.enroll {
             w.escape();
@@ -618,6 +667,13 @@ impl Flow {
                 let cmd = self.views.as_mut().and_then(|v| v.enter(crate::unix_now()));
                 if let Some(cmd) = cmd {
                     return self.send(cmd, Busy::Views);
+                }
+                let cmd = self
+                    .publishers
+                    .as_mut()
+                    .and_then(|p| p.enter(crate::unix_now()));
+                if let Some(cmd) = cmd {
+                    return self.send(cmd, Busy::Publishers);
                 }
             }
             return Vec::new();
@@ -749,6 +805,7 @@ impl Flow {
                 code: Secret::new(),
                 error: None,
                 register: None,
+                publisher: None,
             });
             self.notice = None;
         }
@@ -761,6 +818,18 @@ impl Flow {
             code: Secret::new(),
             error: None,
             register: Some(req),
+            publisher: None,
+        });
+        self.notice = None;
+    }
+
+    /// [`Flow::open_add_proof`] for a trusted publisher's add.
+    fn open_publisher_proof(&mut self, req: Box<AddTrustedPublisherRequest>) {
+        self.step_up = Some(StepUpForm {
+            code: Secret::new(),
+            error: None,
+            register: None,
+            publisher: Some(req),
         });
         self.notice = None;
     }
@@ -801,6 +870,14 @@ impl Flow {
             let req = req.clone();
             return self.send(Cmd::Register { req, proof: factor }, Busy::Register { key });
         }
+        if let Some(req) = &form.publisher {
+            // The same request each time: a retry reuses its key.
+            let req = req.clone();
+            return self.send(
+                Cmd::AddPublisher { req, proof: factor },
+                Busy::AddPublisher { key },
+            );
+        }
         self.send(Cmd::StepUp { factor }, Busy::StepUp { key })
     }
 
@@ -814,11 +891,17 @@ impl Flow {
     /// The step-up prompt closes unconfirmed (its code is wiped): what
     /// waited for it is dropped, unsent.
     fn step_up_abandoned(&mut self) {
-        let add = self
-            .step_up
-            .take()
-            .is_some_and(|form| form.register.is_some());
-        if let Some(v) = &mut self.views {
+        let (add, publisher) = self.step_up.take().map_or((false, false), |f| {
+            (f.register.is_some(), f.publisher.is_some())
+        });
+        if let Some(p) = &mut self.publishers {
+            if publisher {
+                p.add_cancelled();
+            }
+            if self.after_step_up.take() == Some(AfterStepUp::ResendRemoval) {
+                p.drop_pending();
+            }
+        } else if let Some(v) = &mut self.views {
             if add {
                 v.register_cancelled();
             }
@@ -903,10 +986,16 @@ impl Flow {
         if self.busy.is_some() || self.step_up.is_some() || s.restricted {
             return Vec::new();
         }
-        if self.views.as_ref().is_some_and(AdminViews::has_pending) {
+        if self.views.as_ref().is_some_and(AdminViews::has_pending)
+            || self
+                .publishers
+                .as_ref()
+                .is_some_and(PublishersPanel::has_pending)
+        {
             return Vec::new();
         }
         self.views = None;
+        self.publishers = None;
         self.factors = Some(FactorsPanel::new(false, s.info.methods, self.key_available));
         self.notice = None;
         self.send(Cmd::ListFactors, Busy::Factors { key: false })
@@ -921,7 +1010,15 @@ impl Flow {
         if self.busy.is_some() || self.step_up.is_some() || s.restricted {
             return Vec::new();
         }
+        if self
+            .publishers
+            .as_ref()
+            .is_some_and(PublishersPanel::has_pending)
+        {
+            return Vec::new();
+        }
         self.factors = None;
+        self.publishers = None;
         self.notice = None;
         let views = self.views.get_or_insert_with(|| AdminViews::new(tab));
         let cmd = if views.knows_permissions() {
@@ -966,6 +1063,117 @@ impl Flow {
                 self.send(cmd, Busy::Views)
             }
             None => Vec::new(),
+        }
+    }
+
+    /// "Trusted publishers" (signed in): open the panel. The session's
+    /// permissions are read first unless already known (they gate the add
+    /// and remove buttons); an account known not to list publishers gets
+    /// nothing.
+    pub fn open_publishers(&mut self) -> Vec<Effect> {
+        let Some(s) = &self.session else {
+            return Vec::new();
+        };
+        if self.busy.is_some() || self.step_up.is_some() || s.restricted {
+            return Vec::new();
+        }
+        if self.views.as_ref().is_some_and(AdminViews::has_pending) {
+            return Vec::new();
+        }
+        let known = s.permissions.clone();
+        if known
+            .as_ref()
+            .is_some_and(|p| !p.iter().any(|x| x == perm::PUBLISHER_LIST))
+        {
+            return Vec::new();
+        }
+        self.factors = None;
+        self.views = None;
+        self.notice = None;
+        let mut panel = PublishersPanel::new(known.clone());
+        let cmd = if known.is_some() {
+            panel.reload()
+        } else {
+            Cmd::Permissions
+        };
+        self.publishers = Some(panel);
+        self.send(cmd, Busy::Publishers)
+    }
+
+    /// Close the trusted publishers (every record shown is dropped); not
+    /// while an add or a removal waits.
+    pub fn close_publishers(&mut self) {
+        if self.busy.is_none()
+            && self.step_up.is_none()
+            && !self
+                .publishers
+                .as_ref()
+                .is_some_and(PublishersPanel::has_pending)
+        {
+            self.publishers = None;
+        }
+    }
+
+    /// A button on the trusted publishers. "Confirm" on the add's review
+    /// page asks for a fresh second factor (whatever the step-up window);
+    /// nothing is sent before that factor is given.
+    pub fn publishers_action(&mut self, action: PubAction) -> Vec<Effect> {
+        if self.busy.is_some() || self.session.is_none() || self.step_up.is_some() {
+            return Vec::new();
+        }
+        let now = crate::unix_now();
+        if action == PubAction::Confirm {
+            if let Some(req) = self.publishers.as_mut().and_then(|p| p.confirm(now)) {
+                self.open_publisher_proof(req);
+            }
+            return Vec::new();
+        }
+        let cmd = self.publishers.as_mut().and_then(|p| p.act(action, now));
+        match cmd {
+            Some(cmd) => {
+                self.notice = None;
+                self.send(cmd, Busy::Publishers)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// An executable was chosen for a new publisher: the read to run off
+    /// the UI thread, then [`Flow::publisher_inspected`].
+    pub fn publisher_executable(&mut self, path: std::path::PathBuf) -> Option<InspectJob> {
+        if self.busy.is_some() || self.step_up.is_some() {
+            return None;
+        }
+        self.publishers.as_mut()?.start_executable(path)
+    }
+
+    /// The signing certificate file was chosen.
+    pub fn publisher_leaf(&mut self, path: std::path::PathBuf) {
+        if let Some(p) = &mut self.publishers {
+            p.set_leaf(path);
+        }
+    }
+
+    /// The CA certificate file was chosen.
+    pub fn publisher_anchor(&mut self, path: std::path::PathBuf) {
+        if let Some(p) = &mut self.publishers {
+            p.set_anchor(path);
+        }
+    }
+
+    /// Both certificate files are chosen: the read to run off the UI
+    /// thread, then [`Flow::publisher_inspected`].
+    pub fn publisher_certificates(&mut self) -> Option<InspectJob> {
+        if self.busy.is_some() || self.step_up.is_some() {
+            return None;
+        }
+        self.publishers.as_mut()?.start_certificates()
+    }
+
+    /// A local read finished (dropped when the panel is gone or moved on).
+    pub fn publisher_inspected(&mut self, result: Result<Candidate, InspectFailure>) {
+        if let (Some(_), Some(p)) = (&self.session, &mut self.publishers) {
+            p.inspected(result);
         }
     }
 
@@ -1053,6 +1261,7 @@ impl Flow {
         self.enroll = None;
         self.factors = None;
         self.views = None;
+        self.publishers = None;
         self.adding = None;
         self.after_step_up = None;
         self.busy = None;
@@ -1156,6 +1365,16 @@ impl Flow {
             Reply::FactorAdded(result) => self.factor_changed_reply(result.map(|_| ()), true, now),
             Reply::FactorRemoved(result) => self.factor_changed_reply(result, false, now),
             Reply::Registered(result) => self.registered_reply(result, now),
+            Reply::PublisherAdded(result) => self.publisher_added_reply(result, now),
+            Reply::Permissions(result) => self.permissions_reply(result),
+            Reply::Publishers(result) => {
+                let event = self.publishers.as_mut().map(|p| p.on_listed(result));
+                self.publishers_event(event)
+            }
+            Reply::PublisherRemoved(result) => {
+                let event = self.publishers.as_mut().map(|p| p.on_removed(result));
+                self.publishers_event(event)
+            }
             other => self.views_reply(other),
         }
     }
@@ -1168,34 +1387,14 @@ impl Flow {
         result: Result<Box<AdminRegisterApplicationResponse>, ClientError>,
         now: Instant,
     ) -> Vec<Effect> {
-        let retry = match &result {
-            Err(ClientError::SessionEnded) => return self.end(Some(Notice::SessionEnded)),
-            Err(
-                ClientError::Rejected
-                | ClientError::Throttled(_)
-                | ClientError::FactorNotOffered
-                | ClientError::Authenticator(_)
-                | ClientError::Connect(_),
-            ) => true,
-            Err(ClientError::Other(e)) => {
-                matches!(e.code, Code::DeadlineExceeded | Code::Unavailable)
+        if let Err(e) = &result {
+            if matches!(e, ClientError::SessionEnded) {
+                return self.end(Some(Notice::SessionEnded));
             }
-            Ok(_) => false,
-        };
-        if retry {
-            if let Err(e) = &result {
-                if let ClientError::Throttled(_) = e {
-                    self.fail(e, now);
-                }
-                if let Some(form) = &mut self.step_up {
-                    form.code.clear();
-                    form.error = Some(match e {
-                        ClientError::Other(_) => Problem::Unreachable,
-                        other => problem(other),
-                    });
-                }
+            if keeps_add_prompt(e) {
+                self.add_prompt_failed(e, now);
+                return Vec::new();
             }
-            return Vec::new();
         }
         self.step_up = None;
         let event = match &mut self.views {
@@ -1203,6 +1402,76 @@ impl Flow {
             None => ViewsEvent::None,
         };
         self.views_event(event)
+    }
+
+    /// A refused add keeps its prompt: the code is wiped and the failure
+    /// shown, by kind.
+    fn add_prompt_failed(&mut self, e: &ClientError, now: Instant) {
+        if let ClientError::Throttled(_) = e {
+            self.fail(e, now);
+        }
+        if let Some(form) = &mut self.step_up {
+            form.code.clear();
+            form.error = Some(match e {
+                ClientError::Other(_) => Problem::Unreachable,
+                other => problem(other),
+            });
+        }
+    }
+
+    /// A trusted publisher add's answer, with the same retry rule as an
+    /// application add: a wrong or missing factor, or no answer at all,
+    /// keeps the prompt with the same request (a retry reuses its key).
+    fn publisher_added_reply(
+        &mut self,
+        result: Result<Option<TrustedPublisherInfo>, ClientError>,
+        now: Instant,
+    ) -> Vec<Effect> {
+        if let Err(e) = &result {
+            if matches!(e, ClientError::SessionEnded) {
+                return self.end(Some(Notice::SessionEnded));
+            }
+            if keeps_add_prompt(e) {
+                self.add_prompt_failed(e, now);
+                return Vec::new();
+            }
+        }
+        self.step_up = None;
+        let event = self.publishers.as_mut().map(|p| p.on_added(result));
+        self.publishers_event(event)
+    }
+
+    /// `WhoAmI`'s answer: remembered for the session, then given to the
+    /// panel that asked (the publishers, else the request views).
+    fn permissions_reply(&mut self, result: Result<Vec<String>, ClientError>) -> Vec<Effect> {
+        if let (Ok(p), Some(s)) = (&result, &mut self.session) {
+            s.permissions = Some(p.clone());
+        }
+        if self.publishers.is_some() {
+            let event = self.publishers.as_mut().map(|p| p.on_permissions(result));
+            return self.publishers_event(event);
+        }
+        self.views_reply(Reply::Permissions(result))
+    }
+
+    /// Carry out what the publishers asked for after a reply.
+    fn publishers_event(&mut self, event: Option<PubEvent>) -> Vec<Effect> {
+        match event {
+            None | Some(PubEvent::None) => Vec::new(),
+            Some(PubEvent::Send(cmd)) => self.send(cmd, Busy::Publishers),
+            Some(PubEvent::SessionEnded) => self.end(Some(Notice::SessionEnded)),
+            Some(PubEvent::StepUp) => {
+                // Confirm first, then the same removal goes once more.
+                self.open_step_up();
+                if self.step_up.is_some() {
+                    self.after_step_up = Some(AfterStepUp::ResendRemoval);
+                    self.notice = Some(Notice::StepUpFirst);
+                } else if let Some(p) = &mut self.publishers {
+                    p.drop_pending();
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// A reply for the request and approval views.
@@ -1412,6 +1681,7 @@ impl Flow {
             info,
             step_up_until: None,
             restricted,
+            permissions: None,
         });
         Vec::new()
     }
@@ -1431,6 +1701,13 @@ impl Flow {
                     Some(AfterStepUp::Resend) => {
                         match self.views.as_mut().and_then(AdminViews::resend) {
                             Some(cmd) => self.send(cmd, Busy::Views),
+                            None => Vec::new(),
+                        }
+                    }
+                    // The trusted-publisher removal, likewise.
+                    Some(AfterStepUp::ResendRemoval) => {
+                        match self.publishers.as_mut().and_then(PublishersPanel::resend) {
+                            Some(cmd) => self.send(cmd, Busy::Publishers),
                             None => Vec::new(),
                         }
                     }
@@ -1479,6 +1756,10 @@ impl Flow {
             step_up_until: s.step_up_until,
             methods: s.info.methods,
             restricted: s.restricted,
+            can_list_publishers: s
+                .permissions
+                .as_ref()
+                .is_none_or(|p| p.iter().any(|x| x == perm::PUBLISHER_LIST)),
         });
         let step_up = match (&self.step_up, &self.session) {
             (Some(form), Some(s)) => Some(StepUpView {
@@ -1486,7 +1767,7 @@ impl Flow {
                 error: form.error,
                 can_submit_code: s.info.methods.totp && form.code.is_totp_code(),
                 can_submit_key: s.info.methods.security_key && self.key_available,
-                for_add: form.register.is_some(),
+                for_add: form.register.is_some() || form.publisher.is_some(),
             }),
             _ => None,
         };
@@ -1524,6 +1805,11 @@ impl Flow {
                 .as_ref()
                 .filter(|_| signed_in)
                 .map(|v| v.view(crate::unix_now())),
+            publishers: self
+                .publishers
+                .as_ref()
+                .filter(|_| signed_in)
+                .map(|p| p.view(crate::unix_now())),
         }
     }
 }
@@ -2831,5 +3117,276 @@ mod tests {
         // Its late answer shows nothing.
         let late = f.on_reply(Reply::Registered(Ok(Box::default())), later);
         assert!(late.is_empty() && f.view(later).views.is_none());
+    }
+    // ---- trusted publishers (ADR-0006) -----------------------------------
+
+    use crate::admin::publishers::{FormChoice, Outcome as PubOutcome, Screen as PubScreen};
+    use ferrogate_admin_client::publishers::inspect::inspect_certificates;
+    use ferrogate_admin_client::publishers::proto::TrustedPublisherInfo;
+    use ferrogate_admin_client::publishers::SignatureKind;
+
+    const PUB_ID: &str = "0190f0aa-0000-7000-8000-00000000beef";
+    const LIST_AND_MANAGE: [&str; 2] = [perm::PUBLISHER_LIST, perm::PUBLISHER_MANAGE];
+
+    fn publisher(state: u32) -> TrustedPublisherInfo {
+        TrustedPublisherInfo {
+            publisher_id: PUB_ID.into(),
+            label: "ACME".into(),
+            subject: "CN=ACME".into(),
+            kind: 2,
+            pin_kind: 2,
+            pin: vec![7; 32],
+            state,
+            ..TrustedPublisherInfo::default()
+        }
+    }
+
+    /// Signed in, the publishers open and listed, with `permissions`.
+    fn on_the_publishers(now: Instant, permissions: &[&str]) -> Flow {
+        let mut f = signed_in(now, BOTH, 900);
+        assert!(f.view(now).session.unwrap().can_list_publishers);
+        let Cmd::Permissions = cmd(f.open_publishers()) else {
+            panic!("the permissions are read first");
+        };
+        assert_eq!(f.view(now).busy, Some(Busy::Publishers));
+        let perms = permissions.iter().map(|p| (*p).to_string()).collect();
+        let Cmd::ListPublishers {
+            include_removed: false,
+        } = cmd(f.on_reply(Reply::Permissions(Ok(perms)), now))
+        else {
+            panic!("then the list");
+        };
+        let none = f.on_reply(Reply::Publishers(Ok(vec![publisher(1)])), now);
+        assert!(none.is_empty());
+        assert_eq!(f.view(now).publishers.unwrap().rows.len(), 1);
+        f
+    }
+
+    /// The add, up to the review page with a label typed.
+    fn publisher_review(now: Instant) -> Flow {
+        let mut f = on_the_publishers(now, &LIST_AND_MANAGE);
+        assert!(f.publishers_action(PubAction::StartAdd).is_empty());
+        let job = f.publisher_executable("/opt/tool".into()).expect("a read");
+        assert!(matches!(job, InspectJob::Executable(_)));
+        let chain = ferro_codesign::testing::TestChain::new("ACME Corp");
+        let c = inspect_certificates(SignatureKind::Apple, &chain.leaf_der, &chain.ca_der);
+        f.publisher_inspected(Ok(c.unwrap()));
+        f.type_text("ACME signing");
+        assert!(f.publishers_action(PubAction::Review).is_empty());
+        assert_eq!(f.view(now).publishers.unwrap().screen, PubScreen::Review);
+        f
+    }
+
+    #[test]
+    fn a_publisher_add_needs_the_review_and_a_fresh_factor_and_retries_with_its_key() {
+        let now = Instant::now();
+        let mut f = publisher_review(now);
+        // Confirm sends nothing: it asks for the fresh factor first.
+        assert!(f.publishers_action(PubAction::Confirm).is_empty());
+        let v = f.view(now);
+        assert!(v.step_up.expect("the factor prompt").for_add);
+        assert!(v.publishers.unwrap().pending && v.busy.is_none());
+        assert!(f.open_factors().is_empty() && f.open_views(Tab::Requests).is_empty());
+        f.type_text("654321");
+        clean(&f, now);
+        let Cmd::AddPublisher {
+            req,
+            proof: FactorChoice::Code(code),
+        } = cmd(f.enter())
+        else {
+            panic!("the add with its code");
+        };
+        assert_eq!(
+            (code.expose(), req.label.as_str()),
+            ("654321", "ACME signing")
+        );
+        assert!(req.proof.is_none(), "the worker adds the proof");
+        assert_eq!(f.view(now).busy, Some(Busy::AddPublisher { key: false }));
+        let key = req.idempotency_key.clone();
+        // A wrong code: nothing changed, the prompt asks again.
+        assert!(f
+            .on_reply(Reply::PublisherAdded(Err(ClientError::Rejected)), now)
+            .is_empty());
+        let prompt = f.view(now).step_up.expect("asked again");
+        assert_eq!(
+            (prompt.error, prompt.code_len),
+            (Some(Problem::Rejected), 0)
+        );
+        f.type_text(CODE);
+        let Cmd::AddPublisher { req: again, .. } = cmd(f.enter()) else {
+            panic!("the retry");
+        };
+        assert_eq!(again.idempotency_key, key, "the retry reuses the key");
+        let Cmd::ListPublishers { .. } =
+            cmd(f.on_reply(Reply::PublisherAdded(Ok(Some(publisher(1)))), now))
+        else {
+            panic!("the list is reloaded");
+        };
+        let v = f.view(now);
+        assert!(v.step_up.is_none());
+        let p = v.publishers.unwrap();
+        assert_eq!(p.screen, PubScreen::List);
+        assert_eq!(
+            p.outcome,
+            Some(PubOutcome::Added(Some("P-0000BEEF".into())))
+        );
+    }
+
+    #[test]
+    fn cancelling_the_factor_or_any_page_of_the_add_sends_nothing() {
+        let now = Instant::now();
+        let mut f = publisher_review(now);
+        assert!(f.publishers_action(PubAction::Confirm).is_empty());
+        f.type_text("12");
+        f.escape();
+        let v = f.view(now);
+        assert!(v.step_up.is_none());
+        let p = v.publishers.unwrap();
+        assert_eq!(p.outcome, Some(PubOutcome::NotSent));
+        assert!(!p.pending && p.screen == PubScreen::Review);
+        // The button cancels the prompt the same way.
+        assert!(f.publishers_action(PubAction::Confirm).is_empty());
+        f.cancel_step_up();
+        assert!(f.view(now).step_up.is_none());
+        // Escape walks back page by page; no command ever goes.
+        for want in [PubScreen::Form, PubScreen::Source, PubScreen::List] {
+            f.escape();
+            assert_eq!(f.view(now).publishers.unwrap().screen, want);
+        }
+        assert!(f.publishers_action(PubAction::Review).is_empty());
+        assert_eq!(f.view(now).busy, None);
+        // A refusal keeps the review and sends nothing more.
+        let mut f = publisher_review(now);
+        assert!(f.publishers_action(PubAction::Confirm).is_empty());
+        f.type_text(CODE);
+        let _ = cmd(f.enter());
+        let refused = ClientError::Other(RpcError::local(Code::PermissionDenied, "denied"));
+        assert!(f
+            .on_reply(Reply::PublisherAdded(Err(refused)), now)
+            .is_empty());
+        let v = f.view(now);
+        assert!(v.step_up.is_none() && v.busy.is_none());
+        let p = v.publishers.unwrap();
+        assert_eq!(p.screen, PubScreen::Review);
+        assert!(matches!(p.outcome, Some(PubOutcome::Refused(_))));
+    }
+
+    #[test]
+    fn a_form_with_a_problem_cannot_reach_the_review_or_the_factor() {
+        let now = Instant::now();
+        let mut f = on_the_publishers(now, &LIST_AND_MANAGE);
+        let _ = f.publishers_action(PubAction::StartAdd);
+        let _ = f.publisher_executable("/opt/tool".into());
+        let chain = ferro_codesign::testing::TestChain::new("ACME Corp");
+        let c = inspect_certificates(SignatureKind::Apple, &chain.leaf_der, &chain.ca_der);
+        f.publisher_inspected(Ok(c.unwrap()));
+        f.publishers_action(PubAction::Choose(FormChoice::Timestamp(false)));
+        // No label: the problem is shown and Review and Enter stay on the form.
+        let p = f.view(now).publishers.unwrap();
+        assert_eq!(p.form.unwrap().problems.len(), 1);
+        assert!(f.publishers_action(PubAction::Review).is_empty());
+        assert!(f.enter().is_empty());
+        assert!(f.publishers_action(PubAction::Confirm).is_empty());
+        let v = f.view(now);
+        assert_eq!(v.publishers.unwrap().screen, PubScreen::Form);
+        assert!(v.step_up.is_none() && v.busy.is_none());
+    }
+
+    #[test]
+    fn a_removal_needs_the_short_id_steps_up_and_resends_the_same_request() {
+        let now = Instant::now();
+        let mut f = on_the_publishers(now, &LIST_AND_MANAGE);
+        assert!(f.publishers_action(PubAction::StartRemove(0)).is_empty());
+        f.type_text("P-0000BEEE");
+        assert!(f.enter().is_empty(), "a near miss sends nothing");
+        f.backspace();
+        f.type_text("F");
+        let Cmd::RemovePublisher(first) = cmd(f.enter()) else {
+            panic!("the removal");
+        };
+        assert_eq!(f.view(now).busy, Some(Busy::Publishers));
+        // The server wants a step-up: confirm first, then the same request.
+        assert!(f
+            .on_reply(Reply::PublisherRemoved(Err(step_up_required())), now)
+            .is_empty());
+        let v = f.view(now);
+        assert_eq!(v.notice, Some(Notice::StepUpFirst));
+        assert!(!v.step_up.expect("the step-up prompt").for_add);
+        f.type_text(CODE);
+        let Cmd::StepUp { .. } = cmd(f.enter()) else {
+            panic!("the step-up");
+        };
+        let until = crate::unix_now() + 300;
+        let Cmd::RemovePublisher(again) = cmd(f.on_reply(Reply::SteppedUp(Ok(until)), now)) else {
+            panic!("the same removal once more");
+        };
+        assert_eq!(first.idempotency_key, again.idempotency_key);
+        assert_eq!(first.publisher_id, again.publisher_id);
+        let Cmd::ListPublishers { .. } = cmd(f.on_reply(Reply::PublisherRemoved(Ok(None)), now))
+        else {
+            panic!("the list is reloaded");
+        };
+        assert_eq!(
+            f.view(now).publishers.unwrap().outcome,
+            Some(PubOutcome::Removed)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_step_up_drops_the_removal_unsent() {
+        let now = Instant::now();
+        let mut f = on_the_publishers(now, &LIST_AND_MANAGE);
+        let _ = f.publishers_action(PubAction::StartRemove(0));
+        f.type_text("p-0000beef");
+        let _ = cmd(f.enter());
+        let _ = f.on_reply(Reply::PublisherRemoved(Err(step_up_required())), now);
+        f.escape();
+        let v = f.view(now);
+        assert!(v.step_up.is_none() && v.busy.is_none());
+        let p = v.publishers.unwrap();
+        assert_eq!((p.outcome, p.pending), (Some(PubOutcome::NotSent), false));
+        assert_eq!(p.screen, PubScreen::List);
+    }
+
+    #[test]
+    fn publisher_permissions_gate_the_entry_and_the_buttons() {
+        let now = Instant::now();
+        // List only: the view opens (from the cached permissions) but cannot manage.
+        let mut f = on_the_publishers(now, &[perm::PUBLISHER_LIST]);
+        let p = f.view(now).publishers.unwrap();
+        assert!(!p.can_manage);
+        assert!(f.publishers_action(PubAction::StartAdd).is_empty());
+        assert!(f.publishers_action(PubAction::StartRemove(0)).is_empty());
+        assert_eq!(f.view(now).publishers.unwrap().screen, PubScreen::List);
+        f.close_publishers();
+        assert!(f.view(now).publishers.is_none());
+        let Cmd::ListPublishers { .. } = cmd(f.open_publishers()) else {
+            panic!("the cached permissions skip the read");
+        };
+        // No publisher.list: the entry is hidden and opening does nothing.
+        let mut f = signed_in(now, BOTH, 900);
+        let _ = cmd(f.open_views(Tab::Requests));
+        let perms = vec!["app_request.approve".to_string()];
+        let _ = f.on_reply(Reply::Permissions(Ok(perms)), now);
+        assert!(!f.view(now).session.unwrap().can_list_publishers);
+        f.close_views();
+        assert!(f.open_publishers().is_empty());
+    }
+
+    #[test]
+    fn a_lock_drops_the_publishers_and_a_late_reply_shows_nothing() {
+        let now = Instant::now();
+        let mut f = publisher_review(now);
+        assert!(f.publishers_action(PubAction::Confirm).is_empty());
+        f.type_text("1234");
+        let later = now + Duration::from_secs(2000);
+        assert!(ends(&f.tick(later)));
+        let v = f.view(later);
+        assert!(v.step_up.is_none() && v.publishers.is_none() && v.session.is_none());
+        let late = f.on_reply(Reply::PublisherAdded(Ok(None)), later);
+        assert!(late.is_empty() && f.view(later).publishers.is_none());
+        // A read that lands after the lock is dropped too.
+        f.publisher_inspected(Err(InspectFailure::Unreadable));
+        assert!(f.view(later).publishers.is_none());
     }
 }

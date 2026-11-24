@@ -242,6 +242,36 @@ The third-party verifier (an API gateway, sidecar, …) validates:
 3. The `cnf.jkt` matches the DPoP proof presented alongside.
 4. Application-level policy on `actor_bin` and `actor_uid`.
 
+## Trusted publishers (ADR-0006)
+
+A caller that no allowlist entry admits may still get a token when its
+executable is signed by a **trusted publisher** that an administrator added in
+CMIS (`ferrogate admin publishers add`, or the tray admin client's *Trusted
+publishers* view; `publisher.manage` plus a fresh second factor). The list
+reaches the MIA inside the signed allowlist (format 3, only to agents that ask
+for it), never from a file or a caller.
+
+The check runs after the host SVID and CRL gates, only when the allowlist
+carries publishers and no entry admits the caller:
+
+1. The OS verifies the code signature of the caller the kernel identified, bound
+   to the `SHA-384` the helper hashed: on **Windows** `WinVerifyTrust` on the
+   image opened with `FILE_SHARE_READ` only, with whole-chain revocation checks;
+   on **macOS** the dynamic validity of the running process's code
+   (`SecCodeCheckValidity`, `anchor apple generic`). **Linux** has no verifier:
+   publishers never admit there.
+2. A publisher admits when the chain contains its pinned CA (SHA-256) and the
+   leaf matches its pin (SHA-256 of the certificate, its key or its subject
+   DER), the rule is unexpired, and a required timestamp is present. An expired
+   leaf admits only with a verified timestamp.
+
+Any failure (unsigned, untrusted, revoked, revocation unknown, image changed,
+no match) is the ordinary `permission_denied` with `LocalDenied
+not-allowlisted`; the specific reason is logged locally
+(`helper.publisher.refused`). A match mints the token and records
+`LocalGrantByPublisher` in place of `LocalGrant`, with the publisher id and the
+leaf thumbprint. No request goes to CMIS and nobody is asked.
+
 ## Protocol v2: app registration (F19)
 
 Since 0.29 the socket also carries a v2 envelope, `{v: 2, op}` (types in

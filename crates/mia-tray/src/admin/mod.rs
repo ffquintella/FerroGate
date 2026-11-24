@@ -10,6 +10,7 @@
 //! - [`enroll`] — the token-enrollment wizard (password, TOTP and/or a key);
 //! - [`factors`] — "My account → Second factors": list, add, remove;
 //! - [`views`] — Requests and Approvals: lists, filters, details;
+//! - [`publishers`] — trusted publishers: list, add (review, fresh factor), remove;
 //! - [`decide`] — approve, deny, edit, revoke and freeze dialogs;
 //! - [`seed`] — a TOTP seed on screen: its QR code and text, wiped;
 //! - [`flow`] — the window's state machine: offer, sign-in, step-up, idle lock;
@@ -39,6 +40,7 @@ mod keycheck;
 pub mod keyprompt;
 pub mod local;
 pub mod login;
+pub mod publishers;
 pub mod secret;
 pub mod seed;
 pub mod server;

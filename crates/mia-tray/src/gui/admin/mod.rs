@@ -12,8 +12,9 @@
 //! [`eframe::NativeOptions::persist_window`] off, no `save`, no
 //! `persist_egui_memory`. Enrollment and second factors: [`enroll`],
 //! [`factors`]; a TOTP seed is painted by [`seed`], never as a string.
-//! Requests, approvals and their decisions: [`views`]. The admin endpoint
-//! and its pin are entered on the "admin server" screen ([`server`]).
+//! Requests, approvals and their decisions: [`views`]; trusted publishers:
+//! [`publishers`]. The admin endpoint and its pin are entered on the
+//! "admin server" screen ([`server`]).
 
 //! F23: one navigable page (breadcrumb, no nested boxes), the pending
 //! requests opened after sign-in, a status bar fed by [`crate::notice`],
@@ -21,6 +22,7 @@
 
 mod enroll;
 mod factors;
+mod publishers;
 mod seed;
 mod server;
 mod views;
@@ -35,6 +37,7 @@ use ferrogate_admin_client::config::ConfigError;
 use ferrogate_admin_client::display::inert;
 use ferrogate_admin_client::factors::FactorMethod;
 use ferrogate_admin_client::files::WriteError;
+use ferrogate_admin_client::publishers::inspect::Candidate;
 use ferrogate_admin_client::webauthn::Authenticator;
 
 use crate::admin::config::{self, Location, SaveError, SaveTarget, SETUP_HELP};
@@ -43,6 +46,7 @@ use crate::admin::factors::FactorField;
 use crate::admin::flow::{Busy, Effect, Flow, FlowView, KeyPromptView, Notice, Problem};
 use crate::admin::keyprompt::{KeyAsk, KeyPrompt};
 use crate::admin::login::{Field, LoginError, Stage, Submission};
+use crate::admin::publishers::{InspectFailure, InspectJob, PubAction, Screen as PubScreen};
 use crate::admin::server::{SavePlan, SaveProblem, ServerField, ServerForm};
 use crate::admin::session::{self, Link, SHUTDOWN_WAIT};
 use crate::admin::views::{Screen, Tab, ViewAction};
@@ -179,6 +183,11 @@ struct AdminApp {
     announced_pending: Option<usize>,
     /// What the page showed last frame ([`page_key`]).
     page: String,
+    /// Identity reads for a new trusted publisher, run off the UI thread.
+    inspect_tx: mpsc::Sender<Result<Candidate, InspectFailure>>,
+    inspect_rx: mpsc::Receiver<Result<Candidate, InspectFailure>>,
+    /// Wakes the window when a read finishes (set on the first frame).
+    repaint: Option<egui::Context>,
 }
 
 /// What the page shows, coarsely. When it changes, egui's keyboard focus
@@ -187,7 +196,7 @@ struct AdminApp {
 /// one (a "Confirm and send" right after the form, say).
 fn page_key(server_form: bool, view: &FlowView) -> String {
     format!(
-        "{server_form}|{:?}|{}|{:?}|{}|{}|{:?}|{:?}",
+        "{server_form}|{:?}|{}|{:?}|{}|{}|{:?}|{:?}|{:?}",
         view.login.stage,
         view.session.is_some(),
         view.enroll.as_ref().map(|e| e.stage),
@@ -200,6 +209,7 @@ fn page_key(server_form: bool, view: &FlowView) -> String {
             v.filters.is_some(),
             v.decision.as_ref().map(|d| (d.kind, d.stage))
         )),
+        view.publishers.as_ref().map(|p| p.screen),
     )
 }
 
@@ -277,6 +287,7 @@ impl AdminApp {
         setup: Setup,
     ) -> Self {
         let (activate_tx, activate_rx) = mpsc::channel();
+        let (inspect_tx, inspect_rx) = mpsc::channel();
         Self {
             lang,
             flow: Flow::new(key_available, Instant::now()),
@@ -295,6 +306,9 @@ impl AdminApp {
             was_signed_in: false,
             announced_pending: None,
             page: String::new(),
+            inspect_tx,
+            inspect_rx,
+            repaint: None,
         }
     }
 
@@ -618,6 +632,10 @@ impl AdminApp {
                 ui.separator();
                 views::panel(ui, lang, v, idle, actions);
             }
+            if let Some(p) = &view.publishers {
+                ui.separator();
+                publishers::panel(ui, lang, p, idle, actions);
+            }
         } else if let Some(w) = &view.enroll {
             enroll::wizard(ui, lang, w, shown.as_ref(), idle, actions);
         } else {
@@ -670,6 +688,7 @@ impl AdminApp {
             && (fresh || to_requests)
             && view.views.is_none()
             && view.factors.is_none()
+            && view.publishers.is_none()
             && view.busy.is_none()
         {
             actions.push(Action::OpenViews(Tab::Requests));
@@ -719,6 +738,10 @@ impl AdminApp {
     /// Draw one frame at `now`.
     fn show(&mut self, ui: &mut egui::Ui, now: Instant) {
         let ctx = ui.ctx().clone();
+        self.repaint.get_or_insert_with(|| ctx.clone());
+        while let Ok(result) = self.inspect_rx.try_recv() {
+            self.flow.publisher_inspected(result);
+        }
         self.read_input(&ctx, now);
         let view = self.flow.view(now);
         let page = page_key(self.server_form.is_some(), &view);
@@ -812,6 +835,13 @@ impl AdminApp {
                     Vec::new()
                 }
                 Action::View(action) => self.flow.views_action(action),
+                Action::OpenPublishers
+                | Action::ClosePublishers
+                | Action::Publisher(_)
+                | Action::PubPickExecutable
+                | Action::PubPickLeaf
+                | Action::PubPickAnchor
+                | Action::PubReadCerts => self.act_publishers(action),
                 Action::KeyPin => {
                     self.flow.submit_key_pin();
                     Vec::new()
@@ -832,6 +862,63 @@ impl AdminApp {
                 }
             };
             self.apply(effects);
+        }
+    }
+
+    /// The trusted publishers' buttons; the file dialogs open here, and the
+    /// reads they start run on their own thread.
+    fn act_publishers(&mut self, action: Action) -> Vec<Effect> {
+        match action {
+            Action::OpenPublishers => return self.flow.open_publishers(),
+            Action::ClosePublishers => self.flow.close_publishers(),
+            Action::Publisher(action) => return self.flow.publishers_action(action),
+            Action::PubPickExecutable => self.pick_executable(),
+            Action::PubPickLeaf => {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    self.flow.publisher_leaf(path);
+                }
+            }
+            Action::PubPickAnchor => {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    self.flow.publisher_anchor(path);
+                }
+            }
+            Action::PubReadCerts => {
+                if let Some(job) = self.flow.publisher_certificates() {
+                    self.spawn_inspect(job);
+                }
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Let the administrator choose a signed program, then read its signer
+    /// off the UI thread (the OS verifies the signature); nothing is sent.
+    fn pick_executable(&mut self) {
+        let Some(path) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        if let Some(job) = self.flow.publisher_executable(path) {
+            self.spawn_inspect(job);
+        }
+    }
+
+    /// Run `job` on its own thread; its result comes back through the
+    /// channel and the window is woken to take it.
+    fn spawn_inspect(&mut self, job: InspectJob) {
+        let (tx, ctx) = (self.inspect_tx.clone(), self.repaint.clone());
+        let started = std::thread::Builder::new()
+            .name("mia-tray-admin-inspect".into())
+            .spawn(move || {
+                let _ = tx.send(job.run());
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            });
+        if started.is_err() {
+            self.flow
+                .publisher_inspected(Err(InspectFailure::Unreadable));
         }
     }
 
@@ -895,6 +982,13 @@ enum Action {
     OpenViews(Tab),
     CloseViews,
     View(ViewAction),
+    OpenPublishers,
+    ClosePublishers,
+    Publisher(PubAction),
+    PubPickExecutable,
+    PubPickLeaf,
+    PubPickAnchor,
+    PubReadCerts,
     OpenServer,
     FocusServer(ServerField),
     ServerSave,
@@ -914,7 +1008,8 @@ fn busy_message(busy: Busy) -> Msg {
         | Busy::StepUp { key: true }
         | Busy::Enroll { key: true }
         | Busy::Factors { key: true }
-        | Busy::Register { key: true } => {
+        | Busy::Register { key: true }
+        | Busy::AddPublisher { key: true } => {
             // Windows shows its own dialog (touch, PIN, biometric).
             if cfg!(windows) {
                 Msg::AdminFollowSystemKeyPrompt
@@ -923,11 +1018,13 @@ fn busy_message(busy: Busy) -> Msg {
             }
         }
         Busy::Register { key: false } => Msg::AdminRegistering,
+        Busy::AddPublisher { key: false } => Msg::AdminPubAdding,
         Busy::SignIn { key: false } => Msg::AdminSigningIn,
         Busy::StepUp { key: false } => Msg::AdminConfirming,
-        Busy::Enroll { key: false } | Busy::Factors { key: false } | Busy::Views => {
-            Msg::AdminWorking
-        }
+        Busy::Enroll { key: false }
+        | Busy::Factors { key: false }
+        | Busy::Views
+        | Busy::Publishers => Msg::AdminWorking,
     }
 }
 
@@ -1186,6 +1283,17 @@ fn crumbs(lang: Lang, view: &FlowView) -> Vec<String> {
             out.push(views::decision_title(lang, d));
         }
     }
+    if let Some(p) = &view.publishers {
+        out.push(Msg::AdminPubOpen.text(lang).to_string());
+        match (p.screen, &p.detail) {
+            (PubScreen::Detail, Some(d)) => out.push(d.short_id.clone()),
+            (PubScreen::Source | PubScreen::Form | PubScreen::Review, _) => {
+                out.push(Msg::AdminPubCrumbAdd.text(lang).to_string());
+            }
+            (PubScreen::Remove, _) => out.push(Msg::AdminPubCrumbRemove.text(lang).to_string()),
+            _ => {}
+        }
+    }
     if view.step_up.is_some() {
         out.push(Msg::AdminStepUp.text(lang).to_string());
     }
@@ -1240,7 +1348,19 @@ fn session_buttons(
             }
         }
     }
-    let deciding = view.views.as_ref().is_some_and(|v| v.pending);
+    let deciding = view.views.as_ref().is_some_and(|v| v.pending)
+        || view.publishers.as_ref().is_some_and(|p| p.pending);
+    if view.publishers.is_none()
+        && view.session.as_ref().is_some_and(|s| s.can_list_publishers)
+        && ui
+            .add_enabled(
+                idle && !deciding,
+                egui::Button::new(Msg::AdminPubOpen.text(lang)),
+            )
+            .clicked()
+    {
+        actions.push(Action::OpenPublishers);
+    }
     if view.factors.is_none()
         && ui
             .add_enabled(
@@ -1368,6 +1488,17 @@ mod tests {
                 Cmd::Mutate(m) => {
                     seen.cmds.push("mutate");
                     seen.keys.push(m.idempotency_key().to_string());
+                }
+                Cmd::ListPublishers { .. } => seen.cmds.push("list_publishers"),
+                Cmd::AddPublisher { req, proof } => {
+                    seen.cmds.push("add_publisher");
+                    seen.keys.push(req.idempotency_key.clone());
+                    seen.secrets_ok = req.proof.is_none()
+                        && matches!(proof, FactorChoice::Code(c) if c.expose() == "123456");
+                }
+                Cmd::RemovePublisher(req) => {
+                    seen.cmds.push("remove_publisher");
+                    seen.keys.push(req.idempotency_key.clone());
                 }
                 Cmd::Register { req, proof } => {
                     seen.cmds.push("register");
@@ -2297,6 +2428,213 @@ mod tests {
         );
         let memory = ctx.memory(|m| format!("{m:?}"));
         assert!(!memory.contains("123456"));
+    }
+
+    /// Signed in on the trusted publishers, listing one hostile row.
+    fn on_the_publishers(
+        ctx: &egui::Context,
+        app: &mut AdminApp,
+        seen: &Rc<RefCell<Seen>>,
+        permissions: &[&str],
+    ) -> String {
+        use ferrogate_admin_client::publishers::proto::TrustedPublisherInfo;
+        let painted = signed_in_as(ctx, app, seen, "Alice");
+        let entry = Msg::AdminPubOpen.text(app.lang);
+        assert!(painted.contains(entry), "the entry: {painted}");
+        app.act(vec![Action::OpenPublishers]);
+        let perms = permissions.iter().map(|p| (*p).to_string()).collect();
+        push(seen, Reply::Permissions(Ok(perms)));
+        frame(ctx, app, Vec::new());
+        assert_eq!(seen.borrow().cmds.last(), Some(&"list_publishers"));
+        let row = TrustedPublisherInfo {
+            publisher_id: "0190f0aa-0000-7000-8000-00000000beef".into(),
+            label: "ACME \u{202e}gpj".into(),
+            subject: "CN=ACME \u{1b}[31m".into(),
+            kind: 2,
+            pin_kind: 2,
+            pin: vec![0xab; 32],
+            state: 1,
+            ..TrustedPublisherInfo::default()
+        };
+        push(seen, Reply::Publishers(Ok(vec![row])));
+        frame(ctx, app, Vec::new()).join("\n")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one frame per step of the add.
+    fn a_publisher_is_added_only_after_the_review_and_a_fresh_masked_code() {
+        use crate::admin::publishers::{PubAction, Screen as PubScreen};
+        use ferrogate_admin_client::error::ClientError;
+        use ferrogate_admin_client::publishers::inspect::inspect_certificates;
+        use ferrogate_admin_client::publishers::SignatureKind;
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        let painted = on_the_publishers(
+            &ctx,
+            &mut app,
+            &seen,
+            &["publisher.list", "publisher.manage"],
+        );
+        assert!(painted.contains("P-0000BEEF"), "{painted}");
+        assert!(
+            !painted.contains('\u{202e}') && !painted.contains('\u{1b}'),
+            "inert"
+        );
+        assert!(painted.contains("Add a publisher…"), "{painted}");
+        app.act(vec![Action::Publisher(PubAction::StartAdd)]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("Choose a program…"), "{painted}");
+        assert!(painted.contains("Certificate files"), "{painted}");
+        // The read itself runs elsewhere; its result is handed to the flow.
+        let chain = ferro_codesign::testing::TestChain::new("ACME Corp");
+        let candidate =
+            inspect_certificates(SignatureKind::Apple, &chain.leaf_der, &chain.ca_der).unwrap();
+        app.flow.publisher_executable("/opt/acme".into());
+        app.inspect_tx.send(Ok(candidate)).unwrap();
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("New trusted publisher"), "{painted}");
+        assert!(
+            painted.contains("ACME Corp"),
+            "the identity read: {painted}"
+        );
+        assert!(
+            painted.contains("The label must be 1 to 128"),
+            "problem: {painted}"
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text("ACME signing".into())],
+        );
+        app.act(vec![Action::Publisher(PubAction::Review)]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        for want in [
+            "Review this trusted publisher",
+            "Nothing has been sent",
+            "ACME signing",
+            "ACME Corp",
+            "every host, any user",
+            "root CA",
+            "Confirm with a fresh second factor…",
+        ] {
+            assert!(painted.contains(want), "{want}: {painted}");
+        }
+        // Enter on the review never confirms.
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert!(!seen.borrow().cmds.contains(&"add_publisher"));
+        app.act(vec![Action::Publisher(PubAction::Confirm)]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(
+            painted.contains("Confirm this addition with a fresh second factor"),
+            "{painted}"
+        );
+        assert!(
+            !seen.borrow().cmds.contains(&"add_publisher"),
+            "nothing yet"
+        );
+        let mut typed = frame(&ctx, &mut app, vec![egui::Event::Text("123456".into())]);
+        typed.extend(frame(&ctx, &mut app, Vec::new()));
+        assert!(typed.iter().all(|t| !t.contains("123456")), "masked");
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert_eq!(seen.borrow().cmds.last(), Some(&"add_publisher"));
+        assert!(seen.borrow().secrets_ok, "the code went with the request");
+        push(&seen, Reply::PublisherAdded(Err(ClientError::Rejected)));
+        frame(&ctx, &mut app, Vec::new());
+        frame(&ctx, &mut app, vec![egui::Event::Text("123456".into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        {
+            let s = seen.borrow();
+            assert_eq!(s.keys.len(), 2);
+            assert_eq!(s.keys[0], s.keys[1], "the retry reuses the key");
+        }
+        push(&seen, Reply::PublisherAdded(Ok(None)));
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert_eq!(
+            seen.borrow().cmds.last(),
+            Some(&"list_publishers"),
+            "reloaded"
+        );
+        assert!(painted.contains("Trusted publisher added."), "{painted}");
+        let view = app.flow.view(Instant::now());
+        assert_eq!(view.publishers.unwrap().screen, PubScreen::List);
+        let memory = ctx.memory(|m| format!("{m:?}"));
+        assert!(!memory.contains("123456"));
+    }
+
+    #[test]
+    fn a_publisher_is_removed_by_typing_its_short_id_and_without_manage_there_is_no_button() {
+        use crate::admin::publishers::PubAction;
+        let ctx = egui::Context::default();
+        let (mut app, seen) = app();
+        let painted = on_the_publishers(&ctx, &mut app, &seen, &["publisher.list"]);
+        assert!(!painted.contains("Remove…") && !painted.contains("Add a publisher…"));
+        drop((app, seen));
+        // A new window with manage: remove asks for the typed short id.
+        let (mut app, seen2) = self::app();
+        let painted = on_the_publishers(
+            &ctx,
+            &mut app,
+            &seen2,
+            &["publisher.list", "publisher.manage"],
+        );
+        assert!(painted.contains("Remove…"), "{painted}");
+        app.act(vec![Action::Publisher(PubAction::StartRemove(0))]);
+        let painted = frame(&ctx, &mut app, Vec::new()).join("\n");
+        assert!(painted.contains("Type P-0000BEEF to confirm:"), "{painted}");
+        frame(&ctx, &mut app, vec![egui::Event::Text("P-0000BEEE".into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert!(!seen2.borrow().cmds.contains(&"remove_publisher"));
+        frame(&ctx, &mut app, vec![key(egui::Key::Backspace)]);
+        frame(&ctx, &mut app, vec![egui::Event::Text("F".into())]);
+        frame(&ctx, &mut app, vec![key(egui::Key::Enter)]);
+        assert_eq!(seen2.borrow().cmds.last(), Some(&"remove_publisher"));
+    }
+
+    #[test]
+    fn every_publishers_page_paints_in_every_language() {
+        use crate::admin::publishers::{FormChoice, PubAction};
+        use ferrogate_admin_client::publishers::inspect::inspect_certificates;
+        use ferrogate_admin_client::publishers::SignatureKind;
+        for lang in Lang::ALL {
+            let ctx = egui::Context::default();
+            let (mut app, seen) = app();
+            app.lang = lang;
+            on_the_publishers(
+                &ctx,
+                &mut app,
+                &seen,
+                &["publisher.list", "publisher.manage"],
+            );
+            app.act(vec![Action::Publisher(PubAction::Open(0))]);
+            let detail = frame(&ctx, &mut app, Vec::new()).join("\n");
+            assert!(detail.contains("abababab"), "the full digest: {detail}");
+            app.act(vec![
+                Action::Publisher(PubAction::Back),
+                Action::Publisher(PubAction::StartAdd),
+            ]);
+            frame(&ctx, &mut app, Vec::new());
+            let chain = ferro_codesign::testing::TestChain::new("ACME Corp");
+            let c = inspect_certificates(SignatureKind::Apple, &chain.leaf_der, &chain.ca_der);
+            app.flow.publisher_executable("/opt/acme".into());
+            app.inspect_tx.send(c.map_err(|_| unreachable!())).unwrap();
+            frame(&ctx, &mut app, Vec::new());
+            frame(&ctx, &mut app, vec![egui::Event::Text("ACME".into())]);
+            app.act(vec![Action::Publisher(PubAction::Choose(
+                FormChoice::Timestamp(true),
+            ))]);
+            let form = frame(&ctx, &mut app, Vec::new());
+            assert!(form.iter().any(|t| t.contains("ACME")));
+            app.act(vec![Action::Publisher(PubAction::Review)]);
+            let review = frame(&ctx, &mut app, Vec::new()).join("\n");
+            assert!(
+                review.contains(Msg::AdminRegConfirm.text(lang)),
+                "{lang:?}: {review}"
+            );
+            assert!(
+                review.contains(Msg::AdminPubWarnRoot.text(lang)),
+                "{lang:?}: {review}"
+            );
+        }
     }
 
     #[test]

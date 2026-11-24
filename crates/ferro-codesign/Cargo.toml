@@ -1,0 +1,37 @@
+[package]
+name        = "ferro-codesign"
+description = "FerroGate — trusted-publisher code-signature model, matching and platform verifiers (ADR-0006)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish                = false
+
+# source: ADR-0006. Pure model and matching; FFI only in src/macos.rs.
+[lints]
+workspace = true
+
+# Generated test chains and a fake verifier for other crates' tests.
+[features]
+test-support = ["dep:rcgen"]
+
+[dependencies]
+rcgen       = { workspace = true, optional = true }
+thiserror   = { workspace = true }
+sha2        = { workspace = true }
+# Already used by cmis, ferro-crypto and ferro-svid: parses signer chains.
+x509-parser = { workspace = true }
+
+# Windows Authenticode FFI stays in ferro-winauth (the Windows FFI crate).
+[target.'cfg(windows)'.dependencies]
+ferro-winauth = { path = "../ferro-winauth" }
+
+# Already in the lockfile through ferro-sep; wraps SecCode / SecRequirement.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", features = ["OSX_10_15"] }
+core-foundation    = "0.10"
+
+[dev-dependencies]
+rcgen = { workspace = true }

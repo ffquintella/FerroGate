@@ -420,6 +420,8 @@ MFA.
 | legacy `BumpEpoch` (S) | `policy.epoch_bump` | | | | ✓ |
 | `SetAllowlistMode` (S), `ImportLegacyAllowlists` (S) (F19 §11) | `settings.allowlist_mode`, `allowlist.import` | | | | ✓ |
 | `GetAllowlistMode` (F19 §11; read-only, lets every client pick the legacy or approvals flow) | any authenticated session | ✓ | ✓ | ✓ | ✓ |
+| `ListTrustedPublishers` (ADR-0006) | `publisher.list` | ✓ | ✓ | | ✓ |
+| `AddTrustedPublisher` (M) / `RemoveTrustedPublisher` (S) (ADR-0006) | `publisher.manage` | | | | ✓ |
 | `MachineIdentity` host methods (`SubmitAppRequest`, `GetAppRequestStatus`, `SyncAllowlist`, `ProposeAllowlist`, `AppendAuditEvent`, `Rotate` (T293, context `ferrogate-rotate-v1`)) | host proof (F19 §7.1) | | | | |
 | `Attest`, `FetchSVID`, `JWKS`, `GetEnrollmentKey`, `GetAllowlist` (legacy), `Health`, `LatestSth`, `InclusionProof`, `ConsistencyProof` | public (unchanged) | | | | |
 

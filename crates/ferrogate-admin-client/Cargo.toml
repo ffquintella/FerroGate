@@ -29,6 +29,8 @@ ferro-crypto    = { path = "../ferro-crypto" }
 ferro-transport = { path = "../ferro-transport" }
 # F19 §4.5 risk-flag bits for the approval rules and filters (no I/O used).
 ferro-appid     = { path = "../ferro-appid" }
+# Trusted publishers (ADR-0006): read a signer locally for the add flow.
+ferro-codesign  = { path = "../ferro-codesign" }
 
 tokio             = { workspace = true }
 tonic             = { workspace = true }
@@ -42,6 +44,7 @@ sha2              = { workspace = true }
 static_assertions = { workspace = true }
 # Idempotency keys (v4) and host-UUID filter checks.
 uuid              = { workspace = true, features = ["v4"] }
+hex               = { workspace = true }
 
 # Unix: owner/mode checks and `O_NOFOLLOW` opens through safe wrappers.
 [target.'cfg(unix)'.dependencies]
@@ -51,6 +54,7 @@ rustix = { workspace = true, features = ["std", "process", "fs"] }
 # `crates/cmis/tests/support` (included by path) behind a real TLS listener,
 # with that harness's software FIDO2 authenticator.
 [dev-dependencies]
+ferro-codesign = { path = "../ferro-codesign", features = ["test-support"] }
 cmis          = { path = "../cmis" }
 ferro-attest  = { path = "../ferro-attest" }
 ferro-audit   = { path = "../ferro-audit" }
@@ -58,7 +62,6 @@ ferro-raft    = { path = "../ferro-raft" }
 ferro-sep     = { path = "../ferro-sep" }
 ferro-svid    = { path = "../ferro-svid" }
 ciborium      = { workspace = true }
-hex           = { workspace = true }
 p256          = { workspace = true }
 ed25519-dalek = { workspace = true }
 rcgen         = { workspace = true }

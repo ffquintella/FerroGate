@@ -232,14 +232,42 @@ impl Issuer {
         issued_at: i64,
         not_after: i64,
     ) -> Result<SignedAllowlist, crate::allowlist_v2::AllowlistV2Error> {
+        self.sign_allowlist_compiled(
+            host_uuid,
+            generation,
+            entries,
+            Vec::new(),
+            issued_at,
+            not_after,
+        )
+    }
+
+    /// Sign a compiled allowlist: format 2 without publishers, format 3
+    /// (ADR-0006) with them. Same context and envelope as
+    /// [`Self::sign_allowlist_v2`].
+    pub fn sign_allowlist_compiled(
+        &self,
+        host_uuid: &str,
+        generation: u64,
+        entries: Vec<crate::allowlist_v2::AllowEntryV2>,
+        publishers: Vec<crate::allowlist_v2::TrustedPublisherV3>,
+        issued_at: i64,
+        not_after: i64,
+    ) -> Result<SignedAllowlist, crate::allowlist_v2::AllowlistV2Error> {
+        let format = if publishers.is_empty() {
+            crate::allowlist_v2::ALLOWLIST_V2_FORMAT
+        } else {
+            crate::allowlist_v2::ALLOWLIST_V3_FORMAT
+        };
         let doc = crate::allowlist_v2::AllowlistDocV2 {
-            format: crate::allowlist_v2::ALLOWLIST_V2_FORMAT,
+            format,
             trust_domain: self.trust_domain.clone(),
             host_uuid: host_uuid.to_string(),
             generation,
             issued_at,
             not_after,
             entries,
+            publishers,
         };
         crate::allowlist_v2::sign_v2(&doc, &self.secret)
     }

@@ -9,7 +9,10 @@
 //! 2. establish caller identity from kernel-attested credentials (the cheap
 //!    `SO_PEERCRED` / `GetNamedPipeClientProcessId` step happens on the async
 //!    side; the authenticator's blocking work runs on the blocking pool);
-//! 3. authorize against the signed allowlist and mint, or refuse.
+//! 3. authorize against the signed allowlist and mint, or refuse. A caller
+//!    no entry admits may still be admitted by a trusted publisher of the
+//!    same signed body: its OS-verified code signature must match one
+//!    (ADR-0006, [`publisher_grant`]).
 //!
 //! Concurrency model: one task per connection, each holding a permit from a
 //! bounded [`Semaphore`], under a per-connection read deadline so a slow or
@@ -28,7 +31,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ferro_audit::{AuditEvent, Bytes16, Hash384};
+use ferro_audit::{AuditEvent, Bytes16, Bytes32, Hash384};
+use ferro_codesign::{
+    match_publisher, CallerTarget, PublisherRule, SignatureVerifier, SignerFacts, VerifyError,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, RwLock};
 
@@ -152,6 +158,10 @@ struct Shared<A: CallerAuth> {
     /// ([`HelperServer::set_registration`]). Unset ⇒ registration operations
     /// answer `registration_disabled`.
     registration: std::sync::OnceLock<Arc<dyn RegistrationHandler>>,
+    /// Verifies a caller's code signature for the trusted publishers of the
+    /// allowlist (ADR-0006). This platform's verifier unless one was
+    /// installed before serving ([`HelperServer::set_signature_verifier`]).
+    verifier: std::sync::OnceLock<Arc<dyn SignatureVerifier>>,
 }
 
 /// Handles the helper protocol v2 registration operations (F19 §7.6) for an
@@ -187,6 +197,17 @@ impl<A: CallerAuth> Shared<A> {
             ledger: CallerLedger::new(),
             self_sha: running_exe_sha(),
             registration: std::sync::OnceLock::new(),
+            verifier: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn verifier(&self) -> Arc<dyn SignatureVerifier> {
+        Arc::clone(self.verifier.get_or_init(ferro_codesign::platform_verifier))
+    }
+
+    fn set_verifier(&self, verifier: Arc<dyn SignatureVerifier>) {
+        if self.verifier.set(verifier).is_err() {
+            tracing::warn!("signature verifier already installed; keeping the first");
         }
     }
 
@@ -518,12 +539,26 @@ async fn process_request<A: CallerAuth>(
     //    A missing allowlist fails closed; the self-trust path does not consult
     //    it. The host SVID and CRL gates above still applied either way.
     let is_self = shared.self_sha == Some(id.bin_sha);
-    let permitted = is_self
-        || match &*shared.allowlist.read().await {
-            Some(al) => al.permits_caller(&CallerFacts::of(&id), now),
-            None => false,
-        };
-    if !permitted {
+    let (permitted, publishers) = if is_self {
+        (true, Vec::new())
+    } else {
+        match &*shared.allowlist.read().await {
+            Some(al) => (
+                al.permits_caller(&CallerFacts::of(&id), now),
+                al.publishers_at(now).to_vec(),
+            ),
+            None => (false, Vec::new()),
+        }
+    };
+    // 4.5 No entry admits the caller: a trusted publisher of the same signed
+    //     body may (ADR-0006). Without publishers nothing is verified, so
+    //     behaviour is unchanged.
+    let by_publisher = if permitted || publishers.is_empty() {
+        None
+    } else {
+        publisher_grant(shared.verifier(), &id, publishers, now).await
+    };
+    if !permitted && by_publisher.is_none() {
         deny(shared, id.pid, id.uid, id.bin_sha, "not-allowlisted").await;
         return err(ErrorCode::PermissionDenied, None);
     }
@@ -533,20 +568,105 @@ async fn process_request<A: CallerAuth>(
         deny(shared, id.pid, id.uid, id.bin_sha, "mint-failed").await;
         return err(ErrorCode::Internal, None);
     };
-    record(
-        shared,
-        AuditEvent::LocalGrant {
+    let event = match by_publisher {
+        Some(grant) => {
+            tracing::info!(
+                event = "helper.publisher.auto_approved",
+                publisher_id = %hex::encode(grant.publisher_id),
+                leaf_cert_sha256 = %hex::encode(grant.leaf_cert_sha256),
+                bin_sha = %hex::encode(id.bin_sha),
+                pid = id.pid,
+                uid = id.uid,
+                "caller admitted by a trusted publisher"
+            );
+            AuditEvent::LocalGrantByPublisher {
+                pid: id.pid,
+                uid: id.uid,
+                bin_sha: Hash384(id.bin_sha),
+                jti: Bytes16(tok.jti),
+                publisher_id: Bytes16(grant.publisher_id),
+                leaf_cert_sha256: Bytes32(grant.leaf_cert_sha256),
+            }
+        }
+        None => AuditEvent::LocalGrant {
             pid: id.pid,
             uid: id.uid,
             bin_sha: Hash384(id.bin_sha),
             jti: Bytes16(tok.jti),
         },
-    )
-    .await;
+    };
+    record(shared, event).await;
     HelperResp::Token(ChildToken {
         jws: tok.jws,
         exp: tok.exp,
     })
+}
+
+/// Which trusted publisher admitted a caller, for the audit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublisherGrant {
+    publisher_id: [u8; 16],
+    leaf_cert_sha256: [u8; 32],
+}
+
+/// The trusted publisher admitting `id` at `now`, or `None` (ADR-0006).
+///
+/// The OS verifies the caller's code signature on the blocking pool, bound
+/// to the image hash `id` was identified by; then [`match_publisher`]
+/// applies the pins. Every error, a panic included, admits nobody.
+async fn publisher_grant(
+    verifier: Arc<dyn SignatureVerifier>,
+    id: &CallerIdentity,
+    rules: Vec<PublisherRule>,
+    now: i64,
+) -> Option<PublisherGrant> {
+    let (pid, uid, bin_sha, exe_path) = (id.pid, id.uid, id.bin_sha, id.exe_path.clone());
+    let outcome = tokio::task::spawn_blocking(move || {
+        verifier.verify_caller(&CallerTarget {
+            pid,
+            exe_path: exe_path.as_deref(),
+            bin_sha: &bin_sha,
+        })
+    })
+    .await;
+    let refused = |reason: &'static str, notable: bool| {
+        if notable {
+            tracing::warn!(
+                event = "helper.publisher.refused",
+                reason,
+                pid,
+                uid,
+                "trusted publisher check refused the caller"
+            );
+        } else {
+            tracing::debug!(
+                event = "helper.publisher.refused",
+                reason,
+                pid,
+                uid,
+                "trusted publisher check refused the caller"
+            );
+        }
+        None
+    };
+    let sig = match outcome {
+        Ok(Ok(sig)) => sig,
+        Ok(Err(e)) => {
+            let notable = matches!(e, VerifyError::ImageChanged | VerifyError::Revoked);
+            return refused(e.reason(), notable);
+        }
+        Err(_) => return refused("publisher-internal", true),
+    };
+    let Ok(facts) = SignerFacts::of(&sig) else {
+        return refused("publisher-chain-unparsable", true);
+    };
+    match match_publisher(&rules, &facts, now) {
+        Ok(rule) => Some(PublisherGrant {
+            publisher_id: rule.publisher_id,
+            leaf_cert_sha256: facts.leaf.cert_sha256,
+        }),
+        Err(r) => refused(r.reason(), matches!(r, ferro_codesign::Refusal::WrongChain)),
+    }
 }
 
 fn err(code: ErrorCode, retry_after: Option<u32>) -> HelperResp {

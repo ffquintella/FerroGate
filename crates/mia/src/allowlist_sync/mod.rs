@@ -8,7 +8,7 @@
 //! 1. needs a valid host SVID whose machine key signs host calls; without
 //!    one it reports `no_svid` and keeps the current allowlist;
 //! 2. sends a host-signed `AllowlistSyncDoc {host_uuid, issued_at, nonce,
-//!    have_generation, accept_formats: [2]}` — `have_generation` is 0 when
+//!    have_generation, accept_formats: [2, 3]}` — `have_generation` is 0 when
 //!    nothing is held or the held body is past half its lifetime, so CMIS
 //!    sends a freshly signed body;
 //! 3. on `not_modified`, records success; on a body, checks the v2
@@ -381,7 +381,10 @@ impl AllowlistSync {
             issued_at: now,
             nonce: crate::host_api::random_bytes(),
             have_generation: have,
-            accept_formats: vec![ferro_svid::allowlist_v2::ALLOWLIST_V2_FORMAT],
+            accept_formats: vec![
+                ferro_svid::allowlist_v2::ALLOWLIST_V2_FORMAT,
+                ferro_svid::allowlist_v2::ALLOWLIST_V3_FORMAT,
+            ],
         };
         let request = match encode_allowlist_sync(&doc)
             .map_err(|e| e.to_string())

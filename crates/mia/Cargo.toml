@@ -55,6 +55,8 @@ mia-status-proto = { path = "../mia-status-proto" }
 mia-helper-proto = { path = "../mia-helper-proto" }
 # Read-only binary identification for app registration (feature F19 §4).
 ferro-appid      = { path = "../ferro-appid" }
+# Trusted publishers (ADR-0006): rules, matching and the OS signature check.
+ferro-codesign   = { path = "../ferro-codesign" }
 
 tokio              = { workspace = true }
 tokio-stream       = { workspace = true }
@@ -92,6 +94,7 @@ rcgen              = { workspace = true, optional = true }
 ferro-winres = { path = "../ferro-winres" }
 
 [dev-dependencies]
+ferro-codesign    = { path = "../ferro-codesign", features = ["test-support"] }
 # Self dev-dependency with `virtual-tpm` on: this turns the feature on for the
 # crate's own test targets (so the software TPM is available to integration
 # tests) without enabling it for normal `cargo build` / release builds.

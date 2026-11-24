@@ -44,6 +44,7 @@ mod admin;
 mod allowlist;
 mod apps;
 mod migration;
+mod publishers;
 
 use ferro_crypto::composite::CompositePublicKey;
 use ferro_crypto::pin::SpkiPin;

@@ -366,7 +366,9 @@ async fn approve_and_deny_emit_one_event_each_and_reach_the_host() {
     assert_eq!(app_events(&w.h).len(), before + 2);
 
     // The host sees both outcomes, and the next sync serves the approval.
-    let Served::Body { signed, .. } = serve(&w.h.cmis, &w.host.uuid, 0, now_unix()).await.unwrap()
+    let Served::Body { signed, .. } = serve(&w.h.cmis, &w.host.uuid, 0, false, now_unix())
+        .await
+        .unwrap()
     else {
         panic!("expected a body");
     };
@@ -636,10 +638,13 @@ async fn revoke_update_and_freeze_are_audited_and_change_the_served_allowlist() 
     // The admin plane runs on the manual test clock but request intake uses the
     // wall clock, so anchor on whichever is later; otherwise the approval would
     // already be expired for intake once real time passes `clock + 30 days`.
-    let wall_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let wall_now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
     let new_expiry = w.h.clock_now().max(wall_now) + 30 * 86_400;
     let updated =
         w.h.call(
@@ -712,7 +717,9 @@ async fn revoke_update_and_freeze_are_audited_and_change_the_served_allowlist() 
         .await
         .unwrap();
     assert_eq!(revoked.approval.unwrap().state, 3);
-    let Served::Body { signed, .. } = serve(&w.h.cmis, &w.host.uuid, 0, now_unix()).await.unwrap()
+    let Served::Body { signed, .. } = serve(&w.h.cmis, &w.host.uuid, 0, false, now_unix())
+        .await
+        .unwrap()
     else {
         panic!("expected a body");
     };

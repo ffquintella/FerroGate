@@ -27,6 +27,17 @@ pub const ALLOWLIST_V2_SIGNING_CONTEXT: &[u8] = b"ferrogate-allowlist-v2";
 /// The `format` value of a v2 body.
 pub const ALLOWLIST_V2_FORMAT: u32 = 2;
 
+/// The `format` value of a body that also carries trusted publishers
+/// (ADR-0006). Same struct, same signing context; served only to a host
+/// whose `accept_formats` lists it, so an older MIA never receives one.
+pub const ALLOWLIST_V3_FORMAT: u32 = 3;
+
+/// Most trusted publishers in one body.
+pub const MAX_TRUSTED_PUBLISHERS: usize = 256;
+
+/// Domain-separation tag of [`compiled_digest`] when publishers are present.
+pub const COMPILED_DIGEST_TAG: &[u8] = b"ferrogate-allowlist-v3-digest";
+
 /// Largest encoded v2 body accepted (about 40 000 entries).
 pub const MAX_ALLOWLIST_V2_BYTES: usize = 8 * 1024 * 1024;
 
@@ -60,6 +71,31 @@ pub struct AllowEntryV2 {
     pub expires_at: Option<i64>,
 }
 
+/// One trusted publisher (ADR-0006): a binary whose code signature the
+/// host's OS verifies, whose chain contains the CA `anchor_sha256` and whose
+/// leaf has the `pin_kind` digest `pin`, is admitted for any user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedPublisherV3 {
+    /// UUID bytes of the CMIS record (audit correlation).
+    #[serde(with = "fixed")]
+    pub publisher_id: [u8; 16],
+    /// 1 Authenticode, 2 Apple.
+    pub kind: u8,
+    /// SHA-256 of a CA certificate that must be in the verified chain.
+    #[serde(with = "fixed")]
+    pub anchor_sha256: [u8; 32],
+    /// 1 leaf certificate, 2 leaf SPKI, 3 leaf subject (all SHA-256).
+    pub pin_kind: u8,
+    /// The pinned leaf digest.
+    #[serde(with = "fixed")]
+    pub pin: [u8; 32],
+    /// Refuse signatures without a trusted timestamp.
+    pub require_timestamp: bool,
+    /// Unix seconds after which the publisher admits nobody.
+    pub expires_at: Option<i64>,
+}
+
 /// The signed v2 body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +114,11 @@ pub struct AllowlistDocV2 {
     pub not_after: i64,
     /// Entries, sorted by `(bin_sha, approval_id)`.
     pub entries: Vec<AllowEntryV2>,
+    /// Trusted publishers, sorted by `publisher_id`: non-empty exactly when
+    /// `format` is [`ALLOWLIST_V3_FORMAT`]. Absent from a v2 encoding, which
+    /// stays byte-identical to the one before ADR-0006.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishers: Vec<TrustedPublisherV3>,
 }
 
 /// v2 encode, sign and verify failures. A verifier treats every variant as
@@ -90,9 +131,14 @@ pub enum AllowlistV2Error {
     /// The encoded body exceeds [`MAX_ALLOWLIST_V2_BYTES`].
     #[error("body too large ({0} bytes)")]
     TooLarge(usize),
-    /// `format` is not [`ALLOWLIST_V2_FORMAT`].
+    /// `format` is neither [`ALLOWLIST_V2_FORMAT`] nor
+    /// [`ALLOWLIST_V3_FORMAT`], or does not agree with `publishers`.
     #[error("unsupported allowlist format {0}")]
     Format(u32),
+    /// A publisher has an unknown code, a duplicate id, or there are more
+    /// than [`MAX_TRUSTED_PUBLISHERS`].
+    #[error("malformed trusted publisher")]
+    MalformedPublisher,
     /// `host_uuid` is empty or longer than 64 bytes.
     #[error("bad host_uuid")]
     HostUuid,
@@ -114,9 +160,15 @@ fn valid_bin_sha(s: &str) -> bool {
 }
 
 fn validate(doc: &AllowlistDocV2) -> Result<(), AllowlistV2Error> {
-    if doc.format != ALLOWLIST_V2_FORMAT {
+    let format_ok = match doc.format {
+        ALLOWLIST_V2_FORMAT => doc.publishers.is_empty(),
+        ALLOWLIST_V3_FORMAT => !doc.publishers.is_empty(),
+        _ => false,
+    };
+    if !format_ok {
         return Err(AllowlistV2Error::Format(doc.format));
     }
+    validate_publishers(&doc.publishers)?;
     if doc.host_uuid.is_empty() || doc.host_uuid.len() > crate::host_call::MAX_HOST_UUID_LEN {
         return Err(AllowlistV2Error::HostUuid);
     }
@@ -124,6 +176,54 @@ fn validate(doc: &AllowlistDocV2) -> Result<(), AllowlistV2Error> {
         return Err(AllowlistV2Error::MalformedEntry);
     }
     Ok(())
+}
+
+/// Bounds, known codes and unique ids of a publisher list.
+fn validate_publishers(publishers: &[TrustedPublisherV3]) -> Result<(), AllowlistV2Error> {
+    if publishers.len() > MAX_TRUSTED_PUBLISHERS {
+        return Err(AllowlistV2Error::MalformedPublisher);
+    }
+    let mut ids: Vec<[u8; 16]> = publishers.iter().map(|p| p.publisher_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let codes_ok = publishers
+        .iter()
+        .all(|p| matches!(p.kind, 1 | 2) && matches!(p.pin_kind, 1..=3));
+    if ids.len() != publishers.len() || !codes_ok {
+        return Err(AllowlistV2Error::MalformedPublisher);
+    }
+    Ok(())
+}
+
+/// Sort publishers into the canonical order, `publisher_id`.
+pub fn sort_publishers(publishers: &mut [TrustedPublisherV3]) {
+    publishers.sort_by_key(|p| p.publisher_id);
+}
+
+/// The digest CMIS records per generation: [`entries_digest`] when there are
+/// no publishers (unchanged from v2, so no generation moves on upgrade),
+/// otherwise `SHA-384(tag ‖ 0x00 ‖ CBOR(entries) ‖ CBOR(publishers))`, both
+/// sorted. A publisher change therefore moves every capable host's
+/// generation on its next sync.
+pub fn compiled_digest(
+    entries: &[AllowEntryV2],
+    publishers: &[TrustedPublisherV3],
+) -> Result<[u8; 48], AllowlistV2Error> {
+    if publishers.is_empty() {
+        return entries_digest(entries);
+    }
+    let mut sorted = entries.to_vec();
+    sort_entries(&mut sorted);
+    let mut pubs = publishers.to_vec();
+    sort_publishers(&mut pubs);
+    let mut cbor = Vec::with_capacity(64 * sorted.len() + 128 * pubs.len() + 64);
+    cbor.extend_from_slice(COMPILED_DIGEST_TAG);
+    cbor.push(0);
+    ciborium::into_writer(&sorted, &mut cbor).map_err(|e| AllowlistV2Error::Cbor(e.to_string()))?;
+    ciborium::into_writer(&pubs, &mut cbor).map_err(|e| AllowlistV2Error::Cbor(e.to_string()))?;
+    let mut out = [0u8; 48];
+    out.copy_from_slice(&Sha384::digest(&cbor));
+    Ok(out)
 }
 
 /// Sort entries into the canonical order, `(bin_sha, approval_id)`.
@@ -152,6 +252,7 @@ pub fn encode_body_v2(doc: &AllowlistDocV2) -> Result<Vec<u8>, AllowlistV2Error>
     validate(doc)?;
     let mut doc = doc.clone();
     sort_entries(&mut doc.entries);
+    sort_publishers(&mut doc.publishers);
     let mut body = Vec::with_capacity(128 + 160 * doc.entries.len());
     ciborium::into_writer(&doc, &mut body).map_err(|e| AllowlistV2Error::Cbor(e.to_string()))?;
     if body.len() > MAX_ALLOWLIST_V2_BYTES {
@@ -263,7 +364,85 @@ mod tests {
             issued_at: 1000,
             not_after: 4600,
             entries: vec![entry(0xbb, 2), entry(0xaa, 9), entry(0xaa, 1)],
+            publishers: Vec::new(),
         }
+    }
+
+    fn publisher(id: u8) -> TrustedPublisherV3 {
+        TrustedPublisherV3 {
+            publisher_id: [id; 16],
+            kind: 1,
+            anchor_sha256: [0xa0; 32],
+            pin_kind: 2,
+            pin: [id; 32],
+            require_timestamp: true,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn format_3_carries_sorted_publishers_and_format_2_stays_unchanged() {
+        let (sk, pk) = CompositeSecretKey::generate().unwrap();
+        let v2 = encode_body_v2(&doc()).unwrap();
+        let mut v3 = doc();
+        v3.format = ALLOWLIST_V3_FORMAT;
+        v3.publishers = vec![publisher(9), publisher(3)];
+        let signed = sign_v2(&v3, &sk).unwrap();
+        let back = verify_v2(&signed, &pk).unwrap();
+        assert_eq!(back.publishers, vec![publisher(3), publisher(9)]);
+        // A v2 body without publishers has no `publishers` key at all.
+        let plain: ciborium::Value = ciborium::from_reader(&v2[..]).unwrap();
+        let keys: Vec<String> = plain
+            .as_map()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.as_text().unwrap().to_string())
+            .collect();
+        assert!(!keys.iter().any(|k| k == "publishers"), "{keys:?}");
+    }
+
+    #[test]
+    fn format_and_publishers_must_agree() {
+        let mut d = doc();
+        d.publishers = vec![publisher(1)];
+        assert!(matches!(
+            encode_body_v2(&d),
+            Err(AllowlistV2Error::Format(2))
+        ));
+        let mut d = doc();
+        d.format = ALLOWLIST_V3_FORMAT;
+        assert!(matches!(
+            encode_body_v2(&d),
+            Err(AllowlistV2Error::Format(3))
+        ));
+        d.publishers = vec![publisher(1), publisher(1)];
+        assert!(matches!(
+            encode_body_v2(&d),
+            Err(AllowlistV2Error::MalformedPublisher)
+        ));
+        let mut bad = publisher(2);
+        bad.pin_kind = 4;
+        d.publishers = vec![bad];
+        assert!(matches!(
+            encode_body_v2(&d),
+            Err(AllowlistV2Error::MalformedPublisher)
+        ));
+    }
+
+    #[test]
+    fn the_compiled_digest_moves_only_when_publishers_exist() {
+        let d = doc();
+        assert_eq!(
+            compiled_digest(&d.entries, &[]).unwrap(),
+            entries_digest(&d.entries).unwrap()
+        );
+        let one = compiled_digest(&d.entries, &[publisher(1)]).unwrap();
+        assert_ne!(one, entries_digest(&d.entries).unwrap());
+        assert_ne!(one, compiled_digest(&d.entries, &[publisher(2)]).unwrap());
+        assert_eq!(
+            compiled_digest(&d.entries, &[publisher(2), publisher(1)]).unwrap(),
+            compiled_digest(&d.entries, &[publisher(1), publisher(2)]).unwrap()
+        );
     }
 
     #[test]

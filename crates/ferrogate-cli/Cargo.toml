@@ -21,6 +21,8 @@ ferro-proto     = { path = "../ferro-proto" }
 ferro-crypto    = { path = "../ferro-crypto" }
 ferro-transport = { path = "../ferro-transport" }
 ferro-svid      = { path = "../ferro-svid" }
+# Shared request building, validation and display with the tray (F20 §12).
+ferrogate-admin-client = { path = "../ferrogate-admin-client" }
 
 tokio            = { workspace = true }
 tonic            = { workspace = true }

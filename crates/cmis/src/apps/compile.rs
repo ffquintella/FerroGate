@@ -28,7 +28,11 @@
 //! consistent.
 
 use ferro_raft::apps::{ApprovalOrigin, LiveApproval, PathMatch, UserKind, UserScope};
-use ferro_svid::allowlist_v2::{entries_digest, path_hash, sid_hash, sort_entries, AllowEntryV2};
+use ferro_raft::publishers::PublisherRow;
+use ferro_svid::allowlist_v2::{
+    compiled_digest, path_hash, sid_hash, sort_entries, sort_publishers, AllowEntryV2,
+    TrustedPublisherV3,
+};
 use tonic::Status;
 
 use super::mode::{self, AllowlistMode};
@@ -183,20 +187,56 @@ pub async fn entries(
     }
 }
 
-/// Sign `entries` for `host_uuid` at `generation` with a fresh window and
-/// cache the body. A failed cache write is logged; the signed body is still
-/// correct and is served.
+/// The signed form of a trusted publisher record (ADR-0006), or `None`
+/// (logged) when a stored value is out of range: that publisher is left
+/// out, which fails closed for it only.
+#[must_use]
+pub fn publisher_of(row: &PublisherRow) -> Option<TrustedPublisherV3> {
+    let p = &row.record;
+    let id = uuid::Uuid::parse_str(&p.publisher_id).ok();
+    let (Some(id), Ok(kind), Ok(pin_kind)) = (id, u8::try_from(p.kind), u8::try_from(p.pin_kind))
+    else {
+        tracing::error!(event = "apps.compile.publisher_skipped", publisher_id = %p.publisher_id, "trusted publisher left out of the allowlist");
+        return None;
+    };
+    Some(TrustedPublisherV3 {
+        publisher_id: *id.as_bytes(),
+        kind,
+        anchor_sha256: p.anchor_sha256,
+        pin_kind,
+        pin: p.pin,
+        require_timestamp: p.require_timestamp,
+        expires_at: p.expires_at,
+    })
+}
+
+/// The trusted publishers in force at `now`, in canonical order.
+pub async fn publishers(state: &CmisState, now: i64) -> Result<Vec<TrustedPublisherV3>, Status> {
+    let rows = state
+        .cluster()
+        .publishers_in_force(now)
+        .await
+        .map_err(ledger_status)?;
+    let mut out: Vec<TrustedPublisherV3> = rows.iter().filter_map(publisher_of).collect();
+    sort_publishers(&mut out);
+    Ok(out)
+}
+
+/// Sign `entries` (and `publishers`: format 3 when any) for `host_uuid` at
+/// `generation` with a fresh window and cache the body. A failed cache
+/// write is logged; the signed body is still correct and is served.
 async fn sign_and_cache(
     state: &CmisState,
     host_uuid: &str,
     generation: u64,
     entries: Vec<AllowEntryV2>,
+    publishers: Vec<TrustedPublisherV3>,
     now: i64,
 ) -> Result<Served, Status> {
     let not_after = now.saturating_add(state.config.allowlist_ttl_secs);
     let signed = state
         .issuer
-        .sign_allowlist_v2(host_uuid, generation, entries, now, not_after)
+        .sign_allowlist_compiled(host_uuid, generation, entries, publishers, now, not_after)
         .map_err(|e| internal("sign", &e))?;
     let bytes = ferro_svid::allowlist::encode(&signed).map_err(|e| internal("encode", &e))?;
     match state
@@ -218,11 +258,14 @@ async fn sign_and_cache(
 }
 
 /// Serve `host_uuid`'s allowlist v2 to a host holding `have_generation`
-/// (see the module docs).
+/// (see the module docs). `with_publishers`: the host accepts format 3, so
+/// the trusted publishers in force are compiled in (ADR-0006); a host that
+/// does not gets exactly the v2 body it always did.
 pub async fn serve(
     state: &CmisState,
     host_uuid: &str,
     have_generation: u64,
+    with_publishers: bool,
     now: i64,
 ) -> Result<Served, Status> {
     let cluster = state.cluster();
@@ -245,7 +288,12 @@ pub async fn serve(
             continue;
         };
         let entries = entries(state, mode, host_uuid, now).await?;
-        let digest = entries_digest(&entries).map_err(|e| internal("digest", &e))?;
+        let publishers = if with_publishers {
+            publishers(state, now).await?
+        } else {
+            Vec::new()
+        };
+        let digest = compiled_digest(&entries, &publishers).map_err(|e| internal("digest", &e))?;
         if st.entries_digest == digest {
             if let (Some(body), Some(not_after)) = (&st.cached_v2, st.cached_not_after) {
                 if not_after.saturating_sub(now) > half_life {
@@ -263,7 +311,7 @@ pub async fn serve(
                 }
             }
             // Same entries, no fresh body: only the window moves.
-            return sign_and_cache(state, host_uuid, st.generation, entries, now).await;
+            return sign_and_cache(state, host_uuid, st.generation, entries, publishers, now).await;
         }
         // The entry set differs from the one recorded for this generation.
         // `None`: the generation moved concurrently; compile again.
@@ -278,7 +326,7 @@ pub async fn serve(
                 now,
             );
             tracing::info!(event = "apps.allowlist.compiled", %host_uuid, generation, entry_count = entries.len(), "allowlist v2 compiled");
-            return sign_and_cache(state, host_uuid, generation, entries, now).await;
+            return sign_and_cache(state, host_uuid, generation, entries, publishers, now).await;
         }
     }
     tracing::warn!(%host_uuid, "allowlist generation kept moving; giving up for now");

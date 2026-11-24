@@ -625,6 +625,56 @@ pub enum AuditEvent {
         /// the administrator explicitly allowed it).
         entries_not_imported: u64,
     },
+    /// An administrator added a trusted publisher (ADR-0006): every host
+    /// admits binaries signed by it. Digests only, no display strings.
+    TrustedPublisherAdded {
+        /// Publisher id.
+        publisher_id: Bytes16,
+        /// Administrator.
+        admin_id: String,
+        /// Reference to the session.
+        session_ref: String,
+        /// 1 authenticode, 2 apple.
+        kind: u8,
+        /// SHA-256 of the pinned CA certificate.
+        anchor_sha256: Bytes32,
+        /// 1 leaf certificate, 2 leaf SPKI, 3 leaf subject.
+        pin_kind: u8,
+        /// The pinned leaf digest.
+        pin: Bytes32,
+        /// Signatures must carry a trusted timestamp.
+        require_timestamp: bool,
+        /// Second-factor method of the per-operation proof.
+        mfa_method: String,
+        /// Unix seconds; `None` for no expiry.
+        expires_at: Option<i64>,
+    },
+    /// An administrator removed a trusted publisher (ADR-0006).
+    TrustedPublisherRemoved {
+        /// Publisher id.
+        publisher_id: Bytes16,
+        /// Administrator.
+        admin_id: String,
+        /// Reference to the session.
+        session_ref: String,
+    },
+    /// MIA granted a token to a caller that no approval admitted, because
+    /// its verified code signature matched a trusted publisher (ADR-0006).
+    /// Takes the place of `LocalGrant` for that request.
+    LocalGrantByPublisher {
+        /// Calling process id.
+        pid: u32,
+        /// Calling user id.
+        uid: u32,
+        /// SHA-384 of the calling binary.
+        bin_sha: Hash384,
+        /// Token `jti`.
+        jti: Bytes16,
+        /// The matching publisher.
+        publisher_id: Bytes16,
+        /// SHA-256 of the caller's signing (leaf) certificate.
+        leaf_cert_sha256: Bytes32,
+    },
 }
 
 /// Failure modes for event codec.
@@ -690,6 +740,39 @@ mod tests {
         })
         .unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn trusted_publisher_events_roundtrip() {
+        for e in [
+            AuditEvent::TrustedPublisherAdded {
+                publisher_id: Bytes16([1; 16]),
+                admin_id: "a".into(),
+                session_ref: "s".into(),
+                kind: 1,
+                anchor_sha256: Bytes32([2; 32]),
+                pin_kind: 3,
+                pin: Bytes32([3; 32]),
+                require_timestamp: true,
+                mfa_method: "totp".into(),
+                expires_at: Some(9),
+            },
+            AuditEvent::TrustedPublisherRemoved {
+                publisher_id: Bytes16([1; 16]),
+                admin_id: "a".into(),
+                session_ref: "s".into(),
+            },
+            AuditEvent::LocalGrantByPublisher {
+                pid: 7,
+                uid: 501,
+                bin_sha: Hash384([4; 48]),
+                jti: Bytes16([5; 16]),
+                publisher_id: Bytes16([1; 16]),
+                leaf_cert_sha256: Bytes32([6; 32]),
+            },
+        ] {
+            assert_eq!(decode(&encode(&e).unwrap()).unwrap(), e);
+        }
     }
 
     #[test]

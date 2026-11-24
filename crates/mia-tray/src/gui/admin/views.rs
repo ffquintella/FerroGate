@@ -30,7 +30,7 @@ use crate::i18n::{fill, Lang, Msg};
 /// The latest Unix time shown as a date (a hostile value stays readable).
 const MAX_DATE: i64 = 253_402_300_799;
 
-fn when(secs: i64) -> String {
+pub(super) fn when(secs: i64) -> String {
     if secs <= 0 {
         "—".to_string()
     } else {
@@ -65,7 +65,7 @@ fn state_name(lang: Lang, tab: Tab, state: u32) -> &'static str {
     msg.text(lang)
 }
 
-fn refusal_text(lang: Lang, r: Refusal) -> &'static str {
+pub(super) fn refusal_text(lang: Lang, r: Refusal) -> &'static str {
     match r {
         Refusal::NotAllowed => Msg::AdminRefNotAllowed.text(lang),
         Refusal::Invalid => Msg::AdminRefInvalid.text(lang),

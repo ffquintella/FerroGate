@@ -38,6 +38,11 @@
 #![allow(clippy::borrow_as_ptr, clippy::cast_possible_truncation)]
 
 #[cfg(windows)]
+mod authenticode;
+#[cfg(windows)]
+pub use authenticode::{authenticode_signature, AuthenticodeError, AuthenticodeSignature};
+
+#[cfg(windows)]
 mod imp;
 #[cfg(windows)]
 pub use imp::{

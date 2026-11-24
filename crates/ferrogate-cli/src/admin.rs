@@ -40,7 +40,7 @@ use tonic::service::Interceptor;
 use tonic::transport::Channel;
 use zeroize::Zeroizing;
 
-use crate::{apps, migration, rpc_err, CmisError};
+use crate::{apps, migration, publishers, rpc_err, CmisError};
 
 /// Default admin listener.
 pub(crate) const DEFAULT_ADMIN_ENDPOINT: &str = "https://127.0.0.1:8444";
@@ -487,7 +487,7 @@ pub(crate) async fn run(a: AdminArgs<'_>, sub: &str, args: &[String]) -> anyhow:
         "bootstrap" => enroll(a, args, true).await,
         "enroll" => enroll(a, args, false).await,
         "whoami" | "sessions" | "passwd" | "accounts" | "groups" | "factors" | "apps"
-        | "migrate-allowlists" | "set-allowlist-mode" => {
+        | "publishers" | "migrate-allowlists" | "set-allowlist-mode" => {
             if matches!(sub, "migrate-allowlists" | "set-allowlist-mode") {
                 if matches!(
                     args.first().map(String::as_str),
@@ -509,6 +509,18 @@ pub(crate) async fn run(a: AdminArgs<'_>, sub: &str, args: &[String]) -> anyhow:
                 }
                 // Typos are caught before a sign-in costs a TOTP code.
                 apps::validate(args)?;
+            }
+            if sub == "publishers" {
+                if matches!(
+                    args.first().map(String::as_str),
+                    Some("help" | "-h" | "--help")
+                ) {
+                    println!("{}", publishers::usage());
+                    return Ok(());
+                }
+                // Typos and bad certificate files are caught before a sign-in
+                // costs a TOTP code.
+                publishers::validate(args)?;
             }
             let session =
                 session_for_command(a.channel.clone(), a.session_file, a.device_file, a.prompter)
@@ -661,6 +673,7 @@ async fn authenticated(
         "accounts" => accounts(&mut admin, args, a.prompter).await,
         "factors" => factors(&mut admin, args, a.prompter).await,
         "apps" => apps::run(&mut admin, args, a.prompter).await,
+        "publishers" => publishers::run(&mut admin, args, a.prompter).await,
         "migrate-allowlists" | "set-allowlist-mode" => {
             migration::run(&mut admin, migration::parse(sub, args)?, a.prompter).await
         }

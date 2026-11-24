@@ -241,7 +241,7 @@ pub enum Refusal {
     ServerError,
 }
 
-fn refusal(e: &ClientError) -> Refusal {
+pub(super) fn refusal(e: &ClientError) -> Refusal {
     match e {
         ClientError::Connect(_) => Refusal::Unreachable,
         ClientError::Other(r) => match r.code {

@@ -17,6 +17,10 @@ use ferro_audit::AuditEvent;
 use ferro_proto::admin_v1::admin_server::{Admin, AdminServer};
 use ferro_proto::admin_v1::login_request::SecondFactor;
 use ferro_proto::admin_v1::{
+    AddTrustedPublisherRequest, AddTrustedPublisherResponse, ListTrustedPublishersRequest,
+    ListTrustedPublishersResponse, RemoveTrustedPublisherRequest, RemoveTrustedPublisherResponse,
+};
+use ferro_proto::admin_v1::{
     AdminAccountInfo, AdminGroupInfo, BeginAddFactorRequest, BeginAddFactorResponse,
     BeginEnrollmentRequest, BeginEnrollmentResponse, BeginLoginRequest, BeginLoginResponse,
     BeginStepUpRequest, BeginStepUpResponse, ChangePasswordRequest, ChangePasswordResponse,
@@ -708,6 +712,29 @@ impl Admin for AdminSvc {
         request: Request<ImportLegacyAllowlistsRequest>,
     ) -> Result<Response<ImportLegacyAllowlistsResponse>, Status> {
         super::migration::import_legacy_allowlists(&self.authz, request).await
+    }
+
+    // ---- ADR-0006 trusted publishers (see `super::publishers`) ----
+
+    async fn list_trusted_publishers(
+        &self,
+        request: Request<ListTrustedPublishersRequest>,
+    ) -> Result<Response<ListTrustedPublishersResponse>, Status> {
+        super::publishers::list_trusted_publishers(&self.authz, request).await
+    }
+
+    async fn add_trusted_publisher(
+        &self,
+        request: Request<AddTrustedPublisherRequest>,
+    ) -> Result<Response<AddTrustedPublisherResponse>, Status> {
+        super::publishers::add_trusted_publisher(&self.authz, request).await
+    }
+
+    async fn remove_trusted_publisher(
+        &self,
+        request: Request<RemoveTrustedPublisherRequest>,
+    ) -> Result<Response<RemoveTrustedPublisherResponse>, Status> {
+        super::publishers::remove_trusted_publisher(&self.authz, request).await
     }
 
     async fn begin_login(

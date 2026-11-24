@@ -40,6 +40,7 @@ pub mod apps;
 pub mod cluster;
 mod migrations;
 mod peer_cert;
+pub mod publishers;
 pub mod raft_timing;
 
 pub use apps::LedgerError;

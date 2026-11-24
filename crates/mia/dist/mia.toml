@@ -115,6 +115,8 @@
 # live in the daemon's state directory (state_path). Needs cmis.* and
 # allowlist.key. Default: true (set false to keep only the start-time `fetch`,
 # which cannot carry exact-path or expiring approvals).
+# The synced body also carries the fleet's trusted publishers (ADR-0006): they
+# are managed only in CMIS (`ferrogate admin publishers`), never in this file.
 #sync = true
 #sync_interval_secs = 300
 #sync_jitter_pct = 10

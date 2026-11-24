@@ -51,6 +51,7 @@ pub const BUILTIN_GROUPS: &[(&str, &[&str])] = &[
             "approval.list",
             "approval.read",
             "host.list",
+            "publisher.list",
         ],
     ),
     (
@@ -66,6 +67,7 @@ pub const BUILTIN_GROUPS: &[(&str, &[&str])] = &[
             "approval.update",
             "approval.revoke",
             "app.direct_register",
+            "publisher.list",
         ],
     ),
     (
@@ -90,6 +92,8 @@ pub const BUILTIN_GROUPS: &[(&str, &[&str])] = &[
             "policy.epoch_bump",
             "settings.allowlist_mode",
             "allowlist.import",
+            "publisher.list",
+            "publisher.manage",
         ],
     ),
 ];

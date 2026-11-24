@@ -745,6 +745,14 @@ is `active` in `ferrogate admin apps approvals` yet denied `not-allowlisted`
 on a v1 agent. `ferrogate allowlist show` prints the v2 view (the live approvals, with an
 `in_v1` column) in approvals mode; `show --v1` prints the v1 body.
 
+**Trusted publishers (ADR-0006).** The agent asks for formats `[2, 3]`. A CMIS
+with trusted publishers configured then serves format 3: the same signed,
+host-bound body plus the publisher rules, which the helper API applies to
+callers no entry admits (see `docs/helper-api.md`). There is nothing to
+configure on the host and no local way to add a publisher; manage them with
+`ferrogate admin publishers` or the tray admin client. Auto-approval by
+publisher works on Windows and macOS; on Linux it never admits (fail closed).
+
 **Superseded revisions.** An auto-update creates a new approval and marks its
 parent `superseded_by`, but the parent stays `active`, so older revision
 hashes remain allowed (and served) until revoked or expired. This keeps

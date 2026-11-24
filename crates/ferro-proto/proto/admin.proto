@@ -73,6 +73,14 @@ service Admin {
   rpc GetAllowlistMode (GetAllowlistModeRequest) returns (GetAllowlistModeResponse);
   rpc SetAllowlistMode (SetAllowlistModeRequest) returns (SetAllowlistModeResponse);
   rpc ImportLegacyAllowlists (ImportLegacyAllowlistsRequest) returns (ImportLegacyAllowlistsResponse);
+
+  // ---- Trusted publishers (ADR-0006) ----
+  // List: publisher.list. Add: publisher.manage plus a per-operation
+  // MfaProof. Remove: publisher.manage with a recent step-up. Each mutation
+  // emits exactly one audit event (TrustedPublisherAdded / Removed).
+  rpc ListTrustedPublishers (ListTrustedPublishersRequest) returns (ListTrustedPublishersResponse);
+  rpc AddTrustedPublisher (AddTrustedPublisherRequest) returns (AddTrustedPublisherResponse);
+  rpc RemoveTrustedPublisher (RemoveTrustedPublisherRequest) returns (RemoveTrustedPublisherResponse);
 }
 
 // Client kind: 1 tui, 2 tray, 3 cli.
@@ -715,3 +723,60 @@ message ImportLegacyAllowlistsResponse {
   uint64 imports_revoked = 9;
   bool hosts_truncated = 10;
 }
+
+// ---- Trusted publishers (ADR-0006) ----
+//
+// A trusted publisher admits, on every host and for any user, a binary whose
+// code signature the host's OS verifies, whose chain contains the CA
+// `anchor_sha256` and whose leaf has the `pin_kind` digest `pin`. Kind codes:
+// 1 authenticode, 2 apple. Pin kinds: 1 leaf certificate SHA-256, 2 leaf
+// SubjectPublicKeyInfo SHA-256, 3 leaf subject (ferro-codesign subject_pin).
+// Digests are 32 raw bytes. `label`, `subject` and `issuer` are display
+// strings only and never used for matching.
+
+message TrustedPublisherInfo {
+  string publisher_id = 1;
+  uint32 kind = 2;
+  bytes anchor_sha256 = 3;
+  uint32 pin_kind = 4;
+  bytes pin = 5;
+  bool require_timestamp = 6;
+  string label = 7;                 // <= 128 characters
+  string subject = 8;               // leaf subject at add time, <= 512
+  string issuer = 9;                // leaf issuer at add time, <= 512
+  bytes leaf_cert_sha256 = 10;      // empty when added by pins only
+  int64 created_at = 11;
+  string created_by_admin_id = 12;
+  int64 expires_at = 13;            // 0: no expiry
+  uint32 state = 14;                // 1 active, 2 removed
+  int64 removed_at = 15;            // 0 while active
+  string removed_by_admin_id = 16;
+}
+
+message ListTrustedPublishersRequest { bool include_removed = 1; }
+message ListTrustedPublishersResponse { repeated TrustedPublisherInfo publishers = 1; }
+
+// ALREADY_EXISTS `publisher_exists` when an active publisher has the same
+// kind, anchor, pin kind and pin; RESOURCE_EXHAUSTED `too_many_publishers`
+// beyond 256 active publishers.
+message AddTrustedPublisherRequest {
+  string idempotency_key = 1;       // <= 128, optional
+  MfaProof proof = 2;
+  uint32 kind = 3;
+  bytes anchor_sha256 = 4;
+  uint32 pin_kind = 5;
+  bytes pin = 6;
+  bool require_timestamp = 7;
+  string label = 8;
+  string subject = 9;
+  string issuer = 10;
+  bytes leaf_cert_sha256 = 11;
+  int64 expires_at = 12;            // 0: no expiry
+}
+message AddTrustedPublisherResponse { TrustedPublisherInfo publisher = 1; }
+
+message RemoveTrustedPublisherRequest {
+  string idempotency_key = 1;
+  string publisher_id = 2;
+}
+message RemoveTrustedPublisherResponse { TrustedPublisherInfo publisher = 1; }

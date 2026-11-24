@@ -32,7 +32,7 @@ forwarding that journal to CMIS through `AppendAuditEvent` is a follow-up
 (T226). The daemon's own events are forwarded, see below.
 
 **Forwarding from hosts.** The MIA daemon appends its own events
-(`LocalGrant`, `LocalDenied`, `AllowlistSyncApplied`, `AllowlistSyncRejected`)
+(`LocalGrant`, `LocalGrantByPublisher`, `LocalDenied`, `AllowlistSyncApplied`, `AllowlistSyncRejected`)
 through `AppendAuditEvent`. CMIS also accepts `ConfigChanged` from a host,
 but MIA does not send it yet (T226). Since 0.29.0 every forward is
 host-authenticated (F19 §7.1 `HostCallAuth`): the host presents its
@@ -115,6 +115,17 @@ Requests, approvals and lineages appear as UUID bytes, binaries as SHA-384,
 paths only as the host-salted `path_hash`; user names, SIDs, paths and
 free-text messages never. Hosts may forward `AllowlistSyncApplied` /
 `AllowlistSyncRejected`, and only for themselves (`host_mismatch` otherwise).
+
+**Trusted publishers (ADR-0006).** CMIS records `TrustedPublisherAdded
+{publisher_id, admin_id, session_ref, kind, anchor_sha256, pin_kind, pin,
+require_timestamp, mfa_method, expires_at}` and `TrustedPublisherRemoved
+{publisher_id, admin_id, session_ref}`, one per change, after the store
+committed; a refused or unproven add records nothing. Display strings (label,
+subject, issuer) are not in the events. A MIA records `LocalGrantByPublisher
+{pid, uid, bin_sha, jti, publisher_id, leaf_cert_sha256}` instead of
+`LocalGrant` when a trusted publisher, not an approval, admitted the caller,
+and forwards it like `LocalGrant`. Review every `TrustedPublisherAdded` in the
+SIEM: it is a fleet-wide grant.
 
 **Allowlist migration (F19 §11).** `AllowlistImported {host_uuid,
 approvals_created, admin_id}` is written once per host whose legacy body

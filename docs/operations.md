@@ -624,6 +624,36 @@ administrator (ADR-0004).
   ledger, readable by viewers and approvers (F19 §10). Store failures answer
   `UNAVAILABLE store_unavailable` and audit nothing.
 
+### Trusted publishers (ADR-0006)
+
+A trusted publisher makes every MIA approve, by itself, any program signed by
+one code-signing identity: no request, no decision. It is a fleet-wide grant,
+so only `ferrogate-platform-operators` hold `publisher.manage`, and every add
+needs a fresh TOTP or FIDO2 proof (viewers and approvers can list).
+
+```sh
+ferrogate admin publishers list [--all]
+ferrogate admin publishers add --label "ACME" --exe /path/to/signed/tool   # macOS, Windows
+ferrogate admin publishers add --label "ACME" --kind authenticode \
+    --leaf-cert acme-signing.cer --anchor-cert acme-issuing-ca.cer [--pin leaf-spki]
+ferrogate admin publishers show P-0000BEEF
+ferrogate admin publishers remove P-0000BEEF          # types the short id back
+```
+
+- **What is pinned.** A CA that must be in the signer's chain (prefer the
+  issuing intermediate over a root) and the leaf certificate, its key
+  (default) or its subject, all as SHA-256 digests. Names are never matched.
+  Timestamps are required by default (`--no-require-timestamp` to waive).
+- **Where it applies.** MIAs that request allowlist format 3 (this release and
+  later) on Windows (Authenticode, with revocation checks that fail closed
+  when CRL/OCSP is unreachable) and macOS (Apple-rooted signatures). Linux
+  agents never auto-approve. Approvals keep working everywhere.
+- **Propagation.** An add, removal or expiry reaches each host at its next sync
+  (5 minutes). Every add and removal is audited (`TrustedPublisherAdded`,
+  `TrustedPublisherRemoved`) and each auto-approved token as
+  `LocalGrantByPublisher` with the publisher and the leaf thumbprint. Review
+  them in the SIEM; remove a publisher as soon as one of its builds is suspect.
+
 ### Migrating legacy allowlists to approvals (runbook)
 
 F19 §11. The migration is reversible until the legacy bodies are deleted, which this

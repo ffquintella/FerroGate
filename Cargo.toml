@@ -23,6 +23,7 @@ members = [
     "crates/ferro-harden",
     "crates/ferro-machineid",
     "crates/ferro-appid",
+    "crates/ferro-codesign",
     "crates/ferro-sep",
     "crates/ferrogate-cli",
     "crates/ferrogate-admin-client",

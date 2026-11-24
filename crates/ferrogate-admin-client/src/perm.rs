@@ -18,3 +18,7 @@ pub const REVOKE: &str = "approval.revoke";
 pub const DIRECT_REGISTER: &str = "app.direct_register";
 /// List accounts.
 pub const ACCOUNT_LIST: &str = "account.list";
+/// List trusted publishers (ADR-0006).
+pub const PUBLISHER_LIST: &str = "publisher.list";
+/// Add or remove a trusted publisher (ADR-0006).
+pub const PUBLISHER_MANAGE: &str = "publisher.manage";

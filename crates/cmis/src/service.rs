@@ -1894,8 +1894,17 @@ impl MachineIdentity for MachineIdentitySvc {
         {
             return Err(invalid_field("unsupported_format", Some("accept_formats")));
         }
-        let served =
-            apps::compile::serve(&self.state, &host.host_uuid, doc.have_generation, now).await?;
+        let with_publishers = doc
+            .accept_formats
+            .contains(&ferro_svid::allowlist_v2::ALLOWLIST_V3_FORMAT);
+        let served = apps::compile::serve(
+            &self.state,
+            &host.host_uuid,
+            doc.have_generation,
+            with_publishers,
+            now,
+        )
+        .await?;
         let resp = match served {
             apps::compile::Served::NotModified {
                 generation,
@@ -1931,6 +1940,7 @@ const MAX_FORWARDED_EVENT_BYTES: usize = 64 * 1024;
 fn host_forwardable(event: &AuditEvent) -> bool {
     match event {
         AuditEvent::LocalGrant { .. }
+        | AuditEvent::LocalGrantByPublisher { .. }
         | AuditEvent::LocalDenied { .. }
         | AuditEvent::ConfigChanged { .. }
         | AuditEvent::AllowlistSyncApplied { .. }
@@ -1983,7 +1993,9 @@ fn host_forwardable(event: &AuditEvent) -> bool {
         | AuditEvent::AdminDirectRegistration { .. }
         | AuditEvent::AllowlistCompiled { .. }
         | AuditEvent::AllowlistImported { .. }
-        | AuditEvent::AllowlistModeChanged { .. } => false,
+        | AuditEvent::AllowlistModeChanged { .. }
+        | AuditEvent::TrustedPublisherAdded { .. }
+        | AuditEvent::TrustedPublisherRemoved { .. } => false,
     }
 }
 

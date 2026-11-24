@@ -778,6 +778,349 @@ async fn apps_register_list_revoke_and_show_the_history() {
     );
 }
 
+/// A CA and a leaf it signed (rcgen), written as PEM files in `dir`; returns
+/// the leaf path, the CA path and the SHA-256 of the leaf's DER.
+fn write_publisher_chain(dir: &Path) -> (PathBuf, PathBuf, String) {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    use sha2::{Digest as _, Sha256};
+
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.distinguished_name
+        .push(DnType::CommonName, "ACME Test CA");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca.self_signed(&ca_key).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let mut leaf = CertificateParams::new(Vec::<String>::new()).unwrap();
+    leaf.distinguished_name
+        .push(DnType::CommonName, "ACME Corp");
+    let issuer = Issuer::from_params(&ca, &ca_key);
+    let leaf_cert = leaf.signed_by(&leaf_key, &issuer).unwrap();
+    let (leaf_path, ca_path) = (dir.join("leaf.pem"), dir.join("ca.pem"));
+    std::fs::write(&leaf_path, leaf_cert.pem()).unwrap();
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    let thumbprint = hex::encode(Sha256::digest(leaf_cert.der().as_ref()));
+    (leaf_path, ca_path, thumbprint)
+}
+
+/// ADR-0006 through the CLI: add by digests and by certificate files, the
+/// confirmation, a refused proof, a duplicate, list/show, and removal with a
+/// wrong then a right confirmation (typed back, across a step-up).
+#[tokio::test]
+async fn trusted_publishers_add_list_show_and_remove() {
+    let cmis = spawn_cmis("publishers").await;
+    let secret = cmis.bootstrap().await;
+    let session = cmis.dir.join("session");
+    cmis.login(&secret, &session).await;
+    let s = session.to_str().unwrap();
+    let (anchor, pin) = (hex::encode([0xA1; 32]), hex::encode([0xB2; 32]));
+
+    // Parsed before the sign-in: no stdin needed to learn it is a typo.
+    for bad in [
+        &["frobnicate"][..],
+        &["add", "--label", "x"],
+        &["add", "--label", "x", "--pin", "sha1", "--exe", "/bin/sh"],
+        &["remove"],
+    ] {
+        let mut args = vec!["admin", "publishers"];
+        args.extend_from_slice(bad);
+        let (ok, _, stderr) = cmis.run(&args, &[]).await;
+        assert!(
+            !ok && stderr.starts_with("error:") && !stderr.contains("no input"),
+            "{bad:?}: {stderr}"
+        );
+    }
+    let (ok, stdout, _) = cmis.run(&["admin", "publishers", "help"], &[]).await;
+    assert!(ok && stdout.contains("publishers add"), "{stdout}");
+
+    // Without --yes and without a terminal nothing is asked or sent.
+    cmis.clock.advance(30);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "add",
+                "--label",
+                "ACME pins",
+                "--kind",
+                "authenticode",
+                "--anchor-sha256",
+                &anchor,
+                "--pin-sha256",
+                &pin,
+            ],
+            &[&cmis.code(&secret)],
+        )
+        .await;
+    assert!(!ok && stderr.contains("--yes"), "{stderr}");
+    assert!(
+        stdout.contains(&pin),
+        "the confirmation shows what is pinned: {stdout}"
+    );
+
+    // A refused proof changes nothing and says so.
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "add",
+                "--label",
+                "ACME pins",
+                "--kind",
+                "authenticode",
+                "--anchor-sha256",
+                &anchor,
+                "--pin-sha256",
+                &pin,
+                "--yes",
+            ],
+            &["000000"],
+        )
+        .await;
+    assert!(
+        !ok && stderr.contains("rejected") && stderr.contains("nothing was added"),
+        "{stderr}"
+    );
+    let (ok, stdout, _) = cmis
+        .run(
+            &["--session-file", s, "admin", "publishers", "list", "--all"],
+            &[],
+        )
+        .await;
+    assert!(ok && stdout.trim().is_empty(), "nothing added: {stdout}");
+
+    // Add by digests.
+    cmis.clock.advance(30);
+    let pins_args = [
+        "--session-file",
+        s,
+        "admin",
+        "publishers",
+        "add",
+        "--label",
+        "ACME pins",
+        "--kind",
+        "authenticode",
+        "--anchor-sha256",
+        &anchor,
+        "--pin-sha256",
+        &pin,
+        "--yes",
+    ];
+    let (ok, stdout, stderr) = cmis.run(&pins_args, &[&cmis.code(&secret)]).await;
+    assert!(ok, "add by pins: {stderr}");
+    let short_of = |text: &str| -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix("added trusted publisher "))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_else(|| panic!("no added line in {text}"))
+            .to_string()
+    };
+    let pins_short = short_of(&stdout);
+    assert!(pins_short.starts_with("P-"), "{stdout}");
+
+    // The same digests again are refused before a second factor is used.
+    cmis.clock.advance(30);
+    let (ok, _, stderr) = cmis.run(&pins_args, &[&cmis.code(&secret)]).await;
+    assert!(!ok && stderr.contains("publisher_exists"), "{stderr}");
+
+    // Add by certificate files, pinning the thumbprint.
+    let (leaf, ca, thumbprint) = write_publisher_chain(&cmis.dir);
+    cmis.clock.advance(30);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "add",
+                "--label",
+                "ACME files",
+                "--leaf-cert",
+                leaf.to_str().unwrap(),
+                "--anchor-cert",
+                ca.to_str().unwrap(),
+                "--kind",
+                "apple",
+                "--pin",
+                "leaf-cert",
+                "--no-require-timestamp",
+                "--yes",
+            ],
+            &[&cmis.code(&secret)],
+        )
+        .await;
+    assert!(ok, "add by files: {stderr}");
+    assert!(
+        stdout.contains("ACME Corp") && stdout.contains(&thumbprint),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("would refuse it"),
+        "no timestamp claim for files: {stdout}"
+    );
+    let files_short = short_of(&stdout);
+
+    // List and show (short id in lower case).
+    let (ok, stdout, stderr) = cmis
+        .run(&["--session-file", s, "admin", "publishers", "list"], &[])
+        .await;
+    assert!(ok, "list: {stderr}");
+    let (pins_line, files_line) = (
+        stdout
+            .lines()
+            .find(|l| l.starts_with(&pins_short))
+            .expect("pins row"),
+        stdout
+            .lines()
+            .find(|l| l.starts_with(&files_short))
+            .expect("files row"),
+    );
+    assert!(
+        pins_line.contains("active") && pins_line.contains("authenticode"),
+        "{stdout}"
+    );
+    assert!(
+        pins_line.contains("leaf-spki") && pins_line.contains("ACME pins"),
+        "{stdout}"
+    );
+    assert!(
+        files_line.contains("apple") && files_line.contains("ACME files — CN="),
+        "{stdout}"
+    );
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "show",
+                &files_short.to_lowercase(),
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok, "show: {stderr}");
+    assert!(
+        stdout.contains(&thumbprint) && stdout.contains("leaf-cert"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("require_timestamp:  no"), "{stdout}");
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "show",
+                "P-00000000",
+            ],
+            &[],
+        )
+        .await;
+    assert!(!ok && stderr.contains("no trusted publisher"), "{stderr}");
+
+    // A wrong confirmation sends nothing.
+    let (ok, _, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "remove",
+                &pins_short,
+                "--confirm",
+                "P-WRONG000",
+            ],
+            &[],
+        )
+        .await;
+    assert!(!ok && stderr.contains("nothing was removed"), "{stderr}");
+    let (_, stdout, _) = cmis
+        .run(&["--session-file", s, "admin", "publishers", "list"], &[])
+        .await;
+    assert!(stdout.contains(&pins_short), "still trusted: {stdout}");
+
+    // Remove with --confirm (a code is on stdin in case a step-up is asked).
+    cmis.clock.advance(30);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "remove",
+                &pins_short,
+                "--confirm",
+                &pins_short.to_lowercase(),
+            ],
+            &[&cmis.code(&secret)],
+        )
+        .await;
+    assert!(ok, "remove: {stderr}");
+    assert!(stdout.contains("removed trusted publisher"), "{stdout}");
+
+    // Typed back, after the step-up window passed: the retry after the
+    // step-up asks for the short id again (nothing is remembered).
+    cmis.clock.advance(400);
+    let (ok, stdout, stderr) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "remove",
+                &files_short,
+            ],
+            &[&files_short, &cmis.code(&secret), &files_short],
+        )
+        .await;
+    assert!(ok, "typed remove: {stderr}\n{stdout}");
+
+    // Default listing hides removed ones; --all shows them.
+    let (_, stdout, _) = cmis
+        .run(&["--session-file", s, "admin", "publishers", "list"], &[])
+        .await;
+    assert!(stdout.trim().is_empty(), "{stdout}");
+    let (_, stdout, _) = cmis
+        .run(
+            &["--session-file", s, "admin", "publishers", "list", "--all"],
+            &[],
+        )
+        .await;
+    assert_eq!(
+        stdout.lines().filter(|l| l.contains("removed")).count(),
+        2,
+        "{stdout}"
+    );
+    let (ok, stdout, _) = cmis
+        .run(
+            &[
+                "--session-file",
+                s,
+                "admin",
+                "publishers",
+                "show",
+                &pins_short,
+            ],
+            &[],
+        )
+        .await;
+    assert!(ok && stdout.contains("removed_by:"), "{stdout}");
+}
+
 /// F19 §11 through the CLI (M38): dry run, import (idempotent), the switch
 /// to approvals (refused until imported), `allowlist add|remove` mapped onto
 /// the approval RPCs, the read-only legacy writes, and the confirmed

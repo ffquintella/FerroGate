@@ -69,11 +69,15 @@ pub enum Permission {
     SettingsAllowlistMode,
     /// `allowlist.import`
     AllowlistImport,
+    /// `publisher.list` (ADR-0006)
+    PublisherList,
+    /// `publisher.manage` (ADR-0006)
+    PublisherManage,
 }
 
 impl Permission {
     /// Every permission.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::AppRequestList,
         Self::AppRequestRead,
         Self::ApprovalList,
@@ -97,6 +101,8 @@ impl Permission {
         Self::PolicyEpochBump,
         Self::SettingsAllowlistMode,
         Self::AllowlistImport,
+        Self::PublisherList,
+        Self::PublisherManage,
     ];
 
     /// The stored string form.
@@ -126,6 +132,8 @@ impl Permission {
             Self::PolicyEpochBump => "policy.epoch_bump",
             Self::SettingsAllowlistMode => "settings.allowlist_mode",
             Self::AllowlistImport => "allowlist.import",
+            Self::PublisherList => "publisher.list",
+            Self::PublisherManage => "publisher.manage",
         }
     }
 
@@ -292,6 +300,12 @@ pub mod paths {
     pub const SET_ALLOWLIST_MODE: &str = "/ferrogate.admin.v1.Admin/SetAllowlistMode";
     /// `Admin/ImportLegacyAllowlists` (F19 §11).
     pub const IMPORT_LEGACY_ALLOWLISTS: &str = "/ferrogate.admin.v1.Admin/ImportLegacyAllowlists";
+    /// `Admin/ListTrustedPublishers` (ADR-0006).
+    pub const LIST_TRUSTED_PUBLISHERS: &str = "/ferrogate.admin.v1.Admin/ListTrustedPublishers";
+    /// `Admin/AddTrustedPublisher` (ADR-0006).
+    pub const ADD_TRUSTED_PUBLISHER: &str = "/ferrogate.admin.v1.Admin/AddTrustedPublisher";
+    /// `Admin/RemoveTrustedPublisher` (ADR-0006).
+    pub const REMOVE_TRUSTED_PUBLISHER: &str = "/ferrogate.admin.v1.Admin/RemoveTrustedPublisher";
 }
 
 use Permission as P;
@@ -497,6 +511,19 @@ pub const METHOD_ACCESS: &[(&str, Access)] = &[
     (
         paths::IMPORT_LEGACY_ALLOWLISTS,
         session(Some(P::AllowlistImport), true, false, false),
+    ),
+    // ---- Admin: trusted publishers (ADR-0006; M checked in the handler) ----
+    (
+        paths::LIST_TRUSTED_PUBLISHERS,
+        session(Some(P::PublisherList), false, false, false),
+    ),
+    (
+        paths::ADD_TRUSTED_PUBLISHER,
+        session(Some(P::PublisherManage), false, false, false),
+    ),
+    (
+        paths::REMOVE_TRUSTED_PUBLISHER,
+        session(Some(P::PublisherManage), true, false, false),
     ),
 ];
 

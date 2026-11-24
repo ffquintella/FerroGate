@@ -171,6 +171,8 @@ ferro-winres = { path = "../ferro-winres" }
 proptest = { workspace = true }
 # Only to pin the pipe access mask to the DACL contract in a test.
 ferro-winauth = { path = "../ferro-winauth" }
+# Certificate chains for the trusted-publisher tests (no OS call).
+ferro-codesign = { path = "../ferro-codesign", features = ["test-support"] }
 
 # ── Linux packaging ───────────────────────────────────────────────────────────
 # Debian now ships this crate inside the combined `ferrogate-mia` workstation

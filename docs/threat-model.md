@@ -10,6 +10,7 @@
 | A4 | Cryptographically Relevant Quantum Computer | Break ECC/RSA retroactively | ML-DSA-65 for signatures, ML-KEM-768 for KEX; both hybridized with classical (AND-combiner) |
 | A5 | Malicious peer host | Replay another node's TPM quote | Per-session 32-byte server nonce; EK certificate pinning; TPM2_ActivateCredential proof-of-residency |
 | A6 | Insider with SIEM write access | Tamper with audit trail | Merkle-chained STH signed inside TEE; write-once local-disk WORM store (`O_CREAT|O_EXCL`); public transparency anchor |
+| A7 | Local process seeking a token without approval (ADR-0006) | Run a binary signed by someone else, swap the image on disk, present a look-alike certificate | Trusted publishers are CMIS records changed only through F20 (`publisher.manage` + fresh second factor), delivered in the signed allowlist; the OS verifies the kernel-identified caller's signature bound to its image hash; rules pin a CA in the chain and a leaf digest, never a name; every error fails closed. Residual risks and limits: [ADR-0006 §7](adr/0006-trusted-publishers.md#7-threat-model-and-limits) |
 | A7 | Local userspace attacker | Steal token from the MIA helper socket (UDS) or named pipe (Windows) | SO_PEERCRED + IMA runtime hash (Windows: pipe client PID + image SHA-384 + Authenticode, client-only pipe DACL, remote clients rejected) + signed allowlist; DPoP sender-constraint |
 
 ## Security goals

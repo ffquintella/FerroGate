@@ -15,6 +15,7 @@ ADRs are immutable once **Accepted**. To revise a decision, add a new ADR that
 | [0003](0003-host-allowlist-request-status.md) | Host-side allowlist request and status commands | Superseded by ADR-0004 |
 | [0004](0004-app-approval-ledger.md) | Application approval ledger and the non-replacement invariant | Accepted |
 | [0005](0005-admin-authentication.md) | Administrator authentication and authorization for CMIS | Proposed |
+| [0006](0006-trusted-publishers.md) | Trusted publishers: automatic approval of applications signed by an allowlisted publisher | Proposed |
 
 ## Status values
 

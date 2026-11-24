@@ -625,6 +625,31 @@ approved") and the list reloads. Picking a local file, identifying it with
 `ferro-appid`, taking this machine's host UUID and "Sync this machine now" are
 not in the tray yet.
 
+### Trusted publishers
+
+**Trusted publishers** (shown with `publisher.list`; add and remove need
+`publisher.manage`) lists the code-signing publishers whose signed programs
+every MIA approves by itself, on every host and for any user (ADR-0006). Each
+row opens a detail page with the full SHA-256 digests (selectable, with a Copy
+button); **Show removed** includes removed records.
+
+**Add a publisher…** reads the identity on this machine first: pick a signed
+executable (the OS verifies its signature: Authenticode on Windows, the Apple
+code signature on macOS; on Linux the tray says this is not supported), or pick
+the signing certificate and the CA certificate files and say whether they are
+Authenticode or Apple. The form asks for a label, the CA to anchor on (default:
+the nearest issuer), what to pin (default: the certificate's key), whether a
+trusted timestamp is required (default on) and an optional expiry. The review
+page shows the publisher, its issuer, the certificate thumbprint, the pin, the
+anchor, the scope and any warning (a subject pin, a root anchor, an executable
+without a timestamp). Only **Confirm** asks for a fresh second factor, which
+every add carries; a wrong code changes nothing and asks again with the same
+request. **Remove** asks you to type the publisher's short id (`P-XXXXXXXX`),
+needs a recent step-up, and takes effect on every host at its next sync.
+
+The view uses `ferrogate-admin-client::publishers`, the same code as
+`ferrogate admin publishers`, and the server authorizes both alike.
+
 Credential handling:
 
 - the password and the TOTP code live in fixed-capacity `Zeroizing` buffers

@@ -174,9 +174,9 @@ fn p(s: &str) -> Param {
 }
 
 #[tokio::test]
-async fn the_ledger_is_schema_migrations_1_to_3() {
+async fn the_ledger_is_schema_migrations_1_to_3_and_publishers_4() {
     let (c, _d) = cluster("migr").await;
-    assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2, 3]);
+    assert_eq!(c.applied_migrations().await.unwrap(), vec![1, 2, 3, 4]);
     c.shutdown().await.unwrap();
 }
 

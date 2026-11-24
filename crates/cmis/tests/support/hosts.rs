@@ -121,13 +121,19 @@ impl Host {
 
     /// A signed `SyncAllowlist` holding `have_generation`.
     pub fn sync(&self, have_generation: u64) -> SyncAllowlistRequest {
+        self.sync_accepting(have_generation, &[2])
+    }
+
+    /// A signed `SyncAllowlist` accepting `formats` (`[2, 3]`: trusted
+    /// publishers, ADR-0006).
+    pub fn sync_accepting(&self, have_generation: u64, formats: &[u32]) -> SyncAllowlistRequest {
         let doc = AllowlistSyncDoc {
             v: DOC_VERSION,
             host_uuid: self.uuid.clone(),
             issued_at: now_unix(),
             nonce: nonce(),
             have_generation,
-            accept_formats: vec![2],
+            accept_formats: formats.to_vec(),
         };
         let bytes = encode_allowlist_sync(&doc).unwrap();
         SyncAllowlistRequest {

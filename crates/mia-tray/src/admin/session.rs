@@ -12,7 +12,8 @@
 //! worker keeps no state between commands (nonces and creation requests go
 //! back and forth with the window). So do the request and approval reads
 //! and decisions (F22 §4), which carry no secret, and the single-step add
-//! (F22 §5), which carries its fresh second factor.
+//! (F22 §5), which carries its fresh second factor. So do the trusted
+//! publishers' list, add (fresh factor) and removal (ADR-0006).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +32,9 @@ use ferrogate_admin_client::client::{
 use ferrogate_admin_client::enroll::EnrollmentOffer;
 use ferrogate_admin_client::error::ClientError;
 use ferrogate_admin_client::factors::{register_key, AddNonce, AddOffer, FactorInfo, FactorMethod};
+use ferrogate_admin_client::publishers::proto::{
+    AddTrustedPublisherRequest, RemoveTrustedPublisherRequest, TrustedPublisherInfo,
+};
 use ferrogate_admin_client::session::SessionHandle;
 use ferrogate_admin_client::webauthn::{
     Authenticator, AuthenticatorError, CreationRequest, WebAuthnAttestation,
@@ -151,6 +155,22 @@ pub enum Cmd {
         /// The fresh second factor.
         proof: FactorChoice,
     },
+    /// `ListTrustedPublishers`.
+    ListPublishers {
+        /// Also list removed publishers.
+        include_removed: bool,
+    },
+    /// `AddTrustedPublisher` with a fresh second factor (the window keeps
+    /// the request, not the factor, for a retry with the same key).
+    AddPublisher {
+        /// The request, without its proof.
+        req: Box<AddTrustedPublisherRequest>,
+        /// The fresh second factor.
+        proof: FactorChoice,
+    },
+    /// `RemoveTrustedPublisher` (kept by the window for the one step-up
+    /// retry).
+    RemovePublisher(Box<RemoveTrustedPublisherRequest>),
 }
 
 static_assertions::assert_not_impl_any!(Cmd: std::fmt::Debug, std::fmt::Display, Clone);
@@ -165,7 +185,8 @@ impl Cmd {
             Cmd::SignIn { factor, .. } | Cmd::StepUp { factor } => key(factor),
             Cmd::CompleteAddTotp { proof, .. }
             | Cmd::RemoveFactor { proof, .. }
-            | Cmd::Register { proof, .. } => key(proof),
+            | Cmd::Register { proof, .. }
+            | Cmd::AddPublisher { proof, .. } => key(proof),
             Cmd::EnrollKey { .. } | Cmd::CompleteAddKey { .. } => true,
             Cmd::Offer { .. }
             | Cmd::BeginEnrollment { .. }
@@ -177,7 +198,9 @@ impl Cmd {
             | Cmd::GetRequest(_)
             | Cmd::ListApprovals(_)
             | Cmd::GetApproval(_)
-            | Cmd::Mutate(_) => false,
+            | Cmd::Mutate(_)
+            | Cmd::ListPublishers { .. }
+            | Cmd::RemovePublisher(_) => false,
         }
     }
 }
@@ -237,6 +260,12 @@ pub enum Reply {
     Mutated(Result<Box<Mutated>, ClientError>),
     /// Answer to [`Cmd::Register`].
     Registered(Result<Box<AdminRegisterApplicationResponse>, ClientError>),
+    /// Answer to [`Cmd::ListPublishers`].
+    Publishers(Result<Vec<TrustedPublisherInfo>, ClientError>),
+    /// Answer to [`Cmd::AddPublisher`].
+    PublisherAdded(Result<Option<TrustedPublisherInfo>, ClientError>),
+    /// Answer to [`Cmd::RemovePublisher`].
+    PublisherRemoved(Result<Option<TrustedPublisherInfo>, ClientError>),
 }
 
 static_assertions::assert_not_impl_any!(Reply: std::fmt::Debug, std::fmt::Display, Clone);
@@ -457,12 +486,16 @@ async fn run_factors(
             log_failure("register_application", result.as_ref().err());
             Reply::Registered(result)
         }
-        other => run_views(conn, other).await,
+        other => run_views(conn, other, key).await,
     }
 }
 
 /// [`run`] for the request and approval views and decisions.
-async fn run_views(conn: &mut AdminSession, cmd: Cmd) -> Reply {
+async fn run_views(
+    conn: &mut AdminSession,
+    cmd: Cmd,
+    key: Option<&Arc<dyn Authenticator>>,
+) -> Reply {
     match cmd {
         Cmd::Permissions => {
             let result = conn.who_am_i().await.map(|w| w.permissions);
@@ -493,6 +526,41 @@ async fn run_views(conn: &mut AdminSession, cmd: Cmd) -> Reply {
             let result = conn.mutate(*m).await.map(Box::new);
             log_failure("mutate", result.as_ref().err());
             Reply::Mutated(result)
+        }
+        other => run_publishers(conn, other, key).await,
+    }
+}
+
+/// [`run`] for the trusted-publisher list, add and removal.
+async fn run_publishers(
+    conn: &mut AdminSession,
+    cmd: Cmd,
+    key: Option<&Arc<dyn Authenticator>>,
+) -> Reply {
+    match cmd {
+        Cmd::ListPublishers { include_removed } => {
+            let result = conn.list_trusted_publishers(include_removed).await;
+            log_failure("list_trusted_publishers", result.as_ref().err());
+            Reply::Publishers(result)
+        }
+        Cmd::AddPublisher { req, proof } => {
+            let proof = match proof {
+                FactorChoice::Code(code) => Ok(Factor::Totp(code)),
+                FactorChoice::SecurityKey => key
+                    .map(|k| Factor::SecurityKey(Arc::clone(k)))
+                    .ok_or(ClientError::Authenticator(AuthenticatorError::Unavailable)),
+            };
+            let result = match proof {
+                Ok(p) => conn.add_trusted_publisher(*req, p).await,
+                Err(e) => Err(e),
+            };
+            log_failure("add_trusted_publisher", result.as_ref().err());
+            Reply::PublisherAdded(result)
+        }
+        Cmd::RemovePublisher(req) => {
+            let result = conn.remove_trusted_publisher(*req).await;
+            log_failure("remove_trusted_publisher", result.as_ref().err());
+            Reply::PublisherRemoved(result)
         }
         other => refused(other, &ClientError::FactorNotOffered).1,
     }
@@ -536,6 +604,15 @@ fn refused(cmd: Cmd, e: &ClientError) -> (&'static str, Reply) {
         Cmd::GetApproval(_) => ("get_approval", Reply::Approval(failed(err()))),
         Cmd::Mutate(_) => ("mutate", Reply::Mutated(failed(err()))),
         Cmd::Register { .. } => ("register_application", Reply::Registered(failed(err()))),
+        Cmd::ListPublishers { .. } => ("list_trusted_publishers", Reply::Publishers(failed(err()))),
+        Cmd::AddPublisher { .. } => (
+            "add_trusted_publisher",
+            Reply::PublisherAdded(failed(err())),
+        ),
+        Cmd::RemovePublisher(_) => (
+            "remove_trusted_publisher",
+            Reply::PublisherRemoved(failed(err())),
+        ),
     }
 }
 
@@ -741,6 +818,14 @@ mod tests {
                 req: Box::default(),
                 proof: FactorChoice::Code(secret("123456")),
             },
+            Cmd::ListPublishers {
+                include_removed: true,
+            },
+            Cmd::AddPublisher {
+                req: Box::default(),
+                proof: FactorChoice::Code(secret("123456")),
+            },
+            Cmd::RemovePublisher(Box::default()),
         ];
         for cmd in stale {
             let ended = match rt.block_on(run(&mut conn, queued_at, cmd, None)) {
@@ -753,6 +838,8 @@ mod tests {
                 Reply::Request(r) => r.err(),
                 Reply::Mutated(r) => r.err(),
                 Reply::Registered(r) => r.err(),
+                Reply::Publishers(r) => r.err(),
+                Reply::PublisherAdded(r) | Reply::PublisherRemoved(r) => r.err(),
                 _ => panic!("a reply of another kind"),
             };
             assert_eq!(ended, Some(ClientError::SessionEnded));
@@ -840,6 +927,21 @@ mod tests {
             label: String::new(),
         }
         .uses_key());
+        assert!(Cmd::AddPublisher {
+            req: Box::default(),
+            proof: key(),
+        }
+        .uses_key());
+        assert!(!Cmd::AddPublisher {
+            req: Box::default(),
+            proof: code(),
+        }
+        .uses_key());
+        assert!(!Cmd::RemovePublisher(Box::default()).uses_key());
+        assert!(!Cmd::ListPublishers {
+            include_removed: false
+        }
+        .uses_key());
         assert!(!Cmd::ListFactors.uses_key());
         assert!(!Cmd::Offer {
             username: "alice".into()
@@ -888,6 +990,42 @@ mod tests {
         assert!(matches!(
             next(&mut w),
             Reply::Registered(Err(ClientError::Authenticator(
+                AuthenticatorError::Unavailable
+            )))
+        ));
+        w.stop(SHUTDOWN_WAIT);
+    }
+
+    #[test]
+    fn publisher_commands_without_a_session_or_a_key_backend_send_nothing() {
+        let mut w = spawn(refused_config(), None, Arc::new(|| {})).unwrap();
+        assert!(w.send(Cmd::ListPublishers {
+            include_removed: false
+        }));
+        assert!(matches!(
+            next(&mut w),
+            Reply::Publishers(Err(ClientError::SessionEnded))
+        ));
+        assert!(w.send(Cmd::RemovePublisher(Box::default())));
+        assert!(matches!(
+            next(&mut w),
+            Reply::PublisherRemoved(Err(ClientError::SessionEnded))
+        ));
+        assert!(w.send(Cmd::AddPublisher {
+            req: Box::default(),
+            proof: FactorChoice::Code(secret("123456")),
+        }));
+        assert!(matches!(
+            next(&mut w),
+            Reply::PublisherAdded(Err(ClientError::SessionEnded))
+        ));
+        assert!(w.send(Cmd::AddPublisher {
+            req: Box::default(),
+            proof: FactorChoice::SecurityKey,
+        }));
+        assert!(matches!(
+            next(&mut w),
+            Reply::PublisherAdded(Err(ClientError::Authenticator(
                 AuthenticatorError::Unavailable
             )))
         ));

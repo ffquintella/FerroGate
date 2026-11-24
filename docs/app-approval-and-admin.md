@@ -13,6 +13,7 @@ give administrators authenticated access to CMIS. **Status: specification
 | [F22 — Tray admin client](features/F22-tray-admin-client.md) | `mia-tray-admin`: login, approval views, "add application" from the desktop |
 | [ADR-0004](adr/0004-app-approval-ledger.md) | Approval ledger, **non-replacement invariant**, allowlist v2 |
 | [ADR-0005](adr/0005-admin-authentication.md) | Administrator authentication and authorization scheme |
+| [ADR-0006](adr/0006-trusted-publishers.md) | Trusted publishers: auto-approval by code-signing identity (Proposed; amends P5) |
 
 Reading order: this page → ADR-0004 → F19 → ADR-0005 → F20 → F21 / F22.
 
@@ -182,7 +183,7 @@ These are numbered for ESI approval and re-checked at each homologation.
 | P2 | Admin traffic only over hybrid-PQC TLS 1.3 with SPKI pinning on a dedicated listener that is not internet-exposed. No plaintext mode. |
 | P3 | Administrators authenticate with individual local accounts stored in CMIS (Argon2id password ≥ 24 characters plus a mandatory second factor: TOTP everywhere, FIDO2 through the tray admin client; an account may hold both). Local accounts were **decided by the product owner** (D2). The FGV norm prefers AD/IdP federation, so this deviation (G-002 third option) **must be recorded with the ESI**. Federation is a future item and a non-goal here. |
 | P4 | Authorization by groups only. A single-step direct add (register and approve together) is the default: it needs a fresh second factor and is audited with the distinct `AppApprovedBySameActor` event. This is an **accepted risk decided by the product owner** (D4), to be acknowledged by the ESI. Strict separation of duties is an optional server policy (`CMIS_ADMIN_STRICT_SOD`, default off). |
-| P5 | Hosts can only *request*. Approval is a human act or an administrator-configured auto-update policy. Only CMIS signs allowlists. |
+| P5 | Hosts can only *request*. Approval is a human act or an administrator-configured policy: auto-update, or a trusted publisher (ADR-0006, Proposed). Only CMIS signs allowlists. |
 | P6 | Non-replacement: no request removes or alters an approval (ADR-0004 INV-1 to INV-3). |
 | P7 | Binaries are identified by reading, never by executing. Policy uses hash, path, user and signer, never self-declared versions. |
 | P8 | MIA fails closed on any allowlist verification failure and refuses rollback or wrong-host bodies. |
