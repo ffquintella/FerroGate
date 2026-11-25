@@ -106,7 +106,7 @@ Write-Host 'Securing the MIA configuration directory...'
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
-    & $miaExe service secure-config
+    & $miaExe service secure-config --operators-group FerroGateOperators
     if ($LASTEXITCODE -ne 0) {
         throw "mia.exe service secure-config failed with exit code $LASTEXITCODE; $env:ProgramData\FerroGate is not administrator-only."
     }

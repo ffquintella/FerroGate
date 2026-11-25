@@ -1504,3 +1504,8 @@ with an inheritable `Modify` ACE for it. Group members can then read and edit
 the configuration and allowlist; they can never own the objects or change
 their permissions. Note that whoever can edit `mia.toml` influences what the
 LocalSystem service loads: only add accounts you would trust with that.
+
+The MSI, NSIS and Chocolatey installers run this with
+`--operators-group FerroGateOperators`, so a fresh install already has that
+(empty) group registered and granted `Modify` on the directory; add the
+operators with `net localgroup FerroGateOperators <account> /add`.

@@ -398,7 +398,7 @@ fn the_windows_msi_sets_path_auto_start_and_icon() {
     for attr in [
         r#"Id="MiaSecureConfig""#,
         r#"FileKey="miaExe""#,
-        r#"ExeCommand="service secure-config""#,
+        r#"ExeCommand="service secure-config --operators-group FerroGateOperators""#,
         r#"Execute="deferred""#,
         r#"Impersonate="no""#,
         r#"Return="check""#,
