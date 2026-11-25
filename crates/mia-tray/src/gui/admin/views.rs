@@ -503,6 +503,20 @@ fn field(ui: &mut egui::Ui, lang: Lang, label: Msg, value: &str) {
     });
 }
 
+/// The host's reported name and last-seen address (already inert), each
+/// "not recorded" when the server has none.
+fn host_fields(ui: &mut egui::Ui, lang: Lang, name: &str, ip: &str) {
+    let or_unknown = |v: &str| {
+        if v.is_empty() {
+            Msg::AdminNotRecorded.text(lang).to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    field(ui, lang, Msg::AdminFieldHostName, &or_unknown(name));
+    field(ui, lang, Msg::AdminFieldHostIp, &or_unknown(ip));
+}
+
 #[allow(clippy::too_many_lines)] // one line per field of the record (F21 §3).
 fn request(
     ui: &mut egui::Ui,
@@ -529,6 +543,7 @@ fn request(
         field(ui, lang, Msg::AdminFieldProduct, &r.product);
     }
     field(ui, lang, Msg::AdminFieldHost, &r.row.host);
+    host_fields(ui, lang, &r.host_name, &r.host_ip);
     field(ui, lang, Msg::AdminFieldUser, &r.row.user);
     field(ui, lang, Msg::AdminFieldRequester, &r.requester);
     if !r.reason.is_empty() {
@@ -671,6 +686,7 @@ fn approval(
         field(ui, lang, Msg::AdminFieldProduct, &a.product);
     }
     field(ui, lang, Msg::AdminFieldHost, &a.row.host);
+    host_fields(ui, lang, &a.host_name, &a.host_ip);
     field(ui, lang, Msg::AdminFieldUser, &a.row.user);
     let pick = |on: bool, yes: Msg, no: Msg| if on { yes } else { no }.text(lang);
     field(

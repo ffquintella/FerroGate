@@ -4,6 +4,7 @@
 use std::fmt::Write as _;
 
 use ferro_proto::admin_v1::{AppBinaryInfo, AppUser};
+use ferrogate_admin_client::approvals::rules::host_address;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -46,6 +47,31 @@ fn user(u: Option<&AppUser>) -> String {
         _ => "",
     };
     format!("{} {kind}", user_label(u)).trim_end().to_string()
+}
+
+/// The host's reported name and last-seen address (`kv` makes them inert),
+/// in one line, only when the server knows either.
+fn host_seen_lines(hostname: &str, ip: &str, width: u16, out: &mut Vec<Line<'static>>) {
+    let ip = host_address(ip);
+    if hostname.is_empty() && ip.is_empty() {
+        return;
+    }
+    let or_dash = |v: &str| {
+        if v.is_empty() {
+            "—".to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    out.extend(kv(
+        "Host name / IP",
+        &format!(
+            "{} · {} (last attestation/renewal)",
+            or_dash(hostname),
+            or_dash(&ip)
+        ),
+        width,
+    ));
 }
 
 fn binary_lines(b: &AppBinaryInfo, width: u16, out: &mut Vec<Line<'static>>) {
@@ -123,6 +149,7 @@ pub(super) fn request(app: &App, area: Rect, frame: &mut Frame<'_>) {
         &format!("{} · tier {}", r.host_uuid, r.host_tier),
         w,
     ));
+    host_seen_lines(&r.host_hostname, &r.host_ip, w, &mut lines);
     lines.extend(kv("Path", &r.canonical_path, w));
     lines.extend(kv("SHA-384", &hash(app, &r.bin_sha), w));
     if let Some(b) = &d.binary {
@@ -281,6 +308,7 @@ pub(super) fn approval(app: &App, area: Rect, frame: &mut Frame<'_>) {
     lines.extend(kv("State", &state, w));
     lines.extend(kv("Origin", name(&APPROVAL_ORIGINS, a.origin), w));
     lines.extend(kv("Host", &a.host_uuid, w));
+    host_seen_lines(&a.host_hostname, &a.host_ip, w, &mut lines);
     lines.extend(kv("Path", &a.canonical_path, w));
     lines.extend(kv("SHA-384", &hash(app, &a.bin_sha), w));
     if let Some(b) = &d.binary {

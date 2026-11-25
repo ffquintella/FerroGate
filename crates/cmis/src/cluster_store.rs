@@ -77,6 +77,13 @@ pub struct WireIssuedRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
 
+    /// TCP peer address seen at the last attestation or renewal, as text
+    /// (display only, personal data). Optional with a default so older
+    /// records decode; a value that does not parse decodes as `None` rather
+    /// than failing the whole record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_ip: Option<String>,
+
     /// The host's composite CSR key, hex-encoded concat bytes — the subject key
     /// the X.509-SVID profile binds its leaf to. Optional with a default so
     /// records written before the profile existed still decode; such a record
@@ -144,6 +151,7 @@ impl WireIssuedRecord {
             iat: r.bundle.iat,
             exp: r.bundle.exp,
             hostname: r.hostname.clone(),
+            peer_ip: r.peer_ip.map(|ip| ip.to_string()),
             subject_pub_hex: r.params.subject_pub.as_ref().map(hex::encode),
             x509_leaf_der_hex: r.bundle.x509.as_ref().map(|x| hex::encode(&x.leaf_der)),
             child_pub_hex: r.child_pub.as_ref().map(hex::encode),
@@ -207,6 +215,7 @@ impl WireIssuedRecord {
             last_attestation,
             bundle,
             hostname: self.hostname,
+            peer_ip: self.peer_ip.as_deref().and_then(|s| s.parse().ok()),
             child_pub,
         })
     }
@@ -260,6 +269,7 @@ mod tests {
                 exp: 1_700_003_600,
             },
             hostname: Some("segdc1vds0005".into()),
+            peer_ip: Some("10.20.30.40".parse().unwrap()),
             child_pub: Some(vec![0xCD; 1984]),
         }
     }
@@ -281,6 +291,7 @@ mod tests {
         assert_eq!(back.bundle.jws, r.bundle.jws);
         assert_eq!(back.bundle.spiffe_id, r.bundle.spiffe_id);
         assert_eq!(back.hostname, r.hostname);
+        assert_eq!(back.peer_ip, r.peer_ip);
         assert_eq!(back.child_pub, r.child_pub);
 
         // Both profiles survive replication: the certificate byte-for-byte, and
@@ -335,6 +346,42 @@ mod tests {
         let bytes = serde_json::to_vec(&wire).unwrap();
         let back = decode(&bytes).unwrap();
         assert_eq!(back.hostname, None);
+    }
+
+    #[test]
+    fn peer_ip_round_trips_v4_and_v6_as_text() {
+        let mut r = sample_record();
+        for ip in ["10.20.30.40", "2001:db8::7"] {
+            r.peer_ip = Some(ip.parse().unwrap());
+            let wire = serde_json::to_value(WireIssuedRecord::from_record(&r)).unwrap();
+            assert_eq!(wire["peer_ip"], ip, "stored as plain text");
+            let back = decode(&serde_json::to_vec(&wire).unwrap()).unwrap();
+            assert_eq!(back.peer_ip, r.peer_ip);
+        }
+        // Absent means absent on the wire too.
+        r.peer_ip = None;
+        let wire = serde_json::to_value(WireIssuedRecord::from_record(&r)).unwrap();
+        assert!(wire.get("peer_ip").is_none());
+    }
+
+    #[test]
+    fn decodes_record_written_before_peer_ip_existed() {
+        let mut wire =
+            serde_json::to_value(WireIssuedRecord::from_record(&sample_record())).unwrap();
+        wire.as_object_mut().unwrap().remove("peer_ip");
+        let back = decode(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(back.peer_ip, None);
+        assert_eq!(back.hostname.as_deref(), Some("segdc1vds0005"));
+    }
+
+    #[test]
+    fn a_malformed_peer_ip_reads_as_unknown_not_as_a_broken_record() {
+        // Display-only: a bad value must never stop a host from renewing.
+        let mut wire = WireIssuedRecord::from_record(&sample_record());
+        wire.peer_ip = Some("10.0.0.1\u{1b}[2J".into());
+        let back = decode(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(back.peer_ip, None);
+        assert_eq!(back.bundle.jws, "eyJ...");
     }
 
     #[test]

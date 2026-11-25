@@ -436,6 +436,9 @@ messages! {
     AdminFieldVersion => "Version", "Versão";
     AdminFieldProduct => "Product", "Produto";
     AdminFieldHost => "Host", "Host";
+    AdminFieldHostName => "Host name (reported by the host)", "Nome do host (informado pelo host)";
+    AdminFieldHostIp => "Host IP (at its last attestation or renewal)", "IP do host (na última atestação ou renovação)";
+    AdminNotRecorded => "not recorded", "não registrado";
     AdminFieldUser => "User", "Usuário";
     AdminFieldRequester => "Requested by (OS user)", "Solicitada por (usuário do SO)";
     AdminFieldReason => "Reason given", "Motivo informado";

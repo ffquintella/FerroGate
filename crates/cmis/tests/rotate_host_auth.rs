@@ -191,6 +191,7 @@ impl Fixture {
                 },
                 bundle: h.issued.clone(),
                 hostname: None,
+                peer_ip: None,
                 child_pub: None,
             })
             .await;
@@ -359,6 +360,37 @@ async fn rotate_succeeds_short_path() {
     );
 }
 
+/// A renewal refreshes the stored peer address (display only) from the
+/// connection it arrived on; a call without connect info keeps the old one.
+#[tokio::test]
+async fn rotate_refreshes_the_last_seen_peer_address() {
+    let f = setup().await;
+    let mut h = f.attested(0x42).await;
+    assert_eq!(f.state.lookup(h.spiffe_id()).await.unwrap().peer_ip, None);
+
+    let mut req = tonic::Request::new(Proof::honest(&h).request());
+    req.extensions_mut()
+        .insert(cmis::transport::PeerConnectInfo {
+            remote_addr: Some("[::ffff:192.0.2.7]:50123".parse().unwrap()),
+            client_cert_sha256: None,
+        });
+    let renewed = f.svc.rotate(req).await.unwrap().into_inner();
+    let rec = f.state.lookup(h.spiffe_id()).await.unwrap();
+    assert_eq!(rec.bundle.jws, renewed.jws);
+    assert_eq!(
+        rec.peer_ip,
+        Some("192.0.2.7".parse().unwrap()),
+        "mapped v4 folded"
+    );
+
+    // No connect info (an in-process call): the address is kept.
+    h.issued.jws = renewed.jws;
+    rotate(&f, Proof::honest(&h).request()).await.unwrap();
+    let rec = f.state.lookup(h.spiffe_id()).await.unwrap();
+    assert_ne!(rec.bundle.jws, h.jws(), "renewed again");
+    assert_eq!(rec.peer_ip, Some("192.0.2.7".parse().unwrap()));
+}
+
 #[tokio::test]
 async fn rotate_records_audit_event() {
     let f = setup().await;
@@ -432,6 +464,7 @@ async fn rotate_rejects_forged_svid_with_the_victims_pcr_values() {
             },
             bundle: h.issued.clone(),
             hostname: None,
+            peer_ip: None,
             child_pub: None,
         })
         .await;
@@ -796,7 +829,7 @@ async fn rotate_store_swap_refuses_a_record_changed_after_lookup() {
     let mine = f.state.issuer.issue(&h.params, now_unix()).unwrap();
     assert_eq!(
         f.state
-            .replace_bundle_if_current(h.spiffe_id(), &expected, mine)
+            .replace_bundle_if_current(h.spiffe_id(), &expected, mine, None)
             .await,
         BundleSwap::Superseded
     );
@@ -809,7 +842,8 @@ async fn rotate_store_swap_refuses_a_record_changed_after_lookup() {
             .replace_bundle_if_current(
                 h.spiffe_id(),
                 &sha384(other.jws().as_bytes()),
-                fresh.clone()
+                fresh.clone(),
+                None
             )
             .await,
         BundleSwap::Replaced
@@ -823,7 +857,8 @@ async fn rotate_store_swap_refuses_a_record_changed_after_lookup() {
             .replace_bundle_if_current(
                 gone.spiffe_id(),
                 &sha384(gone.jws().as_bytes()),
-                gone.issued.clone()
+                gone.issued.clone(),
+                None
             )
             .await,
         BundleSwap::Superseded

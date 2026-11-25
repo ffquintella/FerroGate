@@ -241,6 +241,7 @@ async fn revoking_an_svid_also_revokes_the_x509_certificate_issued_with_it() {
             },
             bundle: issued.clone(),
             hostname: None,
+            peer_ip: None,
             child_pub: None,
         })
         .await;

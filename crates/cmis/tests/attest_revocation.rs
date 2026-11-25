@@ -309,6 +309,28 @@ async fn attest_refuses_revoked_host_key_tier() {
     );
 }
 
+/// An attestation stores, for operators only, the sanitised hostname the
+/// host reported and the TCP peer address the server saw.
+#[tokio::test]
+async fn attest_records_the_hostname_and_the_observed_peer_address() {
+    let (state, _store, _dirs) = state().await;
+    let mut client = spawn_server(Arc::clone(&state)).await;
+    let svid = attest_host_key(
+        &mut client,
+        &facts("seen"),
+        &SoftwareMachineKey::generate().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rec = state.lookup(&svid.spiffe_id).await.expect("stored");
+    assert_eq!(rec.hostname.as_deref(), Some("attest-revocation-test"));
+    assert_eq!(
+        rec.peer_ip,
+        Some(std::net::IpAddr::from([127, 0, 0, 1])),
+        "the loopback peer of the test listener"
+    );
+}
+
 #[tokio::test]
 async fn attest_of_unrevoked_host_still_succeeds() {
     let (state, store, _dirs) = state().await;

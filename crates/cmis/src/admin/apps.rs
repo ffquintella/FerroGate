@@ -282,6 +282,9 @@ fn request_info(
         declared_version: declared_version.unwrap_or_default().to_string(),
         product_name: product_name.unwrap_or_default().to_string(),
         display_version: display_version(declared_version, r.revision),
+        // Personal data: only `GetAppRequest` fills them ([`HostFacts`]).
+        host_hostname: String::new(),
+        host_ip: String::new(),
     }
 }
 
@@ -323,6 +326,43 @@ fn approval_info(
         row_version: u64::try_from(a.row_version).unwrap_or(0),
         declared_version: declared_version.unwrap_or_default().to_string(),
         product_name: product_name.unwrap_or_default().to_string(),
+        // Personal data: only `GetApproval` fills them ([`HostFacts`]).
+        host_hostname: String::new(),
+        host_ip: String::new(),
+    }
+}
+
+/// What the single-record reads say about the host behind a request or an
+/// approval, from its issued-SVID record: the self-reported hostname
+/// (re-sanitised, display only) and the peer address CMIS saw at its last
+/// attestation or renewal — not necessarily the one a request came from.
+/// Personal data (F19 §10): never in listings, the audit log or logs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HostFacts {
+    hostname: String,
+    ip: String,
+}
+
+impl HostFacts {
+    /// From the stored record's fields; absent values stay empty.
+    fn from_record(hostname: Option<&str>, peer_ip: Option<std::net::IpAddr>) -> Self {
+        Self {
+            hostname: hostname
+                .and_then(crate::service::display_hostname)
+                .unwrap_or_default(),
+            ip: peer_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+        }
+    }
+
+    /// The facts of `host_uuid`, empty when it never attested here or the
+    /// store cannot be read (display only: the read itself still succeeds).
+    async fn of(st: &AdminState, host_uuid: &str) -> Self {
+        let spiffe_id = format!("spiffe://{}/host/{host_uuid}", st.config().trust_domain);
+        st.cmis()
+            .lookup(&spiffe_id)
+            .await
+            .map(|r| Self::from_record(r.hostname.as_deref(), r.peer_ip))
+            .unwrap_or_default()
     }
 }
 
@@ -604,8 +644,14 @@ pub async fn get_app_request(
         .app_approvals_of_lineage(&r.lineage_id)
         .await
         .map_err(ledger_status)?;
+    let host = HostFacts::of(st, &r.host_uuid).await;
+    let request = AppRequestInfo {
+        host_hostname: host.hostname,
+        host_ip: host.ip,
+        ..info(&r)
+    };
     Ok(Response::new(GetAppRequestResponse {
-        request: Some(info(&r)),
+        request: Some(request),
         binary: meta(&r.bin_sha).map(binary_info),
         lineage_binaries: binaries.iter().map(binary_info).collect(),
         lineage_requests: requests.iter().map(info).collect(),
@@ -719,8 +765,14 @@ pub async fn get_approval(
     for l in &lineage {
         lineage_approvals.push(approval_full(cluster, l).await?);
     }
+    let host = HostFacts::of(st, &a.host_uuid).await;
+    let approval = ApprovalInfo {
+        host_hostname: host.hostname,
+        host_ip: host.ip,
+        ..approval_full(cluster, &a).await?
+    };
     Ok(Response::new(GetApprovalResponse {
-        approval: Some(approval_full(cluster, &a).await?),
+        approval: Some(approval),
         revisions: revisions.iter().map(revision_info).collect(),
         lineage_approvals,
         binary: binary.as_ref().map(binary_info),
@@ -1403,6 +1455,19 @@ mod tests {
         assert!(terms(&t, FLAG_PATH_PROTECTED, &cfg, 1).is_ok());
         t.user_scope = 9;
         assert_eq!(terms(&t, 0, &cfg, 1).unwrap_err().message(), "bad_value");
+    }
+
+    #[test]
+    fn host_facts_are_sanitised_text_and_empty_when_unknown() {
+        assert_eq!(HostFacts::from_record(None, None), HostFacts::default());
+        let f = HostFacts::from_record(
+            Some(" web-01\u{1b}[2J\n.prod "),
+            Some("2001:db8::7".parse().unwrap()),
+        );
+        assert_eq!(f.hostname, "web-01[2J.prod", "re-sanitised on the way out");
+        assert_eq!(f.ip, "2001:db8::7");
+        let f = HostFacts::from_record(Some("\u{7}"), Some([10, 0, 0, 5].into()));
+        assert_eq!((f.hostname.as_str(), f.ip.as_str()), ("", "10.0.0.5"));
     }
 
     #[test]

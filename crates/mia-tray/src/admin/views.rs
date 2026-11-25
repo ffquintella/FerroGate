@@ -24,7 +24,7 @@ use ferrogate_admin_client::approvals::proto::{
 use ferrogate_admin_client::approvals::register::{
     self, AdminRegisterApplicationRequest, AdminRegisterApplicationResponse, Registered,
 };
-use ferrogate_admin_client::approvals::rules::{short_host, short_id, user_label};
+use ferrogate_admin_client::approvals::rules::{host_address, short_host, short_id, user_label};
 use ferrogate_admin_client::approvals::{Mutated, Mutation};
 use ferrogate_admin_client::display::inert;
 use ferrogate_admin_client::error::{ClientError, Code};
@@ -44,6 +44,8 @@ pub const MAX_SHOWN: usize = 600;
 /// Longest path shown, in characters: a path is shown whole, so its end
 /// (the binary's name) is never cut off.
 pub const MAX_PATH: usize = 4096;
+/// Longest host name shown, in characters (CMIS stores at most 64).
+pub const MAX_HOST_NAME: usize = 64;
 
 /// Which list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -379,6 +381,11 @@ pub struct RequestDetail {
     pub lineage_frozen: bool,
     /// Approved by its own requester.
     pub same_actor: bool,
+    /// The host's self-reported name (empty when not recorded).
+    pub host_name: String,
+    /// The host's address at its last attestation or renewal, not
+    /// necessarily the request's (empty when not recorded).
+    pub host_ip: String,
     /// Approvals of the lineage.
     pub lineage: Vec<ApprovalRow>,
 }
@@ -411,6 +418,11 @@ pub struct ApprovalDetail {
     pub row_version: u64,
     /// Revisions of its terms recorded.
     pub revisions: usize,
+    /// The host's self-reported name (empty when not recorded).
+    pub host_name: String,
+    /// The host's address at its last attestation or renewal (empty when
+    /// not recorded).
+    pub host_ip: String,
 }
 
 /// The filter panel (inert).
@@ -1427,6 +1439,8 @@ impl AdminViews {
             signer_valid: bin.signer_valid,
             lineage_frozen: d.lineage_auto_update_frozen,
             same_actor: r.same_actor_approved,
+            host_name: inert(&r.host_hostname, MAX_HOST_NAME),
+            host_ip: host_address(&r.host_ip),
             lineage: d
                 .lineage_approvals
                 .iter()
@@ -1452,6 +1466,8 @@ impl AdminViews {
             note: shown(&a.note),
             row_version: a.row_version,
             revisions: d.revisions.len(),
+            host_name: inert(&a.host_hostname, MAX_HOST_NAME),
+            host_ip: host_address(&a.host_ip),
         })
     }
 
@@ -1759,6 +1775,41 @@ mod tests {
         let view = v.view(NOW);
         assert!(view.decision.is_none());
         assert_eq!(view.outcome, Some(Outcome::Refused(Refusal::NotAllowed)));
+    }
+
+    /// The host's name arrives inert, its address only when it is a real IP
+    /// address, and both stay empty when the server has none.
+    #[test]
+    fn the_details_carry_the_host_name_and_address_inert_or_empty() {
+        let mut v = on_request(&[perm::REQUEST_LIST]);
+        let r = v.view(NOW).request.unwrap();
+        assert_eq!((r.host_name.as_str(), r.host_ip.as_str()), ("", ""));
+
+        let mut det = detail(0);
+        let req = det.request.as_mut().unwrap();
+        req.host_hostname = format!("web-01\u{1b}[2J\u{202e}{}", "x".repeat(100));
+        req.host_ip = "10.20.30.40".into();
+        let _ = v.on_request(Ok(Box::new(det)));
+        let r = v.view(NOW).request.unwrap();
+        assert!(
+            r.host_name.starts_with("web-01\\x1b[2J⟨U+202E⟩"),
+            "{}",
+            r.host_name
+        );
+        assert_eq!(r.host_name.chars().count(), MAX_HOST_NAME);
+        assert_eq!(r.host_ip, "10.20.30.40");
+
+        let _ = v.on_approval(Ok(Box::new(GetApprovalResponse {
+            approval: Some(ApprovalInfo {
+                host_hostname: "segdc1vds0005".into(),
+                host_ip: "10.0.0.1; rm -rf /".into(),
+                ..approval(1, 1)
+            }),
+            ..GetApprovalResponse::default()
+        })));
+        let a = v.view(NOW).approval.unwrap();
+        assert_eq!(a.host_name, "segdc1vds0005");
+        assert_eq!(a.host_ip, "", "not an address: not shown");
     }
 
     #[test]

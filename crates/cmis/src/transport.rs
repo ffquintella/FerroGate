@@ -20,7 +20,7 @@
 //! is the TCP peer address; the client certificate binds the session).
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,6 +49,21 @@ pub struct PeerConnectInfo {
     pub remote_addr: Option<SocketAddr>,
     /// SHA-256 of the client's leaf certificate (mTLS listeners only).
     pub client_cert_sha256: Option<[u8; 32]>,
+}
+
+/// The caller's TCP peer address, for records an operator reads: from the
+/// TLS listener's [`PeerConnectInfo`] or tonic's plain TCP connect info, an
+/// IPv4-mapped IPv6 address folded to IPv4. Display only — the admin layer's
+/// own `peer_info` keeps the raw address for its access decisions.
+#[must_use]
+pub fn observed_peer_ip(ext: &tonic::codegen::http::Extensions) -> Option<IpAddr> {
+    let addr = match ext.get::<PeerConnectInfo>() {
+        Some(info) => info.remote_addr,
+        None => ext
+            .get::<tonic::transport::server::TcpConnectInfo>()
+            .and_then(tonic::transport::server::TcpConnectInfo::remote_addr),
+    };
+    addr.map(|a| a.ip().to_canonical())
 }
 
 /// A handshake-complete server-side TLS connection.
@@ -235,6 +250,30 @@ mod tests {
         std::fs::write(&cert_path, cert).unwrap();
         std::fs::write(&key_path, key).unwrap();
         (cert_path, key_path)
+    }
+
+    #[test]
+    fn the_observed_peer_ip_prefers_the_tls_info_and_folds_mapped_v4() {
+        use tonic::codegen::http::Extensions;
+        let mut ext = Extensions::new();
+        assert_eq!(observed_peer_ip(&ext), None, "no connect info");
+
+        ext.insert(PeerConnectInfo {
+            remote_addr: Some("[::ffff:10.1.2.3]:4433".parse().unwrap()),
+            client_cert_sha256: None,
+        });
+        assert_eq!(observed_peer_ip(&ext), Some("10.1.2.3".parse().unwrap()));
+
+        let mut ext = Extensions::new();
+        ext.insert(PeerConnectInfo {
+            remote_addr: Some("[2001:db8::7]:4433".parse().unwrap()),
+            client_cert_sha256: None,
+        });
+        assert_eq!(observed_peer_ip(&ext), Some("2001:db8::7".parse().unwrap()));
+
+        // A TLS listener without a peer address does not fall back.
+        ext.insert(PeerConnectInfo::default());
+        assert_eq!(observed_peer_ip(&ext), None);
     }
 
     #[test]

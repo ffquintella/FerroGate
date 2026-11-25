@@ -180,7 +180,7 @@ refresh_secs = 30                      # list auto-refresh; 0 disables
 | **Change password** | Forced when `password_change_required`; policy hints; generator (`g`) | `ChangePassword` |
 | **Dashboard** | Counts: pending requests, auto-approved in the last 24 h, approvals expiring in 14 days, legacy no-expiry approvals, hosts with sync failures (when exposed); session info | `ListAppRequests`/`ListApprovals` with `page_size = 0` (counts) |
 | **Requests** | Table as above; flag line per row; sort by age, host or app | `ListAppRequests` |
-| **Request detail** | Full path, SHA-384 (wrapped, monospace), declared version and source, revision, product, bundle or package, signer, user (name, uid or SID), requester, origin, host and tier, reason, flags explained, **lineage history** (revisions with their approvals and decisions), auto-downgrade reason | `GetAppRequest` |
+| **Request detail** | Full path, SHA-384 (wrapped, monospace), declared version and source, revision, product, bundle or package, signer, user (name, uid or SID), requester, origin, host and tier, the host's reported name and last-attested IP when known, reason, flags explained, **lineage history** (revisions with their approvals and decisions), auto-downgrade reason | `GetAppRequest` |
 | **Approvals** | ID, state, host, app, version, user scope, policy, continuity, expires, origin, superseded badge | `ListApprovals` |
 | **Approval detail** | All fields, revision history (who, when, what changed), lineage tree (parent and children), the request that created it | `GetApproval` |
 | **Hosts** | Host uuid, display hostname, tier, last attest, approval and pending counts; Enter opens Requests filtered by host | `ListHosts` |

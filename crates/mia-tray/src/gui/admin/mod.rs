@@ -2231,6 +2231,37 @@ mod tests {
         assert_eq!(seen.borrow().cmds.last(), Some(&"mutate"));
     }
 
+    /// The request detail names the host by its reported name and its
+    /// last-seen address, inert, or says that they are not recorded.
+    #[test]
+    fn the_request_detail_shows_the_hosts_name_and_address() {
+        use crate::admin::decide::tests::detail;
+        let open = |det| {
+            let ctx = egui::Context::default();
+            let (mut app, seen) = app();
+            on_the_requests(&ctx, &mut app, &seen, &["app_request.approve"]);
+            app.act(vec![Action::View(ViewAction::OpenRequest(0))]);
+            push(&seen, Reply::Request(Ok(Box::new(det))));
+            frame(&ctx, &mut app, Vec::new()).join("\n")
+        };
+        let painted = open(detail(0));
+        assert!(
+            painted.contains("Host name (reported by the host)"),
+            "{painted}"
+        );
+        assert!(painted.contains("Host IP (at its last attestation or renewal)"));
+        assert_eq!(painted.matches("not recorded").count(), 2, "{painted}");
+
+        let mut det = detail(0);
+        let r = det.request.as_mut().unwrap();
+        r.host_hostname = "segdc1vds0005\u{1b}[2J".into();
+        r.host_ip = "10.20.30.40".into();
+        let painted = open(det);
+        assert!(painted.contains("segdc1vds0005\\x1b[2J"), "{painted}");
+        assert!(painted.contains("10.20.30.40"), "{painted}");
+        assert!(!painted.contains("not recorded") && !painted.contains('\u{1b}'));
+    }
+
     #[test]
     fn the_views_show_inert_text_and_resend_a_decision_once_after_a_step_up() {
         use crate::admin::decide::tests::detail;

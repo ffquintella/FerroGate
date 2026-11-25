@@ -271,6 +271,9 @@ spanish! {
     AdminFieldVersion => "Versión";
     AdminFieldProduct => "Producto";
     AdminFieldHost => "Host";
+    AdminFieldHostName => "Nombre del host (informado por el host)";
+    AdminFieldHostIp => "IP del host (en su última atestación o renovación)";
+    AdminNotRecorded => "no registrado";
     AdminFieldUser => "Usuario";
     AdminFieldRequester => "Solicitada por (usuario del SO)";
     AdminFieldReason => "Motivo indicado";

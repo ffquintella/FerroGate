@@ -403,6 +403,16 @@ message AppRequestInfo {
   string declared_version = 26;
   string product_name = 27;
   string display_version = 28;
+  // The requesting host as CMIS last knew it, from its issued-SVID record
+  // (personal data, F19 §10). Filled only by `GetAppRequest`, for the
+  // request itself; empty in listings, in the lineage and when unknown.
+  // Self-reported hostname from the host's last full attestation: untrusted
+  // display text (printable ASCII, at most 64 characters), never identity.
+  string host_hostname = 29;
+  // The TCP peer address CMIS observed at the host's last attestation or
+  // renewal (IPv4-mapped IPv6 shown as IPv4). Not necessarily the address
+  // the request came from; a NAT or proxy in front of CMIS hides it.
+  string host_ip = 30;
 }
 
 message ApprovalInfo {
@@ -432,6 +442,11 @@ message ApprovalInfo {
   uint64 row_version = 24;
   string declared_version = 25;
   string product_name = 26;
+  // The approval's host as CMIS last knew it, exactly as
+  // `AppRequestInfo.host_hostname` / `host_ip`. Filled only by
+  // `GetApproval`, for the approval itself; empty elsewhere and when unknown.
+  string host_hostname = 27;
+  string host_ip = 28;
 }
 
 // The policy view of an approval at one revision (no personal data).

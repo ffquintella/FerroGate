@@ -11,19 +11,21 @@ mod support;
 
 use cmis::admin::authz::paths;
 use cmis::apps::compile::{serve, Served};
+use cmis::IssuedRecord;
 use ferro_audit::AuditEvent;
 use ferro_proto::admin_v1::admin_server::Admin;
 use ferro_proto::admin_v1::{
     approve_app_request_request::Choice, AdminRegisterApplicationRequest, AppBinaryDesc, AppUser,
-    ApprovalTerms, ApproveAppRequestRequest, DenyAppRequestRequest, GetApprovalRequest,
-    ListAppRequestsRequest, ListApprovalsRequest, PageRequest, RevokeApprovalRequest,
-    SetLineageAutoUpdateFrozenRequest, UpdateApprovalRequest,
+    ApprovalTerms, ApproveAppRequestRequest, DenyAppRequestRequest, GetAppRequestRequest,
+    GetAppRequestResponse, GetApprovalRequest, ListAppRequestsRequest, ListApprovalsRequest,
+    PageRequest, RevokeApprovalRequest, SetLineageAutoUpdateFrozenRequest, UpdateApprovalRequest,
 };
 use ferro_proto::v1::machine_identity_server::MachineIdentity;
 use ferro_proto::v1::{AppRequestState, SubmitAppRequestResponse};
 use ferro_raft::apps::{
     ApprovalState, IntakeChecks, RequestOrigin, RequestState, FLAG_PATH_PROTECTED,
 };
+use ferro_svid::{IssueParams, LastAttestation};
 use support::hosts::{approvals_mode, mint_host, now_unix, open_v2, Host};
 use support::{Admin1, Harness};
 use tonic::Code;
@@ -761,6 +763,112 @@ async fn revoke_update_and_freeze_are_audited_and_change_the_served_allowlist() 
         let text = format!("{e:?}");
         assert!(
             !text.contains("alice") && !text.contains("/opt/tool") && !text.contains("reviewed"),
+            "{text}"
+        );
+    }
+}
+
+async fn get_request(w: &World, request_id: &str) -> GetAppRequestResponse {
+    w.h.call(
+        &w.token,
+        paths::GET_APP_REQUEST,
+        GetAppRequestRequest {
+            request_id: request_id.into(),
+        },
+        |svc, r| Box::pin(async move { svc.get_app_request(r).await }),
+    )
+    .await
+    .unwrap()
+}
+
+/// The request and approval details name the host by the hostname it
+/// reported and the address CMIS last saw it at (personal data, F19 §10);
+/// listings, lineage entries and never-attested hosts carry neither.
+#[tokio::test]
+async fn details_show_the_hosts_name_and_last_seen_address_and_listings_do_not() {
+    let w = world("apps-hostfacts", false).await;
+    let a = submit(&w, 1, 1000, "alice", 0).await;
+
+    // No issued record for the host yet: empty, and the read still works.
+    let d = get_request(&w, &a.request_id).await.request.unwrap();
+    assert!(d.host_hostname.is_empty() && d.host_ip.is_empty());
+
+    let now = now_unix();
+    let params = IssueParams {
+        ek_cert_sha384: [0x61; 48],
+        pcr_digest: [0u8; 48],
+        policy_id: "p1".into(),
+        dpop_jkt: "jkt".into(),
+        ttl_secs: 3600,
+        tee_evidence_id: None,
+        subject_pub: None,
+    };
+    let bundle = w.h.cmis.issuer.issue(&params, now).unwrap();
+    assert_eq!(bundle.spiffe_id, w.host.spiffe_id, "the same host");
+    w.h.cmis
+        .record(IssuedRecord {
+            params,
+            last_attestation: LastAttestation {
+                at: now,
+                pcr_digest: [0u8; 48],
+                policy_epoch: 0,
+            },
+            bundle,
+            hostname: Some("segdc1vds0005".into()),
+            peer_ip: Some("10.20.30.40".parse().unwrap()),
+            child_pub: None,
+        })
+        .await;
+
+    let detail = get_request(&w, &a.request_id).await;
+    let d = detail.request.unwrap();
+    assert_eq!(
+        (d.host_hostname.as_str(), d.host_ip.as_str()),
+        ("segdc1vds0005", "10.20.30.40")
+    );
+    assert!(detail
+        .lineage_requests
+        .iter()
+        .all(|q| q.host_hostname.is_empty() && q.host_ip.is_empty()));
+    let list =
+        w.h.call(
+            &w.token,
+            paths::LIST_APP_REQUESTS,
+            ListAppRequestsRequest::default(),
+            |svc, r| Box::pin(async move { svc.list_app_requests(r).await }),
+        )
+        .await
+        .unwrap();
+    assert!(!list.items.is_empty());
+    assert!(list
+        .items
+        .iter()
+        .all(|i| i.host_hostname.is_empty() && i.host_ip.is_empty()));
+
+    let ok = approve(&w, &w.token, approve_req(&a.request_id, manual_terms()))
+        .await
+        .unwrap();
+    let approval_id = ok.approval.unwrap().approval_id;
+    let detail =
+        w.h.call(
+            &w.token,
+            paths::GET_APPROVAL,
+            GetApprovalRequest { approval_id },
+            |svc, r| Box::pin(async move { svc.get_approval(r).await }),
+        )
+        .await
+        .unwrap();
+    let ap = detail.approval.unwrap();
+    assert_eq!(
+        (ap.host_hostname.as_str(), ap.host_ip.as_str()),
+        ("segdc1vds0005", "10.20.30.40")
+    );
+
+    // Never in an audit event.
+    for e in &w.h.audit_events() {
+        let text = format!("{e:?}");
+        assert!(
+            !text.contains("10.20.30.40") && !text.contains("segdc1vds0005"),
             "{text}"
         );
     }

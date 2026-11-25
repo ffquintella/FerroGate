@@ -208,6 +208,51 @@ fn the_request_detail_shows_the_full_escaped_values() {
 }
 
 #[test]
+fn the_details_name_the_host_inert_and_only_when_known() {
+    let mut app = main_app(&["app_request.read", "approval.read"]);
+    app.screen = Screen::RequestDetail;
+    let detail = |r: AppRequestInfo| {
+        Some(Box::new(GetAppRequestResponse {
+            request: Some(r),
+            ..GetAppRequestResponse::default()
+        }))
+    };
+    app.request_detail = detail(hostile_request());
+    let (text, _) = render(&app, 80, 24);
+    assert!(!text.contains("Host name / IP"), "nothing known: {text}");
+
+    app.request_detail = detail(AppRequestInfo {
+        host_hostname: "segdc1\u{1b}[2J\u{202e}".into(),
+        host_ip: "10.20.30.40".into(),
+        ..hostile_request()
+    });
+    let (text, _) = render(&app, 80, 24);
+    assert_inert(&text);
+    assert!(text.contains("Host name / IP"), "{text}");
+    assert!(
+        text.contains("segdc1\\x1b[2J⟨U+202E⟩ · 10.20.30.40"),
+        "{text}"
+    );
+
+    app.screen = Screen::ApprovalDetail;
+    app.approval_detail = Some(Box::new(GetApprovalResponse {
+        approval: Some(ApprovalInfo {
+            approval_id: "0191c2aa-0000-7000-8000-00000000beef".into(),
+            host_uuid: "deadbeef-2222-3333-4444-555555555555".into(),
+            host_ip: "not an address".into(),
+            host_hostname: "web-01".into(),
+            ..ApprovalInfo::default()
+        }),
+        ..GetApprovalResponse::default()
+    }));
+    let (text, _) = render(&app, 80, 24);
+    assert!(
+        text.contains("web-01 · — (last"),
+        "a bad address is not shown: {text}"
+    );
+}
+
+#[test]
 fn the_approval_list_and_detail_render() {
     let mut app = main_app(&["approval.list", "approval.read"]);
     let a = ApprovalInfo {

@@ -12,6 +12,7 @@
 //! [`crate::admin::AdminContext`] the layer inserted, so they fail closed even
 //! if the layer is missing.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -378,7 +379,7 @@ async fn next_request(inbound: &mut Streaming<AttestRequest>) -> Result<ReqPhase
 /// an operator. The value is host-controlled free text and display-only —
 /// never identity — so keep only printable ASCII, cap the length, and return
 /// `None` when nothing usable remains.
-fn display_hostname(raw: &str) -> Option<String> {
+pub(crate) fn display_hostname(raw: &str) -> Option<String> {
     const MAX_HOSTNAME_CHARS: usize = 64;
     let cleaned: String = raw
         .trim()
@@ -387,6 +388,14 @@ fn display_hostname(raw: &str) -> Option<String> {
         .take(MAX_HOSTNAME_CHARS)
         .collect();
     (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// What an attestation stores about the host for operators only (display,
+/// never identity): its sanitised self-reported hostname and the TCP peer
+/// address CMIS saw. Both are personal data (F19 §10) and are not logged.
+struct HostSeen {
+    hostname: Option<String>,
+    peer_ip: Option<IpAddr>,
 }
 
 async fn send(
@@ -408,6 +417,7 @@ async fn run_attest(
     state: Arc<CmisState>,
     inbound: &mut Streaming<AttestRequest>,
     tx: &mpsc::Sender<Result<AttestResponse, Status>>,
+    peer_ip: Option<IpAddr>,
 ) -> Result<(), Status> {
     let now = unix_now();
 
@@ -427,14 +437,17 @@ async fn run_attest(
         return Err(Status::invalid_argument("expected attest init"));
     };
 
-    // Display-only operator label, sanitised once here for both profiles.
-    let hostname = display_hostname(&init.hostname);
+    // Display-only operator labels, sanitised once here for both profiles.
+    let seen = HostSeen {
+        hostname: display_hostname(&init.hostname),
+        peer_ip,
+    };
 
     // Profile split (F15): a TPM-less host sets `host_key` and runs a 3-phase
     // handshake with no credential-activation round. Branch before any
     // TPM-specific work.
     if let Some(host_key) = init.host_key {
-        return run_attest_host_key(state, inbound, tx, &nonce, host_key, hostname, now).await;
+        return run_attest_host_key(state, inbound, tx, &nonce, host_key, seen, now).await;
     }
 
     // F13 pre-admission: gate the host on the offline-signed fleet manifest
@@ -596,7 +609,8 @@ async fn run_attest(
                 policy_epoch: state.current_epoch(),
             },
             bundle: issued.clone(),
-            hostname,
+            hostname: seen.hostname,
+            peer_ip: seen.peer_ip,
             child_pub: Some(csr.composite_pub.clone()),
         })
         .await;
@@ -616,7 +630,7 @@ async fn run_attest_host_key(
     tx: &mpsc::Sender<Result<AttestResponse, Status>>,
     nonce: &[u8],
     evidence: ferro_proto::v1::HostKeyEvidence,
-    hostname: Option<String>,
+    seen: HostSeen,
     now: i64,
 ) -> Result<(), Status> {
     let facts = evidence.facts.unwrap_or_default();
@@ -775,7 +789,8 @@ async fn run_attest_host_key(
                 policy_epoch: state.current_epoch(),
             },
             bundle: issued.clone(),
-            hostname,
+            hostname: seen.hostname,
+            peer_ip: seen.peer_ip,
             child_pub: Some(csr.composite_pub.clone()),
         })
         .await;
@@ -805,10 +820,12 @@ fn reattest_opcode(reason: ReattestReason) -> &'static str {
 /// proves possession of the machine key its **latest** SVID is bound to.
 /// Fails closed; every authenticated refusal is audited as `AttestFail` and
 /// every renewal as `SvidIssued`. Logs name the SPIFFE id, never the JWS.
+/// A renewal also refreshes the stored peer address (`peer_ip`, display only).
 #[allow(clippy::result_large_err)] // `tonic::Status` is the RPC error shape.
 async fn rotate_with_host_proof(
     state: &CmisState,
     req: &RotateRequest,
+    peer_ip: Option<IpAddr>,
     now: i64,
 ) -> Result<SvidBundle, Status> {
     // `pcr_values` and `known_epoch` are ignored (unsigned); `current_svid`
@@ -897,7 +914,7 @@ async fn rotate_with_host_proof(
         Status::unavailable("issuer temporarily unavailable")
     })?;
     match state
-        .replace_bundle_if_current(spiffe_id, &doc.svid_sha384, issued.clone())
+        .replace_bundle_if_current(spiffe_id, &doc.svid_sha384, issued.clone(), peer_ip)
         .await
     {
         BundleSwap::Replaced => {}
@@ -957,10 +974,11 @@ impl MachineIdentity for MachineIdentitySvc {
         request: Request<Streaming<AttestRequest>>,
     ) -> Result<Response<Self::AttestStream>, Status> {
         let state = self.state.clone();
+        let peer_ip = crate::transport::observed_peer_ip(request.extensions());
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
-            if let Err(status) = run_attest(state, &mut inbound, &tx).await {
+            if let Err(status) = run_attest(state, &mut inbound, &tx, peer_ip).await {
                 let _ = tx.send(Err(status)).await;
             }
         });
@@ -982,7 +1000,9 @@ impl MachineIdentity for MachineIdentitySvc {
         &self,
         request: Request<RotateRequest>,
     ) -> Result<Response<SvidBundle>, Status> {
-        let bundle = rotate_with_host_proof(&self.state, &request.into_inner(), unix_now()).await?;
+        let peer_ip = crate::transport::observed_peer_ip(request.extensions());
+        let bundle =
+            rotate_with_host_proof(&self.state, &request.into_inner(), peer_ip, unix_now()).await?;
         Ok(Response::new(bundle))
     }
 

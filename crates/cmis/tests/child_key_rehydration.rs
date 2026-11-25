@@ -88,6 +88,7 @@ fn record_with_child_key(spiffe_id: &str, child_pub: Vec<u8>) -> IssuedRecord {
             exp: 1_700_003_600,
         },
         hostname: None,
+        peer_ip: None,
         child_pub: Some(child_pub),
     }
 }

@@ -78,6 +78,16 @@ pub fn short_host(uuid: &str) -> String {
     uuid.chars().take(8).collect()
 }
 
+/// The host address of a request or approval detail (`host_ip`), re-parsed
+/// so only a well-formed IP address is ever shown: empty when the server
+/// sent none or anything else. Personal data — show it, never log it.
+#[must_use]
+pub fn host_address(ip: &str) -> String {
+    ip.parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default()
+}
+
 /// A display label for an operating-system user (untrusted text: the
 /// caller makes it inert before showing it).
 #[must_use]
@@ -664,6 +674,15 @@ mod tests {
         };
         assert_eq!(user_label(Some(&u)), "alice (1000)");
         assert_eq!(user_label(None), "—");
+    }
+
+    #[test]
+    fn only_a_well_formed_host_address_is_shown() {
+        assert_eq!(host_address("10.20.30.40"), "10.20.30.40");
+        assert_eq!(host_address("2001:0db8:0000::7"), "2001:db8::7");
+        for bad in ["", "unknown", "10.0.0.1\u{1b}[2J", "10.0.0.1 ", "999.1.1.1"] {
+            assert_eq!(host_address(bad), "", "{bad:?}");
+        }
     }
 
     #[test]

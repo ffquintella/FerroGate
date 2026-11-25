@@ -11,6 +11,7 @@
 //! visible on the next hop.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -148,6 +149,13 @@ pub struct IssuedRecord {
     /// The host's self-reported hostname at the last full attestation.
     /// Display-only operator convenience — never identity, never verified.
     pub hostname: Option<String>,
+    /// The TCP peer address CMIS observed at the host's last full
+    /// attestation or `Rotate` renewal (IPv4-mapped IPv6 folded to IPv4).
+    /// Display-only and **personal data** (LGPD, F19 §10): never identity,
+    /// never logged, only the latest value is kept. `None` for records
+    /// written before this field existed, or when the listener exposed no
+    /// peer address.
+    pub peer_ip: Option<IpAddr>,
     /// The host's composite child-token signing key (F09) as concat bytes, when
     /// the attestation CSR carried a well-formed one. Persisted so any replica —
     /// and any restarted instance — can republish it into the JWKS by `kid` (see
@@ -765,13 +773,15 @@ impl CmisState {
     /// stored record still holds the SVID whose compact-JWS SHA-384 is
     /// `expected_jws_sha384` — checked by a compare-and-swap on the stored
     /// payload, so of two renewals racing from one SVID at most one lands
-    /// (T293). `last_attestation` is left unchanged. Store failures are
-    /// logged here and answered as [`BundleSwap::StoreFailed`].
+    /// (T293). `last_attestation` is left unchanged; a `Some(peer_ip)`
+    /// refreshes [`IssuedRecord::peer_ip`] in the same write. Store failures
+    /// are logged here and answered as [`BundleSwap::StoreFailed`].
     pub async fn replace_bundle_if_current(
         &self,
         spiffe_id: &str,
         expected_jws_sha384: &[u8; 48],
         bundle: IssuedSvid,
+        peer_ip: Option<IpAddr>,
     ) -> BundleSwap {
         let current = match self.cluster.fetch_svid_consistent(spiffe_id).await {
             Ok(Some(bytes)) => bytes,
@@ -793,6 +803,9 @@ impl CmisState {
         }
         let updated_at = bundle.iat;
         rec.bundle = bundle;
+        if peer_ip.is_some() {
+            rec.peer_ip = peer_ip;
+        }
         let payload = match cluster_store::encode(&rec) {
             Ok(p) => p,
             Err(e) => {

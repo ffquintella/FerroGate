@@ -551,10 +551,10 @@ stays ACTIVE** (INV-1).
 | RPC | Permission (F20) | Effect | Notes |
 |-----|------------------|--------|-------|
 | `ListAppRequests` | `app_request.list` | Paged, filtered listing | §7.5 filters |
-| `GetAppRequest` | `app_request.read` | Detail, lineage history, flags | |
+| `GetAppRequest` | `app_request.read` | Detail, lineage history, flags; the host's reported name and last-attested address (§10) | |
 | `ApproveAppRequest` | `app_request.approve` + step-up | `PENDING` → `APPROVED`. Creates an approval, or reuses a covering one. Generation bump. | Strict SoD policy only: approver ≠ `requested_by_admin_id` (`sod_self_approval`). With the policy off, approving one's own `admin_direct` request is allowed and audited as `AppApprovedBySameActor`. Optional `also_revoke_approval_ids[]` (each audited as a revocation, INV-2); a non-empty list also needs `approval.revoke` (`permission_denied` otherwise, nothing written). |
 | `DenyAppRequest` | `app_request.deny` + step-up | `PENDING` → `DENIED` | `reason_code` required; `message` ≤ 200 is shown to the requester |
-| `ListApprovals` / `GetApproval` | `approval.list` / `approval.read` | Includes revisions and lineage tree | |
+| `ListApprovals` / `GetApproval` | `approval.list` / `approval.read` | Includes revisions and lineage tree; `GetApproval` adds the host's name and address (§10) | |
 | `UpdateApproval` | `approval.update` + step-up | Edit `update_policy`, `expires_at`, `continuity`, `note`, `user_scope` (narrowing only: any → exact is allowed, exact → any is not), `path_match` (narrowing only). Generation bump if the compiled entry changes. | `expected_row_version`. Renewal of `EXPIRED` → `ACTIVE`. Widening scope needs a new request. |
 | `RevokeApproval` ("delete") | `approval.revoke` + step-up | `ACTIVE`/`EXPIRED` → `REVOKED`. Generation bump. The record is kept. | `reason_code` required. Typed confirmation in the UIs. |
 | `SetLineageAutoUpdateFrozen` | `approval.update` + step-up | Freeze or unfreeze auto-update for the lineage | |
@@ -974,6 +974,7 @@ plaintext paths and free-text messages are **never** included. The existing
 | `app_approvals.user_name`, `sid` | Personal data | Same | While `ACTIVE`, then as above | Viewers, approvers |
 | `app_requests.decision_message`, `reason` | Free text, may contain PII | ≤ 200 chars; UI warns not to include personal data | As requests | Approvers; requester (own) |
 | MIA `app-requests.cbor` | Personal data (local paths, uids) | root `0600` | 30 days after terminal state | root |
+| `issued_svids` payload `hostname`, `peer_ip` (shown as `AppRequestInfo` / `ApprovalInfo` `host_hostname`, `host_ip`) | Personal data (network identifier; a hostname may name a person) | Same; hostname sanitised (printable ASCII, ≤ 64); only `GetAppRequest` / `GetApproval` return them, never listings, audit or logs | Only the latest value: overwritten at each attestation (`Rotate` refreshes `peer_ip`), gone with the record | Viewers, approvers |
 
 **Pseudonymisation (open follow-up T289).** The sweep waits for the DPO to fix
 the retention periods. The store already constrains it: an approval's `sid` and
