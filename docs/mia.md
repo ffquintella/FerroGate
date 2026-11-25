@@ -1494,7 +1494,7 @@ write right is refused. To let a group of ordinary users operate the MIA, run
 once from an elevated prompt:
 
 ```
-mia service secure-config --operators-group FerroGateOperators
+mia service secure-config --operators-group FerroGateStatus
 ```
 
 This creates the local group if missing, records it in
@@ -1506,6 +1506,6 @@ their permissions. Note that whoever can edit `mia.toml` influences what the
 LocalSystem service loads: only add accounts you would trust with that.
 
 The MSI, NSIS and Chocolatey installers run this with
-`--operators-group FerroGateOperators`, so a fresh install already has that
+`--operators-group FerroGateStatus`, so a fresh install already has that
 (empty) group registered and granted `Modify` on the directory; add the
-operators with `net localgroup FerroGateOperators <account> /add`.
+operators with `net localgroup FerroGateStatus <account> /add`.

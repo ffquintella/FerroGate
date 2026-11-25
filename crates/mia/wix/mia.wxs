@@ -129,7 +129,7 @@
          runs before StartServices so the service finds its groups. -->
     <CustomAction Id="MiaSecureConfig"
                   FileKey="miaExe"
-                  ExeCommand="service secure-config --operators-group FerroGateOperators"
+                  ExeCommand="service secure-config --operators-group FerroGateStatus"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />

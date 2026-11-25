@@ -127,7 +127,7 @@ Section "FerroGate MIA" SecMia
   ; users created there keep their owner and stay refused by the service
   ; (see docs/mia.md). Any failure aborts the installation.
   DetailPrint "Securing the MIA configuration directory..."
-  nsExec::ExecToLog '"$INSTDIR\mia.exe" service secure-config --operators-group FerroGateOperators'
+  nsExec::ExecToLog '"$INSTDIR\mia.exe" service secure-config --operators-group FerroGateStatus'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONSTOP "Could not make %ProgramData%\FerroGate administrator-only ('mia service secure-config' exited with $0; see the details). The installation is aborted." /SD IDOK
