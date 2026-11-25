@@ -61,8 +61,8 @@ pub mod file_acl;
 mod file_security;
 #[cfg(windows)]
 pub use file_security::{
-    create_admin_only_dir, object_info, open_no_follow, read_security, security_of, set_admin_only,
-    set_administrators_owner,
+    create_admin_only_dir, object_info, open_no_follow, operator_group_names, operator_sids,
+    read_security, security_of, set_admin_only, set_administrators_owner, set_operator_group_names,
 };
 
 /// Create the local groups the pipe DACLs name when they are missing.

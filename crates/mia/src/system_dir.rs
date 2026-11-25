@@ -124,6 +124,26 @@ pub fn prepare() -> io::Result<Prepared> {
     }
 }
 
+/// Re-apply the administrator-only DACL, now including the registered
+/// operator groups' `Modify` ACEs, to the system configuration directory and
+/// everything that inherits from it (Windows; elsewhere a no-op). Run by
+/// `mia service secure-config --operators-group` after [`prepare`].
+///
+/// # Errors
+///
+/// The directory is missing or not a plain directory, or the DACL cannot be
+/// set (the caller is not elevated).
+pub fn apply_operator_acl() -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        imp::apply_operator_acl(&crate::config::system_config_dir())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
+
 /// [`std::fs::create_dir_all`], except that on Windows, when `dir` is the
 /// system configuration directory or lies inside it, [`prepare`] runs first:
 /// a missing system directory is created administrator-only (never with the
@@ -373,9 +393,9 @@ mod imp {
     use std::path::{Path, PathBuf};
 
     use ferro_winauth::file_acl::{
-        check_admin_only, check_object, ObjectKind, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, GENERIC_WRITE, READ_CONTROL,
-        SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+        check_admin_only_with, check_object, ObjectKind, FILE_APPEND_DATA,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        GENERIC_WRITE, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
     };
 
     use super::Prepared;
@@ -404,9 +424,9 @@ mod imp {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} is not administrator-only: {why}; refusing to trust it (only SYSTEM and \
-                 BUILTIN\\Administrators may own or modify what the MIA uses in its \
-                 configuration directory) — {remedy}",
+                "{} is not administrator-only: {why}; refusing to trust it (only SYSTEM, BUILTIN\\Administrators and the operator groups registered \
+                 with `mia service secure-config --operators-group` may modify what the MIA \
+                 uses in its configuration directory) — {remedy}",
                 path.display()
             ),
         )
@@ -449,8 +469,11 @@ mod imp {
     /// Refuse the open object unless its owner and DACL are
     /// administrator-only.
     fn require_admin_only(file: &File, path: &Path, kind: ObjectKind) -> io::Result<()> {
-        check_admin_only(&ferro_winauth::security_of(file)?)
-            .map_err(|v| refused(path, &v.to_string(), kind))
+        check_admin_only_with(
+            &ferro_winauth::security_of(file)?,
+            &ferro_winauth::operator_sids(),
+        )
+        .map_err(|v| refused(path, &v.to_string(), kind))
     }
 
     /// Refuse an open file unless it is a plain, single-named file that is
@@ -478,6 +501,13 @@ mod imp {
         let path = std::path::absolute(path)?;
         let dirs = super::guarding_dirs(&std::path::absolute(system_dir)?, &path);
         Ok(dirs.map(|dirs| (path, dirs)))
+    }
+
+    /// See [`super::apply_operator_acl`].
+    pub(super) fn apply_operator_acl(dir: &Path) -> io::Result<()> {
+        let handle = open_plain(dir, ObjectKind::Directory, WRITE_DAC | WRITE_OWNER)?
+            .ok_or_else(|| missing(dir))?;
+        ferro_winauth::set_admin_only(&handle, true)
     }
 
     /// See [`super::prepare`].
@@ -532,7 +562,10 @@ mod imp {
         reasons: &mut Vec<String>,
     ) -> io::Result<()> {
         let file = open_plain(dir, ObjectKind::Directory, 0)?.ok_or_else(|| missing(dir))?;
-        let Err(violation) = check_admin_only(&ferro_winauth::security_of(&file)?) else {
+        let Err(violation) = check_admin_only_with(
+            &ferro_winauth::security_of(&file)?,
+            &ferro_winauth::operator_sids(),
+        ) else {
             return Ok(());
         };
         drop(file);

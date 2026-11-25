@@ -275,6 +275,22 @@ fn classify(ace_type: u8) -> AceClass {
 ///
 /// The [`AclViolation`] that disqualifies the object.
 pub fn check_admin_only(facts: &SecurityFacts) -> Result<(), AclViolation> {
+    check_admin_only_with(facts, &[])
+}
+
+/// [`check_admin_only`] that also lets the SIDs in `operators` hold write
+/// access (the operator groups an administrator named in the machine
+/// registry, see `file_security::operator_sids`). They never qualify as
+/// *owner*: the owner holds implicit `WRITE_DAC`, so it stays SYSTEM or
+/// Administrators.
+///
+/// # Errors
+///
+/// The [`AclViolation`] that disqualifies the object.
+pub fn check_admin_only_with(
+    facts: &SecurityFacts,
+    operators: &[String],
+) -> Result<(), AclViolation> {
     let owner = facts.owner.as_deref().ok_or(AclViolation::MissingOwner)?;
     if !is_trusted_sid(owner) {
         return Err(AclViolation::UntrustedOwner {
@@ -293,6 +309,7 @@ pub fn check_admin_only(facts: &SecurityFacts) -> Result<(), AclViolation> {
         match (classify(ace.ace_type), ace.sid.as_deref()) {
             (AceClass::Deny, _) => {}
             (AceClass::Allow, Some(sid)) if is_trusted_sid(sid) => {}
+            (AceClass::Allow, Some(sid)) if operators.iter().any(|o| o == sid) => {}
             (AceClass::Allow, Some(sid)) => {
                 return Err(AclViolation::WritableBy {
                     sid: sid.to_string(),
@@ -308,6 +325,32 @@ pub fn check_admin_only(facts: &SecurityFacts) -> Result<(), AclViolation> {
         }
     }
     Ok(())
+}
+
+/// Access mask granted to an operator group: read, write, execute and delete
+/// (`Modify`), but neither `WRITE_DAC` nor `WRITE_OWNER`.
+pub const OPERATOR_MODIFY_MASK: u32 = 0x0013_01BF;
+
+/// Whether `sid` is a well-formed SID string (`S-1-5-21-...`), so it can be
+/// spliced into an SDDL string without changing its structure.
+#[must_use]
+pub fn is_sid_string(sid: &str) -> bool {
+    sid.len() <= 184
+        && sid.starts_with("S-1-")
+        && sid[4..]
+            .split('-')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// [`ADMIN_ONLY_DIR_SDDL`] plus an inheritable `Modify` ACE for each SID in
+/// `operators` (malformed SIDs are skipped, never spliced).
+#[must_use]
+pub fn admin_dir_sddl(operators: &[String]) -> String {
+    let mut sddl = String::from(ADMIN_ONLY_DIR_SDDL);
+    for sid in operators.iter().filter(|s| is_sid_string(s)) {
+        sddl.push_str(&format!("(A;OICI;0x{OPERATOR_MODIFY_MASK:x};;;{sid})"));
+    }
+    sddl
 }
 
 /// `sid` with the well-known account name appended, for messages
@@ -609,6 +652,47 @@ mod tests {
             owner: Some(owner.to_string()),
             dacl: Some(dacl),
         }
+    }
+
+    const OPERATORS: &str = "S-1-5-21-1111111111-2222222222-3333333333-1018";
+
+    #[test]
+    fn an_operator_group_may_hold_write_access_only_when_named() {
+        let mut dacl = hardened();
+        dacl.push(ace(
+            ACCESS_ALLOWED_ACE_TYPE,
+            OICI,
+            OPERATOR_MODIFY_MASK,
+            OPERATORS,
+        ));
+        let f = facts(SID_BUILTIN_ADMINISTRATORS, dacl);
+        assert!(matches!(
+            check_admin_only(&f),
+            Err(AclViolation::WritableBy { .. })
+        ));
+        assert_eq!(check_admin_only_with(&f, &[OPERATORS.to_string()]), Ok(()));
+        // A different group is still refused.
+        assert!(check_admin_only_with(&f, &[USER.to_string()]).is_err());
+    }
+
+    #[test]
+    fn an_operator_group_never_qualifies_as_owner() {
+        let f = facts(OPERATORS, hardened());
+        assert!(matches!(
+            check_admin_only_with(&f, &[OPERATORS.to_string()]),
+            Err(AclViolation::UntrustedOwner { .. })
+        ));
+    }
+
+    #[test]
+    fn the_sddl_adds_a_modify_ace_per_valid_operator_sid() {
+        assert_eq!(admin_dir_sddl(&[]), ADMIN_ONLY_DIR_SDDL);
+        let sddl = admin_dir_sddl(&[OPERATORS.to_string(), "S-1-5-21-1)(A;;GA;;;WD".to_string()]);
+        assert_eq!(
+            sddl,
+            format!("{ADMIN_ONLY_DIR_SDDL}(A;OICI;0x1301bf;;;{OPERATORS})")
+        );
+        assert!(!sddl.contains("GA;;;WD"));
     }
 
     #[test]

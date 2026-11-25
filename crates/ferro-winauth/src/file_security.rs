@@ -7,7 +7,7 @@
 //! - [`security_of`] — its owner and DACL, decoded by the pure parsers in
 //!   [`crate::file_acl`] for [`crate::file_acl::check_admin_only`];
 //! - [`create_admin_only_dir`] — create a directory whose security descriptor
-//!   is [`ADMIN_ONLY_DIR_SDDL`] from the start (no window with an inherited
+//!   is [`crate::file_acl::ADMIN_ONLY_DIR_SDDL`] from the start (no window with an inherited
 //!   DACL);
 //! - [`set_admin_only`] — give an open directory that owner and protected
 //!   DACL, either on the object alone (`SetKernelObjectSecurity`) or also
@@ -34,17 +34,20 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsValidSid,
-    SetKernelObjectSecurity, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
+    LookupAccountNameW, SetKernelObjectSecurity, ACL, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
 };
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_MULTI_SZ,
+};
 
 use crate::file_acl::{
-    parse_acl, parse_sid, ObjectInfo, SecurityFacts, ADMIN_ONLY_DIR_SDDL,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL,
-    SID_BUILTIN_ADMINISTRATORS,
+    parse_acl, parse_sid, ObjectInfo, SecurityFacts, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL, SID_BUILTIN_ADMINISTRATORS,
 };
 
 /// Memory a Win32 API allocated with `LocalAlloc` (a security descriptor or a
@@ -194,9 +197,167 @@ pub fn read_security(path: &Path) -> io::Result<SecurityFacts> {
     security_of(&open_no_follow(path, READ_CONTROL | FILE_READ_ATTRIBUTES)?)
 }
 
-/// [`ADMIN_ONLY_DIR_SDDL`] as a security descriptor.
+/// The registry key (under `HKLM`, writable by administrators only) that
+/// holds the operator groups; kept outside the configuration directory so a
+/// file planted there cannot name its own trusted group.
+const OPERATORS_KEY: &str = r"SOFTWARE\FerroGate\MIA";
+/// The `REG_MULTI_SZ` value under [`OPERATORS_KEY`] listing the local group
+/// names whose members may operate (modify) the configuration directory.
+const OPERATORS_VALUE: &str = "OperatorGroups";
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+/// The operator group names an administrator registered
+/// (`HKLM\SOFTWARE\FerroGate\MIA\OperatorGroups`); empty when none.
+#[must_use]
+pub fn operator_group_names() -> Vec<String> {
+    let key = wide(OPERATORS_KEY);
+    let value = wide(OPERATORS_VALUE);
+    let mut hkey: HKEY = ptr::null_mut();
+    // SAFETY: NUL-terminated names; `hkey` is closed below on success.
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.as_ptr(), 0, KEY_READ, &mut hkey) }
+        != ERROR_SUCCESS
+    {
+        return Vec::new();
+    }
+    let mut kind = 0u32;
+    let mut len = 0u32;
+    // SAFETY: first call only asks for the size.
+    let mut ok = unsafe {
+        RegQueryValueExW(
+            hkey,
+            value.as_ptr(),
+            ptr::null(),
+            &mut kind,
+            ptr::null_mut(),
+            &mut len,
+        )
+    } == ERROR_SUCCESS
+        && kind == REG_MULTI_SZ
+        && len > 0
+        && len <= 64 * 1024;
+    let mut buf = vec![0u16; (len as usize).div_ceil(2)];
+    if ok {
+        // SAFETY: `buf` spans at least `len` bytes.
+        ok = unsafe {
+            RegQueryValueExW(
+                hkey,
+                value.as_ptr(),
+                ptr::null(),
+                &mut kind,
+                buf.as_mut_ptr().cast::<u8>(),
+                &mut len,
+            )
+        } == ERROR_SUCCESS;
+    }
+    // SAFETY: `hkey` was opened above and is closed once.
+    unsafe { RegCloseKey(hkey) };
+    if !ok {
+        return Vec::new();
+    }
+    buf.split(|&c| c == 0)
+        .filter(|w| !w.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
+/// Register `names` as the operator groups (needs administrator rights).
+///
+/// # Errors
+///
+/// The registry failure (`PermissionDenied` when not elevated).
+pub fn set_operator_group_names(names: &[String]) -> io::Result<()> {
+    let key = wide(OPERATORS_KEY);
+    let value = wide(OPERATORS_VALUE);
+    let mut hkey: HKEY = ptr::null_mut();
+    // SAFETY: NUL-terminated name; `hkey` is closed below on success.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            0,
+            ptr::null(),
+            0,
+            KEY_WRITE,
+            ptr::null(),
+            &mut hkey,
+            ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(win32_error(status));
+    }
+    let mut data: Vec<u16> = Vec::new();
+    for n in names {
+        data.extend(n.encode_utf16());
+        data.push(0);
+    }
+    data.push(0);
+    // SAFETY: `data` is valid for `len` bytes for the call.
+    let status = unsafe {
+        RegSetValueExW(
+            hkey,
+            value.as_ptr(),
+            0,
+            REG_MULTI_SZ,
+            data.as_ptr().cast::<u8>(),
+            (data.len() * 2) as u32,
+        )
+    };
+    // SAFETY: `hkey` was opened above and is closed once.
+    unsafe { RegCloseKey(hkey) };
+    if status != ERROR_SUCCESS {
+        return Err(win32_error(status));
+    }
+    Ok(())
+}
+
+/// The SID string of the local account `name`, or `None` if it does not
+/// resolve.
+fn sid_string_of(name: &str) -> Option<String> {
+    let name = wide(name);
+    let mut sid = vec![0u8; 256];
+    let mut sid_len = sid.len() as u32;
+    let mut domain = vec![0u16; 256];
+    let mut domain_len = domain.len() as u32;
+    let mut use_ = 0;
+    // SAFETY: buffers and their sizes are valid for the call.
+    let ok = unsafe {
+        LookupAccountNameW(
+            ptr::null(),
+            name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut use_,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    parse_sid(&sid[..sid_len as usize]).map(|(s, _)| s)
+}
+
+/// The SIDs of the registered operator groups that resolve on this machine.
+#[must_use]
+pub fn operator_sids() -> Vec<String> {
+    operator_group_names()
+        .iter()
+        .filter_map(|n| sid_string_of(n))
+        .filter(|s| crate::file_acl::is_sid_string(s))
+        .collect()
+}
+
+/// [`crate::file_acl::ADMIN_ONLY_DIR_SDDL`] (plus the operator groups' ACEs) as a security
+/// descriptor.
 fn admin_only_descriptor() -> io::Result<LocalBox> {
-    let sddl: Vec<u16> = ADMIN_ONLY_DIR_SDDL.encode_utf16().chain([0]).collect();
+    let sddl: Vec<u16> = crate::file_acl::admin_dir_sddl(&operator_sids())
+        .encode_utf16()
+        .chain([0])
+        .collect();
     let mut descriptor: *mut c_void = ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; on success `descriptor` is a
     // `LocalAlloc`ed descriptor owned by the returned guard.
@@ -215,7 +376,7 @@ fn admin_only_descriptor() -> io::Result<LocalBox> {
 }
 
 /// Create the directory `path` (its parent must exist) with the
-/// [`ADMIN_ONLY_DIR_SDDL`] security descriptor, applied atomically by
+/// [`crate::file_acl::ADMIN_ONLY_DIR_SDDL`] security descriptor, applied atomically by
 /// `CreateDirectoryW`. A reparse point already at `path` makes it fail with
 /// `AlreadyExists`; it is never followed.
 ///
@@ -241,7 +402,7 @@ pub fn create_admin_only_dir(path: &Path) -> io::Result<()> {
 }
 
 /// Give the open directory the owner (`BUILTIN\Administrators`) and the
-/// protected DACL of [`ADMIN_ONLY_DIR_SDDL`], through its handle — never a
+/// protected DACL of [`crate::file_acl::ADMIN_ONLY_DIR_SDDL`], through its handle — never a
 /// path, so a directory swapped for a junction after it was opened is not
 /// what changes. The handle needs `WRITE_DAC | WRITE_OWNER`; callers open it
 /// with [`open_no_follow`] and check [`object_info`] first.

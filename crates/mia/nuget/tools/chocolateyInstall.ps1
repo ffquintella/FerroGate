@@ -72,10 +72,8 @@ try {
 #    not hard-fail on service quirks), so this log is the only record of a
 #    failed InstallServices/StartServices action.
 #    The administrator client (feature F22) is the MSI feature "Admin client",
-#    OFF by default: `choco install ferrogate-mia --params "'/AdminClient'"`
-#    turns it on (ADDLOCAL=Main,AdminClient). It is for approvers on managed
-#    devices; pass the parameter again on `choco upgrade` (or remember
-#    arguments) or the upgrade installs the default features only.
+#    ON by default (the tray menu's "Administration…" entry needs it).
+#    `/AdminClient` is still accepted and forces it on (ADDLOCAL=Main,AdminClient).
 $pp = Get-PackageParameters
 $msiFeatures = ''
 if ($pp.ContainsKey('AdminClient')) {

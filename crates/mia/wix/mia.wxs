@@ -172,11 +172,10 @@
       <ComponentRef Id="MiaTrayExe" /><!-- TRAY-REF -->
     </Feature>
 
-    <!-- ADMIN-FEATURE-BEGIN: "Admin client" is OFF by default (Level 2 is above
-         the default INSTALLLEVEL 1). Turn it on with
-         msiexec /i ... ADDLOCAL=Main,AdminClient, or with the Chocolatey
-         package parameter /AdminClient. -->
-    <Feature Id="AdminClient" Title="Admin client" Level="2"
+    <!-- ADMIN-FEATURE-BEGIN: "Admin client" is ON by default (Level 1), so the
+         tray menu shows "Administration…". Leave it out with
+         msiexec /i ... ADDLOCAL=Main (or REMOVE=AdminClient). -->
+    <Feature Id="AdminClient" Title="Admin client" Level="1"
              Description="FerroGate administrator client, for approvers on managed devices. Opened from the tray menu; runs as the signed-in user.">
       <ComponentRef Id="MiaTrayAdminExe" />
     </Feature>

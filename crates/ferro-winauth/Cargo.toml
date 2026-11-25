@@ -44,6 +44,8 @@ windows-sys = { version = "0.61", features = [
     # NetLocalGroupAdd: create the pipe DACLs' local groups when missing
     # (`local_group`).
     "Win32_NetworkManagement_NetManagement",
+    # HKLM operator-group list (`file_security::operator_sids`).
+    "Win32_System_Registry",
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]

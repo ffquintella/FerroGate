@@ -1485,3 +1485,22 @@ allowlist           = "/etc/ferrogate/allowlist.toml"
 | Host SVID renewal fails (T294) | retried with a bounded back-off while the SVID in force keeps serving; at expiry minting and host calls stop until a full attestation succeeds (every 5 min) |
 | Re-attestation returns another SPIFFE id | not put in force; minting stops; status `host_identity_changed`; exit non-zero so the service manager restarts under the new identity |
 | Renewal task dies | minting and host calls off; exit non-zero |
+
+## Operator groups (non-administrator operation, Windows)
+
+By default only SYSTEM and `BUILTIN\Administrators` may own or modify
+`%ProgramData%\FerroGate`, `mia.toml` and the allowlist; anything else with a
+write right is refused. To let a group of ordinary users operate the MIA, run
+once from an elevated prompt:
+
+```
+mia service secure-config --operators-group FerroGateOperators
+```
+
+This creates the local group if missing, records it in
+`HKLM\SOFTWARE\FerroGate\MIA\OperatorGroups` (the trust anchor: outside the
+directory, writable by administrators only) and re-applies the directory DACL
+with an inheritable `Modify` ACE for it. Group members can then read and edit
+the configuration and allowlist; they can never own the objects or change
+their permissions. Note that whoever can edit `mia.toml` influences what the
+LocalSystem service loads: only add accounts you would trust with that.

@@ -563,6 +563,10 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
         // The installers run it, and so can an administrator; it needs
         // elevation.
         Some("secure-config") => {
+            let operators = operator_groups_from_args(&args[1..])?;
+            if !operators.is_empty() {
+                register_operator_groups(&operators)?;
+            }
             let dir = mia::config::system_config_path()
                 .parent()
                 .map(std::path::Path::to_path_buf)
@@ -583,6 +587,15 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
                     println!("{} is administrator-only.", dir.display());
                 }
             }
+            if !operators.is_empty() {
+                mia::system_dir::apply_operator_acl()
+                    .with_context(|| format!("granting the operator groups access to {}", dir.display()))?;
+                println!(
+                    "operator group(s) {} may now modify {} (and the files inside it).",
+                    operators.join(", "),
+                    dir.display()
+                );
+            }
             ensure_installer_groups()
         }
         Some("stop") => {
@@ -591,11 +604,11 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         Some(other) => anyhow::bail!(
-            "unknown service subcommand: {other}\n\nusage: mia service <install|uninstall|start|stop|secure-config>"
+            "unknown service subcommand: {other}\n\nusage: mia service <install|uninstall|start|stop|secure-config [--operators-group <group>]>"
         ),
         None => {
             println!(
-                "usage: mia service <install|uninstall|start|stop|secure-config>\n\n\
+                "usage: mia service <install|uninstall|start|stop|secure-config [--operators-group <group>]>\n\n\
                  Manage the mia Windows service so it runs in the background and\n\
                  `Restart-Service mia` works. `install` registers an auto-start\n\
                  LocalSystem service that runs `mia service run` (used internally\n\
@@ -608,6 +621,53 @@ fn service_cmd(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The `--operators-group NAME` values (repeatable; `NAME` is a plain local
+/// group name) among the `secure-config` arguments.
+#[cfg(windows)]
+fn operator_groups_from_args(args: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a != "--operators-group" {
+            anyhow::bail!(
+                "unknown secure-config option: {a} (usage: --operators-group <local group>)"
+            );
+        }
+        let name = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("--operators-group needs a local group name"))?;
+        if let Some(problem) = ferro_winauth::local_group::creatable_name_problem(name) {
+            anyhow::bail!("--operators-group {name}: {problem}");
+        }
+        if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            out.push(name.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Create the operator groups when missing and record them in the machine
+/// registry (`HKLM`, administrators only) — the trust anchor that lets
+/// `system_dir` accept their write access.
+#[cfg(windows)]
+fn register_operator_groups(names: &[String]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let groups: Vec<mia::host_groups::RequiredGroup> = names
+        .iter()
+        .map(|n| mia::host_groups::RequiredGroup {
+            name: n.clone(),
+            comment: "FerroGate MIA operators (may modify the configuration)",
+        })
+        .collect();
+    for report in mia::host_groups::ensure(&groups) {
+        if let mia::host_groups::GroupReport::Failed(name, e) = report {
+            anyhow::bail!("could not create local group {name}: {e}");
+        }
+    }
+    ferro_winauth::set_operator_group_names(names)
+        .context("registering the operator groups (needs an elevated prompt)")
 }
 
 /// `mia service secure-config`, second half: create the local groups the pipe
