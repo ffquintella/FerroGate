@@ -63,8 +63,6 @@ tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "io-
 # tracing
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
-tracing-appender   = "0.2"
-file-rotate        = "0.7"
 
 # errors
 thiserror = "2"
@@ -124,7 +122,6 @@ tss-esapi = "7.5"
 # `ferro-raft` to expose typed access to issued-SVID metadata and the RIM
 # version pointer without leaking the Raft library into the rest of the tree.
 hiqlite      = { version = "0.16", default-features = false, features = ["sqlite", "auto-heal"] }
-async-trait  = "0.1"
 
 # gRPC / protobuf (F04 — MachineIdentity service surface)
 # tonic 0.14 split the prost codec out of the core crate: `tonic` is now
@@ -155,7 +152,6 @@ plist = { version = "=1.10.3", default-features = false, features = ["enable_uns
 
 # misc
 parking_lot = "0.13"
-once_cell   = "1"
 
 # interactive terminal prompts (mia `setup` configuration wizard)
 inquire = "0.9"
