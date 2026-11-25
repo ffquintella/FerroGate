@@ -346,9 +346,10 @@ pub fn is_sid_string(sid: &str) -> bool {
 /// `operators` (malformed SIDs are skipped, never spliced).
 #[must_use]
 pub fn admin_dir_sddl(operators: &[String]) -> String {
+    use std::fmt::Write as _;
     let mut sddl = String::from(ADMIN_ONLY_DIR_SDDL);
     for sid in operators.iter().filter(|s| is_sid_string(s)) {
-        sddl.push_str(&format!("(A;OICI;0x{OPERATOR_MODIFY_MASK:x};;;{sid})"));
+        let _ = write!(sddl, "(A;OICI;0x{OPERATOR_MODIFY_MASK:x};;;{sid})");
     }
     sddl
 }

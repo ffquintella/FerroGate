@@ -117,7 +117,7 @@ cargo build --release -p mia --bin mia --target "$TARGET"
 rm -f "$BINDIR/mia-tray.exe" "$BINDIR/mia-tray-admin.exe"
 if [ "$MIA_TRAY" != 0 ]; then
   cargo build --release -p mia-tray --features gui --bin mia-tray --target "$TARGET" \
-    || echo "WARNING: mia-tray.exe did not build; the MSI will ship without the tray"
+    || { die "mia-tray.exe did not build (MIA_TRAY=0 to ship without it)"; }
   # The admin client (F22) is a separate build so its dependencies never
   # unify into the tray binary.
   if [ "$MIA_TRAY_ADMIN" != 0 ] && [ -f "$BINDIR/mia-tray.exe" ]; then

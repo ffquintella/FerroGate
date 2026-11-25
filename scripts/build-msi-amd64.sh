@@ -70,7 +70,7 @@ docker run --rm --platform linux/amd64 \
     rm -f target/x86_64-pc-windows-msvc/release/mia-tray.exe target/x86_64-pc-windows-msvc/release/mia-tray-admin.exe
     if [ "$MIA_TRAY" != 0 ]; then
       cargo xwin build --release -p mia-tray --features gui --bin mia-tray --target x86_64-pc-windows-msvc \
-        || echo "WARNING: mia-tray.exe did not build; the MSI will ship without the tray"
+        || { echo "ERROR: mia-tray.exe did not build (MIA_TRAY=0 to ship without it)" >&2; exit 1; }
       # The administrator client (feature F22): a separate build, so its
       # dependencies never unify into the tray binary. It sits beside the tray.
       if [ "$MIA_TRAY_ADMIN" != 0 ] && [ -f target/x86_64-pc-windows-msvc/release/mia-tray.exe ]; then

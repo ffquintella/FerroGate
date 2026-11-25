@@ -717,11 +717,11 @@ mod imp {
         let result = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .access_mode(GENERIC_WRITE | WRITE_OWNER | READ_CONTROL)
+            .access_mode(GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | READ_CONTROL)
             .open(&tmp)
             .and_then(|mut file| {
                 file.write_all(bytes)?;
-                ferro_winauth::set_administrators_owner(&file)
+                ferro_winauth::set_admin_only(&file, false)
                     .map_err(|e| not_elevated(&path, &e))?;
                 file.sync_all()
             })
@@ -738,9 +738,14 @@ mod imp {
             return Ok(());
         };
         require_dirs(&dirs)?;
-        let file =
-            open_plain(&path, ObjectKind::File, WRITE_OWNER)?.ok_or_else(|| missing(&path))?;
-        ferro_winauth::set_administrators_owner(&file).map_err(|e| not_elevated(&path, &e))
+        let file = open_plain(&path, ObjectKind::File, WRITE_DAC | WRITE_OWNER)?
+            .ok_or_else(|| missing(&path))?;
+        // Owner Administrators and an explicit, protected DACL: SYSTEM and
+        // Administrators full control plus the registered operator groups
+        // (`FerroGateStatus`, so the `mia-tray` user can replace the synced
+        // allowlist) with Modify — never left to what the directory happens to
+        // inherit.
+        ferro_winauth::set_admin_only(&file, false).map_err(|e| not_elevated(&path, &e))
     }
 
     /// Wrap a failure to make Administrators the owner of `path`.
