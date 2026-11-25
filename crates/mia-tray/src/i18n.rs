@@ -724,7 +724,7 @@ messages! {
 
     MenuOpenMain => "Open FerroGate…", "Abrir o FerroGate…";
     MenuEnvironments => "Environments", "Ambientes";
-    MenuReviewApprovals => "Review approvals…", "Revisar aprovações…";
+    MenuReviewApprovals => "Administration…", "Administração…";
     HeaderUpdated => "Updated {when}", "Atualizado {when}";
     HeaderLanguage => "Language", "Idioma";
     HeaderSource => "Read from: {source}", "Lido de: {source}";

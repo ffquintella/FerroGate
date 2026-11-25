@@ -559,7 +559,7 @@ spanish! {
 
     MenuOpenMain => "Abrir FerroGate…";
     MenuEnvironments => "Entornos";
-    MenuReviewApprovals => "Revisar aprobaciones…";
+    MenuReviewApprovals => "Administración…";
     HeaderUpdated => "Actualizado {when}";
     HeaderLanguage => "Idioma";
     HeaderSource => "Leído de: {source}";

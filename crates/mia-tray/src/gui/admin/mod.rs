@@ -630,7 +630,8 @@ impl AdminApp {
             }
             if let Some(v) = &view.views {
                 ui.separator();
-                views::panel(ui, lang, v, idle, actions);
+                let can_publishers = view.session.as_ref().is_some_and(|s| s.can_list_publishers);
+                views::panel(ui, lang, v, can_publishers, idle, actions);
             }
             if let Some(p) = &view.publishers {
                 ui.separator();

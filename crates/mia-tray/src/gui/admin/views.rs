@@ -145,6 +145,7 @@ pub(super) fn panel(
     ui: &mut egui::Ui,
     lang: Lang,
     v: &ViewsView,
+    can_publishers: bool,
     idle: bool,
     actions: &mut Vec<Action>,
 ) {
@@ -160,6 +161,13 @@ pub(super) fn panel(
             {
                 actions.push(view(ViewAction::Tab(tab)));
             }
+        }
+        if can_publishers
+            && ui
+                .add_enabled(free, egui::Button::new(Msg::AdminPubOpen.text(lang)))
+                .clicked()
+        {
+            actions.push(Action::OpenPublishers);
         }
         if ui
             .add_enabled(free, egui::Button::new(Msg::ButtonRefresh.text(lang)))
