@@ -238,7 +238,14 @@ pub fn recoveries(snapshot: &StatusSnapshot) -> Vec<Recovery> {
         AgentState::ImaDisabled => vec![Read(Doc::Hardening)],
         AgentState::CrlStale => vec![Run(Action::RunSelfTest), Read(Doc::CrlStale)],
         AgentState::AllowlistMissing | AgentState::AllowlistInvalid => {
-            vec![Run(Action::ResyncAllowlist), Read(Doc::Allowlist)]
+            // With the sync loop running (a `sync` summary), asking it to sync
+            // needs no elevation; otherwise the CLI writes the body itself.
+            let resync = if snapshot.sync.is_some() {
+                Action::SyncAllowlist
+            } else {
+                Action::ResyncAllowlist
+            };
+            vec![Run(resync), Read(Doc::Allowlist)]
         }
         AgentState::SvidExpiring => {
             vec![Run(Action::RunSelfTest), Run(Action::ServiceRestart)]
@@ -877,6 +884,19 @@ mod tests {
             assert_eq!(recoveries(&snap(state, None, None)), recs, "{state:?}");
             assert_ne!(title(state).text(Lang::Pt), "", "{state:?}");
         }
+    }
+
+    #[test]
+    fn allowlist_recovery_needs_no_elevation_when_the_sync_loop_runs() {
+        let mut s = snap(AgentState::AllowlistMissing, None, None);
+        assert_eq!(recoveries(&s)[0], Recovery::Run(Action::ResyncAllowlist));
+        s.sync = Some(mia_status_proto::AllowlistSyncSummary::default());
+        let r = recoveries(&s);
+        assert_eq!(r[0], Recovery::Run(Action::SyncAllowlist));
+        assert_eq!(
+            Action::SyncAllowlist.privilege(),
+            crate::actions::Privilege::User
+        );
     }
 
     #[test]

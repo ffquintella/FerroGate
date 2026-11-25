@@ -106,8 +106,10 @@ pub const DEFAULT_ENDPOINT: &str = "mia-status.sock";
 
 // ── Requests ─────────────────────────────────────────────────────────────────
 
-/// Every request the status endpoint accepts. The set is closed and
-/// read-only: anything that does not decode as one of these variants (a
+/// Every request the status endpoint accepts. The set is closed: it reads
+/// status and the log, and its one action, [`StatusRequest::SyncNow`], only
+/// wakes the daemon's own allowlist sync loop (it carries no data into the
+/// daemon). Anything that does not decode as one of these variants (a
 /// helper-API `HelperReq`, garbage, a future write request) is rejected with
 /// [`StatusErrorCode::UnsupportedRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +119,11 @@ pub enum StatusRequest {
     Status(StatusReq),
     /// Ask for recent log records from the daemon's ring buffer.
     LogTail(LogTailReq),
+    /// Ask the allowlist sync loop of the matching environment(s) to sync as
+    /// soon as possible. Needs no privilege beyond access to the endpoint:
+    /// the daemon fetches, verifies and applies exactly as it does on its own
+    /// schedule, so the caller can neither choose nor inject a body.
+    SyncNow(StatusReq),
 }
 
 /// `StatusReq { environment }` — snapshot request.
@@ -151,6 +158,12 @@ pub enum StatusResponse {
     Status(Vec<StatusSnapshot>),
     /// A slice of the log ring buffer.
     LogTail(LogTailResp),
+    /// The answer to [`StatusRequest::SyncNow`]: how many environments had
+    /// a sync loop to wake (0: the sync is off for the selected environments).
+    SyncRequested {
+        /// Environments whose sync loop was asked to sync now.
+        environments: u32,
+    },
     /// A refusal.
     Error {
         /// Stable refusal code.
@@ -801,6 +814,9 @@ mod tests {
     fn requests_and_responses_roundtrip() {
         for req in [
             StatusRequest::Status(StatusReq { environment: None }),
+            StatusRequest::SyncNow(StatusReq {
+                environment: Some("prod".into()),
+            }),
             StatusRequest::Status(StatusReq {
                 environment: Some("prod".into()),
             }),

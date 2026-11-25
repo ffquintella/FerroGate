@@ -90,6 +90,7 @@ spanish! {
     ActionServiceStop => "Detener el servicio";
     ActionServiceRestart => "Reiniciar el servicio";
     ActionResyncAllowlist => "Volver a sincronizar la lista de permitidos";
+    ActionSyncAllowlist => "Sincronizar la lista de permitidos ahora";
     ActionRefreshKey => "Obtener de nuevo la clave de inscripción";
     ActionApplySetup => "Aplicar la configuración";
     ActionSetDefaultEnvironment => "Establecer como entorno predeterminado";

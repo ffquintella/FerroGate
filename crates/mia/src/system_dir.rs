@@ -721,8 +721,7 @@ mod imp {
             .open(&tmp)
             .and_then(|mut file| {
                 file.write_all(bytes)?;
-                ferro_winauth::set_admin_only(&file, false)
-                    .map_err(|e| not_elevated(&path, &e))?;
+                ferro_winauth::set_admin_only(&file, false).map_err(|e| not_elevated(&path, &e))?;
                 file.sync_all()
             })
             .and_then(|()| std::fs::rename(&tmp, &path));

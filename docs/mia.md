@@ -1306,8 +1306,8 @@ the allowlist check works. Options:
 
 ### Status endpoint and `mia status`
 
-Besides the helper socket, the daemon serves a **read-only status endpoint**
-(feature F18) that the `mia-tray` companion and `mia status` read. It is a
+Besides the helper socket, the daemon serves a **status endpoint** (feature F18;
+read-only apart from `SyncNow`, below) that the `mia-tray` companion and `mia status` read. It is a
 separate listener, so status reads never touch the token-minting path:
 
 | OS | default endpoint | access |
@@ -1319,8 +1319,15 @@ separate listener, so status reads never touch the token-minting path:
 Framing is the helper protocol's (4-byte big-endian length + one CBOR value,
 ≤ 64 KiB, one exchange per connection, 5 s read deadline). Two requests are
 accepted — `StatusReq { environment }` → one `StatusSnapshot` per environment,
-and `LogTailReq { since_seq, min_level, max }` → redacted log records — and
-everything else, including a helper `HelperReq`, is answered with
+and `LogTailReq { since_seq, min_level, max }` → redacted log records — plus
+`SyncNow { environment }`, which only wakes the allowlist sync loop of the
+matching environment(s) (reply `sync_requested { environments }`; 0 when
+`allowlist.sync` is off there). It carries no data into the daemon: the loop
+fetches, verifies and applies exactly as on its own schedule, so the status
+group can ask for a sync without administrator rights (`mia resync-allowlist
+--reload` and the tray's "Sync the allowlist now" use it, and fall back to the
+SIGHUP / service restart only when the endpoint cannot be reached). Everything
+else, including a helper `HelperReq`, is answered with
 `unsupported_request`. Each peer uid gets `status.rate_limit_per_sec` requests
 per second (default 10); at most 16 connections are served at once. The wire
 types live in the small `mia-status-proto` crate so clients need not depend on

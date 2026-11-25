@@ -255,6 +255,7 @@ messages! {
     ActionServiceStop => "Stop the service", "Parar o serviço";
     ActionServiceRestart => "Restart the service", "Reiniciar o serviço";
     ActionResyncAllowlist => "Resync the allowlist", "Ressincronizar a lista de permissões";
+    ActionSyncAllowlist => "Sync the allowlist now", "Sincronizar a lista de permissões agora";
     ActionRefreshKey => "Re-fetch the enrollment key", "Obter novamente a chave de registro";
     ActionApplySetup => "Apply the configuration", "Aplicar a configuração";
     ActionSetDefaultEnvironment => "Set as default environment", "Definir como ambiente padrão";

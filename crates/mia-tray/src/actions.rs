@@ -90,8 +90,12 @@ pub enum Action {
     ServiceStop,
     /// Restart the `mia` service (admin).
     ServiceRestart,
-    /// `mia resync-allowlist --reload` (admin).
+    /// `mia resync-allowlist --reload` (admin): fetches and writes the
+    /// allowlist body itself, for hosts without `allowlist.sync`.
     ResyncAllowlist,
+    /// `mia resync-allowlist --reload` (user): with `allowlist.sync` on it
+    /// only asks the agent, over the status endpoint, to sync now.
+    SyncAllowlist,
     /// `mia refresh-key` (admin).
     RefreshKey,
     /// `mia default-environment set <env>` (admin): hand the helper API's
@@ -105,7 +109,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, in display order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::RunSelfTest,
         Self::ShowMachineId,
         Self::ShowStatus,
@@ -113,6 +117,7 @@ impl Action {
         Self::ServiceStop,
         Self::ServiceRestart,
         Self::ResyncAllowlist,
+        Self::SyncAllowlist,
         Self::RefreshKey,
         Self::SetDefaultEnvironment,
         Self::ClearDefaultEnvironment,
@@ -122,7 +127,9 @@ impl Action {
     #[must_use]
     pub fn privilege(self) -> Privilege {
         match self {
-            Self::RunSelfTest | Self::ShowMachineId | Self::ShowStatus => Privilege::User,
+            Self::RunSelfTest | Self::ShowMachineId | Self::ShowStatus | Self::SyncAllowlist => {
+                Privilege::User
+            }
             Self::ServiceStart
             | Self::ServiceStop
             | Self::ServiceRestart
@@ -141,6 +148,7 @@ impl Action {
             Self::RunSelfTest
                 | Self::ShowStatus
                 | Self::ResyncAllowlist
+                | Self::SyncAllowlist
                 | Self::RefreshKey
                 | Self::SetDefaultEnvironment
         )
@@ -167,6 +175,7 @@ impl Action {
             Self::ServiceStop => Msg::ActionServiceStop,
             Self::ServiceRestart => Msg::ActionServiceRestart,
             Self::ResyncAllowlist => Msg::ActionResyncAllowlist,
+            Self::SyncAllowlist => Msg::ActionSyncAllowlist,
             Self::RefreshKey => Msg::ActionRefreshKey,
             Self::SetDefaultEnvironment => Msg::ActionSetDefaultEnvironment,
             Self::ClearDefaultEnvironment => Msg::ActionClearDefaultEnvironment,
@@ -332,7 +341,7 @@ pub fn invocation(action: Action, env: Option<&EnvName>, os: Os) -> Invocation {
             env_args(&mut a, env);
             (Program::Mia, a)
         }
-        (Action::ResyncAllowlist, _) => {
+        (Action::ResyncAllowlist | Action::SyncAllowlist, _) => {
             let mut a = strings(&["resync-allowlist", "--reload"]);
             env_args(&mut a, env);
             (Program::Mia, a)

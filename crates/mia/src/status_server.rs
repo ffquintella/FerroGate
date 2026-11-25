@@ -9,9 +9,12 @@
 //! - **Framing.** Exactly the helper protocol's: a 4-byte big-endian length
 //!   then one CBOR value, at most [`MAX_FRAME_LEN`], one exchange per
 //!   connection, under a read deadline.
-//! - **Requests.** Only `StatusReq` and `LogTailReq`. Anything else —
+//! - **Requests.** `StatusReq`, `LogTailReq` and `SyncNow`. Anything else —
 //!   including a helper-API `HelperReq` — is answered with
-//!   [`StatusErrorCode::UnsupportedRequest`]. There is no write request.
+//!   [`StatusErrorCode::UnsupportedRequest`]. There is no write request:
+//!   `SyncNow` carries no data into the daemon, it only wakes the allowlist
+//!   sync loop, which then fetches, verifies and applies as on its own
+//!   schedule (and the per-uid budget below bounds how often).
 //! - **Limits.** A bounded number of concurrent connections (excess
 //!   connections are dropped, not queued), a per-uid request budget
 //!   ([`RateLimiter`]), a clamped log-tail size and a reply that always fits
@@ -251,6 +254,20 @@ impl StatusService {
                     .await
                 {
                     Ok(snapshots) => StatusResponse::Status(snapshots),
+                    Err(_) => error(StatusErrorCode::UnknownEnvironment, None),
+                }
+            }
+            StatusRequest::SyncNow(req) => {
+                if let Some(env) = req.environment.as_deref() {
+                    if !valid_environment_filter(env) {
+                        return error(StatusErrorCode::MalformedRequest, None);
+                    }
+                }
+                match self.registry.request_sync(req.environment.as_deref()) {
+                    Ok(environments) => {
+                        tracing::info!(peer_uid, environments, "allowlist sync requested");
+                        StatusResponse::SyncRequested { environments }
+                    }
                     Err(_) => error(StatusErrorCode::UnknownEnvironment, None),
                 }
             }
@@ -627,6 +644,66 @@ mod tests {
 
     fn body<T: serde::Serialize>(v: &T) -> Vec<u8> {
         encode_frame(v).unwrap()[4..].to_vec()
+    }
+
+    #[tokio::test]
+    async fn sync_now_wakes_only_the_selected_environments_sync_loop() {
+        let default = StatusHandle::new(DEFAULT_ENVIRONMENT_LABEL, 100);
+        let prod = StatusHandle::new("prod", 100);
+        let trigger = crate::allowlist_sync::SyncTrigger::new();
+        prod.set_sync_trigger(trigger.clone());
+        let svc = StatusService::new(StatusRegistry::new(vec![default, prod]), None, 100)
+            .with_clock(Arc::new(|| 100));
+        let ask = |env: Option<&str>| {
+            body(&StatusRequest::SyncNow(StatusReq {
+                environment: env.map(str::to_string),
+            }))
+        };
+        // The environment without a sync loop: nothing to wake.
+        assert_eq!(
+            svc.handle_body(1, &ask(Some("default"))).await,
+            StatusResponse::SyncRequested { environments: 0 }
+        );
+        // Every environment: only `prod` has a loop.
+        assert_eq!(
+            svc.handle_body(1, &ask(None)).await,
+            StatusResponse::SyncRequested { environments: 1 }
+        );
+        assert_eq!(
+            svc.handle_body(1, &ask(Some("prod"))).await,
+            StatusResponse::SyncRequested { environments: 1 }
+        );
+        assert!(matches!(
+            svc.handle_body(1, &ask(Some("nope"))).await,
+            StatusResponse::Error {
+                code: StatusErrorCode::UnknownEnvironment,
+                ..
+            }
+        ));
+        assert!(matches!(
+            svc.handle_body(1, &ask(Some("../x"))).await,
+            StatusResponse::Error {
+                code: StatusErrorCode::MalformedRequest,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_now_is_rate_limited_like_every_request() {
+        let svc = service(1);
+        let req = body(&StatusRequest::SyncNow(StatusReq::default()));
+        assert!(matches!(
+            svc.handle_body(7, &req).await,
+            StatusResponse::SyncRequested { .. }
+        ));
+        assert!(matches!(
+            svc.handle_body(7, &req).await,
+            StatusResponse::Error {
+                code: StatusErrorCode::RateLimited,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

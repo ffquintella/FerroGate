@@ -123,7 +123,9 @@ fn run_inner(args: &[String]) -> anyhow::Result<i32> {
                 retry_after.map_or(String::new(), |s| format!(", retry after {s}s"))
             )
         }
-        Ok(StatusResponse::LogTail(_)) => anyhow::bail!("unexpected reply from the agent"),
+        Ok(StatusResponse::LogTail(_) | StatusResponse::SyncRequested { .. }) => {
+            anyhow::bail!("unexpected reply from the agent")
+        }
         Err(QueryError::NotRunning) => {
             let snapshots = not_running_snapshots(opts.environment.as_deref());
             print(&snapshots, opts.json)?;

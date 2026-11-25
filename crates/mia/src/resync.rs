@@ -284,7 +284,7 @@ async fn resync(config: &Config, reload: bool) -> anyhow::Result<()> {
             config.allowlist_sync_interval().as_secs()
         );
         if reload {
-            if signal_reload() {
+            if request_sync_now(config) || signal_reload() {
                 wait_for_completed_sync(config, &before).await?;
                 println!("✓ the agent completed the sync and loaded a verified allowlist.");
             } else {
@@ -380,6 +380,41 @@ fn sync_now_hint(live_reload: bool) -> &'static str {
     } else {
         "Run `mia resync-allowlist --reload` (or `mia --resync`) to sync now; on this platform \
          that restarts the agent (no live reload), which syncs as it starts."
+    }
+}
+
+/// Ask the running agent, over its status endpoint, to sync now: no signal
+/// and no service restart, so no elevation (the endpoint is open to the status
+/// group). `false` when the agent could not be asked or has no sync loop for
+/// this environment, in which case the caller falls back to [`signal_reload`].
+fn request_sync_now(config: &Config) -> bool {
+    let environment = config
+        .environment()
+        .unwrap_or(crate::status::DEFAULT_ENVIRONMENT_LABEL)
+        .to_owned();
+    let request = mia_status_proto::StatusRequest::SyncNow(mia_status_proto::StatusReq {
+        environment: Some(environment),
+    });
+    print!("\nAsking the running agent to sync now … ");
+    match crate::status_cli::query(&config.status_socket(), &request) {
+        Ok(mia_status_proto::StatusResponse::SyncRequested { environments })
+            if environments > 0 =>
+        {
+            println!("requested.");
+            true
+        }
+        Ok(mia_status_proto::StatusResponse::SyncRequested { .. }) => {
+            println!("the agent has no sync loop for this environment.");
+            false
+        }
+        Ok(other) => {
+            println!("the agent did not accept it ({other:?}).");
+            false
+        }
+        Err(e) => {
+            println!("failed ({e:?}).");
+            false
+        }
     }
 }
 

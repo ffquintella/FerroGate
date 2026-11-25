@@ -125,6 +125,9 @@ pub fn start(inputs: ServiceInputs<'_>) -> Services {
     let interval = config.allowlist_sync_interval();
 
     if config.allowlist_sync_enabled() && resolver.is_some() {
+        // A status client (the tray) may ask this loop to sync now.
+        status.set_sync_trigger(trigger.clone());
+        status.update_sync(|_| {});
         let mut sync = AllowlistSync::new(SyncConfig::from_config(config), api, creds, sink, held)
             .with_trigger(trigger.clone())
             .with_audit(audit)

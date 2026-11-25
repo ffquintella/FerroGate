@@ -18,6 +18,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::allowlist_sync::SyncTrigger;
+
 use mia_status_proto::{
     error_codes, AgentState, AllowlistState, AttestBackend, ErrorSummary, StatusSnapshot,
     StoreBackend, SvidSummary,
@@ -335,6 +337,7 @@ struct EnvStatus {
     sync: Option<mia_status_proto::AllowlistSyncSummary>,
     registrations: Option<mia_status_proto::RegistrationCounts>,
     renewal: Option<RenewalPhase>,
+    sync_trigger: Option<SyncTrigger>,
     last_state: Option<AgentState>,
     since: i64,
 }
@@ -375,6 +378,7 @@ impl StatusHandle {
                 sync: None,
                 registrations: None,
                 renewal: None,
+                sync_trigger: None,
                 last_state: None,
                 since: now,
             })),
@@ -487,6 +491,18 @@ impl StatusHandle {
         self.with(|s| f(s.sync.get_or_insert_with(Default::default)));
     }
 
+    /// Register this environment's sync loop so a status client may ask it to
+    /// sync now ([`Self::request_sync`]).
+    pub fn set_sync_trigger(&self, trigger: SyncTrigger) {
+        self.with(|s| s.sync_trigger = Some(trigger));
+    }
+
+    /// Wake this environment's sync loop; `false` when none is running.
+    #[must_use]
+    pub fn request_sync(&self) -> bool {
+        self.with(|s| s.sync_trigger.as_ref().map(SyncTrigger::sync_now).is_some())
+    }
+
     /// Record the local app-registration counts (feature F19 §7.6).
     pub fn set_registrations(&self, counts: mia_status_proto::RegistrationCounts) {
         self.with(|s| s.registrations = Some(counts));
@@ -584,6 +600,31 @@ impl StatusRegistry {
     #[must_use]
     pub fn handles(&self) -> &[StatusHandle] {
         &self.handles
+    }
+
+    /// Ask the sync loop of every environment, or only the one named by
+    /// `environment`, to sync now; returns how many had one.
+    pub fn request_sync(&self, environment: Option<&str>) -> Result<u32, UnknownEnvironment> {
+        let mut known = false;
+        let mut woken = 0;
+        for h in self.handles.iter() {
+            let env = h.environment();
+            let selected = match environment {
+                None => true,
+                Some(want) => {
+                    env.as_deref() == Some(want)
+                        || (env.is_none() && want == DEFAULT_ENVIRONMENT_LABEL)
+                }
+            };
+            if selected {
+                known = true;
+                woken += u32::from(h.request_sync());
+            }
+        }
+        if environment.is_some() && !known {
+            return Err(UnknownEnvironment);
+        }
+        Ok(woken)
     }
 
     /// Snapshots at `now` for every environment, or only the one named by

@@ -326,7 +326,9 @@ pub fn fetch_status(
             Ok(snapshots)
         }
         StatusResponse::Error { code, .. } => Err(ClientError::Refused(code)),
-        StatusResponse::LogTail(_) => Err(ClientError::UnexpectedReply),
+        StatusResponse::LogTail(_) | StatusResponse::SyncRequested { .. } => {
+            Err(ClientError::UnexpectedReply)
+        }
     }
 }
 
@@ -345,7 +347,28 @@ pub fn fetch_logs(transport: &dyn Transport, since_seq: u64) -> Result<LogTailRe
             Ok(resp)
         }
         StatusResponse::Error { code, .. } => Err(ClientError::Refused(code)),
-        StatusResponse::Status(_) => Err(ClientError::UnexpectedReply),
+        StatusResponse::Status(_) | StatusResponse::SyncRequested { .. } => {
+            Err(ClientError::UnexpectedReply)
+        }
+    }
+}
+
+/// Ask the daemon to sync the allowlist now (every environment, or one),
+/// without elevation: the status endpoint only wakes the sync loop, which
+/// fetches, verifies and applies as on its own schedule. Returns how many
+/// environments had a sync loop to wake (0: `allowlist.sync` is off there).
+/// A daemon older than this request answers `UnsupportedRequest`.
+pub fn request_sync(
+    transport: &dyn Transport,
+    environment: Option<&str>,
+) -> Result<u32, ClientError> {
+    let req = StatusRequest::SyncNow(StatusReq {
+        environment: environment.map(str::to_string),
+    });
+    match transport.exchange(&req)? {
+        StatusResponse::SyncRequested { environments } => Ok(environments),
+        StatusResponse::Error { code, .. } => Err(ClientError::Refused(code)),
+        StatusResponse::Status(_) | StatusResponse::LogTail(_) => Err(ClientError::UnexpectedReply),
     }
 }
 
@@ -594,6 +617,28 @@ mod tests {
         assert_eq!(
             PIPE_CLIENT_DESIRED_ACCESS,
             ferro_winauth::pipe_acl::PIPE_CLIENT_DESIRED_ACCESS
+        );
+    }
+
+    #[test]
+    fn request_sync_sends_sync_now_and_reports_the_environments_woken() {
+        let fake = Fake::new(vec![
+            Ok(StatusResponse::SyncRequested { environments: 1 }),
+            Ok(StatusResponse::Error {
+                code: StatusErrorCode::UnsupportedRequest,
+                retry_after: None,
+            }),
+        ]);
+        assert_eq!(request_sync(&fake, Some("prod")).unwrap(), 1);
+        assert_eq!(
+            fake.1.lock().unwrap()[0],
+            StatusRequest::SyncNow(StatusReq {
+                environment: Some("prod".into())
+            })
+        );
+        assert_eq!(
+            request_sync(&fake, None),
+            Err(ClientError::Refused(StatusErrorCode::UnsupportedRequest))
         );
     }
 
