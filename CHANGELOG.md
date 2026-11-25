@@ -35,6 +35,8 @@ record them.
 
 ### Fixed
 
+- Stop the tray offering "Sync the allowlist now" when the agent refused the sync with `no_key`. Without `allowlist.key` (the CMIS enrollment key) a sync can never verify a body, so the Recovery tab now points only to the allowlist provisioning guide, where `mia allowlist-key fetch` is explained.
+
 - The tray's Recovery tab no longer lists the elevated "Resync the allowlist" next to the user-level "Sync the allowlist now": it shows only the one that applies (the user-level action when the snapshot carries a sync summary, the administrator resync otherwise), so an operator on a host with `allowlist.sync` is no longer led to the action that asks for an administrator.
 
 - The tray's allowlist resync no longer asks for an administrator when `allowlist.sync` is on. The status endpoint gains a `SyncNow` request (status group, same per-uid rate limit) that only wakes the daemon's sync loop, which fetches, verifies and applies as on its own schedule; the reply is `SyncRequested { environments }`. `mia resync-allowlist --reload` uses it first (no SIGHUP, and on Windows no service restart) and falls back to the signal/restart only when the endpoint cannot be reached; the tray offers the user-level "Sync the allowlist now" action (new `Action::SyncAllowlist`) when the snapshot carries a sync summary, and keeps the elevated "Resync" for hosts without the sync. A daemon older than this answers `unsupported_request`. The status endpoint's contract changes from "no write request" to "one action that carries no data".

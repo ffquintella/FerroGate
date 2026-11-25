@@ -245,7 +245,18 @@ pub fn recoveries(snapshot: &StatusSnapshot) -> Vec<Recovery> {
             } else {
                 Action::ResyncAllowlist
             };
-            vec![Run(resync), Read(Doc::Allowlist)]
+            // A sync refused for want of `allowlist.key` cannot succeed
+            // until the operator installs the CMIS enrollment key, so
+            // offering to sync again would only repeat the failure.
+            let no_key = snapshot
+                .sync
+                .as_ref()
+                .is_some_and(|s| s.last_reason.as_deref() == Some("no_key"));
+            if no_key {
+                vec![Read(Doc::Allowlist)]
+            } else {
+                vec![Run(resync), Read(Doc::Allowlist)]
+            }
         }
         AgentState::SvidExpiring => {
             vec![Run(Action::RunSelfTest), Run(Action::ServiceRestart)]
@@ -897,6 +908,17 @@ mod tests {
             Action::SyncAllowlist.privilege(),
             crate::actions::Privilege::User
         );
+    }
+
+    #[test]
+    fn allowlist_sync_refused_for_no_key_offers_no_sync_action() {
+        let mut s = snap(AgentState::AllowlistMissing, None, None);
+        s.sync = Some(mia_status_proto::AllowlistSyncSummary {
+            failing: true,
+            last_reason: Some("no_key".into()),
+            ..Default::default()
+        });
+        assert_eq!(recoveries(&s), vec![Recovery::Read(Doc::Allowlist)]);
     }
 
     #[test]
