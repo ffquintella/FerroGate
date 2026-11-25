@@ -639,6 +639,11 @@ async fn status(client: &mut CmisClient) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Render a Unix timestamp as `YYYY-MM-DD HH:MM` (UTC); `—` when unset.
+fn human_time<T: TryInto<i64>>(unix: T) -> String {
+    ferrogate_admin_client::timefmt::datetime(unix.try_into().unwrap_or(0))
+}
+
 async fn list_svids(client: &mut CmisClient) -> anyhow::Result<()> {
     let resp = client
         .list_svids(ListSvidsRequest {})
@@ -660,8 +665,8 @@ async fn list_svids(client: &mut CmisClient) -> anyhow::Result<()> {
             );
         }
         println!("  cert_sha:     {}", s.cert_sha);
-        println!("  issued_at:    {} (unix)", s.issued_at);
-        println!("  expires_at:   {} (unix)", s.expires_at);
+        println!("  issued_at:    {} UTC", human_time(s.issued_at));
+        println!("  expires_at:   {} UTC", human_time(s.expires_at));
         println!("  policy_id:    {}", s.policy_id);
         println!("  policy_epoch: {}", s.policy_epoch);
     }
@@ -787,4 +792,16 @@ fn spki_pin(global: &GlobalArgs, args: &[String]) -> anyhow::Result<()> {
         other => anyhow::bail!("unknown --format `{other}` (expected hex|env|flag)"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_time;
+
+    #[test]
+    fn human_time_formats_utc_and_handles_unset() {
+        assert_eq!(human_time(1_700_000_000_i64), "2023-11-14 22:13");
+        assert_eq!(human_time(1_700_000_000_u64), "2023-11-14 22:13");
+        assert_eq!(human_time(0_i64), "—");
+    }
 }
