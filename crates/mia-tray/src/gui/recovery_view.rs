@@ -228,7 +228,15 @@ impl RecoveryView {
             ui.add_space(8.0);
             ui.separator();
             ui.label(RichText::new(Msg::LabelAllActions.text(lang)).strong());
+            // With the sync loop running only the user-level "sync now" applies;
+            // otherwise only the administrator resync that writes the body.
+            let sync_running = obs.is_some_and(|o| o.snapshots.iter().any(|s| s.sync.is_some()));
             for action in Action::ALL {
+                match action {
+                    Action::ResyncAllowlist if sync_running => continue,
+                    Action::SyncAllowlist if !sync_running => continue,
+                    _ => {}
+                }
                 ui.horizontal(|ui| {
                     let running = self.jobs.contains_key(&action);
                     let env = action
