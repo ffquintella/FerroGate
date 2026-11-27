@@ -1,0 +1,16 @@
+# Daily rotation of the Linux MIA log (/var/log/ferrogate/mia.log).
+#
+# copytruncate, not a rename: the daemon opens the file before it drops
+# privileges and installs its seccomp profile, so it cannot reopen a new one.
+# The file is opened O_APPEND, so writes after the truncation land at offset 0.
+/var/log/ferrogate/mia.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 root root
+    dateext
+}

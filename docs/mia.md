@@ -322,6 +322,12 @@ mia service secure-config  # make %ProgramData%\FerroGate administrator-only (ne
 Restart-Service mia      # once installed
 ```
 
+On Linux the agent logs to stdout (the journal: `journalctl -u mia`) and also
+appends to `/var/log/ferrogate/mia.log` (`0640`, root). The packages install
+`/etc/logrotate.d/ferrogate-mia`, which rotates that file daily, keeps 14
+compressed copies and uses `copytruncate`: the daemon holds the file open across
+its privilege drop and seccomp profile and cannot reopen a renamed one.
+
 The service runs as `LocalSystem`, reads its configuration from the system path
 (`%ProgramData%\FerroGate\mia.toml`), and — because it has no console — writes
 its logs to `%ProgramData%\FerroGate\logs\mia.log`. `mia service run` is the

@@ -199,6 +199,7 @@ assets = [
     ["dist/70-ferrogate-mia-tpm.rules", "usr/lib/udev/rules.d/70-ferrogate-mia-tpm.rules", "644"],
     ["dist/mia.env", "etc/ferrogate/mia.env", "640"],
     ["dist/mia.toml", "etc/ferrogate/mia.toml", "640"],
+    ["dist/mia.logrotate", "etc/logrotate.d/ferrogate-mia", "644"],
     ["../../docs/mia.md", "usr/share/doc/ferrogate-mia/mia.md", "644"],
     ["../../docs/mia-tray.md", "usr/share/doc/ferrogate-mia/mia-tray.md", "644"],
 ]
@@ -219,6 +220,7 @@ assets = [
     { source = "target/release/mia", dest = "/usr/bin/mia", mode = "755" },
     { source = "crates/mia/dist/mia.env", dest = "/etc/ferrogate/mia.env", mode = "640", config = true },
     { source = "crates/mia/dist/mia.toml", dest = "/etc/ferrogate/mia.toml", mode = "640", config = true },
+    { source = "crates/mia/dist/mia.logrotate", dest = "/etc/logrotate.d/ferrogate-mia", mode = "644", config = true },
     { source = "crates/mia/dist/mia.service", dest = "/usr/lib/systemd/system/mia.service", mode = "644" },
     { source = "crates/mia/dist/70-ferrogate-mia-tpm.rules", dest = "/usr/lib/udev/rules.d/70-ferrogate-mia-tpm.rules", mode = "644" },
     { source = "docs/mia.md", dest = "/usr/share/doc/ferrogate-mia/mia.md", mode = "644", doc = true },

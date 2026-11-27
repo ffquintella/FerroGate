@@ -248,6 +248,35 @@ pub fn open_log(path: &Path) -> io::Result<std::fs::File> {
     }
 }
 
+/// The directory the Linux daemon writes `mia.log` to.
+#[cfg(target_os = "linux")]
+pub const LINUX_LOG_DIR: &str = "/var/log/ferrogate";
+
+/// Open (creating it, and `dir` at `0750`, when missing) the append-only log
+/// file `dir/mia.log` at `0640`, for the Linux daemon.
+///
+/// The file is opened with `O_APPEND`, so an external `logrotate` using
+/// `copytruncate` (see `dist/mia.logrotate`) can rotate it daily while the
+/// daemon keeps its descriptor: the daemon drops privileges and installs its
+/// seccomp profile after logging starts and could not reopen a renamed file.
+///
+/// # Errors
+///
+/// The directory creation or open failure (for example when not root).
+#[cfg(unix)]
+pub fn open_unix_log(dir: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o750)
+        .create(dir)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o640)
+        .open(dir.join("mia.log"))
+}
+
 /// Write `bytes` to `path`, like [`std::fs::write`].
 ///
 /// On Windows, when `path` is inside the system configuration directory (whose
@@ -1009,6 +1038,26 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn open_unix_log_creates_private_append_only_file() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("mia-log-{}", std::process::id()));
+        let log = dir.join("sub");
+        let mut f = open_unix_log(&log).expect("opens");
+        f.write_all(b"one\n").unwrap();
+        drop(f);
+        let mut f = open_unix_log(&log).expect("reopens");
+        f.write_all(b"two\n").unwrap();
+        drop(f);
+        let path = log.join("mia.log");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&path) & !0o640, 0, "no wider than 0640");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn is_inside_system_dir_is_strict_and_lexical() {

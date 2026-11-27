@@ -230,6 +230,7 @@ fn run_daemon(args: &[String], service_log: bool) -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt::layer().with_ansi(ansi).with_writer(writer))
+        .with(linux_file_log_layer(service_log))
         .with(mia::logbuf::LogBufferLayer::new(Arc::clone(&logbuf)))
         .init();
     let log_reload: LogReload =
@@ -516,6 +517,45 @@ fn log_writer(
     } else {
         Ok((BoxMakeWriter::new(std::io::stdout), true))
     }
+}
+
+/// On Linux, a second log sink: `/var/log/ferrogate/mia.log` (no ANSI), beside
+/// the stdout/journal output. Opened here, before the privilege drop, and
+/// rotated daily by `logrotate` (`dist/mia.logrotate`, `copytruncate`). When the
+/// file cannot be opened (not root, read-only `/var`) the daemon keeps logging
+/// to stdout only and says so on stderr.
+#[cfg(target_os = "linux")]
+fn linux_file_log_layer<S>(service_log: bool) -> Option<impl tracing_subscriber::Layer<S>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    if service_log {
+        return None;
+    }
+    match mia::system_dir::open_unix_log(std::path::Path::new(mia::system_dir::LINUX_LOG_DIR)) {
+        Ok(file) => Some(
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file)),
+        ),
+        Err(e) => {
+            eprintln!(
+                "mia: not logging to {}/mia.log: {e}",
+                mia::system_dir::LINUX_LOG_DIR
+            );
+            None
+        }
+    }
+}
+
+/// Other platforms have no extra file sink (macOS launchd redirects stdout).
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn linux_file_log_layer<S>(_service_log: bool) -> Option<impl tracing_subscriber::Layer<S>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    None::<fmt::Layer<S>>
 }
 
 /// Dispatch `mia service <subcommand>` — manage the Windows service so the agent
